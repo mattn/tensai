@@ -24,6 +24,14 @@ type Node struct {
 	parents      []*Node
 	backFn       func()
 	requiresGrad bool
+	op           string // operation that produced this node ("" for leaves)
+	name         string // optional display name for ToDot
+}
+
+// Named sets a display name shown by ToDot and returns the node.
+func (n *Node) Named(name string) *Node {
+	n.name = name
+	return n
 }
 
 // Input wraps a matrix as a constant graph leaf. No gradient is computed
@@ -54,17 +62,14 @@ func (n *Node) ensureGrad() *Matrix {
 	return n.Grad
 }
 
-// newNode wires up a result node; backFn is dropped when no parent needs
-// gradients, so constant subgraphs cost nothing on the backward pass.
-func newNode(value *Matrix, backFn func(), parents ...*Node) *Node {
-	out := &Node{Value: value, parents: parents}
+// newNode wires up a result node, recording the operation that produced it
+// (used by ToDot).
+func newNode(op string, value *Matrix, parents ...*Node) *Node {
+	out := &Node{Value: value, op: op, parents: parents}
 	for _, p := range parents {
 		if p.requiresGrad {
 			out.requiresGrad = true
 		}
-	}
-	if out.requiresGrad {
-		out.backFn = backFn
 	}
 	return out
 }
@@ -106,7 +111,7 @@ func (n *Node) MatMul(o *Node) *Node {
 	if err != nil {
 		panic(err.Error())
 	}
-	out := newNode(v, nil, n, o)
+	out := newNode("matmul", v, n, o)
 	out.backFn = func() {
 		if n.requiresGrad {
 			d, _ := Dot(out.Grad, o.Value.T())
@@ -126,7 +131,7 @@ func (n *Node) Add(o *Node) *Node {
 	if err != nil {
 		panic(err.Error())
 	}
-	return newNode(v, nil, n, o).withBack(func(out *Node) {
+	return newNode("add", v, n, o).withBack(func(out *Node) {
 		if n.requiresGrad {
 			addInto(n.ensureGrad(), out.Grad)
 		}
@@ -146,7 +151,7 @@ func (n *Node) Sub(o *Node) *Node {
 	for i := range v.Data {
 		v.Data[i] = n.Value.Data[i] - o.Value.Data[i]
 	}
-	return newNode(v, nil, n, o).withBack(func(out *Node) {
+	return newNode("sub", v, n, o).withBack(func(out *Node) {
 		if n.requiresGrad {
 			addInto(n.ensureGrad(), out.Grad)
 		}
@@ -169,7 +174,7 @@ func (n *Node) MulElem(o *Node) *Node {
 	for i := range v.Data {
 		v.Data[i] = n.Value.Data[i] * o.Value.Data[i]
 	}
-	return newNode(v, nil, n, o).withBack(func(out *Node) {
+	return newNode("mulelem", v, n, o).withBack(func(out *Node) {
 		if n.requiresGrad {
 			g := n.ensureGrad()
 			for i, gv := range out.Grad.Data {
@@ -191,7 +196,7 @@ func (n *Node) Scale(s Float) *Node {
 	for i, x := range n.Value.Data {
 		v.Data[i] = s * x
 	}
-	return newNode(v, nil, n).withBack(func(out *Node) {
+	return newNode("scale", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for i, gv := range out.Grad.Data {
 			g.Data[i] += s * gv
@@ -206,7 +211,7 @@ func (n *Node) AddRow(row *Node) *Node {
 		panic(fmt.Sprintf("tensai: addrow expects 1x%d row, got %dx%d",
 			n.Value.Cols, row.Value.Rows, row.Value.Cols))
 	}
-	return newNode(v, nil, n, row).withBack(func(out *Node) {
+	return newNode("addrow", v, n, row).withBack(func(out *Node) {
 		if n.requiresGrad {
 			addInto(n.ensureGrad(), out.Grad)
 		}
@@ -225,7 +230,7 @@ func (n *Node) AddRow(row *Node) *Node {
 func (n *Node) ReLU() *Node {
 	v := NewMatrix(n.Value.Rows, n.Value.Cols)
 	reluFwd(v.Data, n.Value.Data)
-	return newNode(v, nil, n).withBack(func(out *Node) {
+	return newNode("relu", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for i, gv := range out.Grad.Data {
 			if n.Value.Data[i] > 0 {
@@ -239,7 +244,7 @@ func (n *Node) ReLU() *Node {
 func (n *Node) Sigmoid() *Node {
 	v := NewMatrix(n.Value.Rows, n.Value.Cols)
 	sigmoidFwd(v.Data, n.Value.Data)
-	return newNode(v, nil, n).withBack(func(out *Node) {
+	return newNode("sigmoid", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for i, gv := range out.Grad.Data {
 			y := v.Data[i]
@@ -252,7 +257,7 @@ func (n *Node) Sigmoid() *Node {
 func (n *Node) Tanh() *Node {
 	v := NewMatrix(n.Value.Rows, n.Value.Cols)
 	tanhFwd(v.Data, n.Value.Data)
-	return newNode(v, nil, n).withBack(func(out *Node) {
+	return newNode("tanh", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for i, gv := range out.Grad.Data {
 			y := v.Data[i]
@@ -263,7 +268,7 @@ func (n *Node) Tanh() *Node {
 
 // T returns the transpose of n.
 func (n *Node) T() *Node {
-	return newNode(n.Value.T(), nil, n).withBack(func(out *Node) {
+	return newNode("transpose", n.Value.T(), n).withBack(func(out *Node) {
 		addInto(n.ensureGrad(), out.Grad.T())
 	})
 }
@@ -288,7 +293,7 @@ func (n *Node) Softmax() *Node {
 		}
 		scaleSlice(outRow, 1/denom)
 	}
-	return newNode(v, nil, n).withBack(func(out *Node) {
+	return newNode("softmax", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for r := 0; r < v.Rows; r++ {
 			y := v.Data[r*cols : (r+1)*cols]
@@ -310,7 +315,7 @@ func (n *Node) Sum() *Node {
 	for _, x := range n.Value.Data {
 		v.Data[0] += x
 	}
-	return newNode(v, nil, n).withBack(func(out *Node) {
+	return newNode("sum", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for i := range g.Data {
 			g.Data[i] += out.Grad.Data[0]
@@ -340,7 +345,7 @@ func (n *Node) SoftmaxCELoss(target *Matrix) *Node {
 	}
 	v := NewMatrix(1, 1)
 	v.Data[0] = lossVal
-	return newNode(v, nil, n).withBack(func(out *Node) {
+	return newNode("softmax_ce", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for i, gv := range grad.Data {
 			g.Data[i] += out.Grad.Data[0] * gv

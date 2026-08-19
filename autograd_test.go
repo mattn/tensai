@@ -3,6 +3,7 @@ package tensai
 import (
 	"math"
 	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -142,5 +143,27 @@ func TestAutogradTrainsXOR(t *testing.T) {
 		if math.Abs(float64(got-want)) > 0.15 {
 			t.Errorf("sample %d: predicted %.3f, want %g", r, got, want)
 		}
+	}
+}
+
+func TestToDot(t *testing.T) {
+	rng := rand.New(rand.NewSource(71))
+	x := Input(RandomMatrix(3, 2, rng)).Named("x")
+	w := Param(RandomMatrix(2, 4, rng)).Named("w")
+	root := x.MatMul(w).Tanh().Sum()
+	dot := root.ToDot()
+
+	for _, want := range []string{
+		"digraph tensai",
+		`"x\n3x2"`, `"w\n2x4"`,
+		`"matmul\n3x4"`, `"tanh\n3x4"`, `"sum\n1x1"`,
+	} {
+		if !strings.Contains(dot, want) {
+			t.Errorf("ToDot output missing %q:\n%s", want, dot)
+		}
+	}
+	// x->matmul, w->matmul, matmul->tanh, tanh->sum
+	if got := strings.Count(dot, "->"); got != 4 {
+		t.Errorf("expected 4 edges, got %d:\n%s", got, dot)
 	}
 }

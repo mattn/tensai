@@ -13,7 +13,7 @@
 - **Loss functions** - `MeanSquaredError` for regression, `SoftmaxCrossEntropy` for multi-class classification, and `BinaryCrossEntropy` for binary targets
 - **Optimizers** - momentum `SGD`, `Adam`, and `AdamW` (decoupled weight decay)
 - **Sequential models** - stack layers and run `Compile` -> `Fit` / `FitStep` -> `Predict`
-- **Automatic differentiation** - a micrograd-style reverse-mode autograd engine over matrices (`Param` / `Input` / `Backward`), for models that don't fit the Sequential mold
+- **Automatic differentiation** - a micrograd-style reverse-mode autograd engine over matrices (`Param` / `Input` / `Backward`), for models that don't fit the Sequential mold; `ToDot` renders the computation graph for Graphviz
 - **Recurrence and attention** - `RNNCell`, `LSTMCell`, and single-head `SelfAttention` built on the autograd engine, with backpropagation through time handled automatically
 - **Serialization** - `Save`/`Load` (and `SaveFile`/`LoadFile`) round-trip trained Sequential parameters as JSON, including BatchNorm running statistics; `SaveParams`/`LoadParams` do the same for autograd parameters (RNN/LSTM/attention cells)
 
@@ -46,6 +46,7 @@ _example/iris       Runnable Iris classification example
 _example/mnist      Runnable MNIST classifier (-model dense or cnn) with save/load
 _example/charrnn    Character-level LSTM text generation on the autograd engine
 _example/plasma     Demoscene-style terminal plasma rendered by a neural network
+_example/dot        Computation-graph visualization via Graphviz DOT
 ```
 
 ## Usage
@@ -118,6 +119,8 @@ for step := 0; step < 2000; step++ {
 ```
 
 For manual control, the pieces are still public: `loss.Backward()`, `p.Grad`, and `tensai.ZeroGrads(params...)`.
+
+The graph a loss node holds can be visualized: `loss.ToDot()` returns Graphviz DOT (label leaves with `.Named("w1")`), so `go run ./_example/dot | dot -Tsvg > graph.svg` draws the network the same way Gorgonia's encoding/dot does.
 
 Graphs are built dynamically per step (define-by-run) and are single-use. Available ops: `MatMul`, `Add`, `Sub`, `MulElem`, `Scale`, `AddRow`, `T`, `Softmax`, `ReLU`, `Sigmoid`, `Tanh`, `Sum`, `Mean`, `MSELoss`, and `SoftmaxCELoss`. Shape mismatches panic during graph construction. Every op's gradient is verified against finite differences in the test suite.
 
