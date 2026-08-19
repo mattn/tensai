@@ -115,6 +115,10 @@ func DotInto(out, a, b *Matrix) error {
 	// Rows are independent, so large products are split across CPUs. Small
 	// ones stay single-threaded to avoid goroutine overhead.
 	workers := dotWorkerCount(a.Rows, a.Cols, b.Cols)
+	if workers == 1 {
+		dotRows(out, a, b, 0, a.Rows)
+		return nil
+	}
 	chunk := (a.Rows + workers - 1) / workers
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
