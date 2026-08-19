@@ -170,3 +170,11 @@ Both raw IDX files and `.gz` variants are accepted.
 - The `Layer` interface standardizes `Forward`, `Backward`, `Params`, and `Grads`, which keeps new layers such as convolution or dropout straightforward to add.
 - `Dense` weights use Glorot/He-style initialization to keep early training stable.
 - `SoftmaxCrossEntropy` subtracts the row maximum before softmax for numerical stability.
+
+## License
+
+MIT
+
+## Author
+
+Yasuhiro Matsumoto (a.k.a. mattn)
