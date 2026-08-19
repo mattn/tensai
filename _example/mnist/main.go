@@ -240,7 +240,7 @@ func argmaxRow(m *tensai.Matrix, row int) int {
 	return best
 }
 
-func evaluate(model *tensai.Sequential, inputs, targets *tensai.Matrix) (int, [classCount][classCount]int, error) {
+func evaluate(model tensai.Model, inputs, targets *tensai.Matrix) (int, [classCount][classCount]int, error) {
 	var confusion [classCount][classCount]int
 	correct := 0
 	// Predict in chunks: the CNN's im2col expansion over a whole split at
@@ -296,7 +296,7 @@ func buildModel(kind string) (*tensai.Sequential, error) {
 }
 
 func main() {
-	kind := flag.String("model", "dense", "model architecture: dense or cnn")
+	kind := flag.String("model", "dense", "model architecture: dense, cnn, or knn")
 	flag.Parse()
 
 	dataDir := os.Getenv("MNIST_DIR")
@@ -311,6 +311,22 @@ func main() {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mnist: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *kind == "knn" {
+		// A lazy baseline: no training at all, just neighbor votes. The
+		// distance matrix runs on the same Dot kernel as the networks.
+		knn := tensai.NewKNN(3)
+		if err := knn.Fit(trainInputs, trainTargets); err != nil {
+			panic(err)
+		}
+		correct, confusion, err := evaluate(knn, testInputs, testTargets)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Printf("knn (k=3) test accuracy: %d/%d\n", correct, testInputs.Rows)
+		printConfusion(confusion)
+		return
 	}
 
 	model, err := buildModel(*kind)
@@ -368,6 +384,10 @@ func main() {
 		panic(err)
 	}
 	fmt.Printf("saved to %s, reloaded accuracy: %d/%d\n", modelPath, reloadedCorrect, testInputs.Rows)
+	printConfusion(confusion)
+}
+
+func printConfusion(confusion [classCount][classCount]int) {
 	fmt.Println("\nconfusion matrix (rows = actual, columns = predicted):")
 	for r := 0; r < classCount; r++ {
 		fmt.Printf("  %d:", r)

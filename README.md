@@ -12,6 +12,7 @@
 - **Layers** - `Dense`, `Conv2D`, `MaxPool2D`, `BatchNorm`, `Dropout`, plus `ReLU`, `LeakyReLU`, `Sigmoid`, `Tanh`, and `Softmax` activations
 - **Loss functions** - `MeanSquaredError` for regression, `SoftmaxCrossEntropy` for multi-class classification, and `BinaryCrossEntropy` for binary targets
 - **Optimizers** - momentum `SGD`, `Adam`, and `AdamW` (decoupled weight decay)
+- **k-NN baseline** - a `KNN` classifier whose distance matrix runs on the same SIMD matmul kernel; useful as a no-training baseline next to the networks
 - **Sequential models** - stack layers and run `Compile` -> `Fit` / `FitStep` -> `Predict`
 - **Automatic differentiation** - a micrograd-style reverse-mode autograd engine over matrices (`Param` / `Input` / `Backward`), for models that don't fit the Sequential mold; `ToDot` renders the computation graph for Graphviz
 - **Recurrence and attention** - `RNNCell`, `LSTMCell`, and single-head `SelfAttention` built on the autograd engine, with backpropagation through time handled automatically
@@ -44,7 +45,7 @@ _example/xor        Runnable XOR training example
 _example/fizzbuzz   Runnable FizzBuzz classification example
 _example/spiral     Runnable 3-class spiral classification example
 _example/iris       Runnable Iris classification example
-_example/mnist      Runnable MNIST classifier (-model dense or cnn) with save/load
+_example/mnist      Runnable MNIST classifier (-model dense, cnn, or knn) with save/load
 _example/charrnn    Character-level LSTM text generation on the autograd engine
 _example/plasma     Demoscene-style terminal plasma rendered by a neural network
 _example/dot        Graphviz DOT export of the z = x + y graph
@@ -166,11 +167,12 @@ GOEXPERIMENT=simd go test ./...
 GOEXPERIMENT=simd go test -bench=Dot .
 ```
 
-The MNIST example downloads the standard IDX gzip files into `_example/mnist/data` when they are missing. Set `MNIST_DIR` to use another cache directory, and pass `-model cnn` for the convolutional variant (Conv2D/MaxPool2D/Dropout + AdamW); both variants finish by saving the trained model and re-scoring it after a reload:
+The MNIST example downloads the standard IDX gzip files into `_example/mnist/data` when they are missing. Set `MNIST_DIR` to use another cache directory, and pass `-model cnn` for the convolutional variant (Conv2D/MaxPool2D/Dropout + AdamW); both trained variants finish by saving the model and re-scoring it after a reload. `-model knn` runs the no-training k-NN baseline instead — on the 5000-sample subset it scores ~91% against ~92% for the MLP and ~95% for the CNN:
 
 ```bash
 go run ./_example/mnist
 go run ./_example/mnist -model cnn
+go run ./_example/mnist -model knn
 MNIST_DIR=/path/to/mnist go run ./_example/mnist
 ```
 
