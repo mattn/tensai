@@ -17,6 +17,11 @@ type Sequential struct {
 	loss      Loss
 	lossName  string
 	rng       *rand.Rand
+	lossGrad  *Matrix
+}
+
+type lossInto interface {
+	LossInto(pred, target, grad *Matrix) (Float, error)
 }
 
 // NewSequential returns an empty Sequential model. optimizer and loss are
@@ -129,9 +134,20 @@ func (s *Sequential) FitStep(input, target *Matrix) (Float, error) {
 	if err != nil {
 		return 0, err
 	}
-	lossVal, grad, err := s.loss.Loss(pred, target)
-	if err != nil {
-		return 0, fmt.Errorf("tensai: loss: %w", err)
+	var lossVal Float
+	var grad *Matrix
+	if li, ok := s.loss.(lossInto); ok {
+		s.lossGrad = ensureMatrix(s.lossGrad, pred.Rows, pred.Cols)
+		lossVal, err = li.LossInto(pred, target, s.lossGrad)
+		grad = s.lossGrad
+		if err != nil {
+			return 0, fmt.Errorf("tensai: loss: %w", err)
+		}
+	} else {
+		lossVal, grad, err = s.loss.Loss(pred, target)
+		if err != nil {
+			return 0, fmt.Errorf("tensai: loss: %w", err)
+		}
 	}
 	if err := s.backward(grad); err != nil {
 		return 0, err
