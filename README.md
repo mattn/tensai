@@ -15,7 +15,7 @@
 - **Sequential models** - stack layers and run `Compile` -> `Fit` / `FitStep` -> `Predict`
 - **Automatic differentiation** - a micrograd-style reverse-mode autograd engine over matrices (`Param` / `Input` / `Backward`), for models that don't fit the Sequential mold
 - **Recurrence and attention** - `RNNCell`, `LSTMCell`, and single-head `SelfAttention` built on the autograd engine, with backpropagation through time handled automatically
-- **Serialization** - `Save`/`Load` (and `SaveFile`/`LoadFile`) round-trip trained parameters as JSON, including BatchNorm running statistics
+- **Serialization** - `Save`/`Load` (and `SaveFile`/`LoadFile`) round-trip trained Sequential parameters as JSON, including BatchNorm running statistics; `SaveParams`/`LoadParams` do the same for autograd parameters (RNN/LSTM/attention cells)
 
 ## Layout
 
@@ -140,6 +140,8 @@ for step := 0; step < epochs; step++ {
 ```
 
 `SelfAttention` operates on one `(seqLen x inSize)` sequence node: `attn.Forward(x)` computes `softmax(Q*K^T/sqrt(d))*V` with learned projections; the raw `tensai.Attention(q, k, v)` form is also exposed.
+
+Autograd parameters are saved and restored positionally with `tensai.SaveParamsFile("cell.json", cell.Params()...)` / `tensai.LoadParamsFile("cell.json", cell.Params()...)` — build the same cell, then load.
 
 ## Run
 

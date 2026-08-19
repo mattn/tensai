@@ -1,6 +1,7 @@
 package tensai
 
 import (
+	"bytes"
 	"math/rand"
 	"testing"
 )
@@ -146,5 +147,45 @@ func TestRNNLearnsParity(t *testing.T) {
 		if best != int(targets.Data[s]) {
 			t.Errorf("sequence %04b: predicted %d, want %g", s, best, targets.Data[s])
 		}
+	}
+}
+
+func TestSaveLoadParams(t *testing.T) {
+	rng := rand.New(rand.NewSource(59))
+	cell := NewLSTMCell(3, 5, rng)
+	x := RandomMatrix(4, 3, rng)
+
+	forward := func(c *LSTMCell) *Matrix {
+		h, s := c.InitState(4)
+		h, _ = c.Step(Input(x), h, s)
+		return h.Value
+	}
+	want := forward(cell)
+
+	var buf bytes.Buffer
+	if err := SaveParams(&buf, cell.Params()...); err != nil {
+		t.Fatal(err)
+	}
+
+	// A differently initialized cell must reproduce the original's output
+	// after loading.
+	cell2 := NewLSTMCell(3, 5, rand.New(rand.NewSource(61)))
+	if err := LoadParams(&buf, cell2.Params()...); err != nil {
+		t.Fatal(err)
+	}
+	got := forward(cell2)
+	for i := range want.Data {
+		if want.Data[i] != got.Data[i] {
+			t.Fatalf("output %d differs after load: %g vs %g", i, want.Data[i], got.Data[i])
+		}
+	}
+
+	// Shape mismatches must be rejected.
+	if err := SaveParams(&buf, cell.Params()...); err != nil {
+		t.Fatal(err)
+	}
+	other := NewLSTMCell(3, 6, rand.New(rand.NewSource(67)))
+	if err := LoadParams(&buf, other.Params()...); err == nil {
+		t.Error("loading into a different architecture should fail")
 	}
 }
