@@ -3,6 +3,7 @@
 package tensai
 
 import (
+	"runtime"
 	"simd/archsimd"
 	"unsafe"
 )
@@ -61,4 +62,15 @@ func dotRows(out, a, b *Matrix, lo, hi int) {
 			}
 		}
 	}
+}
+
+func dotWorkerCount(rows, inner, cols int) int {
+	workers := 1
+	if rows*inner*cols >= 1<<23 {
+		workers = runtime.NumCPU()
+		if workers > rows {
+			workers = rows
+		}
+	}
+	return workers
 }

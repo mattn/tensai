@@ -94,12 +94,14 @@ func scaleSliceGeneric(dst []Float, s Float) {
 // adamStepGeneric applies one Adam/AdamW update over a parameter slice.
 // rc1/rc2 are the reciprocal bias corrections 1/(1-beta^t).
 func adamStepGeneric(w, g, m, v []Float, beta1, beta2, rc1, rc2, lr, eps, wd Float) {
-	for i := range w {
+	ib1 := 1 - beta1
+	ib2 := 1 - beta2
+	for i, wi := range w {
 		gi := g[i]
-		m[i] = beta1*m[i] + (1-beta1)*gi
-		v[i] = beta2*v[i] + (1-beta2)*gi*gi
-		mHat := m[i] * rc1
-		vHat := v[i] * rc2
-		w[i] -= lr * (mHat/(sqrtF(vHat)+eps) + wd*w[i])
+		mi := beta1*m[i] + ib1*gi
+		vi := beta2*v[i] + ib2*gi*gi
+		m[i] = mi
+		v[i] = vi
+		w[i] = wi - lr*(mi*rc1/(sqrtF(vi*rc2)+eps)+wd*wi)
 	}
 }
