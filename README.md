@@ -39,6 +39,7 @@ rnn.go              RNNCell / LSTMCell / SelfAttention on the autograd engine
 serialize.go        Model parameter save/load (JSON)
 tensai_test.go      Unit tests plus XOR convergence test
 features_test.go    Gradient checks and tests for the newer layers
+_example/helloworld Smallest possible program: add two values on the graph
 _example/xor        Runnable XOR training example
 _example/fizzbuzz   Runnable FizzBuzz classification example
 _example/spiral     Runnable 3-class spiral classification example
@@ -46,7 +47,7 @@ _example/iris       Runnable Iris classification example
 _example/mnist      Runnable MNIST classifier (-model dense or cnn) with save/load
 _example/charrnn    Character-level LSTM text generation on the autograd engine
 _example/plasma     Demoscene-style terminal plasma rendered by a neural network
-_example/dot        Computation-graph visualization via Graphviz DOT
+_example/dot        Graphviz DOT export of the z = x + y graph
 ```
 
 ## Usage
@@ -151,6 +152,7 @@ Autograd parameters are saved and restored positionally with `tensai.SaveParamsF
 ## Run
 
 ```bash
+go run ./_example/helloworld
 go run ./_example/xor
 go run ./_example/fizzbuzz
 go run ./_example/spiral
