@@ -1,0 +1,5 @@
+*.test
+/model.json
+/.agents/
+/.codex/
+_example/mnist/data/

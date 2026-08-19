@@ -1,0 +1,23 @@
+//go:build !goexperiment.simd || !amd64
+
+package tensai
+
+// Portable dispatchers for the element-wise kernels; build with
+// GOEXPERIMENT=simd on amd64 for the AVX2 versions in mathvec_simd.go.
+
+func reluFwd(dst, src []Float)               { reluFwdGeneric(dst, src) }
+func reluBwd(dst, grad, src []Float)         { reluBwdGeneric(dst, grad, src) }
+func leakyFwd(dst, src []Float, alpha Float) { leakyFwdGeneric(dst, src, alpha) }
+func leakyBwd(dst, grad, src []Float, alpha Float) {
+	leakyBwdGeneric(dst, grad, src, alpha)
+}
+func sigmoidFwd(dst, src []Float)            { sigmoidFwdGeneric(dst, src) }
+func sigmoidBwd(dst, grad, y []Float)        { sigmoidBwdGeneric(dst, grad, y) }
+func tanhFwd(dst, src []Float)               { tanhFwdGeneric(dst, src) }
+func tanhBwd(dst, grad, y []Float)           { tanhBwdGeneric(dst, grad, y) }
+func expShift(dst, src []Float, shift Float) { expShiftGeneric(dst, src, shift) }
+func addSlice(dst, src []Float)              { addSliceGeneric(dst, src) }
+func scaleSlice(dst []Float, s Float)        { scaleSliceGeneric(dst, s) }
+func adamStepSlice(w, g, m, v []Float, beta1, beta2, rc1, rc2, lr, eps, wd Float) {
+	adamStepGeneric(w, g, m, v, beta1, beta2, rc1, rc2, lr, eps, wd)
+}
