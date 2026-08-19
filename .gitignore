@@ -4,3 +4,5 @@
 /.codex/
 _example/mnist/data/
 /charrnn.json
+/graph.png
+/graph.svg
