@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"encoding/binary"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"math/rand"
@@ -240,24 +241,64 @@ func argmaxRow(m *tensai.Matrix, row int) int {
 }
 
 func evaluate(model *tensai.Sequential, inputs, targets *tensai.Matrix) (int, [classCount][classCount]int, error) {
-	pred, err := model.Predict(inputs)
-	if err != nil {
-		return 0, [classCount][classCount]int{}, err
-	}
 	var confusion [classCount][classCount]int
 	correct := 0
-	for r := 0; r < pred.Rows; r++ {
-		got := argmaxRow(pred, r)
-		want := int(targets.At(r, 0))
-		confusion[want][got]++
-		if got == want {
-			correct++
+	// Predict in chunks: the CNN's im2col expansion over a whole split at
+	// once would be needlessly large.
+	const chunk = 500
+	for off := 0; off < inputs.Rows; off += chunk {
+		n := min(chunk, inputs.Rows-off)
+		view := &tensai.Matrix{Rows: n, Cols: imageSize, Data: inputs.Data[off*imageSize : (off+n)*imageSize]}
+		pred, err := model.Predict(view)
+		if err != nil {
+			return 0, confusion, err
+		}
+		for r := 0; r < n; r++ {
+			got := argmaxRow(pred, r)
+			want := int(targets.At(off+r, 0))
+			confusion[want][got]++
+			if got == want {
+				correct++
+			}
 		}
 	}
 	return correct, confusion, nil
 }
 
+// buildModel constructs either the plain MLP or a small CNN and compiles it.
+func buildModel(kind string) (*tensai.Sequential, error) {
+	model := tensai.NewSequential()
+	switch kind {
+	case "dense":
+		model.Add(tensai.NewDense(128))
+		model.Add(&tensai.ReLU{})
+		model.Add(tensai.NewDense(64))
+		model.Add(&tensai.ReLU{})
+		model.Add(tensai.NewDense(classCount))
+	case "cnn":
+		model.Add(tensai.NewConv2D(28, 28, 1, 8, 3, 1, 1)) // 28x28x1 -> 28x28x8
+		model.Add(&tensai.ReLU{})
+		model.Add(tensai.NewMaxPool2D(28, 28, 8, 2)) // -> 14x14x8
+		model.Add(tensai.NewConv2D(14, 14, 8, 16, 3, 1, 1))
+		model.Add(&tensai.ReLU{})
+		model.Add(tensai.NewMaxPool2D(14, 14, 16, 2)) // -> 7x7x16
+		model.Add(tensai.NewDense(64))
+		model.Add(&tensai.ReLU{})
+		model.Add(tensai.NewDropout(0.25))
+		model.Add(tensai.NewDense(classCount))
+	default:
+		return nil, fmt.Errorf("unknown model kind %q (want dense or cnn)", kind)
+	}
+	if err := model.Compile(imageSize, tensai.SoftmaxCrossEntropy{}, tensai.NewAdamW(0.001, 0.01)); err != nil {
+		return nil, err
+	}
+	return model, nil
+}
+
 func main() {
+	kind := flag.String("model", "dense", "model architecture: dense or cnn")
+	flag.Parse()
+
 	dataDir := os.Getenv("MNIST_DIR")
 	if dataDir == "" {
 		dataDir = defaultDataDir
@@ -272,14 +313,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	model := tensai.NewSequential()
-	model.Add(tensai.NewDense(128))
-	model.Add(&tensai.ReLU{})
-	model.Add(tensai.NewDense(64))
-	model.Add(&tensai.ReLU{})
-	model.Add(tensai.NewDense(classCount))
-	if err := model.Compile(imageSize, tensai.SoftmaxCrossEntropy{}, tensai.NewAdam(0.001)); err != nil {
-		panic(err)
+	model, err := buildModel(*kind)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "mnist: %v\n", err)
+		os.Exit(1)
 	}
 
 	batchInputs := tensai.NewMatrix(batchSize, imageSize)
@@ -312,6 +349,25 @@ func main() {
 
 	fmt.Printf("\ntrain accuracy: %d/%d\n", trainCorrect, trainInputs.Rows)
 	fmt.Printf("test accuracy:  %d/%d\n", testCorrect, testInputs.Rows)
+
+	// Round-trip the trained parameters through JSON to demonstrate
+	// serialization: a freshly built model must score identically.
+	modelPath := filepath.Join(dataDir, "model-"+*kind+".json")
+	if err := model.SaveFile(modelPath); err != nil {
+		panic(err)
+	}
+	reloaded, err := buildModel(*kind)
+	if err != nil {
+		panic(err)
+	}
+	if err := reloaded.LoadFile(modelPath); err != nil {
+		panic(err)
+	}
+	reloadedCorrect, _, err := evaluate(reloaded, testInputs, testTargets)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("saved to %s, reloaded accuracy: %d/%d\n", modelPath, reloadedCorrect, testInputs.Rows)
 	fmt.Println("\nconfusion matrix (rows = actual, columns = predicted):")
 	for r := 0; r < classCount; r++ {
 		fmt.Printf("  %d:", r)

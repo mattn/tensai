@@ -43,7 +43,8 @@ _example/xor        Runnable XOR training example
 _example/fizzbuzz   Runnable FizzBuzz classification example
 _example/spiral     Runnable 3-class spiral classification example
 _example/iris       Runnable Iris classification example
-_example/mnist      Runnable MNIST IDX loader and classifier example
+_example/mnist      Runnable MNIST classifier (-model dense or cnn) with save/load
+_example/charrnn    Character-level LSTM text generation on the autograd engine
 ```
 
 ## Usage
@@ -150,6 +151,7 @@ go run ./_example/xor
 go run ./_example/fizzbuzz
 go run ./_example/spiral
 go run ./_example/iris
+go run ./_example/charrnn
 go test ./...
 
 # With the AVX2 SIMD kernel (Go 1.26+, amd64):
@@ -157,12 +159,15 @@ GOEXPERIMENT=simd go test ./...
 GOEXPERIMENT=simd go test -bench=Dot .
 ```
 
-The MNIST example downloads the standard IDX gzip files into `_example/mnist/data` when they are missing. Set `MNIST_DIR` to use another cache directory:
+The MNIST example downloads the standard IDX gzip files into `_example/mnist/data` when they are missing. Set `MNIST_DIR` to use another cache directory, and pass `-model cnn` for the convolutional variant (Conv2D/MaxPool2D/Dropout + AdamW); both variants finish by saving the trained model and re-scoring it after a reload:
 
 ```bash
 go run ./_example/mnist
+go run ./_example/mnist -model cnn
 MNIST_DIR=/path/to/mnist go run ./_example/mnist
 ```
+
+The charrnn example trains a character-level LSTM on an embedded public-domain text, saves the parameters with `SaveParamsFile`, restores them into a fresh model, and generates a sample from the reloaded parameters.
 
 Both raw IDX files and `.gz` variants are accepted.
 
