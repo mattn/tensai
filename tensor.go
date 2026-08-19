@@ -111,7 +111,6 @@ func DotInto(out, a, b *Matrix) error {
 		return fmt.Errorf("tensai: dot output shape mismatch: got %dx%d, want %dx%d",
 			out.Rows, out.Cols, a.Rows, b.Cols)
 	}
-	clear(out.Data) // dotRows accumulates
 	// Rows are independent, so large products are split across CPUs. Small
 	// ones stay single-threaded to avoid goroutine overhead.
 	workers := dotWorkerCount(a.Rows, a.Cols, b.Cols)
@@ -158,14 +157,25 @@ func dotRowsGeneric(out, a, b *Matrix, lo, hi int) {
 	for r := lo; r < hi; r++ {
 		aRow := a.Data[r*a.Cols : (r+1)*a.Cols]
 		outRow := out.Data[r*b.Cols : (r+1)*b.Cols]
+		initialized := false
 		for k, av := range aRow {
 			if av == 0 {
 				continue
 			}
 			bRow := b.Data[k*b.Cols : (k+1)*b.Cols]
+			if !initialized {
+				for c, bv := range bRow {
+					outRow[c] = av * bv
+				}
+				initialized = true
+				continue
+			}
 			for c, bv := range bRow {
 				outRow[c] += av * bv
 			}
+		}
+		if !initialized {
+			clear(outRow)
 		}
 	}
 }

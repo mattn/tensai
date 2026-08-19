@@ -35,6 +35,7 @@ func dotRows(out, a, b *Matrix, lo, hi int) {
 		aRow := a.Data[r*a.Cols : (r+1)*a.Cols]
 		aBits := unsafe.Slice((*uint32)(unsafe.Pointer(&aRow[0])), len(aRow))
 		outRow := out.Data[r*cols : (r+1)*cols]
+		initialized := false
 		for k := range aBits {
 			if aBits[k]<<1 == 0 { // +0.0 or -0.0
 				continue
@@ -42,6 +43,28 @@ func dotRows(out, a, b *Matrix, lo, hi int) {
 			bRow := b.Data[k*cols : (k+1)*cols]
 			vv := archsimd.BroadcastUint32x8(aBits[k]).AsFloat32x8()
 			var c int
+			if !initialized {
+				for ; c < wide; c += 32 {
+					archsimd.LoadFloat32x8Slice(bRow[c:]).
+						Mul(vv).StoreSlice(outRow[c:])
+					archsimd.LoadFloat32x8Slice(bRow[c+8:]).
+						Mul(vv).StoreSlice(outRow[c+8:])
+					archsimd.LoadFloat32x8Slice(bRow[c+16:]).
+						Mul(vv).StoreSlice(outRow[c+16:])
+					archsimd.LoadFloat32x8Slice(bRow[c+24:]).
+						Mul(vv).StoreSlice(outRow[c+24:])
+				}
+				for ; c < vecs; c += 8 {
+					archsimd.LoadFloat32x8Slice(bRow[c:]).
+						Mul(vv).StoreSlice(outRow[c:])
+				}
+				if c < cols {
+					archsimd.LoadFloat32x8SlicePart(bRow[c:]).
+						Mul(vv).StoreSlicePart(outRow[c:])
+				}
+				initialized = true
+				continue
+			}
 			for ; c < wide; c += 32 {
 				archsimd.LoadFloat32x8Slice(bRow[c:]).
 					MulAdd(vv, archsimd.LoadFloat32x8Slice(outRow[c:])).StoreSlice(outRow[c:])
@@ -60,6 +83,9 @@ func dotRows(out, a, b *Matrix, lo, hi int) {
 				archsimd.LoadFloat32x8SlicePart(bRow[c:]).
 					MulAdd(vv, archsimd.LoadFloat32x8SlicePart(outRow[c:])).StoreSlicePart(outRow[c:])
 			}
+		}
+		if !initialized {
+			clear(outRow)
 		}
 	}
 }
