@@ -45,6 +45,7 @@ _example/spiral     Runnable 3-class spiral classification example
 _example/iris       Runnable Iris classification example
 _example/mnist      Runnable MNIST classifier (-model dense or cnn) with save/load
 _example/charrnn    Character-level LSTM text generation on the autograd engine
+_example/plasma     Demoscene-style terminal plasma rendered by a neural network
 ```
 
 ## Usage
@@ -152,6 +153,7 @@ go run ./_example/fizzbuzz
 go run ./_example/spiral
 go run ./_example/iris
 go run ./_example/charrnn
+go run ./_example/plasma
 go test ./...
 
 # With the AVX2 SIMD kernel (Go 1.26+, amd64):
@@ -168,6 +170,8 @@ MNIST_DIR=/path/to/mnist go run ./_example/mnist
 ```
 
 The charrnn example trains a character-level LSTM on an embedded public-domain text, saves the parameters with `SaveParamsFile`, restores them into a fresh model, and generates a sample from the reloaded parameters.
+
+The plasma example animates a demoscene-style plasma in the terminal where the plasma function is a randomly weighted network (a CPPN) evaluated for every pixel of every frame as one batch. The status line shows the per-frame network time, which makes it a live SIMD benchmark: 120x90 pixels runs at ~32 fps on the portable build and ~100 fps with `GOEXPERIMENT=simd` on the same machine. Try different `-seed` values for different effects.
 
 Both raw IDX files and `.gz` variants are accepted.
 
