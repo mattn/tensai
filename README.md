@@ -184,6 +184,29 @@ The plasma example animates a demoscene-style plasma in the terminal where the p
 
 Both raw IDX files and `.gz` variants are accepted.
 
+## SIMD Coverage
+
+Where the AVX2 kernels apply today, and where they still could:
+
+- [x] Matmul (`Dot`/`DotInto`) — used by `Dense`, `Conv2D` (im2col product), `KNN` distances, and autograd `MatMul`
+- [x] ReLU / LeakyReLU forward & backward
+- [x] Sigmoid / Tanh forward & backward (vectorized polynomial `exp`)
+- [x] GELU forward & backward (vectorized `erf`)
+- [x] LayerNorm forward & backward (vector row reductions)
+- [x] Softmax / SoftmaxCrossEntropy exponentials and scaling
+- [x] Adam / AdamW parameter update
+- [x] Slice add & scale primitives (bias add, `Embedding` gradient scatter-add)
+- [ ] Transpose (`T`/`TInto`) — needs 8x8 block-and-shuffle
+- [ ] Softmax backward row dot products (layer and autograd)
+- [ ] MSE / BinaryCrossEntropy losses (BCE needs a vectorized `log`)
+- [ ] Autograd element-wise backward passes (gradients accumulate with `+=`, so they need dedicated fused kernels)
+- [ ] BatchNorm statistics (column-strided access needs a restructure)
+- [ ] MaxPool2D window scan
+- [ ] im2col / col2im gather-scatter (contiguous runs could use bulk copies)
+- [ ] SGD update
+
+The unchecked items are ordered roughly by expected impact; none of them show up prominently in training profiles today.
+
 ## Design Notes
 
 - All operations are batched. Inputs are `MxN` matrices, where `M` is the batch size and `N` is the feature dimension.
