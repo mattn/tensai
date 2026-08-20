@@ -181,3 +181,9 @@ func (s *Sequential) Fit(input, target *Matrix, epochs int) error {
 func (s *Sequential) Predict(input *Matrix) (*Matrix, error) {
 	return s.forward(input)
 }
+
+// Layers returns the layers in forward order, for tools that walk the
+// model structure (e.g. format exporters).
+func (s *Sequential) Layers() []Layer {
+	return s.layers
+}

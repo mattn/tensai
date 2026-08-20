@@ -170,3 +170,9 @@ func (b *BatchNorm) setExtraState(state map[string][]Float) error {
 	b.runVar = variance
 	return nil
 }
+
+// RunningStats returns the running mean and variance estimates used at
+// inference time, for exporters.
+func (b *BatchNorm) RunningStats() (mean, variance []Float) {
+	return b.runMean, b.runVar
+}

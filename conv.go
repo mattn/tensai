@@ -302,3 +302,13 @@ func (p *MaxPool2D) Backward(gradOutput *Matrix) (*Matrix, error) {
 func (p *MaxPool2D) Params() (*Matrix, []Float)       { return nil, nil }
 func (p *MaxPool2D) Grads() (*Matrix, []Float)        { return nil, nil }
 func (p *MaxPool2D) SetParams(*Matrix, []Float) error { return nil }
+
+// Shape reports the layer's spatial configuration, for exporters.
+func (c *Conv2D) Shape() (inH, inW, inC, outC, kernel, stride, pad int) {
+	return c.inH, c.inW, c.inC, c.outC, c.kernel, c.stride, c.pad
+}
+
+// Shape reports the layer's spatial configuration, for exporters.
+func (p *MaxPool2D) Shape() (inH, inW, channels, size int) {
+	return p.inH, p.inW, p.channels, p.size
+}
