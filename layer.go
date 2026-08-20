@@ -344,9 +344,7 @@ func (g *GELU) Forward(input *Matrix) (*Matrix, error) {
 	}
 	g.input = input
 	out := g.fwdBuf(input.Rows, input.Cols)
-	for i, x := range input.Data {
-		out.Data[i] = geluF(x)
-	}
+	geluFwd(out.Data, input.Data)
 	g.output = out
 	return out, nil
 }
@@ -356,9 +354,7 @@ func (g *GELU) Backward(gradOutput *Matrix) (*Matrix, error) {
 		return nil, fmt.Errorf("tensai: gelu backward called before forward")
 	}
 	out := g.bwdBuf(gradOutput.Rows, gradOutput.Cols)
-	for i, grad := range gradOutput.Data {
-		out.Data[i] = grad * geluGrad(g.input.Data[i])
-	}
+	geluBwd(out.Data, gradOutput.Data, g.input.Data)
 	return out, nil
 }
 
@@ -412,29 +408,11 @@ func (l *LayerNorm) Forward(input *Matrix) (*Matrix, error) {
 	} else {
 		l.invStd = l.invStd[:input.Rows]
 	}
-	colsF := Float(input.Cols)
 	for r := 0; r < input.Rows; r++ {
 		inRow := input.Data[r*input.Cols : (r+1)*input.Cols]
 		normRow := l.normalized.Data[r*input.Cols : (r+1)*input.Cols]
 		outRow := out.Data[r*input.Cols : (r+1)*input.Cols]
-		var mean Float
-		for _, v := range inRow {
-			mean += v
-		}
-		mean /= colsF
-		var variance Float
-		for _, v := range inRow {
-			d := v - mean
-			variance += d * d
-		}
-		variance /= colsF
-		invStd := 1 / sqrtF(variance+l.eps)
-		l.invStd[r] = invStd
-		for c, v := range inRow {
-			xhat := (v - mean) * invStd
-			normRow[c] = xhat
-			outRow[c] = xhat*l.gamma.Data[c] + l.beta[c]
-		}
+		l.invStd[r] = lnFwdRow(outRow, normRow, inRow, l.gamma.Data, l.beta, l.eps)
 	}
 	return out, nil
 }
@@ -447,24 +425,11 @@ func (l *LayerNorm) Backward(gradOutput *Matrix) (*Matrix, error) {
 	clear(l.gradGamma.Data)
 	clear(l.gradBeta)
 	out := l.bwdBuf(gradOutput.Rows, gradOutput.Cols)
-	colsF := Float(gradOutput.Cols)
 	for r := 0; r < gradOutput.Rows; r++ {
 		gRow := gradOutput.Data[r*gradOutput.Cols : (r+1)*gradOutput.Cols]
 		xhatRow := l.normalized.Data[r*gradOutput.Cols : (r+1)*gradOutput.Cols]
 		outRow := out.Data[r*gradOutput.Cols : (r+1)*gradOutput.Cols]
-		var sumDXhat, sumDXhatXhat Float
-		for c, g := range gRow {
-			l.gradGamma.Data[c] += g * xhatRow[c]
-			l.gradBeta[c] += g
-			dxhat := g * l.gamma.Data[c]
-			sumDXhat += dxhat
-			sumDXhatXhat += dxhat * xhatRow[c]
-		}
-		invStd := l.invStd[r]
-		for c, g := range gRow {
-			dxhat := g * l.gamma.Data[c]
-			outRow[c] = invStd / colsF * (colsF*dxhat - sumDXhat - xhatRow[c]*sumDXhatXhat)
-		}
+		lnBwdRow(outRow, gRow, xhatRow, l.gamma.Data, l.gradGamma.Data, l.gradBeta, l.invStd[r])
 	}
 	return out, nil
 }

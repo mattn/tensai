@@ -218,3 +218,174 @@ func adamStepSlice(w, g, m, v []Float, beta1, beta2, rc1, rc2, lr, eps, wd Float
 	}
 	archsimd.ClearAVXUpperBits()
 }
+
+// verf computes erf(x) per lane with the Abramowitz-Stegun 7.1.26
+// polynomial (max absolute error ~1.5e-7, below float32 resolution for this
+// use). Symmetry handles negative inputs via sign-bit restore.
+func verf(x archsimd.Float32x8) archsimd.Float32x8 {
+	signBit := archsimd.BroadcastInt32x8(-0x80000000)
+	sign := x.AsInt32x8().And(signBit)
+	ax := x.AsInt32x8().AndNot(signBit).AsFloat32x8() // |x|
+
+	one := archsimd.BroadcastFloat32x8(1)
+	t := one.Div(archsimd.BroadcastFloat32x8(0.3275911).MulAdd(ax, one))
+	p := archsimd.BroadcastFloat32x8(1.061405429)
+	p = p.MulAdd(t, archsimd.BroadcastFloat32x8(-1.453152027))
+	p = p.MulAdd(t, archsimd.BroadcastFloat32x8(1.421413741))
+	p = p.MulAdd(t, archsimd.BroadcastFloat32x8(-0.284496736))
+	p = p.MulAdd(t, archsimd.BroadcastFloat32x8(0.254829592))
+	p = p.Mul(t)
+	zero := archsimd.BroadcastFloat32x8(0)
+	e := vexpf(zero.Sub(ax.Mul(ax)))
+	erfAbs := one.Sub(p.Mul(e))
+	return erfAbs.AsInt32x8().Or(sign).AsFloat32x8()
+}
+
+func geluFwd(dst, src []Float) {
+	if !hasAVX2 {
+		geluFwdGeneric(dst, src)
+		return
+	}
+	half := archsimd.BroadcastFloat32x8(0.5)
+	one := archsimd.BroadcastFloat32x8(1)
+	invSqrt2 := archsimd.BroadcastFloat32x8(0.7071067811865476)
+	mapSlices(dst, src, func(v archsimd.Float32x8) archsimd.Float32x8 {
+		return half.Mul(v).Mul(one.Add(verf(v.Mul(invSqrt2))))
+	})
+}
+
+func geluBwd(dst, grad, src []Float) {
+	if !hasAVX2 {
+		geluBwdGeneric(dst, grad, src)
+		return
+	}
+	half := archsimd.BroadcastFloat32x8(0.5)
+	one := archsimd.BroadcastFloat32x8(1)
+	invSqrt2 := archsimd.BroadcastFloat32x8(0.7071067811865476)
+	invSqrt2Pi := archsimd.BroadcastFloat32x8(0.3989422804014327)
+	negHalf := archsimd.BroadcastFloat32x8(-0.5)
+	mapSlices2(dst, grad, src, func(g, v archsimd.Float32x8) archsimd.Float32x8 {
+		cdf := half.Mul(one.Add(verf(v.Mul(invSqrt2))))
+		pdf := v.Mul(invSqrt2Pi).Mul(vexpf(negHalf.Mul(v).Mul(v)))
+		return g.Mul(cdf.Add(pdf))
+	})
+}
+
+// hsum reduces a vector accumulator to a scalar.
+func hsum(v archsimd.Float32x8) Float {
+	var tmp [8]Float
+	storeF32x8(v, tmp[:])
+	return tmp[0] + tmp[1] + tmp[2] + tmp[3] + tmp[4] + tmp[5] + tmp[6] + tmp[7]
+}
+
+func lnFwdRow(out, xhat, src, gamma, beta []Float, eps Float) Float {
+	if !hasAVX2 {
+		return lnFwdRowGeneric(out, xhat, src, gamma, beta, eps)
+	}
+	n := Float(len(src))
+
+	var acc archsimd.Float32x8
+	s := src
+	for len(s) >= 8 {
+		acc = acc.Add(loadF32x8(s))
+		s = s[8:]
+	}
+	if len(s) > 0 {
+		v := loadF32x8Part(s) // missing lanes are zero
+		acc = acc.Add(v)
+	}
+	mean := hsum(acc) / n
+
+	meanV := archsimd.BroadcastFloat32x8(mean)
+	var vacc archsimd.Float32x8
+	s = src
+	for len(s) >= 8 {
+		d := loadF32x8(s).Sub(meanV)
+		vacc = d.MulAdd(d, vacc)
+		s = s[8:]
+	}
+	// Scalar tail: zero-filled part-load lanes would skew (v-mean)^2.
+	variance := hsum(vacc)
+	for _, v := range s {
+		d := v - mean
+		variance += d * d
+	}
+	variance /= n
+	invStd := 1 / sqrtF(variance+eps)
+
+	invStdV := archsimd.BroadcastFloat32x8(invStd)
+	o, xh, sr, ga, be := out, xhat, src, gamma, beta
+	for len(sr) >= 8 {
+		h := loadF32x8(sr).Sub(meanV).Mul(invStdV)
+		storeF32x8(h, xh)
+		storeF32x8(h.MulAdd(loadF32x8(ga), loadF32x8(be)), o)
+		o, xh, sr, ga, be = o[8:], xh[8:], sr[8:], ga[8:], be[8:]
+	}
+	if len(sr) > 0 {
+		sv := loadF32x8Part(sr)
+		gv := loadF32x8Part(ga)
+		bv := loadF32x8Part(be)
+		h := sv.Sub(meanV).Mul(invStdV)
+		storeF32x8Part(h, xh)
+		storeF32x8Part(h.MulAdd(gv, bv), o)
+	}
+	archsimd.ClearAVXUpperBits()
+	return invStd
+}
+
+func lnBwdRow(out, g, xhat, gamma, gradGamma, gradBeta []Float, invStd Float) {
+	if !hasAVX2 {
+		lnBwdRowGeneric(out, g, xhat, gamma, gradGamma, gradBeta, invStd)
+		return
+	}
+	n := Float(len(g))
+
+	var acc1, acc2 archsimd.Float32x8
+	gs, xs, gas, ggs, gbs := g, xhat, gamma, gradGamma, gradBeta
+	for len(gs) >= 8 {
+		gv := loadF32x8(gs)
+		xh := loadF32x8(xs)
+		storeF32x8(gv.MulAdd(xh, loadF32x8(ggs)), ggs)
+		storeF32x8(gv.Add(loadF32x8(gbs)), gbs)
+		dx := gv.Mul(loadF32x8(gas))
+		acc1 = acc1.Add(dx)
+		acc2 = dx.MulAdd(xh, acc2)
+		gs, xs, gas, ggs, gbs = gs[8:], xs[8:], gas[8:], ggs[8:], gbs[8:]
+	}
+	if len(gs) > 0 {
+		gv := loadF32x8Part(gs)
+		xh := loadF32x8Part(xs)
+		gg := loadF32x8Part(ggs)
+		gb := loadF32x8Part(gbs)
+		gav := loadF32x8Part(gas)
+		storeF32x8Part(gv.MulAdd(xh, gg), ggs)
+		storeF32x8Part(gv.Add(gb), gbs)
+		dx := gv.Mul(gav)
+		acc1 = acc1.Add(dx)
+		acc2 = dx.MulAdd(xh, acc2)
+	}
+	sumDXhat := hsum(acc1)
+	sumDXhatXhat := hsum(acc2)
+
+	k := invStd / n
+	kV := archsimd.BroadcastFloat32x8(k)
+	nV := archsimd.BroadcastFloat32x8(n)
+	s1V := archsimd.BroadcastFloat32x8(sumDXhat)
+	s2V := archsimd.BroadcastFloat32x8(sumDXhatXhat)
+	o := out
+	gs, xs, gas = g, xhat, gamma
+	for len(gs) >= 8 {
+		dx := loadF32x8(gs).Mul(loadF32x8(gas))
+		t := dx.Mul(nV).Sub(s1V).Sub(loadF32x8(xs).Mul(s2V))
+		storeF32x8(t.Mul(kV), o)
+		o, gs, xs, gas = o[8:], gs[8:], xs[8:], gas[8:]
+	}
+	if len(gs) > 0 {
+		gv := loadF32x8Part(gs)
+		xh := loadF32x8Part(xs)
+		gav := loadF32x8Part(gas)
+		dx := gv.Mul(gav)
+		storeF32x8Part(dx.Mul(nV).Sub(s1V).Sub(xh.Mul(s2V)).Mul(kV), o)
+	}
+	archsimd.ClearAVXUpperBits()
+}

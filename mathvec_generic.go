@@ -21,3 +21,12 @@ func scaleSlice(dst []Float, s Float)        { scaleSliceGeneric(dst, s) }
 func adamStepSlice(w, g, m, v []Float, beta1, beta2, rc1, rc2, lr, eps, wd Float) {
 	adamStepGeneric(w, g, m, v, beta1, beta2, rc1, rc2, lr, eps, wd)
 }
+
+func geluFwd(dst, src []Float)       { geluFwdGeneric(dst, src) }
+func geluBwd(dst, grad, src []Float) { geluBwdGeneric(dst, grad, src) }
+func lnFwdRow(out, xhat, src, gamma, beta []Float, eps Float) Float {
+	return lnFwdRowGeneric(out, xhat, src, gamma, beta, eps)
+}
+func lnBwdRow(out, g, xhat, gamma, gradGamma, gradBeta []Float, invStd Float) {
+	lnBwdRowGeneric(out, g, xhat, gamma, gradGamma, gradBeta, invStd)
+}

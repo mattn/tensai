@@ -105,3 +105,60 @@ func adamStepGeneric(w, g, m, v []Float, beta1, beta2, rc1, rc2, lr, eps, wd Flo
 		w[i] = wi - lr*(mi*rc1/(sqrtF(vi*rc2)+eps)+wd*wi)
 	}
 }
+
+// geluFwdGeneric computes dst = 0.5*src*(1+erf(src/sqrt(2))).
+func geluFwdGeneric(dst, src []Float) {
+	for i, v := range src {
+		dst[i] = geluF(v)
+	}
+}
+
+// geluBwdGeneric computes dst = grad * gelu'(src).
+func geluBwdGeneric(dst, grad, src []Float) {
+	for i, g := range grad {
+		dst[i] = g * geluGrad(src[i])
+	}
+}
+
+// lnFwdRowGeneric normalizes one row: writes the normalized values into
+// xhat and gamma*xhat+beta into out, returning 1/sqrt(variance+eps).
+func lnFwdRowGeneric(out, xhat, src, gamma, beta []Float, eps Float) Float {
+	n := Float(len(src))
+	var mean Float
+	for _, v := range src {
+		mean += v
+	}
+	mean /= n
+	var variance Float
+	for _, v := range src {
+		d := v - mean
+		variance += d * d
+	}
+	variance /= n
+	invStd := 1 / sqrtF(variance+eps)
+	for c, v := range src {
+		h := (v - mean) * invStd
+		xhat[c] = h
+		out[c] = h*gamma[c] + beta[c]
+	}
+	return invStd
+}
+
+// lnBwdRowGeneric runs one row of the LayerNorm backward pass: accumulates
+// the parameter gradients and writes the input gradient into out.
+func lnBwdRowGeneric(out, g, xhat, gamma, gradGamma, gradBeta []Float, invStd Float) {
+	n := Float(len(g))
+	var sumDXhat, sumDXhatXhat Float
+	for c, gv := range g {
+		gradGamma[c] += gv * xhat[c]
+		gradBeta[c] += gv
+		dxhat := gv * gamma[c]
+		sumDXhat += dxhat
+		sumDXhatXhat += dxhat * xhat[c]
+	}
+	k := invStd / n
+	for c, gv := range g {
+		dxhat := gv * gamma[c]
+		out[c] = k * (n*dxhat - sumDXhat - xhat[c]*sumDXhatXhat)
+	}
+}

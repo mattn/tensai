@@ -2,6 +2,7 @@ package tensai
 
 import (
 	"math"
+	"math/rand"
 	"testing"
 )
 
@@ -68,6 +69,90 @@ func TestKernelTails(t *testing.T) {
 			}
 			if dst[i] != want {
 				t.Fatalf("n=%d: dst[%d]=%g want %g", n, i, dst[i], want)
+			}
+		}
+	}
+}
+
+// TestGELUKernelAccuracy compares the (possibly vectorized) GELU kernels
+// against a float64 reference.
+func TestGELUKernelAccuracy(t *testing.T) {
+	var src []Float
+	for x := -8.0; x <= 8.0; x += 0.011 {
+		src = append(src, Float(x))
+	}
+	dst := make([]Float, len(src))
+	grad := make([]Float, len(src))
+	for i := range grad {
+		grad[i] = 1
+	}
+
+	geluFwd(dst, src)
+	for i, x := range src {
+		want := 0.5 * float64(x) * (1 + math.Erf(float64(x)/math.Sqrt2))
+		if diff := math.Abs(float64(dst[i]) - want); diff > 2e-6*(1+math.Abs(want)) {
+			t.Fatalf("gelu(%g): got %g want %g", x, dst[i], want)
+		}
+	}
+
+	geluBwd(dst, grad, src)
+	for i, x := range src {
+		xf := float64(x)
+		want := 0.5*(1+math.Erf(xf/math.Sqrt2)) + xf*math.Exp(-0.5*xf*xf)/math.Sqrt(2*math.Pi)
+		if diff := math.Abs(float64(dst[i]) - want); diff > 2e-6*(1+math.Abs(want)) {
+			t.Fatalf("gelu'(%g): got %g want %g", x, dst[i], want)
+		}
+	}
+}
+
+// TestLayerNormKernelMatchesGeneric compares the dispatched LayerNorm row
+// kernels against the scalar reference, including non-multiple-of-8 tails.
+func TestLayerNormKernelMatchesGeneric(t *testing.T) {
+	rng := rand.New(rand.NewSource(83))
+	for _, cols := range []int{3, 8, 13, 64, 100} {
+		src := make([]Float, cols)
+		g := make([]Float, cols)
+		gamma := make([]Float, cols)
+		beta := make([]Float, cols)
+		for i := range src {
+			src[i] = Float(rng.NormFloat64())
+			g[i] = Float(rng.NormFloat64())
+			gamma[i] = Float(0.5 + rng.Float64())
+			beta[i] = Float(rng.NormFloat64() * 0.1)
+		}
+		out := make([]Float, cols)
+		xhat := make([]Float, cols)
+		wantOut := make([]Float, cols)
+		wantXhat := make([]Float, cols)
+
+		invStd := lnFwdRow(out, xhat, src, gamma, beta, 1e-5)
+		wantInvStd := lnFwdRowGeneric(wantOut, wantXhat, src, gamma, beta, 1e-5)
+		if math.Abs(float64(invStd-wantInvStd)) > 1e-4*float64(wantInvStd) {
+			t.Fatalf("cols=%d invStd: got %g want %g", cols, invStd, wantInvStd)
+		}
+		for i := range out {
+			if math.Abs(float64(out[i]-wantOut[i])) > 1e-4*(1+math.Abs(float64(wantOut[i]))) {
+				t.Fatalf("cols=%d fwd out[%d]: got %g want %g", cols, i, out[i], wantOut[i])
+			}
+		}
+
+		gradGamma := make([]Float, cols)
+		gradBeta := make([]Float, cols)
+		wantGradGamma := make([]Float, cols)
+		wantGradBeta := make([]Float, cols)
+		bwdOut := make([]Float, cols)
+		wantBwdOut := make([]Float, cols)
+		lnBwdRow(bwdOut, g, wantXhat, gamma, gradGamma, gradBeta, wantInvStd)
+		lnBwdRowGeneric(wantBwdOut, g, wantXhat, gamma, wantGradGamma, wantGradBeta, wantInvStd)
+		for i := range bwdOut {
+			if math.Abs(float64(bwdOut[i]-wantBwdOut[i])) > 1e-4*(1+math.Abs(float64(wantBwdOut[i]))) {
+				t.Fatalf("cols=%d bwd out[%d]: got %g want %g", cols, i, bwdOut[i], wantBwdOut[i])
+			}
+			if math.Abs(float64(gradGamma[i]-wantGradGamma[i])) > 1e-4*(1+math.Abs(float64(wantGradGamma[i]))) {
+				t.Fatalf("cols=%d gradGamma[%d]: got %g want %g", cols, i, gradGamma[i], wantGradGamma[i])
+			}
+			if gradBeta[i] != wantGradBeta[i] {
+				t.Fatalf("cols=%d gradBeta[%d]: got %g want %g", cols, i, gradBeta[i], wantGradBeta[i])
 			}
 		}
 	}
