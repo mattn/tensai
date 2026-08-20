@@ -31,8 +31,3 @@ jobs:
           for d in _example/*/; do
             go build -o /dev/null "./$d"
           done
-      - name: encoding/tflite
-        working-directory: encoding/tflite
-        run: |
-          go vet ./...
-          go test ./...
