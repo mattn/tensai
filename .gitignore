@@ -6,3 +6,4 @@ _example/mnist/data/
 /charrnn.json
 /graph.png
 /graph.svg
+/go.work.sum
