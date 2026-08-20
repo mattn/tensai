@@ -14,6 +14,7 @@ import (
 	"time"
 
 	tensai "github.com/mattn/tensai"
+	tensaitflite "github.com/mattn/tensai/encoding/tflite"
 )
 
 const (
@@ -297,6 +298,7 @@ func buildModel(kind string) (*tensai.Sequential, error) {
 
 func main() {
 	kind := flag.String("model", "dense", "model architecture: dense, cnn, or knn")
+	export := flag.String("export", "", "write the trained model as TFLite to this path")
 	flag.Parse()
 
 	dataDir := os.Getenv("MNIST_DIR")
@@ -314,6 +316,10 @@ func main() {
 	}
 
 	if *kind == "knn" {
+		if *export != "" {
+			fmt.Fprintln(os.Stderr, "mnist: -export is not supported with -model knn")
+			os.Exit(1)
+		}
 		// A lazy baseline: no training at all, just neighbor votes. The
 		// distance matrix runs on the same Dot kernel as the networks.
 		knn := tensai.NewKNN(3)
@@ -384,6 +390,16 @@ func main() {
 		panic(err)
 	}
 	fmt.Printf("saved to %s, reloaded accuracy: %d/%d\n", modelPath, reloadedCorrect, testInputs.Rows)
+
+	if *export != "" {
+		// MNIST is single-channel, so the flat rows already match the NHWC
+		// layout the exported model expects.
+		if err := tensaitflite.MarshalFile(*export, model); err != nil {
+			fmt.Fprintf(os.Stderr, "mnist: tflite export: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("exported TFLite model to %s\n", *export)
+	}
 	printConfusion(confusion)
 }
 

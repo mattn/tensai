@@ -187,7 +187,19 @@ The MNIST example downloads the standard IDX gzip files into `_example/mnist/dat
 go run ./_example/mnist
 go run ./_example/mnist -model cnn
 go run ./_example/mnist -model knn
+go run ./_example/mnist -model cnn -export mnist.tflite
 MNIST_DIR=/path/to/mnist go run ./_example/mnist
+```
+
+`-export` writes the trained model as a TFLite flatbuffer (the exported CNN scores identically on the LiteRT interpreter). MNIST is single-channel, so images feed the exported model unchanged; consume it from Go with [go-tflite](https://github.com/mattn/go-tflite):
+
+```go
+model := tflite.NewModelFromFile("mnist.tflite")
+interpreter := tflite.NewInterpreter(model, nil)
+interpreter.AllocateTensors()
+copy(interpreter.GetInputTensor(0).Float32s(), image) // 28*28 floats, NHWC
+interpreter.Invoke()
+scores := interpreter.GetOutputTensor(0).Float32s() // 10 logits
 ```
 
 The charrnn example trains a character-level LSTM on an embedded public-domain text, saves the parameters with `SaveParamsFile`, restores them into a fresh model, and generates a sample from the reloaded parameters.
