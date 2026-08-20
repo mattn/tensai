@@ -14,7 +14,7 @@ import "simd/archsimd"
 // few float32 ulps, far below what training precision requires.
 func vexpf(x archsimd.Float32x8) archsimd.Float32x8 {
 	x = x.Min(archsimd.BroadcastFloat32x8(88.0)).Max(archsimd.BroadcastFloat32x8(-87.0))
-	z := x.Mul(archsimd.BroadcastFloat32x8(1.44269504)).RoundToEven()
+	z := roundEven(x.Mul(archsimd.BroadcastFloat32x8(1.44269504)))
 	n := z.ConvertToInt32() // exact: z is already an integer value
 	// r = x - z*ln2, with ln2 split for extra precision (Cody-Waite).
 	r := z.MulAdd(archsimd.BroadcastFloat32x8(-0.693359375), x)
@@ -35,11 +35,11 @@ func vexpf(x archsimd.Float32x8) archsimd.Float32x8 {
 // mapSlices runs an 8-lane vector body over dst/src with a masked tail.
 func mapSlices(dst, src []Float, f func(archsimd.Float32x8) archsimd.Float32x8) {
 	for len(dst) >= 8 && len(src) >= 8 {
-		f(archsimd.LoadFloat32x8Slice(src)).StoreSlice(dst)
+		storeF32x8(f(loadF32x8(src)), dst)
 		dst, src = dst[8:], src[8:]
 	}
 	if len(dst) > 0 {
-		f(archsimd.LoadFloat32x8SlicePart(src)).StoreSlicePart(dst)
+		storeF32x8Part(f(loadF32x8Part(src)), dst)
 	}
 	archsimd.ClearAVXUpperBits()
 }
@@ -47,11 +47,11 @@ func mapSlices(dst, src []Float, f func(archsimd.Float32x8) archsimd.Float32x8) 
 // mapSlices2 is mapSlices over two inputs.
 func mapSlices2(dst, x, y []Float, f func(a, b archsimd.Float32x8) archsimd.Float32x8) {
 	for len(dst) >= 8 && len(x) >= 8 && len(y) >= 8 {
-		f(archsimd.LoadFloat32x8Slice(x), archsimd.LoadFloat32x8Slice(y)).StoreSlice(dst)
+		storeF32x8(f(loadF32x8(x), loadF32x8(y)), dst)
 		dst, x, y = dst[8:], x[8:], y[8:]
 	}
 	if len(dst) > 0 {
-		f(archsimd.LoadFloat32x8SlicePart(x), archsimd.LoadFloat32x8SlicePart(y)).StoreSlicePart(dst)
+		storeF32x8Part(f(loadF32x8Part(x), loadF32x8Part(y)), dst)
 	}
 	archsimd.ClearAVXUpperBits()
 }
@@ -204,21 +204,17 @@ func adamStepSlice(w, g, m, v []Float, beta1, beta2, rc1, rc2, lr, eps, wd Float
 		return wv.Sub(update.Mul(lrv)), mv, vv
 	}
 	for len(w) >= 8 {
-		wv, mv, vv := step(
-			archsimd.LoadFloat32x8Slice(w), archsimd.LoadFloat32x8Slice(g),
-			archsimd.LoadFloat32x8Slice(m), archsimd.LoadFloat32x8Slice(v))
-		wv.StoreSlice(w)
-		mv.StoreSlice(m)
-		vv.StoreSlice(v)
+		wv, mv, vv := step(loadF32x8(w), loadF32x8(g), loadF32x8(m), loadF32x8(v))
+		storeF32x8(wv, w)
+		storeF32x8(mv, m)
+		storeF32x8(vv, v)
 		w, g, m, v = w[8:], g[8:], m[8:], v[8:]
 	}
 	if len(w) > 0 {
-		wv, mv, vv := step(
-			archsimd.LoadFloat32x8SlicePart(w), archsimd.LoadFloat32x8SlicePart(g),
-			archsimd.LoadFloat32x8SlicePart(m), archsimd.LoadFloat32x8SlicePart(v))
-		wv.StoreSlicePart(w)
-		mv.StoreSlicePart(m)
-		vv.StoreSlicePart(v)
+		wv, mv, vv := step(loadF32x8Part(w), loadF32x8Part(g), loadF32x8Part(m), loadF32x8Part(v))
+		storeF32x8Part(wv, w)
+		storeF32x8Part(mv, m)
+		storeF32x8Part(vv, v)
 	}
 	archsimd.ClearAVXUpperBits()
 }

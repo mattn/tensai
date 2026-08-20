@@ -45,43 +45,31 @@ func dotRows(out, a, b *Matrix, lo, hi int) {
 			var c int
 			if !initialized {
 				for ; c < wide; c += 32 {
-					archsimd.LoadFloat32x8Slice(bRow[c:]).
-						Mul(vv).StoreSlice(outRow[c:])
-					archsimd.LoadFloat32x8Slice(bRow[c+8:]).
-						Mul(vv).StoreSlice(outRow[c+8:])
-					archsimd.LoadFloat32x8Slice(bRow[c+16:]).
-						Mul(vv).StoreSlice(outRow[c+16:])
-					archsimd.LoadFloat32x8Slice(bRow[c+24:]).
-						Mul(vv).StoreSlice(outRow[c+24:])
+					storeF32x8(loadF32x8(bRow[c:]).Mul(vv), outRow[c:])
+					storeF32x8(loadF32x8(bRow[c+8:]).Mul(vv), outRow[c+8:])
+					storeF32x8(loadF32x8(bRow[c+16:]).Mul(vv), outRow[c+16:])
+					storeF32x8(loadF32x8(bRow[c+24:]).Mul(vv), outRow[c+24:])
 				}
 				for ; c < vecs; c += 8 {
-					archsimd.LoadFloat32x8Slice(bRow[c:]).
-						Mul(vv).StoreSlice(outRow[c:])
+					storeF32x8(loadF32x8(bRow[c:]).Mul(vv), outRow[c:])
 				}
 				if c < cols {
-					archsimd.LoadFloat32x8SlicePart(bRow[c:]).
-						Mul(vv).StoreSlicePart(outRow[c:])
+					storeF32x8Part(loadF32x8Part(bRow[c:]).Mul(vv), outRow[c:])
 				}
 				initialized = true
 				continue
 			}
 			for ; c < wide; c += 32 {
-				archsimd.LoadFloat32x8Slice(bRow[c:]).
-					MulAdd(vv, archsimd.LoadFloat32x8Slice(outRow[c:])).StoreSlice(outRow[c:])
-				archsimd.LoadFloat32x8Slice(bRow[c+8:]).
-					MulAdd(vv, archsimd.LoadFloat32x8Slice(outRow[c+8:])).StoreSlice(outRow[c+8:])
-				archsimd.LoadFloat32x8Slice(bRow[c+16:]).
-					MulAdd(vv, archsimd.LoadFloat32x8Slice(outRow[c+16:])).StoreSlice(outRow[c+16:])
-				archsimd.LoadFloat32x8Slice(bRow[c+24:]).
-					MulAdd(vv, archsimd.LoadFloat32x8Slice(outRow[c+24:])).StoreSlice(outRow[c+24:])
+				storeF32x8(loadF32x8(bRow[c:]).MulAdd(vv, loadF32x8(outRow[c:])), outRow[c:])
+				storeF32x8(loadF32x8(bRow[c+8:]).MulAdd(vv, loadF32x8(outRow[c+8:])), outRow[c+8:])
+				storeF32x8(loadF32x8(bRow[c+16:]).MulAdd(vv, loadF32x8(outRow[c+16:])), outRow[c+16:])
+				storeF32x8(loadF32x8(bRow[c+24:]).MulAdd(vv, loadF32x8(outRow[c+24:])), outRow[c+24:])
 			}
 			for ; c < vecs; c += 8 {
-				archsimd.LoadFloat32x8Slice(bRow[c:]).
-					MulAdd(vv, archsimd.LoadFloat32x8Slice(outRow[c:])).StoreSlice(outRow[c:])
+				storeF32x8(loadF32x8(bRow[c:]).MulAdd(vv, loadF32x8(outRow[c:])), outRow[c:])
 			}
 			if c < cols {
-				archsimd.LoadFloat32x8SlicePart(bRow[c:]).
-					MulAdd(vv, archsimd.LoadFloat32x8SlicePart(outRow[c:])).StoreSlicePart(outRow[c:])
+				storeF32x8Part(loadF32x8Part(bRow[c:]).MulAdd(vv, loadF32x8Part(outRow[c:])), outRow[c:])
 			}
 		}
 		if !initialized {
