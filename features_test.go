@@ -75,6 +75,14 @@ func TestLeakyReLUGradient(t *testing.T) {
 	checkLayerGrad(t, l, randomInput(4, 6, 1), 5e-3)
 }
 
+func TestGELUGradient(t *testing.T) {
+	l := &GELU{}
+	if _, err := l.Init(6, nil); err != nil {
+		t.Fatal(err)
+	}
+	checkLayerGrad(t, l, randomInput(4, 6, 31), 5e-3)
+}
+
 func TestSoftmaxGradient(t *testing.T) {
 	l := &Softmax{}
 	if _, err := l.Init(5, nil); err != nil {
@@ -109,6 +117,18 @@ func TestBatchNormGradient(t *testing.T) {
 		bn.beta[i] = -0.25
 	}
 	checkLayerGrad(t, bn, randomInput(6, 4, 4), 1e-2)
+}
+
+func TestLayerNormGradient(t *testing.T) {
+	ln := NewLayerNorm()
+	if _, err := ln.Init(4, nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := range ln.gamma.Data {
+		ln.gamma.Data[i] = Float(0.8 + 0.2*float64(i))
+		ln.beta[i] = Float(-0.3 + 0.1*float64(i))
+	}
+	checkLayerGrad(t, ln, randomInput(6, 4, 41), 1e-2)
 }
 
 func TestBatchNormEvalUsesRunningStats(t *testing.T) {
@@ -263,6 +283,78 @@ func TestDropout(t *testing.T) {
 	}
 }
 
+func TestEmbeddingForwardBackward(t *testing.T) {
+	emb := NewEmbedding(4, 2)
+	if outCols, err := emb.Init(3, rand.New(rand.NewSource(17))); err != nil {
+		t.Fatal(err)
+	} else if outCols != 6 {
+		t.Fatalf("expected out cols 6, got %d", outCols)
+	}
+	weights, err := NewMatrixFromSlice(4, 2, []Float{
+		1, 2,
+		3, 4,
+		5, 6,
+		7, 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := emb.SetParams(weights, nil); err != nil {
+		t.Fatal(err)
+	}
+	in, err := NewMatrixFromSlice(2, 3, []Float{
+		0, 1, 0,
+		2, 1, 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := emb.Forward(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOut := []Float{
+		1, 2, 3, 4, 1, 2,
+		5, 6, 3, 4, 7, 8,
+	}
+	for i, want := range wantOut {
+		if out.Data[i] != want {
+			t.Fatalf("forward %d: got %g want %g", i, out.Data[i], want)
+		}
+	}
+	gradOut, err := NewMatrixFromSlice(2, 6, []Float{
+		1, 10, 2, 20, 3, 30,
+		4, 40, 5, 50, 6, 60,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gradIn, err := emb.Backward(gradOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, got := range gradIn.Data {
+		if got != 0 {
+			t.Fatalf("input grad %d: got %g want 0", i, got)
+		}
+	}
+	gradW, gradB := emb.Grads()
+	if gradB != nil {
+		t.Fatal("embedding should not expose bias gradients")
+	}
+	wantGradW := []Float{
+		4, 40,
+		7, 70,
+		4, 40,
+		6, 60,
+	}
+	for i, want := range wantGradW {
+		if gradW.Data[i] != want {
+			t.Fatalf("gradW %d: got %g want %g", i, gradW.Data[i], want)
+		}
+	}
+}
+
 func TestBinaryCrossEntropyGradient(t *testing.T) {
 	rng := rand.New(rand.NewSource(13))
 	pred := NewMatrix(4, 3)
@@ -371,6 +463,70 @@ func TestSaveLoadRoundtrip(t *testing.T) {
 	}
 	if err := m3.Load(&buf); err == nil {
 		t.Error("loading into a different architecture should fail")
+	}
+}
+
+func TestEmbeddingLayerNormGELUSaveLoadRoundtrip(t *testing.T) {
+	build := func() *Sequential {
+		m := NewSequential()
+		m.Add(NewEmbedding(4, 3))
+		m.Add(NewLayerNorm())
+		m.Add(&GELU{})
+		m.Add(NewDense(2))
+		if err := m.Compile(2, SoftmaxCrossEntropy{}, NewAdam(0.03)); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+
+	var inputData []Float
+	var targetData []Float
+	for a := 0; a < 4; a++ {
+		for b := 0; b < 4; b++ {
+			inputData = append(inputData, Float(a), Float(b))
+			if a == b {
+				targetData = append(targetData, 1)
+			} else {
+				targetData = append(targetData, 0)
+			}
+		}
+	}
+	in, err := NewMatrixFromSlice(16, 2, inputData)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tgt, err := NewMatrixFromSlice(16, 1, targetData)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m1 := build()
+	for i := 0; i < 30; i++ {
+		if _, err := m1.FitStep(in, tgt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := m1.Save(&buf); err != nil {
+		t.Fatal(err)
+	}
+	m2 := build()
+	if err := m2.Load(&buf); err != nil {
+		t.Fatal(err)
+	}
+	p1, err := m1.Predict(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := m2.Predict(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range p1.Data {
+		if math.Abs(float64(p1.Data[i]-p2.Data[i])) > 1e-12 {
+			t.Fatalf("prediction %d differs after load: %g vs %g", i, p1.Data[i], p2.Data[i])
+		}
 	}
 }
 
