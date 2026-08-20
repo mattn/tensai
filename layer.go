@@ -2,6 +2,7 @@ package tensai
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 )
 
@@ -332,6 +333,250 @@ func (t *Tanh) Backward(gradOutput *Matrix) (*Matrix, error) {
 	return out, nil
 }
 
+// GELU activation: f(x) = 0.5*x*(1+erf(x/sqrt(2))).
+type GELU struct{ activationBase }
+
+func (g *GELU) Init(inputCols int, _ *rand.Rand) (int, error) { return inputCols, nil }
+
+func (g *GELU) Forward(input *Matrix) (*Matrix, error) {
+	if err := input.Validate(); err != nil {
+		return nil, err
+	}
+	g.input = input
+	out := g.fwdBuf(input.Rows, input.Cols)
+	for i, x := range input.Data {
+		out.Data[i] = geluF(x)
+	}
+	g.output = out
+	return out, nil
+}
+
+func (g *GELU) Backward(gradOutput *Matrix) (*Matrix, error) {
+	if g.input == nil {
+		return nil, fmt.Errorf("tensai: gelu backward called before forward")
+	}
+	out := g.bwdBuf(gradOutput.Rows, gradOutput.Cols)
+	for i, grad := range gradOutput.Data {
+		out.Data[i] = grad * geluGrad(g.input.Data[i])
+	}
+	return out, nil
+}
+
+// LayerNorm normalizes each row over its feature dimension and applies a
+// learnable affine transform.
+type LayerNorm struct {
+	bufferPair
+
+	gamma *Matrix
+	beta  []Float
+
+	gradGamma *Matrix
+	gradBeta  []Float
+
+	normalized *Matrix
+	invStd     []Float
+	eps        Float
+}
+
+// NewLayerNorm returns a LayerNorm with the default epsilon.
+func NewLayerNorm() *LayerNorm {
+	return &LayerNorm{eps: 1e-5}
+}
+
+func (l *LayerNorm) Init(inputCols int, _ *rand.Rand) (int, error) {
+	if inputCols <= 0 {
+		return 0, fmt.Errorf("tensai: layernorm init with non-positive input cols: %d", inputCols)
+	}
+	l.gamma = NewMatrix(1, inputCols)
+	for i := range l.gamma.Data {
+		l.gamma.Data[i] = 1
+	}
+	l.beta = make([]Float, inputCols)
+	l.gradGamma = NewMatrix(1, inputCols)
+	l.gradBeta = make([]Float, inputCols)
+	return inputCols, nil
+}
+
+func (l *LayerNorm) Forward(input *Matrix) (*Matrix, error) {
+	if err := input.Validate(); err != nil {
+		return nil, err
+	}
+	if l.gamma == nil || input.Cols != l.gamma.Cols {
+		return nil, fmt.Errorf("tensai: layernorm forward shape mismatch: input %dx%d gamma %v",
+			input.Rows, input.Cols, shapeString(l.gamma))
+	}
+	out := l.fwdBuf(input.Rows, input.Cols)
+	l.normalized = ensureMatrix(l.normalized, input.Rows, input.Cols)
+	if cap(l.invStd) < input.Rows {
+		l.invStd = make([]Float, input.Rows)
+	} else {
+		l.invStd = l.invStd[:input.Rows]
+	}
+	colsF := Float(input.Cols)
+	for r := 0; r < input.Rows; r++ {
+		inRow := input.Data[r*input.Cols : (r+1)*input.Cols]
+		normRow := l.normalized.Data[r*input.Cols : (r+1)*input.Cols]
+		outRow := out.Data[r*input.Cols : (r+1)*input.Cols]
+		var mean Float
+		for _, v := range inRow {
+			mean += v
+		}
+		mean /= colsF
+		var variance Float
+		for _, v := range inRow {
+			d := v - mean
+			variance += d * d
+		}
+		variance /= colsF
+		invStd := 1 / sqrtF(variance+l.eps)
+		l.invStd[r] = invStd
+		for c, v := range inRow {
+			xhat := (v - mean) * invStd
+			normRow[c] = xhat
+			outRow[c] = xhat*l.gamma.Data[c] + l.beta[c]
+		}
+	}
+	return out, nil
+}
+
+func (l *LayerNorm) Backward(gradOutput *Matrix) (*Matrix, error) {
+	if l.normalized == nil {
+		return nil, fmt.Errorf("tensai: layernorm backward called before forward")
+	}
+	l.gradGamma = ensureMatrix(l.gradGamma, 1, gradOutput.Cols)
+	clear(l.gradGamma.Data)
+	clear(l.gradBeta)
+	out := l.bwdBuf(gradOutput.Rows, gradOutput.Cols)
+	colsF := Float(gradOutput.Cols)
+	for r := 0; r < gradOutput.Rows; r++ {
+		gRow := gradOutput.Data[r*gradOutput.Cols : (r+1)*gradOutput.Cols]
+		xhatRow := l.normalized.Data[r*gradOutput.Cols : (r+1)*gradOutput.Cols]
+		outRow := out.Data[r*gradOutput.Cols : (r+1)*gradOutput.Cols]
+		var sumDXhat, sumDXhatXhat Float
+		for c, g := range gRow {
+			l.gradGamma.Data[c] += g * xhatRow[c]
+			l.gradBeta[c] += g
+			dxhat := g * l.gamma.Data[c]
+			sumDXhat += dxhat
+			sumDXhatXhat += dxhat * xhatRow[c]
+		}
+		invStd := l.invStd[r]
+		for c, g := range gRow {
+			dxhat := g * l.gamma.Data[c]
+			outRow[c] = invStd / colsF * (colsF*dxhat - sumDXhat - xhatRow[c]*sumDXhatXhat)
+		}
+	}
+	return out, nil
+}
+
+func (l *LayerNorm) Grads() (*Matrix, []Float) {
+	return l.gradGamma, l.gradBeta
+}
+
+func (l *LayerNorm) Params() (*Matrix, []Float) {
+	return l.gamma, l.beta
+}
+
+func (l *LayerNorm) SetParams(weights *Matrix, bias []Float) error {
+	if weights == nil || weights.Rows != 1 || len(bias) != weights.Cols {
+		return fmt.Errorf("tensai: layernorm SetParams mismatch: weights=%v bias len=%d",
+			shapeString(weights), len(bias))
+	}
+	l.gamma = weights
+	l.beta = bias
+	return nil
+}
+
+// Embedding looks up a learned vector for each token id in the input row and
+// concatenates the vectors across columns.
+type Embedding struct {
+	bufferPair
+
+	weights *Matrix
+	gradW   *Matrix
+	input   *Matrix
+}
+
+// NewEmbedding returns a trainable embedding table of shape vocabSize x dim.
+func NewEmbedding(vocabSize, dim int) *Embedding {
+	return &Embedding{weights: NewMatrix(vocabSize, dim)}
+}
+
+func (e *Embedding) Init(inputCols int, rng *rand.Rand) (int, error) {
+	if inputCols <= 0 {
+		return 0, fmt.Errorf("tensai: embedding init with non-positive input cols: %d", inputCols)
+	}
+	if e.weights == nil || e.weights.Rows <= 0 || e.weights.Cols <= 0 {
+		return 0, fmt.Errorf("tensai: embedding init with invalid table shape")
+	}
+	e.weights = RandomMatrix(e.weights.Rows, e.weights.Cols, rng)
+	e.gradW = NewMatrix(e.weights.Rows, e.weights.Cols)
+	return inputCols * e.weights.Cols, nil
+}
+
+func (e *Embedding) Forward(input *Matrix) (*Matrix, error) {
+	if err := input.Validate(); err != nil {
+		return nil, err
+	}
+	e.input = input
+	outCols := input.Cols * e.weights.Cols
+	out := e.fwdBuf(input.Rows, outCols)
+	for r := 0; r < input.Rows; r++ {
+		outRow := out.Data[r*out.Cols : (r+1)*out.Cols]
+		for c := 0; c < input.Cols; c++ {
+			idx, err := embeddingIndex(input.At(r, c), e.weights.Rows)
+			if err != nil {
+				return nil, err
+			}
+			copy(outRow[c*e.weights.Cols:(c+1)*e.weights.Cols], e.weights.Data[idx*e.weights.Cols:(idx+1)*e.weights.Cols])
+		}
+	}
+	return out, nil
+}
+
+func (e *Embedding) Backward(gradOutput *Matrix) (*Matrix, error) {
+	if e.input == nil {
+		return nil, fmt.Errorf("tensai: embedding backward called before forward")
+	}
+	wantCols := e.input.Cols * e.weights.Cols
+	if gradOutput.Rows != e.input.Rows || gradOutput.Cols != wantCols {
+		return nil, fmt.Errorf("tensai: embedding backward shape mismatch: grad %dx%d, want %dx%d",
+			gradOutput.Rows, gradOutput.Cols, e.input.Rows, wantCols)
+	}
+	e.gradW = ensureMatrix(e.gradW, e.weights.Rows, e.weights.Cols)
+	clear(e.gradW.Data)
+	for r := 0; r < e.input.Rows; r++ {
+		gRow := gradOutput.Data[r*gradOutput.Cols : (r+1)*gradOutput.Cols]
+		for c := 0; c < e.input.Cols; c++ {
+			idx, err := embeddingIndex(e.input.At(r, c), e.weights.Rows)
+			if err != nil {
+				return nil, err
+			}
+			addSlice(e.gradW.Data[idx*e.weights.Cols:(idx+1)*e.weights.Cols], gRow[c*e.weights.Cols:(c+1)*e.weights.Cols])
+		}
+	}
+	gradInput := e.bwdBuf(e.input.Rows, e.input.Cols)
+	clear(gradInput.Data)
+	return gradInput, nil
+}
+
+func (e *Embedding) Grads() (*Matrix, []Float) {
+	return e.gradW, nil
+}
+
+func (e *Embedding) Params() (*Matrix, []Float) {
+	return e.weights, nil
+}
+
+func (e *Embedding) SetParams(weights *Matrix, bias []Float) error {
+	if weights == nil || len(bias) != 0 {
+		return fmt.Errorf("tensai: embedding SetParams mismatch: weights=%v bias len=%d",
+			shapeString(weights), len(bias))
+	}
+	e.weights = weights
+	return nil
+}
+
 // Softmax normalizes each row into a probability distribution. Unlike the
 // element-wise activations its backward pass couples all columns of a row.
 // Note that SoftmaxCrossEntropy already applies softmax internally; use this
@@ -386,4 +631,31 @@ func (s *Softmax) Backward(gradOutput *Matrix) (*Matrix, error) {
 		}
 	}
 	return out, nil
+}
+
+func geluF(x Float) Float {
+	return 0.5 * x * (1 + Float(math.Erf(float64(x/math.Sqrt2))))
+}
+
+func geluGrad(x Float) Float {
+	const invSqrt2Pi = 0.3989422804014327
+	return 0.5*(1+Float(math.Erf(float64(x/math.Sqrt2)))) + x*Float(invSqrt2Pi)*expF(-0.5*x*x)
+}
+
+func shapeString(m *Matrix) string {
+	if m == nil {
+		return "<nil>"
+	}
+	return fmt.Sprintf("%dx%d", m.Rows, m.Cols)
+}
+
+func embeddingIndex(v Float, vocabSize int) (int, error) {
+	idx := int(v)
+	if Float(idx) != v {
+		return 0, fmt.Errorf("tensai: embedding token id must be an integer, got %g", v)
+	}
+	if idx < 0 || idx >= vocabSize {
+		return 0, fmt.Errorf("tensai: embedding token id %d out of range [0,%d)", idx, vocabSize)
+	}
+	return idx, nil
 }
