@@ -135,6 +135,57 @@ func DotInto(out, a, b *Matrix) error {
 	return nil
 }
 
+// DotTAInto computes out = a^T * b into an existing matrix, overwriting it,
+// without materializing the transpose: a is read row by row and scattered
+// into out with the same vector kernel Dot uses. Shapes: a is RxI, b is
+// RxJ, out is IxJ.
+func DotTAInto(out, a, b *Matrix) error {
+	if a.Rows != b.Rows {
+		return fmt.Errorf("tensai: dotta shape mismatch: %dx%d^T * %dx%d", a.Rows, a.Cols, b.Rows, b.Cols)
+	}
+	if out.Rows != a.Cols || out.Cols != b.Cols {
+		return fmt.Errorf("tensai: dotta output shape mismatch: got %dx%d, want %dx%d",
+			out.Rows, out.Cols, a.Cols, b.Cols)
+	}
+	clear(out.Data) // dotTARows accumulates
+	workers := dotWorkerCount(a.Cols, a.Rows, b.Cols)
+	chunk := (a.Cols + workers - 1) / workers
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		lo, hi := w*chunk, (w+1)*chunk
+		if hi > a.Cols {
+			hi = a.Cols
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			dotTARows(out, a, b, lo, hi)
+		}(lo, hi)
+	}
+	wg.Wait()
+	return nil
+}
+
+// dotTARowsGeneric computes out rows lo..hi of out = a^T * b in pure Go.
+// dotTARows (see dot_simd.go and dot_generic.go) dispatches to a SIMD
+// kernel when one is available.
+func dotTARowsGeneric(out, a, b *Matrix, lo, hi int) {
+	for r := 0; r < a.Rows; r++ {
+		aRow := a.Data[r*a.Cols : (r+1)*a.Cols]
+		bRow := b.Data[r*b.Cols : (r+1)*b.Cols]
+		for i := lo; i < hi; i++ {
+			av := aRow[i]
+			if av == 0 {
+				continue
+			}
+			outRow := out.Data[i*b.Cols : (i+1)*b.Cols]
+			for c, bv := range bRow {
+				outRow[c] += av * bv
+			}
+		}
+	}
+}
+
 // TInto writes the transpose of src into dst.
 func TInto(dst, src *Matrix) error {
 	if dst.Rows != src.Cols || dst.Cols != src.Rows {

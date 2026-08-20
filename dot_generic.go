@@ -24,3 +24,9 @@ func dotWorkerCount(rows, inner, cols int) int {
 	}
 	return workers
 }
+
+// dotTARows computes out rows lo..hi of out = a^T * b. Portable fallback;
+// see dot_simd.go for the AVX2 kernel.
+func dotTARows(out, a, b *Matrix, lo, hi int) {
+	dotTARowsGeneric(out, a, b, lo, hi)
+}

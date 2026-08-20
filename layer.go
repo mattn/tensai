@@ -44,7 +44,6 @@ type Dense struct {
 	gradB []Float
 
 	input *Matrix
-	tIn   *Matrix // scratch: input^T
 	tW    *Matrix // scratch: weights^T
 }
 
@@ -96,13 +95,10 @@ func (d *Dense) Backward(gradOutput *Matrix) (*Matrix, error) {
 	if d.input == nil {
 		return nil, fmt.Errorf("tensai: dense backward called before forward")
 	}
-	// gradW = input^T * gradOutput  (in x out)
-	d.tIn = ensureMatrix(d.tIn, d.input.Cols, d.input.Rows)
-	if err := TInto(d.tIn, d.input); err != nil {
-		return nil, err
-	}
+	// gradW = input^T * gradOutput  (in x out), without materializing
+	// the transpose.
 	d.gradW = ensureMatrix(d.gradW, d.weights.Rows, d.weights.Cols)
-	if err := DotInto(d.gradW, d.tIn, gradOutput); err != nil {
+	if err := DotTAInto(d.gradW, d.input, gradOutput); err != nil {
 		return nil, err
 	}
 

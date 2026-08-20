@@ -31,7 +31,7 @@ type Conv2D struct {
 	batch int
 
 	// backward/forward scratch, reused across training steps
-	prod, colsT, wT, gRe, dcols, gradIn *Matrix
+	prod, wT, gRe, dcols, gradIn *Matrix
 }
 
 // NewConv2D returns a convolution layer for inH x inW inputs with inC
@@ -144,12 +144,8 @@ func (c *Conv2D) Backward(gradOutput *Matrix) (*Matrix, error) {
 		}
 	}
 
-	c.colsT = ensureMatrix(c.colsT, c.cols.Cols, c.cols.Rows)
-	if err := TInto(c.colsT, c.cols); err != nil {
-		return nil, err
-	}
 	c.gradW = ensureMatrix(c.gradW, c.weights.Rows, c.weights.Cols)
-	if err := DotInto(c.gradW, c.colsT, g); err != nil {
+	if err := DotTAInto(c.gradW, c.cols, g); err != nil {
 		return nil, err
 	}
 

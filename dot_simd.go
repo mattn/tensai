@@ -88,3 +88,43 @@ func dotWorkerCount(rows, inner, cols int) int {
 	}
 	return workers
 }
+
+// dotTARows computes out rows lo..hi of out = a^T * b with the same
+// SSE-free 8-lane FMA pattern as dotRows: a's element is fetched as integer
+// bits for the zero test and broadcast through an integer register.
+func dotTARows(out, a, b *Matrix, lo, hi int) {
+	if !hasAVX2 {
+		dotTARowsGeneric(out, a, b, lo, hi)
+		return
+	}
+	defer archsimd.ClearAVXUpperBits()
+
+	cols := b.Cols
+	wide := cols &^ 31
+	vecs := cols &^ 7
+	for r := 0; r < a.Rows; r++ {
+		aRow := a.Data[r*a.Cols : (r+1)*a.Cols]
+		aBits := unsafe.Slice((*uint32)(unsafe.Pointer(&aRow[0])), len(aRow))
+		bRow := b.Data[r*cols : (r+1)*cols]
+		for i := lo; i < hi; i++ {
+			if aBits[i]<<1 == 0 { // +0.0 or -0.0
+				continue
+			}
+			outRow := out.Data[i*cols : (i+1)*cols]
+			vv := archsimd.BroadcastUint32x8(aBits[i]).AsFloat32x8()
+			var c int
+			for ; c < wide; c += 32 {
+				storeF32x8(loadF32x8(bRow[c:]).MulAdd(vv, loadF32x8(outRow[c:])), outRow[c:])
+				storeF32x8(loadF32x8(bRow[c+8:]).MulAdd(vv, loadF32x8(outRow[c+8:])), outRow[c+8:])
+				storeF32x8(loadF32x8(bRow[c+16:]).MulAdd(vv, loadF32x8(outRow[c+16:])), outRow[c+16:])
+				storeF32x8(loadF32x8(bRow[c+24:]).MulAdd(vv, loadF32x8(outRow[c+24:])), outRow[c+24:])
+			}
+			for ; c < vecs; c += 8 {
+				storeF32x8(loadF32x8(bRow[c:]).MulAdd(vv, loadF32x8(outRow[c:])), outRow[c:])
+			}
+			if c < cols {
+				storeF32x8Part(loadF32x8Part(bRow[c:]).MulAdd(vv, loadF32x8Part(outRow[c:])), outRow[c:])
+			}
+		}
+	}
+}

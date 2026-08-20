@@ -196,7 +196,8 @@ Where the AVX2 kernels apply today, and where they still could:
 - [x] Softmax / SoftmaxCrossEntropy exponentials and scaling
 - [x] Adam / AdamW parameter update
 - [x] Slice add & scale primitives (bias add, `Embedding` gradient scatter-add)
-- [ ] Transpose (`T`/`TInto`) — needs 8x8 block-and-shuffle
+- [x] Transpose-free gradient matmul (`DotTAInto`) — `Dense`/`Conv2D` weight gradients no longer materialize `input^T` / `im2col^T`
+- [ ] Remaining transposes (`T`/`TInto`, now only weight matrices and autograd) — needs 8x8 block-and-shuffle
 - [ ] Softmax backward row dot products (layer and autograd)
 - [ ] MSE / BinaryCrossEntropy losses (BCE needs a vectorized `log`)
 - [ ] Autograd element-wise backward passes (gradients accumulate with `+=`, so they need dedicated fused kernels)

@@ -2,6 +2,7 @@ package tensai
 
 import (
 	"math"
+	"math/rand"
 	"testing"
 )
 
@@ -170,5 +171,37 @@ func TestSoftmaxCEGradient(t *testing.T) {
 		if math.Abs(float64(grad.Data[i])) > 0.01 {
 			t.Errorf("grad[%d] = %g, expected near zero", i, grad.Data[i])
 		}
+	}
+}
+
+func TestDotTAInto(t *testing.T) {
+	rng := rand.New(rand.NewSource(89))
+	for _, dims := range [][3]int{{5, 3, 4}, {8, 8, 8}, {17, 9, 13}, {64, 33, 5}} {
+		r, i, j := dims[0], dims[1], dims[2]
+		a := RandomMatrix(r, i, rng)
+		b := RandomMatrix(r, j, rng)
+		// Sprinkle zeros to exercise the skip path.
+		for k := 0; k < len(a.Data); k += 3 {
+			a.Data[k] = 0
+		}
+		want, err := Dot(a.T(), b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := NewMatrix(i, j)
+		if err := DotTAInto(got, a, b); err != nil {
+			t.Fatal(err)
+		}
+		for k := range want.Data {
+			if diff := got.Data[k] - want.Data[k]; diff > 1e-5 || diff < -1e-5 {
+				t.Fatalf("dims %v: element %d differs: %g vs %g", dims, k, got.Data[k], want.Data[k])
+			}
+		}
+	}
+	if err := DotTAInto(NewMatrix(2, 2), NewMatrix(3, 2), NewMatrix(4, 2)); err == nil {
+		t.Error("row mismatch should be rejected")
+	}
+	if err := DotTAInto(NewMatrix(2, 2), NewMatrix(3, 2), NewMatrix(3, 5)); err == nil {
+		t.Error("output shape mismatch should be rejected")
 	}
 }
