@@ -1,4 +1,4 @@
-//go:build wgpu && windows
+//go:build (wgpu || wgpu24) && windows
 
 package tensai
 

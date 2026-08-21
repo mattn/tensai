@@ -1,4 +1,4 @@
-//go:build wgpu24 && (linux || darwin)
+//go:build wgpu24 && (linux || darwin || windows)
 
 package tensai
 
@@ -8,14 +8,16 @@ package tensai
 // GPUPower) is identical, so everything else — including _example/wgpu —
 // works unchanged.
 //
-// Two things justify the second binding generation. The new API passes
-// WGPUStringView and callback-info structs by value, which purego can
-// express on linux/darwin amd64/arm64 (SysV/AAPCS pass small aggregates in
-// registers) but not portably on Windows — so this file is linux/darwin
-// only, and Windows stays on -tags wgpu with the v22 library. In exchange
-// the new API exposes WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter,
-// which un-hides non-conformant Vulkan drivers — concretely Mesa's dozen
+// What justifies the second binding generation is
+// WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter, which un-hides
+// non-conformant Vulkan drivers — concretely Mesa's dozen
 // (Vulkan-on-D3D12), the only route to the real GPU inside WSL2.
+//
+// The new API passes WGPUStringView and callback-info structs by value.
+// Every such struct here is reached through a pointer field except the
+// three callback-info arguments, whose calling convention differs between
+// SysV/AAPCS and Windows x64; wgpu24_callinfo.go and its _windows sibling
+// hold that difference, and nothing else in this file has to care.
 //
 // Use a wgpu-native v29-series shared library with this build; the v22
 // library will fail symbol registration cleanly.
@@ -253,14 +255,13 @@ type wgpuAdapterInfo struct {
 }
 
 // Function pointers resolved from the shared library. RequestAdapter,
-// RequestDevice, and MapAsync take their callback-info struct by value and
-// return a WGPUFuture (a single uint64, ABI-identical to returning uint64).
+// RequestDevice, and MapAsync are not here: they take a callback-info
+// struct by value, so they live in the per-OS wgpu24_callinfo files behind
+// the requestAdapter/requestDevice/bufferMapAsync wrappers.
 var (
 	fnCreateInstance          func(*wgpuInstanceDescriptor) uintptr
-	fnInstanceRequestAdapter  func(uintptr, *wgpuRequestAdapterOptions, wgpuCallbackInfo) uint64
 	fnAdapterGetInfo          func(uintptr, *wgpuAdapterInfo) uint32
 	fnAdapterGetLimits        func(uintptr, *wgpuLimits) uint32
-	fnAdapterRequestDevice    func(uintptr, *wgpuDeviceDescriptor, wgpuCallbackInfo) uint64
 	fnDeviceGetQueue          func(uintptr) uintptr
 	fnDeviceCreateShaderMod   func(uintptr, *wgpuShaderModuleDescriptor) uintptr
 	fnDeviceCreatePipeline    func(uintptr, *wgpuComputePipelineDescriptor) uintptr
@@ -277,7 +278,6 @@ var (
 	fnEncoderFinish           func(uintptr, unsafe.Pointer) uintptr
 	fnQueueSubmit             func(uintptr, uintptr, unsafe.Pointer)
 	fnQueueWriteBuffer        func(uintptr, uintptr, uint64, unsafe.Pointer, uintptr)
-	fnBufferMapAsync          func(uintptr, uint64, uintptr, uintptr, wgpuCallbackInfo) uint64
 	fnBufferGetConstMapped    func(uintptr, uintptr, uintptr) unsafe.Pointer
 	fnBufferUnmap             func(uintptr)
 	fnDevicePoll              func(uintptr, uint32, unsafe.Pointer) uint32
@@ -372,10 +372,8 @@ func loadWGPU() error {
 			name string
 		}{
 			{&fnCreateInstance, "wgpuCreateInstance"},
-			{&fnInstanceRequestAdapter, "wgpuInstanceRequestAdapter"},
 			{&fnAdapterGetInfo, "wgpuAdapterGetInfo"},
 			{&fnAdapterGetLimits, "wgpuAdapterGetLimits"},
-			{&fnAdapterRequestDevice, "wgpuAdapterRequestDevice"},
 			{&fnDeviceGetQueue, "wgpuDeviceGetQueue"},
 			{&fnDeviceCreateShaderMod, "wgpuDeviceCreateShaderModule"},
 			{&fnDeviceCreatePipeline, "wgpuDeviceCreateComputePipeline"},
@@ -392,7 +390,6 @@ func loadWGPU() error {
 			{&fnEncoderFinish, "wgpuCommandEncoderFinish"},
 			{&fnQueueSubmit, "wgpuQueueSubmit"},
 			{&fnQueueWriteBuffer, "wgpuQueueWriteBuffer"},
-			{&fnBufferMapAsync, "wgpuBufferMapAsync"},
 			{&fnBufferGetConstMapped, "wgpuBufferGetConstMappedRange"},
 			{&fnBufferUnmap, "wgpuBufferUnmap"},
 			{&fnDevicePoll, "wgpuDevicePoll"},
@@ -411,6 +408,7 @@ func loadWGPU() error {
 		} {
 			purego.RegisterLibFunc(f.ptr, lib, f.name)
 		}
+		registerCallInfoFns(lib)
 
 		// New-API callbacks receive WGPUStringView messages by value; on
 		// SysV/AAPCS a 16-byte aggregate arrives as two register words, so
@@ -479,7 +477,7 @@ func OpenGPU(power ...GPUPower) (*GPU, error) {
 	}
 	// wgpu-native still fires these callbacks synchronously.
 	cbAdapter, cbDevice, cbFailMsg = 0, 0, ""
-	fnInstanceRequestAdapter(g.instance, &opts, wgpuCallbackInfo{
+	requestAdapter(g.instance, &opts, wgpuCallbackInfo{
 		mode: wgpuCallbackModeAllowSpontaneous, callback: adapterCB,
 	})
 	runtime.KeepAlive(&opts)
@@ -518,7 +516,7 @@ func OpenGPU(power ...GPUPower) (*GPU, error) {
 		dDesc.requiredLimits = uintptr(unsafe.Pointer(&lim))
 		g.maxStorage = min(lim.maxStorageBufferBindingSize, lim.maxBufferSize)
 	}
-	fnAdapterRequestDevice(g.adapter, &dDesc, wgpuCallbackInfo{
+	requestDevice(g.adapter, &dDesc, wgpuCallbackInfo{
 		mode: wgpuCallbackModeAllowSpontaneous, callback: deviceCB,
 	})
 	runtime.KeepAlive(&dDesc)
@@ -617,7 +615,7 @@ func (g *GPU) makeBindGroup(layout uintptr, entries []wgpuBindGroupEntry) uintpt
 // range; the caller must fnBufferUnmap when done.
 func (g *GPU) mapRead(buf uintptr, bytes uint64) (unsafe.Pointer, error) {
 	cbMapDone, cbMapOK, cbFailMsg = false, false, ""
-	fnBufferMapAsync(buf, wgpuMapModeRead, 0, uintptr(bytes), wgpuCallbackInfo{
+	bufferMapAsync(buf, wgpuMapModeRead, 0, uintptr(bytes), wgpuCallbackInfo{
 		mode: wgpuCallbackModeAllowProcessEvents, callback: mapCB,
 	})
 	for !cbMapDone {
