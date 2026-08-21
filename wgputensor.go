@@ -16,6 +16,65 @@ import (
 	"unsafe"
 )
 
+// gpuTile is the square tile edge of the matmul kernel; the WGSL
+// workgroup_size and the dispatch below must agree with it.
+const gpuTile = 16
+
+// matmulWGSL multiplies one (m x k) x (k x n) pair per z-slice; per-batch
+// input offsets come from a lookup table so broadcast batches share data.
+// Each 16x16 workgroup streams tiles of a and b through workgroup memory,
+// so every element loaded from global memory is reused 16 times instead of
+// once — the classic shared-memory tiling.
+const matmulWGSL = `
+struct Params { m: u32, k: u32, n: u32, batches: u32 }
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read> a: array<f32>;
+@group(0) @binding(2) var<storage, read> b: array<f32>;
+@group(0) @binding(3) var<storage, read> offs: array<vec2<u32>>;
+@group(0) @binding(4) var<storage, read_write> outv: array<f32>;
+
+const TILE = 16u;
+var<workgroup> tileA: array<f32, 256>;
+var<workgroup> tileB: array<f32, 256>;
+
+@compute @workgroup_size(16, 16, 1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>,
+        @builtin(local_invocation_id) lid: vec3<u32>) {
+    let col = gid.x;
+    let row = gid.y;
+    let batch = gid.z;
+    let offA = offs[batch].x;
+    let offB = offs[batch].y;
+    var sum = 0.0;
+    // The loop count is uniform across the workgroup, so the barriers
+    // inside are in uniform control flow; out-of-range lanes load zeros
+    // and only the final store is guarded.
+    let tiles = (p.k + TILE - 1u) / TILE;
+    for (var t = 0u; t < tiles; t = t + 1u) {
+        let ak = t * TILE + lid.x;
+        if (row < p.m && ak < p.k) {
+            tileA[lid.y * TILE + lid.x] = a[offA + row * p.k + ak];
+        } else {
+            tileA[lid.y * TILE + lid.x] = 0.0;
+        }
+        let bk = t * TILE + lid.y;
+        if (bk < p.k && col < p.n) {
+            tileB[lid.y * TILE + lid.x] = b[offB + bk * p.n + col];
+        } else {
+            tileB[lid.y * TILE + lid.x] = 0.0;
+        }
+        workgroupBarrier();
+        for (var i = 0u; i < TILE; i = i + 1u) {
+            sum = sum + tileA[lid.y * TILE + i] * tileB[i * TILE + lid.x];
+        }
+        workgroupBarrier();
+    }
+    if (row < p.m && col < p.n) {
+        outv[(batch * p.m + row) * p.n + col] = sum;
+    }
+}
+`
+
 // GPUTensor is a tensor whose data lives in GPU memory. Create one with
 // GPU.Upload or as the result of GPUTensor.MatMul, read it back with
 // Download, and release it with Free — GPU memory is not garbage
@@ -187,7 +246,7 @@ func (t *GPUTensor) MatMul(o *GPUTensor) (*GPUTensor, error) {
 	pass := fnEncoderBeginComputePass(encoder, nil)
 	fnPassSetPipeline(pass, g.pipeline)
 	fnPassSetBindGroup(pass, 0, bindGroup, 0, nil)
-	fnPassDispatch(pass, uint32((n+7)/8), uint32((m+7)/8), uint32(batches))
+	fnPassDispatch(pass, uint32((n+gpuTile-1)/gpuTile), uint32((m+gpuTile-1)/gpuTile), uint32(batches))
 	fnPassEnd(pass)
 	fnPassRelease(pass)
 	cmd := fnEncoderFinish(encoder, nil)

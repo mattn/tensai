@@ -431,32 +431,6 @@ func loadWGPU() error {
 	return loadErr
 }
 
-// matmulWGSL multiplies one (m x k) x (k x n) pair per z-slice; per-batch
-// input offsets come from a lookup table so broadcast batches share data.
-const matmulWGSL = `
-struct Params { m: u32, k: u32, n: u32, batches: u32 }
-@group(0) @binding(0) var<uniform> p: Params;
-@group(0) @binding(1) var<storage, read> a: array<f32>;
-@group(0) @binding(2) var<storage, read> b: array<f32>;
-@group(0) @binding(3) var<storage, read> offs: array<vec2<u32>>;
-@group(0) @binding(4) var<storage, read_write> outv: array<f32>;
-
-@compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let col = gid.x;
-    let row = gid.y;
-    let batch = gid.z;
-    if (col >= p.n || row >= p.m || batch >= p.batches) { return; }
-    let offA = offs[batch].x;
-    let offB = offs[batch].y;
-    var sum = 0.0;
-    for (var i = 0u; i < p.k; i = i + 1u) {
-        sum = sum + a[offA + row * p.k + i] * b[offB + i * p.n + col];
-    }
-    outv[(batch * p.m + row) * p.n + col] = sum;
-}
-`
-
 // OpenGPU loads wgpu-native, picks an adapter, and compiles the matmul
 // pipeline. On machines with several GPUs an optional GPUPower steers the
 // choice: GPULowPower prefers the integrated GPU, GPUHighPerformance the
