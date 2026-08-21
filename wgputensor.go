@@ -43,11 +43,14 @@ const gpuKernelWG = 256
 // reduction, then the divide — the numerically stable softmax over the
 // last axis.
 const matmulWGSL = `
-struct Params { m: u32, k: u32, n: u32, batches: u32 }
+struct Params {
+    m: u32, k: u32, n: u32, batches: u32,
+    lda: u32, ldb: u32, ldc: u32, pad: u32,
+}
 @group(0) @binding(0) var<uniform> p: Params;
 @group(0) @binding(1) var<storage, read> a: array<f32>;
 @group(0) @binding(2) var<storage, read> b: array<f32>;
-@group(0) @binding(3) var<storage, read> offs: array<vec2<u32>>;
+@group(0) @binding(3) var<storage, read> offs: array<vec4<u32>>;
 @group(0) @binding(4) var<storage, read_write> outv: array<f32>;
 
 const TILE = 16u;
@@ -62,18 +65,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     let batch = gid.z;
     let offA = offs[batch].x;
     let offB = offs[batch].y;
+    let offC = offs[batch].z;
     var sum = 0.0;
     let tiles = (p.k + TILE - 1u) / TILE;
     for (var t = 0u; t < tiles; t = t + 1u) {
         let ak = t * TILE + lid.x;
         if (row < p.m && ak < p.k) {
-            tileA[lid.y * TILE + lid.x] = a[offA + row * p.k + ak];
+            tileA[lid.y * TILE + lid.x] = a[offA + row * p.lda + ak];
         } else {
             tileA[lid.y * TILE + lid.x] = 0.0;
         }
         let bk = t * TILE + lid.y;
         if (bk < p.k && col < p.n) {
-            tileB[lid.y * TILE + lid.x] = b[offB + bk * p.n + col];
+            tileB[lid.y * TILE + lid.x] = b[offB + bk * p.ldb + col];
         } else {
             tileB[lid.y * TILE + lid.x] = 0.0;
         }
@@ -84,7 +88,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         workgroupBarrier();
     }
     if (row < p.m && col < p.n) {
-        outv[(batch * p.m + row) * p.n + col] = sum;
+        outv[offC + row * p.ldc + col] = sum;
     }
 }
 
@@ -97,21 +101,23 @@ fn matmul_t(@builtin(global_invocation_id) gid: vec3<u32>,
     let batch = gid.z;
     let offA = offs[batch].x;
     let offB = offs[batch].y;
+    let offC = offs[batch].z;
     var sum = 0.0;
     let tiles = (p.k + TILE - 1u) / TILE;
     for (var t = 0u; t < tiles; t = t + 1u) {
         let ak = t * TILE + lid.x;
         if (row < p.m && ak < p.k) {
-            tileA[lid.y * TILE + lid.x] = a[offA + row * p.k + ak];
+            tileA[lid.y * TILE + lid.x] = a[offA + row * p.lda + ak];
         } else {
             tileA[lid.y * TILE + lid.x] = 0.0;
         }
-        // b is (n x k); store its tile transposed so the inner loop reads
-        // b^T while the global loads stay contiguous along k.
+        // b holds n rows of length k (row stride ldb); store its tile
+        // transposed so the inner loop reads b^T while the global loads
+        // stay contiguous along k.
         let bcol = wid.x * TILE + lid.y;
         let bk = t * TILE + lid.x;
         if (bcol < p.n && bk < p.k) {
-            tileB[lid.x * TILE + lid.y] = b[offB + bcol * p.k + bk];
+            tileB[lid.x * TILE + lid.y] = b[offB + bcol * p.ldb + bk];
         } else {
             tileB[lid.x * TILE + lid.y] = 0.0;
         }
@@ -122,7 +128,7 @@ fn matmul_t(@builtin(global_invocation_id) gid: vec3<u32>,
         workgroupBarrier();
     }
     if (row < p.m && col < p.n) {
-        outv[(batch * p.m + row) * p.n + col] = sum;
+        outv[offC + row * p.ldc + col] = sum;
     }
 }
 
@@ -378,15 +384,12 @@ func (t *GPUTensor) matmul(o *GPUTensor, transB bool) (*GPUTensor, error) {
 		return nil, err
 	}
 	batches := prodDims(batch)
-	if batches > 65535 {
-		return nil, fmt.Errorf("tensai: gpu matmul batch count %d exceeds 65535", batches)
-	}
 	outShape := append(append([]int(nil), batch...), m, n)
 
-	// Element offsets of each batch's matrix in t and o.
+	// Element offsets of each batch's (contiguous) matrix in t, o, out.
 	as := broadcastStrides(t.shape[:na-2], batch)
 	bs := broadcastStrides(o.shape[:nb-2], batch)
-	offs := make([]uint32, 2*batches)
+	offs := make([]uint32, 4*batches)
 	for bi := 0; bi < batches; bi++ {
 		offA, offB := 0, 0
 		for d, rem := len(batch)-1, bi; d >= 0; d-- {
@@ -395,12 +398,32 @@ func (t *GPUTensor) matmul(o *GPUTensor, transB bool) (*GPUTensor, error) {
 			offA += i * as[d]
 			offB += i * bs[d]
 		}
-		offs[2*bi] = uint32(offA * m * k)
-		offs[2*bi+1] = uint32(offB * k * n)
+		offs[4*bi] = uint32(offA * m * k)
+		offs[4*bi+1] = uint32(offB * k * n)
+		offs[4*bi+2] = uint32(bi * m * n)
 	}
-	params := [4]uint32{uint32(m), uint32(k), uint32(n), uint32(batches)}
+	ldb := n
+	if transB {
+		ldb = k
+	}
+	return t.g.stridedMatMul(t, o, outShape, transB, m, k, n, batches, k, ldb, n, offs)
+}
 
-	g := t.g
+// stridedMatMul runs `batches` independent (m x k) x (k x n) products —
+// x (n x k) read transposed when transB — where offs holds per-batch
+// element offsets (offA, offB, offC, 0) into a, b, and the freshly
+// allocated output, and lda/ldb/ldc are the row strides. Explicit strides
+// let callers carve sub-matrices out of a wider layout, which is how
+// multi-head attention splits heads without materializing a permute.
+func (g *GPU) stridedMatMul(a, b *GPUTensor, outShape []int, transB bool, m, k, n, batches, lda, ldb, ldc int, offs []uint32) (*GPUTensor, error) {
+	if batches > 65535 {
+		return nil, fmt.Errorf("tensai: gpu matmul batch count %d exceeds 65535", batches)
+	}
+	params := [8]uint32{
+		uint32(m), uint32(k), uint32(n), uint32(batches),
+		uint32(lda), uint32(ldb), uint32(ldc), 0,
+	}
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	wgpuMu.Lock()
@@ -411,13 +434,13 @@ func (t *GPUTensor) matmul(o *GPUTensor, transB bool) (*GPUTensor, error) {
 	uncapturedCB = ""
 
 	outBytes := uint64(prodDims(outShape)) * 4
-	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
 	bufOffs := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
 	bufOut := g.newBuffer(gpuTensorUsage, outBytes)
 	defer fnBufferRelease(bufParams)
 	defer fnBufferRelease(bufOffs)
 
-	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
 	fnQueueWriteBuffer(g.queue, bufOffs, 0, unsafe.Pointer(&offs[0]), uintptr(len(offs))*4)
 
 	pipe, lay := g.pipes.matmul, g.pipes.layMatmul
@@ -425,9 +448,9 @@ func (t *GPUTensor) matmul(o *GPUTensor, transB bool) (*GPUTensor, error) {
 		pipe, lay = g.pipes.matmulT, g.pipes.layMatmulT
 	}
 	entries := [5]wgpuBindGroupEntry{
-		{binding: 0, buffer: bufParams, size: 16},
-		{binding: 1, buffer: t.buf, size: uint64(t.Size()) * 4},
-		{binding: 2, buffer: o.buf, size: uint64(o.Size()) * 4},
+		{binding: 0, buffer: bufParams, size: 32},
+		{binding: 1, buffer: a.buf, size: uint64(a.Size()) * 4},
+		{binding: 2, buffer: b.buf, size: uint64(b.Size()) * 4},
 		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
 		{binding: 4, buffer: bufOut, size: outBytes},
 	}
@@ -435,7 +458,7 @@ func (t *GPUTensor) matmul(o *GPUTensor, transB bool) (*GPUTensor, error) {
 	runtime.KeepAlive(&entries)
 	defer fnBindGroupRelease(bindGroup)
 
-	err = g.dispatch(pipe, bindGroup,
+	err := g.dispatch(pipe, bindGroup,
 		uint32((n+gpuTile-1)/gpuTile), uint32((m+gpuTile-1)/gpuTile), uint32(batches))
 	if err != nil {
 		fnBufferRelease(bufOut)
@@ -548,6 +571,80 @@ func (q *GPUTensor) Attention(k, v *GPUTensor) (*GPUTensor, error) {
 	}
 	defer weights.Free()
 	return weights.MatMul(v)
+}
+
+// MultiHeadAttention computes multi-head scaled dot-product attention
+// entirely on the GPU. q is (batch..., seqQ, d) and k, v are
+// (batch..., seqKV, d) in the usual packed head layout, d = heads * dh;
+// the result is (batch..., seqQ, d). Heads are carved out of the packed
+// layout with strided kernels, so no permute is ever materialized.
+func (q *GPUTensor) MultiHeadAttention(k, v *GPUTensor, heads int) (*GPUTensor, error) {
+	if q.freed || k.freed || v.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if q.g != k.g || q.g != v.g {
+		return nil, errors.New("tensai: gpu tensors belong to different GPUs")
+	}
+	nq := len(q.shape)
+	if nq < 2 {
+		return nil, fmt.Errorf("tensai: attention needs at least 2 axes: %v", q.shape)
+	}
+	d := q.shape[nq-1]
+	if heads <= 0 || d%heads != 0 {
+		return nil, fmt.Errorf("tensai: %d heads do not divide model dimension %d", heads, d)
+	}
+	if !sameDims(k.shape, v.shape) {
+		return nil, fmt.Errorf("tensai: attention k and v shapes differ: %v vs %v", k.shape, v.shape)
+	}
+	if len(k.shape) != nq || k.shape[nq-1] != d || !sameDims(k.shape[:nq-2], q.shape[:nq-2]) {
+		return nil, fmt.Errorf("tensai: attention shape mismatch: q %v, k %v", q.shape, k.shape)
+	}
+	seq := q.shape[nq-2]
+	seqKV := k.shape[nq-2]
+	batch := prodDims(q.shape[:nq-2])
+	dh := d / heads
+	bh := batch * heads
+
+	// scores (batch*heads, seq, seqKV) = q_head @ k_head^T, each head a
+	// (seq x dh) sub-matrix with row stride d inside the packed layout.
+	offs := make([]uint32, 4*bh)
+	for b := 0; b < batch; b++ {
+		for h := 0; h < heads; h++ {
+			i := b*heads + h
+			offs[4*i] = uint32(b*seq*d + h*dh)
+			offs[4*i+1] = uint32(b*seqKV*d + h*dh)
+			offs[4*i+2] = uint32(i * seq * seqKV)
+		}
+	}
+	scores, err := q.g.stridedMatMul(q, k, []int{bh, seq, seqKV}, true,
+		seq, dh, seqKV, bh, d, d, seqKV, offs)
+	if err != nil {
+		return nil, err
+	}
+	defer scores.Free()
+	if err := scores.Scale(1 / sqrtF(Float(dh))); err != nil {
+		return nil, err
+	}
+	weights, err := scores.Softmax()
+	if err != nil {
+		return nil, err
+	}
+	defer weights.Free()
+
+	// out (batch..., seq, d) = weights @ v_head, written back into the
+	// packed head layout.
+	offs2 := make([]uint32, 4*bh)
+	for b := 0; b < batch; b++ {
+		for h := 0; h < heads; h++ {
+			i := b*heads + h
+			offs2[4*i] = uint32(i * seq * seqKV)
+			offs2[4*i+1] = uint32(b*seqKV*d + h*dh)
+			offs2[4*i+2] = uint32(b*seq*d + h*dh)
+		}
+	}
+	outShape := append(append([]int(nil), q.shape[:nq-2]...), seq, d)
+	return q.g.stridedMatMul(weights, v, outShape, false,
+		seq, seqKV, dh, bh, seqKV, d, d, offs2)
 }
 
 // MatMul is the GPU version of the package-level MatMul: identical shape
