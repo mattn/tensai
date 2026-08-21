@@ -197,6 +197,158 @@ func TestGPUTensorChain(t *testing.T) {
 	abc.Free() // second Free is a no-op
 }
 
+// cpuSoftmaxLast applies softmax along the last axis, in place.
+func cpuSoftmaxLast(x *Tensor) {
+	n := x.Shape[len(x.Shape)-1]
+	for pos := 0; pos < len(x.Data); pos += n {
+		row := x.Data[pos : pos+n]
+		maxv := row[0]
+		for _, v := range row[1:] {
+			if v > maxv {
+				maxv = v
+			}
+		}
+		var sum Float
+		for i, v := range row {
+			row[i] = expF(v - maxv)
+			sum += row[i]
+		}
+		for i := range row {
+			row[i] /= sum
+		}
+	}
+}
+
+func TestGPUKernels(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(15))
+
+	// MatMulT against MatMul on a materialized transpose, batched.
+	a, b := randTensor(rng, 3, 5, 8), randTensor(rng, 3, 7, 8)
+	ga, _ := g.Upload(a)
+	gb, _ := g.Upload(b)
+	defer ga.Free()
+	defer gb.Free()
+	gt, err := ga.MatMulT(gb)
+	if err != nil {
+		t.Fatalf("matmul-t: %v", err)
+	}
+	defer gt.Free()
+	got, err := gt.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bt, err := b.Transpose()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := MatMul(a, bt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameDims(got.Shape, want.Shape) {
+		t.Fatalf("matmul-t shape: got %v want %v", got.Shape, want.Shape)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(got.Data[i] - want.Data[i])); diff > 1e-4 {
+			t.Fatalf("matmul-t element %d: gpu=%v cpu=%v", i, got.Data[i], want.Data[i])
+		}
+	}
+	if _, err := ga.MatMulT(gt); err == nil { // (3,5,8) @ (3,5,7)^T: k mismatch
+		t.Fatal("expected matmul-t shape mismatch error")
+	}
+
+	// Scale in place.
+	x := randTensor(rng, 4, 33)
+	gx, _ := g.Upload(x)
+	defer gx.Free()
+	if err := gx.Scale(0.5); err != nil {
+		t.Fatalf("scale: %v", err)
+	}
+	sGot, err := gx.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range x.Data {
+		if diff := math.Abs(float64(sGot.Data[i] - v*0.5)); diff > 1e-6 {
+			t.Fatalf("scale element %d: gpu=%v want=%v", i, sGot.Data[i], v*0.5)
+		}
+	}
+
+	// Softmax over the last axis; 300 columns exercise the strided loops
+	// beyond one 256-lane workgroup pass.
+	for _, shape := range [][]int{{5, 30}, {2, 3, 300}} {
+		y := randTensor(rng, shape...)
+		gy, _ := g.Upload(y)
+		sm, err := gy.Softmax()
+		if err != nil {
+			t.Fatalf("softmax %v: %v", shape, err)
+		}
+		smGot, err := sm.Download()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cpuSoftmaxLast(y)
+		for i := range y.Data {
+			if diff := math.Abs(float64(smGot.Data[i] - y.Data[i])); diff > 1e-5 {
+				t.Fatalf("softmax %v element %d: gpu=%v cpu=%v", shape, i, smGot.Data[i], y.Data[i])
+			}
+		}
+		sm.Free()
+		gy.Free()
+	}
+}
+
+func TestGPUAttention(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(16))
+
+	// Batched single-head attention entirely on the GPU vs the same math
+	// on the CPU tensor ops.
+	q, k, v := randTensor(rng, 2, 6, 8), randTensor(rng, 2, 6, 8), randTensor(rng, 2, 6, 8)
+	gq, _ := g.Upload(q)
+	gk, _ := g.Upload(k)
+	gv, _ := g.Upload(v)
+	defer gq.Free()
+	defer gk.Free()
+	defer gv.Free()
+
+	out, err := gq.Attention(gk, gv)
+	if err != nil {
+		t.Fatalf("attention: %v", err)
+	}
+	defer out.Free()
+	got, err := out.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kt, err := k.Transpose()
+	if err != nil {
+		t.Fatal(err)
+	}
+	scores, err := MatMul(q, kt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scores.Scale(1 / sqrtF(8))
+	cpuSoftmaxLast(scores)
+	want, err := MatMul(scores, v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameDims(got.Shape, want.Shape) {
+		t.Fatalf("shape: got %v want %v", got.Shape, want.Shape)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(got.Data[i] - want.Data[i])); diff > 1e-4 {
+			t.Fatalf("element %d: gpu=%v cpu=%v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
 func TestGPUMatMulLarge(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()

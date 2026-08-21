@@ -43,6 +43,18 @@ func (g *GPU) Upload(t *Tensor) (*GPUTensor, error) { return nil, errNoWGPU }
 // MatMul always fails in builds without the wgpu tag.
 func (t *GPUTensor) MatMul(o *GPUTensor) (*GPUTensor, error) { return nil, errNoWGPU }
 
+// MatMulT always fails in builds without the wgpu tag.
+func (t *GPUTensor) MatMulT(o *GPUTensor) (*GPUTensor, error) { return nil, errNoWGPU }
+
+// Scale always fails in builds without the wgpu tag.
+func (t *GPUTensor) Scale(s Float) error { return errNoWGPU }
+
+// Softmax always fails in builds without the wgpu tag.
+func (t *GPUTensor) Softmax() (*GPUTensor, error) { return nil, errNoWGPU }
+
+// Attention always fails in builds without the wgpu tag.
+func (q *GPUTensor) Attention(k, v *GPUTensor) (*GPUTensor, error) { return nil, errNoWGPU }
+
 // Download always fails in builds without the wgpu tag.
 func (t *GPUTensor) Download() (*Tensor, error) { return nil, errNoWGPU }
 
