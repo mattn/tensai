@@ -349,6 +349,120 @@ func TestGPUAttention(t *testing.T) {
 	}
 }
 
+// cpuAttention is the reference softmax(q*k^T/sqrt(d))*v on CPU tensors.
+func cpuAttention(t *testing.T, q, k, v *Tensor) *Tensor {
+	t.Helper()
+	kt, err := k.Transpose()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := MatMul(q, kt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Scale(1 / sqrtF(Float(q.Shape[len(q.Shape)-1])))
+	cpuSoftmaxLast(s)
+	out, err := MatMul(s, v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestGPUMultiHeadAttention(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(17))
+
+	const batch, seq, seqKV, heads, dh = 2, 5, 7, 3, 4
+	const d = heads * dh
+	q := randTensor(rng, batch, seq, d)
+	k := randTensor(rng, batch, seqKV, d)
+	v := randTensor(rng, batch, seqKV, d)
+	gq, _ := g.Upload(q)
+	gk, _ := g.Upload(k)
+	gv, _ := g.Upload(v)
+	defer gq.Free()
+	defer gk.Free()
+	defer gv.Free()
+
+	out, err := gq.MultiHeadAttention(gk, gv, heads)
+	if err != nil {
+		t.Fatalf("multi-head attention: %v", err)
+	}
+	defer out.Free()
+	got, err := out.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameDims(got.Shape, []int{batch, seq, d}) {
+		t.Fatalf("shape: got %v", got.Shape)
+	}
+
+	// Reference: slice each head out of the packed layout, run single-head
+	// attention on the CPU, and scatter the result back.
+	want := NewTensor(batch, seq, d)
+	for b := 0; b < batch; b++ {
+		for h := 0; h < heads; h++ {
+			slice := func(x *Tensor, rows int) *Tensor {
+				s := NewTensor(rows, dh)
+				for r := 0; r < rows; r++ {
+					for c := 0; c < dh; c++ {
+						s.Data[r*dh+c] = x.Data[(b*rows+r)*d+h*dh+c]
+					}
+				}
+				return s
+			}
+			ho := cpuAttention(t, slice(q, seq), slice(k, seqKV), slice(v, seqKV))
+			for r := 0; r < seq; r++ {
+				for c := 0; c < dh; c++ {
+					want.Data[(b*seq+r)*d+h*dh+c] = ho.Data[r*dh+c]
+				}
+			}
+		}
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(got.Data[i] - want.Data[i])); diff > 1e-4 {
+			t.Fatalf("element %d: gpu=%v cpu=%v", i, got.Data[i], want.Data[i])
+		}
+	}
+
+	// heads=1 must agree with the single-head Attention path.
+	qs := randTensor(rng, 2, 6, 8)
+	ks := randTensor(rng, 2, 6, 8)
+	vs := randTensor(rng, 2, 6, 8)
+	gqs, _ := g.Upload(qs)
+	gks, _ := g.Upload(ks)
+	gvs, _ := g.Upload(vs)
+	defer gqs.Free()
+	defer gks.Free()
+	defer gvs.Free()
+	mh, err := gqs.MultiHeadAttention(gks, gvs, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mh.Free()
+	sh, err := gqs.Attention(gks, gvs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sh.Free()
+	mhT, _ := mh.Download()
+	shT, _ := sh.Download()
+	for i := range shT.Data {
+		if diff := math.Abs(float64(mhT.Data[i] - shT.Data[i])); diff > 1e-5 {
+			t.Fatalf("heads=1 mismatch at %d: %v vs %v", i, mhT.Data[i], shT.Data[i])
+		}
+	}
+
+	if _, err := gq.MultiHeadAttention(gk, gv, 5); err == nil {
+		t.Fatal("expected error: 5 heads do not divide d=12")
+	}
+	if _, err := gq.MultiHeadAttention(gqs, gqs, 2); err == nil {
+		t.Fatal("expected shape mismatch error")
+	}
+}
+
 func TestGPUMatMulLarge(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()

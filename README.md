@@ -237,8 +237,11 @@ result, _ := out.Download()         // one readback at the end
 Beyond MatMul, resident tensors support `MatMulT` (multiply by a transposed operand without materializing the transpose), an in-place `Scale`, and a row-parallel `Softmax` over the last axis — enough to run single-head attention entirely on the GPU:
 
 ```go
-out, _ := gq.Attention(gk, gv) // softmax(q@k^T/sqrt(d))@v, no host round-trips
+out, _ := gq.Attention(gk, gv)                 // softmax(q@k^T/sqrt(d))@v, no host round-trips
+out, _ = gq.MultiHeadAttention(gk, gv, heads)  // packed (batch, seq, heads*dh) layout
 ```
+
+Multi-head attention carves each head out of the packed layout with strided kernels — the matmul kernels take explicit row strides and per-batch offsets — so no permute is ever materialized.
 
 There is no cgo involved: the bindings load the [wgpu-native](https://github.com/gfx-rs/wgpu-native) shared library at runtime via `ebitengine/purego` (`dlopen` on linux/macOS, `LoadLibrary` on Windows). Download a **v22.1.0.5** release binary (the C API these bindings target), then either install it where the loader finds it or point `TENSAI_WGPU_LIB` at it:
 

@@ -55,6 +55,11 @@ func (t *GPUTensor) Softmax() (*GPUTensor, error) { return nil, errNoWGPU }
 // Attention always fails in builds without the wgpu tag.
 func (q *GPUTensor) Attention(k, v *GPUTensor) (*GPUTensor, error) { return nil, errNoWGPU }
 
+// MultiHeadAttention always fails in builds without the wgpu tag.
+func (q *GPUTensor) MultiHeadAttention(k, v *GPUTensor, heads int) (*GPUTensor, error) {
+	return nil, errNoWGPU
+}
+
 // Download always fails in builds without the wgpu tag.
 func (t *GPUTensor) Download() (*Tensor, error) { return nil, errNoWGPU }
 
