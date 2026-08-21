@@ -463,6 +463,56 @@ func TestGPUMultiHeadAttention(t *testing.T) {
 	}
 }
 
+func TestGPUDispatch2D(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(18))
+
+	// 70000 rows exceed the 65535 single-axis dispatch limit, exercising
+	// the 2-D workgroup grid in softmax.
+	x := randTensor(rng, 70000, 8)
+	gx, err := g.Upload(x)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gx.Free()
+	sm, err := gx.Softmax()
+	if err != nil {
+		t.Fatalf("softmax: %v", err)
+	}
+	defer sm.Free()
+	got, err := sm.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cpuSoftmaxLast(x)
+	for i := range x.Data {
+		if diff := math.Abs(float64(got.Data[i] - x.Data[i])); diff > 1e-5 {
+			t.Fatalf("softmax element %d: gpu=%v cpu=%v", i, got.Data[i], x.Data[i])
+		}
+	}
+
+	// 17.4M elements exceed 65535 workgroups of 256 lanes for scale.
+	y := randTensor(rng, 68000, 256)
+	gy, err := g.Upload(y)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gy.Free()
+	if err := gy.Scale(2); err != nil {
+		t.Fatalf("scale: %v", err)
+	}
+	sGot, err := gy.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, i := range []int{0, 12345, len(y.Data) / 2, len(y.Data) - 1} {
+		if diff := math.Abs(float64(sGot.Data[i] - y.Data[i]*2)); diff > 1e-5 {
+			t.Fatalf("scale element %d: gpu=%v want=%v", i, sGot.Data[i], y.Data[i]*2)
+		}
+	}
+}
+
 func TestGPUMatMulLarge(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()

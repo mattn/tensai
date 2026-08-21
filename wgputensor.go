@@ -137,9 +137,14 @@ struct ScaleParams { count: u32, s: f32 }
 @group(0) @binding(6) var<storage, read_write> sbuf: array<f32>;
 
 @compute @workgroup_size(256, 1, 1)
-fn scale_ip(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if (gid.x < scp.count) {
-        sbuf[gid.x] = sbuf[gid.x] * scp.s;
+fn scale_ip(@builtin(workgroup_id) wg: vec3<u32>,
+            @builtin(num_workgroups) nwg: vec3<u32>,
+            @builtin(local_invocation_id) lid: vec3<u32>) {
+    // Workgroups are laid out on a 2-D grid to escape the 65535 per-axis
+    // dispatch limit.
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx < scp.count) {
+        sbuf[idx] = sbuf[idx] * scp.s;
     }
 }
 
@@ -152,8 +157,16 @@ var<workgroup> red: array<f32, 256>;
 
 @compute @workgroup_size(256, 1, 1)
 fn softmax_last(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(num_workgroups) nwg: vec3<u32>,
                 @builtin(local_invocation_id) lid: vec3<u32>) {
-    let base = wid.x * sp.cols;
+    // One workgroup per row, on a 2-D grid to escape the 65535 per-axis
+    // dispatch limit. row is workgroup-uniform, so returning here keeps
+    // the barriers below in uniform control flow.
+    let row = wid.y * nwg.x + wid.x;
+    if (row >= sp.rows) {
+        return;
+    }
+    let base = row * sp.cols;
     var m = -3.40282e38;
     for (var i = lid.x; i < sp.cols; i = i + 256u) {
         m = max(m, sx[base + i]);
@@ -467,6 +480,15 @@ func (g *GPU) stridedMatMul(a, b *GPUTensor, outShape []int, transB bool, m, k, 
 	return &GPUTensor{g: g, buf: bufOut, shape: outShape}, nil
 }
 
+// split2D spreads n workgroups over a 2-D dispatch grid, since a single
+// axis is capped at 65535.
+func split2D(n int) (x, y uint32) {
+	if n <= 65535 {
+		return uint32(n), 1
+	}
+	return 65535, uint32((n + 65534) / 65535)
+}
+
 // Scale multiplies every element by s, in place — the GPU counterpart of
 // Tensor.Scale.
 func (t *GPUTensor) Scale(s Float) error {
@@ -474,9 +496,6 @@ func (t *GPUTensor) Scale(s Float) error {
 		return errors.New("tensai: gpu tensor already freed")
 	}
 	count := t.Size()
-	if count > 65535*gpuKernelWG {
-		return fmt.Errorf("tensai: gpu scale size %d exceeds dispatch limit", count)
-	}
 	g := t.g
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -500,7 +519,8 @@ func (t *GPUTensor) Scale(s Float) error {
 	runtime.KeepAlive(&entries)
 	defer fnBindGroupRelease(bindGroup)
 
-	return g.dispatch(g.pipes.scale, bindGroup, uint32((count+gpuKernelWG-1)/gpuKernelWG), 1, 1)
+	x, y := split2D((count + gpuKernelWG - 1) / gpuKernelWG)
+	return g.dispatch(g.pipes.scale, bindGroup, x, y, 1)
 }
 
 // Softmax applies a numerically stable softmax over the last axis,
@@ -514,9 +534,6 @@ func (t *GPUTensor) Softmax() (*GPUTensor, error) {
 	}
 	cols := t.shape[len(t.shape)-1]
 	rows := t.Size() / cols
-	if rows > 65535 {
-		return nil, fmt.Errorf("tensai: gpu softmax row count %d exceeds 65535", rows)
-	}
 	g := t.g
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -543,7 +560,8 @@ func (t *GPUTensor) Softmax() (*GPUTensor, error) {
 	runtime.KeepAlive(&entries)
 	defer fnBindGroupRelease(bindGroup)
 
-	if err := g.dispatch(g.pipes.softmax, bindGroup, uint32(rows), 1, 1); err != nil {
+	x, y := split2D(rows)
+	if err := g.dispatch(g.pipes.softmax, bindGroup, x, y, 1); err != nil {
 		fnBufferRelease(bufOut)
 		return nil, err
 	}
