@@ -283,7 +283,7 @@ wgpu-native picks Vulkan on Linux, Vulkan or D3D12 on Windows, and Metal on macO
 
 #### `-tags wgpu24`: the new wgpu-native API, and the real GPU inside WSL2
 
-`-tags wgpu24` (linux/darwin) builds the same `OpenGPU` API against the reworked wgpu-native C API instead — pair it with a **v29-series** release binary. The new API's payoff is `WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter`, which un-hides non-conformant Vulkan drivers. Concretely: Mesa's dozen (Vulkan-on-D3D12, shipped in the kisak-mesa PPA) exposes the real host GPU inside WSL2, but the v22 API hides it as non-conformant and falls back to lavapipe; the wgpu24 build reaches it:
+`-tags wgpu24` (linux/darwin/windows) builds the same `OpenGPU` API against the reworked wgpu-native C API instead — pair it with a **v29-series** release binary. The new API's payoff is `WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter`, which un-hides non-conformant Vulkan drivers. Concretely: Mesa's dozen (Vulkan-on-D3D12, shipped in the kisak-mesa PPA) exposes the real host GPU inside WSL2, but the v22 API hides it as non-conformant and falls back to lavapipe; the wgpu24 build reaches it:
 
 ```bash
 VK_DRIVER_FILES=/path/to/dzn_icd.json \
@@ -291,7 +291,16 @@ TENSAI_WGPU_LIB=$PWD/wgpu29/lib/libwgpu_native.so \
     go run -tags wgpu24 ./_example/wgpu   # adapter: Microsoft Direct3D12 (AMD Radeon(TM) Graphics)
 ```
 
-The new API passes structs by value, which the purego bindings can express through the SysV/AAPCS register conventions on linux/darwin but not portably on Windows — Windows stays on `-tags wgpu`, where D3D12 needs no translation layer anyway. When both tags are set, `wgpu24` wins.
+The new API passes structs by value. Every one of them is reached through a pointer field except the three callback-info arguments, and those are the only per-OS code in the binding: `wgpu24_callinfo.go` hands the 40-byte struct to SysV/AAPCS in registers, while `wgpu24_callinfo_windows.go` passes its address, because the Windows x64 convention already defines any aggregate that is not 1, 2, 4, or 8 bytes wide as passed by reference. `WGPUFuture` results come back in RAX either way. When both tags are set, `wgpu24` wins.
+
+On Windows, pair it with `wgpu-windows-x86_64-msvc-release.zip` from the same v29 release:
+
+```powershell
+$env:TENSAI_WGPU_LIB="$PWD\wgpu29\lib\wgpu_native.dll"
+go run -tags wgpu24 ./_example/wgpu
+```
+
+Note that new does not mean faster: on a Radeon 780M at `32x512x512@512x512` the v22 library runs the same shader in 85ms and the v29 one in 165ms (D3D12 190ms, Vulkan 438ms when forced with `WGPU_BACKEND`). Use `wgpu24` for the adapters it reaches, not for speed.
 
 ## Run
 
