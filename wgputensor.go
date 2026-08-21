@@ -278,6 +278,19 @@ type GPUTensor struct {
 // copyable in (Upload) and out (Download).
 const gpuTensorUsage = wgpuBufferUsageStorage | wgpuBufferUsageCopySrc | wgpuBufferUsageCopyDst
 
+// StorageLimit reports how many bytes a single GPU buffer may hold under
+// the device limits negotiated at OpenGPU time (0 when unknown). Tensor
+// operations return an error instead of touching the driver when a buffer
+// would exceed it.
+func (g *GPU) StorageLimit() uint64 { return g.maxStorage }
+
+func (g *GPU) checkSize(bytes uint64) error {
+	if g.maxStorage != 0 && bytes > g.maxStorage {
+		return fmt.Errorf("tensai: gpu buffer of %d bytes exceeds the device storage limit of %d", bytes, g.maxStorage)
+	}
+	return nil
+}
+
 // Shape returns a copy of the tensor's shape.
 func (t *GPUTensor) Shape() []int { return append([]int(nil), t.shape...) }
 
@@ -296,6 +309,9 @@ func (g *GPU) Upload(t *Tensor) (*GPUTensor, error) {
 	defer wgpuMu.Unlock()
 	if g.closed {
 		return nil, errors.New("tensai: gpu is closed")
+	}
+	if err := g.checkSize(uint64(len(t.Data)) * 4); err != nil {
+		return nil, err
 	}
 	buf := g.newBuffer(gpuTensorUsage, uint64(len(t.Data))*4)
 	if buf == 0 {
@@ -447,6 +463,9 @@ func (g *GPU) stridedMatMul(a, b *GPUTensor, outShape []int, transB bool, m, k, 
 	uncapturedCB = ""
 
 	outBytes := uint64(prodDims(outShape)) * 4
+	if err := g.checkSize(outBytes); err != nil {
+		return nil, err
+	}
 	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
 	bufOffs := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
 	bufOut := g.newBuffer(gpuTensorUsage, outBytes)
