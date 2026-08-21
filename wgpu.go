@@ -38,8 +38,7 @@ type GPU struct {
 	device   uintptr
 	queue    uintptr
 	module   uintptr
-	pipeline uintptr
-	layout   uintptr // bind group layout, owned by the pipeline
+	pipes    gpuPipelines
 	name     string
 	closed   bool
 }
@@ -428,22 +427,30 @@ func OpenGPU(power ...GPUPower) (*GPU, error) {
 	}
 	smDesc := wgpuShaderModuleDescriptor{nextInChain: &wgsl}
 	g.module = fnDeviceCreateShaderMod(g.device, unsafe.Pointer(&smDesc))
-	entry := cstr("main")
-	pDesc := wgpuComputePipelineDescriptor{
-		compute: wgpuProgrammableStageDescriptor{module: g.module, entryPoint: entry},
-	}
-	g.pipeline = fnDeviceCreatePipeline(g.device, unsafe.Pointer(&pDesc))
 	runtime.KeepAlive(&wgsl)
 	runtime.KeepAlive(&smDesc)
-	runtime.KeepAlive(&pDesc)
 	runtime.KeepAlive(code)
-	runtime.KeepAlive(entry)
-	if g.pipeline == 0 || uncapturedCB != "" {
+	if g.module == 0 || uncapturedCB != "" {
 		g.Close()
-		return nil, fmt.Errorf("tensai: wgpu pipeline creation failed: %s", uncapturedCB)
+		return nil, fmt.Errorf("tensai: wgpu shader compilation failed: %s", uncapturedCB)
 	}
-	g.layout = fnPipelineGetLayout(g.pipeline, 0)
+	if err := g.initPipelines(); err != nil {
+		g.Close()
+		return nil, err
+	}
 	return g, nil
+}
+
+// makePipeline builds a compute pipeline for one entry point of g.module.
+func (g *GPU) makePipeline(entry string) uintptr {
+	e := cstr(entry)
+	pDesc := wgpuComputePipelineDescriptor{
+		compute: wgpuProgrammableStageDescriptor{module: g.module, entryPoint: e},
+	}
+	p := fnDeviceCreatePipeline(g.device, unsafe.Pointer(&pDesc))
+	runtime.KeepAlive(&pDesc)
+	runtime.KeepAlive(e)
+	return p
 }
 
 // Name reports the adapter wgpu selected, e.g. "AMD Radeon 780M
@@ -460,12 +467,11 @@ func (g *GPU) Close() {
 		return
 	}
 	g.closed = true
+	g.releasePipelines()
 	for _, r := range []struct {
 		fn func(uintptr)
 		h  uintptr
 	}{
-		{fnLayoutRelease, g.layout},
-		{fnPipelineRelease, g.pipeline},
 		{fnShaderModRelease, g.module},
 		{fnQueueRelease, g.queue},
 		{fnDeviceRelease, g.device},
@@ -489,8 +495,8 @@ func (g *GPU) newBuffer(usage, size uint64) uintptr {
 	return buf
 }
 
-func (g *GPU) makeBindGroup(entries []wgpuBindGroupEntry) uintptr {
-	desc := wgpuBindGroupDescriptor{layout: g.layout, entryCount: uintptr(len(entries)), entries: &entries[0]}
+func (g *GPU) makeBindGroup(layout uintptr, entries []wgpuBindGroupEntry) uintptr {
+	desc := wgpuBindGroupDescriptor{layout: layout, entryCount: uintptr(len(entries)), entries: &entries[0]}
 	bg := fnDeviceCreateBindGroup(g.device, unsafe.Pointer(&desc))
 	runtime.KeepAlive(&desc)
 	return bg

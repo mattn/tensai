@@ -3,28 +3,45 @@
 package tensai
 
 // GPUTensor: tensors resident in GPU memory, so a weight is uploaded once
-// and reused across calls instead of riding the bus on every MatMul. This
-// file is shared between the v22 (wgpu.go) and v24+ (wgpu24.go) bindings —
-// it only touches primitives whose shapes agree across the two generations
-// (newBuffer, makeBindGroup, mapRead, and the fn* pointers with identical
-// signatures).
+// and reused across calls instead of riding the bus on every MatMul, and
+// chains of operations keep their intermediates on the device. This file is
+// shared between the v22 (wgpu.go) and v24+ (wgpu24.go) bindings — it only
+// touches primitives whose shapes agree across the two generations
+// (newBuffer, makeBindGroup, makePipeline, mapRead, and the fn* pointers
+// with identical signatures).
 
 import (
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"unsafe"
 )
 
-// gpuTile is the square tile edge of the matmul kernel; the WGSL
-// workgroup_size and the dispatch below must agree with it.
+// gpuTile is the square tile edge of the matmul kernels; the WGSL
+// workgroup_size and the dispatches below must agree with it.
 const gpuTile = 16
 
-// matmulWGSL multiplies one (m x k) x (k x n) pair per z-slice; per-batch
-// input offsets come from a lookup table so broadcast batches share data.
-// Each 16x16 workgroup streams tiles of a and b through workgroup memory,
-// so every element loaded from global memory is reused 16 times instead of
-// once — the classic shared-memory tiling.
+// gpuKernelWG is the workgroup width of the 1-D kernels (scale, softmax).
+const gpuKernelWG = 256
+
+// matmulWGSL holds every compute kernel as one module. Each entry point
+// declares its own bindings on distinct slots, so the auto layouts stay
+// independent.
+//
+// main / matmul_t multiply one (m x k) x (k x n) — respectively (n x k),
+// read transposed — pair per z-slice; per-batch input offsets come from a
+// lookup table so broadcast batches share data. Each 16x16 workgroup
+// streams tiles of a and b through workgroup memory, so every element
+// loaded from global memory is reused 16 times — the classic shared-memory
+// tiling. The tile loop count is uniform across the workgroup, so the
+// barriers inside are in uniform control flow; out-of-range lanes load
+// zeros and only the final store is guarded.
+//
+// scale_ip multiplies a buffer by a scalar in place. softmax_last runs one
+// workgroup per row: a strided max reduction, then exp and a sum
+// reduction, then the divide — the numerically stable softmax over the
+// last axis.
 const matmulWGSL = `
 struct Params { m: u32, k: u32, n: u32, batches: u32 }
 @group(0) @binding(0) var<uniform> p: Params;
@@ -46,9 +63,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     let offA = offs[batch].x;
     let offB = offs[batch].y;
     var sum = 0.0;
-    // The loop count is uniform across the workgroup, so the barriers
-    // inside are in uniform control flow; out-of-range lanes load zeros
-    // and only the final store is guarded.
     let tiles = (p.k + TILE - 1u) / TILE;
     for (var t = 0u; t < tiles; t = t + 1u) {
         let ak = t * TILE + lid.x;
@@ -73,10 +87,165 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         outv[(batch * p.m + row) * p.n + col] = sum;
     }
 }
+
+@compute @workgroup_size(16, 16, 1)
+fn matmul_t(@builtin(global_invocation_id) gid: vec3<u32>,
+            @builtin(local_invocation_id) lid: vec3<u32>,
+            @builtin(workgroup_id) wid: vec3<u32>) {
+    let col = gid.x;
+    let row = gid.y;
+    let batch = gid.z;
+    let offA = offs[batch].x;
+    let offB = offs[batch].y;
+    var sum = 0.0;
+    let tiles = (p.k + TILE - 1u) / TILE;
+    for (var t = 0u; t < tiles; t = t + 1u) {
+        let ak = t * TILE + lid.x;
+        if (row < p.m && ak < p.k) {
+            tileA[lid.y * TILE + lid.x] = a[offA + row * p.k + ak];
+        } else {
+            tileA[lid.y * TILE + lid.x] = 0.0;
+        }
+        // b is (n x k); store its tile transposed so the inner loop reads
+        // b^T while the global loads stay contiguous along k.
+        let bcol = wid.x * TILE + lid.y;
+        let bk = t * TILE + lid.x;
+        if (bcol < p.n && bk < p.k) {
+            tileB[lid.x * TILE + lid.y] = b[offB + bcol * p.k + bk];
+        } else {
+            tileB[lid.x * TILE + lid.y] = 0.0;
+        }
+        workgroupBarrier();
+        for (var i = 0u; i < TILE; i = i + 1u) {
+            sum = sum + tileA[lid.y * TILE + i] * tileB[i * TILE + lid.x];
+        }
+        workgroupBarrier();
+    }
+    if (row < p.m && col < p.n) {
+        outv[(batch * p.m + row) * p.n + col] = sum;
+    }
+}
+
+struct ScaleParams { count: u32, s: f32 }
+@group(0) @binding(5) var<uniform> scp: ScaleParams;
+@group(0) @binding(6) var<storage, read_write> sbuf: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn scale_ip(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x < scp.count) {
+        sbuf[gid.x] = sbuf[gid.x] * scp.s;
+    }
+}
+
+struct SoftParams { rows: u32, cols: u32 }
+@group(0) @binding(7) var<uniform> sp: SoftParams;
+@group(0) @binding(8) var<storage, read> sx: array<f32>;
+@group(0) @binding(9) var<storage, read_write> sy: array<f32>;
+
+var<workgroup> red: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn softmax_last(@builtin(workgroup_id) wid: vec3<u32>,
+                @builtin(local_invocation_id) lid: vec3<u32>) {
+    let base = wid.x * sp.cols;
+    var m = -3.40282e38;
+    for (var i = lid.x; i < sp.cols; i = i + 256u) {
+        m = max(m, sx[base + i]);
+    }
+    red[lid.x] = m;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (lid.x < s) { red[lid.x] = max(red[lid.x], red[lid.x + s]); }
+        workgroupBarrier();
+    }
+    let rowMax = red[0];
+    workgroupBarrier();
+    var sum = 0.0;
+    for (var i = lid.x; i < sp.cols; i = i + 256u) {
+        let e = exp(sx[base + i] - rowMax);
+        sy[base + i] = e;
+        sum = sum + e;
+    }
+    red[lid.x] = sum;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (lid.x < s) { red[lid.x] = red[lid.x] + red[lid.x + s]; }
+        workgroupBarrier();
+    }
+    let total = red[0];
+    for (var i = lid.x; i < sp.cols; i = i + 256u) {
+        sy[base + i] = sy[base + i] / total;
+    }
+}
 `
 
+// gpuPipelines holds one compute pipeline (and its auto bind-group layout)
+// per kernel entry point. It is embedded in each binding generation's GPU
+// struct.
+type gpuPipelines struct {
+	matmul, matmulT, scale, softmax             uintptr
+	layMatmul, layMatmulT, layScale, laySoftmax uintptr
+}
+
+// initPipelines compiles every kernel from g.module; the caller holds
+// wgpuMu.
+func (g *GPU) initPipelines() error {
+	for _, x := range []struct {
+		pipe, lay *uintptr
+		entry     string
+	}{
+		{&g.pipes.matmul, &g.pipes.layMatmul, "main"},
+		{&g.pipes.matmulT, &g.pipes.layMatmulT, "matmul_t"},
+		{&g.pipes.scale, &g.pipes.layScale, "scale_ip"},
+		{&g.pipes.softmax, &g.pipes.laySoftmax, "softmax_last"},
+	} {
+		*x.pipe = g.makePipeline(x.entry)
+		if *x.pipe == 0 || uncapturedCB != "" {
+			return fmt.Errorf("tensai: wgpu pipeline %q creation failed: %s", x.entry, uncapturedCB)
+		}
+		*x.lay = fnPipelineGetLayout(*x.pipe, 0)
+	}
+	return nil
+}
+
+// releasePipelines drops every pipeline and layout; the caller holds
+// wgpuMu.
+func (g *GPU) releasePipelines() {
+	for _, h := range []uintptr{g.pipes.layMatmul, g.pipes.layMatmulT, g.pipes.layScale, g.pipes.laySoftmax} {
+		if h != 0 {
+			fnLayoutRelease(h)
+		}
+	}
+	for _, h := range []uintptr{g.pipes.matmul, g.pipes.matmulT, g.pipes.scale, g.pipes.softmax} {
+		if h != 0 {
+			fnPipelineRelease(h)
+		}
+	}
+}
+
+// dispatch runs one compute pass and pumps the error callback once; the
+// caller holds wgpuMu.
+func (g *GPU) dispatch(pipe, bindGroup uintptr, x, y, z uint32) error {
+	encoder := fnDeviceCreateCmdEncoder(g.device, nil)
+	pass := fnEncoderBeginComputePass(encoder, nil)
+	fnPassSetPipeline(pass, pipe)
+	fnPassSetBindGroup(pass, 0, bindGroup, 0, nil)
+	fnPassDispatch(pass, x, y, z)
+	fnPassEnd(pass)
+	fnPassRelease(pass)
+	cmd := fnEncoderFinish(encoder, nil)
+	fnCmdEncoderRelease(encoder)
+	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
+	fnCmdBufferRelease(cmd)
+	fnDevicePoll(g.device, 0, nil)
+	if uncapturedCB != "" {
+		return fmt.Errorf("tensai: gpu dispatch failed: %s", uncapturedCB)
+	}
+	return nil
+}
+
 // GPUTensor is a tensor whose data lives in GPU memory. Create one with
-// GPU.Upload or as the result of GPUTensor.MatMul, read it back with
+// GPU.Upload or as the result of a GPUTensor operation, read it back with
 // Download, and release it with Free — GPU memory is not garbage
 // collected.
 type GPUTensor struct {
@@ -86,7 +255,7 @@ type GPUTensor struct {
 	freed bool
 }
 
-// Every GPUTensor buffer is storage-usable (matmul input and output),
+// Every GPUTensor buffer is storage-usable (kernel input and output),
 // copyable in (Upload) and out (Download).
 const gpuTensorUsage = wgpuBufferUsageStorage | wgpuBufferUsageCopySrc | wgpuBufferUsageCopyDst
 
@@ -169,6 +338,18 @@ func (t *GPUTensor) Free() {
 // GPU-resident tensor without any host transfer. Chain calls freely; only
 // Download moves data back.
 func (t *GPUTensor) MatMul(o *GPUTensor) (*GPUTensor, error) {
+	return t.matmul(o, false)
+}
+
+// MatMulT multiplies t by o with o's last two axes read transposed: a
+// (batch..., m, k) tensor times a (batch..., n, k) tensor yields
+// (batch..., m, n), without materializing the transpose. This is the
+// attention pattern q @ k^T.
+func (t *GPUTensor) MatMulT(o *GPUTensor) (*GPUTensor, error) {
+	return t.matmul(o, true)
+}
+
+func (t *GPUTensor) matmul(o *GPUTensor, transB bool) (*GPUTensor, error) {
 	if t.freed || o.freed {
 		return nil, errors.New("tensai: gpu tensor already freed")
 	}
@@ -180,10 +361,18 @@ func (t *GPUTensor) MatMul(o *GPUTensor) (*GPUTensor, error) {
 		return nil, fmt.Errorf("tensai: matmul needs at least 2 axes: %v * %v", t.shape, o.shape)
 	}
 	m, k := t.shape[na-2], t.shape[na-1]
-	if o.shape[nb-2] != k {
-		return nil, fmt.Errorf("tensai: matmul shape mismatch: %v * %v", t.shape, o.shape)
+	var n int
+	if transB {
+		if o.shape[nb-1] != k {
+			return nil, fmt.Errorf("tensai: matmul-t shape mismatch: %v * %v^T", t.shape, o.shape)
+		}
+		n = o.shape[nb-2]
+	} else {
+		if o.shape[nb-2] != k {
+			return nil, fmt.Errorf("tensai: matmul shape mismatch: %v * %v", t.shape, o.shape)
+		}
+		n = o.shape[nb-1]
 	}
-	n := o.shape[nb-1]
 	batch, err := broadcastShapes(t.shape[:na-2], o.shape[:nb-2])
 	if err != nil {
 		return nil, err
@@ -231,6 +420,10 @@ func (t *GPUTensor) MatMul(o *GPUTensor) (*GPUTensor, error) {
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
 	fnQueueWriteBuffer(g.queue, bufOffs, 0, unsafe.Pointer(&offs[0]), uintptr(len(offs))*4)
 
+	pipe, lay := g.pipes.matmul, g.pipes.layMatmul
+	if transB {
+		pipe, lay = g.pipes.matmulT, g.pipes.layMatmulT
+	}
 	entries := [5]wgpuBindGroupEntry{
 		{binding: 0, buffer: bufParams, size: 16},
 		{binding: 1, buffer: t.buf, size: uint64(t.Size()) * 4},
@@ -238,31 +431,123 @@ func (t *GPUTensor) MatMul(o *GPUTensor) (*GPUTensor, error) {
 		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
 		{binding: 4, buffer: bufOut, size: outBytes},
 	}
-	bindGroup := g.makeBindGroup(entries[:])
+	bindGroup := g.makeBindGroup(lay, entries[:])
 	runtime.KeepAlive(&entries)
 	defer fnBindGroupRelease(bindGroup)
 
-	encoder := fnDeviceCreateCmdEncoder(g.device, nil)
-	pass := fnEncoderBeginComputePass(encoder, nil)
-	fnPassSetPipeline(pass, g.pipeline)
-	fnPassSetBindGroup(pass, 0, bindGroup, 0, nil)
-	fnPassDispatch(pass, uint32((n+gpuTile-1)/gpuTile), uint32((m+gpuTile-1)/gpuTile), uint32(batches))
-	fnPassEnd(pass)
-	fnPassRelease(pass)
-	cmd := fnEncoderFinish(encoder, nil)
-	fnCmdEncoderRelease(encoder)
-	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
-	fnCmdBufferRelease(cmd)
-
-	// Validation errors surface through the uncaptured-error callback,
-	// which wgpu-native fires during submission; pump once without
-	// blocking on the actual compute work.
-	fnDevicePoll(g.device, 0, nil)
-	if uncapturedCB != "" {
+	err = g.dispatch(pipe, bindGroup,
+		uint32((n+gpuTile-1)/gpuTile), uint32((m+gpuTile-1)/gpuTile), uint32(batches))
+	if err != nil {
 		fnBufferRelease(bufOut)
-		return nil, fmt.Errorf("tensai: gpu matmul failed: %s", uncapturedCB)
+		return nil, err
 	}
 	return &GPUTensor{g: g, buf: bufOut, shape: outShape}, nil
+}
+
+// Scale multiplies every element by s, in place — the GPU counterpart of
+// Tensor.Scale.
+func (t *GPUTensor) Scale(s Float) error {
+	if t.freed {
+		return errors.New("tensai: gpu tensor already freed")
+	}
+	count := t.Size()
+	if count > 65535*gpuKernelWG {
+		return fmt.Errorf("tensai: gpu scale size %d exceeds dispatch limit", count)
+	}
+	g := t.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	params := [4]uint32{uint32(count), math.Float32bits(float32(s))}
+	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+	defer fnBufferRelease(bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+
+	entries := [2]wgpuBindGroupEntry{
+		{binding: 5, buffer: bufParams, size: 16},
+		{binding: 6, buffer: t.buf, size: uint64(count) * 4},
+	}
+	bindGroup := g.makeBindGroup(g.pipes.layScale, entries[:])
+	runtime.KeepAlive(&entries)
+	defer fnBindGroupRelease(bindGroup)
+
+	return g.dispatch(g.pipes.scale, bindGroup, uint32((count+gpuKernelWG-1)/gpuKernelWG), 1, 1)
+}
+
+// Softmax applies a numerically stable softmax over the last axis,
+// returning a new GPU-resident tensor.
+func (t *GPUTensor) Softmax() (*GPUTensor, error) {
+	if t.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if len(t.shape) == 0 {
+		return nil, errors.New("tensai: gpu softmax needs at least 1 axis")
+	}
+	cols := t.shape[len(t.shape)-1]
+	rows := t.Size() / cols
+	if rows > 65535 {
+		return nil, fmt.Errorf("tensai: gpu softmax row count %d exceeds 65535", rows)
+	}
+	g := t.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	bytes := uint64(t.Size()) * 4
+	params := [4]uint32{uint32(rows), uint32(cols)}
+	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+	bufOut := g.newBuffer(gpuTensorUsage, bytes)
+	defer fnBufferRelease(bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+
+	entries := [3]wgpuBindGroupEntry{
+		{binding: 7, buffer: bufParams, size: 16},
+		{binding: 8, buffer: t.buf, size: bytes},
+		{binding: 9, buffer: bufOut, size: bytes},
+	}
+	bindGroup := g.makeBindGroup(g.pipes.laySoftmax, entries[:])
+	runtime.KeepAlive(&entries)
+	defer fnBindGroupRelease(bindGroup)
+
+	if err := g.dispatch(g.pipes.softmax, bindGroup, uint32(rows), 1, 1); err != nil {
+		fnBufferRelease(bufOut)
+		return nil, err
+	}
+	return &GPUTensor{g: g, buf: bufOut, shape: append([]int(nil), t.shape...)}, nil
+}
+
+// Attention computes scaled dot-product attention softmax(q*k^T/sqrt(d))*v
+// entirely on the GPU — the resident counterpart of the autograd Attention.
+// q, k, v are (batch..., seqLen, d) tensors; nothing touches host memory.
+func (q *GPUTensor) Attention(k, v *GPUTensor) (*GPUTensor, error) {
+	if len(q.shape) < 2 {
+		return nil, fmt.Errorf("tensai: attention needs at least 2 axes: %v", q.shape)
+	}
+	scores, err := q.MatMulT(k)
+	if err != nil {
+		return nil, err
+	}
+	defer scores.Free()
+	if err := scores.Scale(1 / sqrtF(Float(q.shape[len(q.shape)-1]))); err != nil {
+		return nil, err
+	}
+	weights, err := scores.Softmax()
+	if err != nil {
+		return nil, err
+	}
+	defer weights.Free()
+	return weights.MatMul(v)
 }
 
 // MatMul is the GPU version of the package-level MatMul: identical shape
