@@ -1,5 +1,8 @@
 *.test
 /model.json
+/mnist.tflite
+_example/charrnn/charrnn
+_example/dataset/dataset
 /.agents/
 /.codex/
 _example/mnist/data/
