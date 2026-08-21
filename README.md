@@ -7,12 +7,14 @@
 ## Features
 
 - **Matrix operations** - `Matrix` plus basic operations such as `Dot`, `Add`, `T`, and `AddBias`. Tensors are float32 (`tensai.Float`)
+- **N-dimensional tensors** - `Tensor` generalizes `Matrix` to any rank: element-wise `Add`/`Sub`/`Mul`/`Div` with NumPy-style broadcasting, batched `MatMul` (the leading axes broadcast, the per-matrix products run on the same kernel as `Dot`, parallelized across the batch), axis-permuting `Transpose`, `Reshape` with `-1` inference, and zero-copy views to and from `Matrix`
 - **SIMD acceleration** - AVX2 kernels written with Go's experimental `simd/archsimd` package: still pure Go, no cgo, no assembly files. Matmul, ReLU/LeakyReLU, Sigmoid/Tanh/Softmax (via a vectorized polynomial `exp`), GELU (via a vectorized `erf`), LayerNorm, and the Adam update are all 8-lane vectorized. Build with `GOEXPERIMENT=simd` on amd64 (Go 1.26 and 1.27 APIs both supported via build tags); every other build uses the portable fallbacks automatically
 - **Low-allocation training** - layers reuse their forward/backward scratch buffers across training steps (a full MLP step runs in ~29 allocations), so GC stays out of the training loop; `Predict` always returns freshly allocated results
 - **Layers** - `Embedding`, `Dense`, `Conv2D`, `MaxPool2D`, `BatchNorm`, `LayerNorm`, `Dropout`, plus `ReLU`, `LeakyReLU`, `GELU`, `Sigmoid`, `Tanh`, and `Softmax` activations
 - **Loss functions** - `MeanSquaredError` for regression, `SoftmaxCrossEntropy` for multi-class classification, and `BinaryCrossEntropy` for binary targets
 - **Optimizers** - momentum `SGD`, `Adam`, and `AdamW` (decoupled weight decay)
 - **k-NN baseline** - a `KNN` classifier whose distance matrix runs on the same SIMD matmul kernel; useful as a no-training baseline next to the networks
+- **Dataset utilities** - `Dataset` pairs inputs with targets and provides `Shuffle`, train/test `Split` (copy-free views), buffer-reusing mini-batch iteration with `Batches`, and `Standardize`/`StandardizeWith`
 - **Sequential models** - stack layers and run `Compile` -> `Fit` / `FitStep` -> `Predict`
 - **Automatic differentiation** - a micrograd-style reverse-mode autograd engine over matrices (`Param` / `Input` / `Backward`), for models that don't fit the Sequential mold; `ToDot` renders the computation graph for Graphviz
 - **Recurrence and attention** - `RNNCell`, `LSTMCell`, and single-head `SelfAttention` built on the autograd engine, with backpropagation through time handled automatically
@@ -24,6 +26,7 @@
 ```
 go.mod              Module definition (github.com/mattn/tensai)
 tensor.go           Matrix and vector operations
+ndtensor.go         N-d Tensor: broadcasting element-wise ops, batched MatMul
 dot_simd.go         AVX2 matmul kernel (GOEXPERIMENT=simd, amd64)
 dot_generic.go      Portable matmul kernel (all other builds)
 kernels.go          Scalar bodies of the element-wise kernels
@@ -50,6 +53,7 @@ _example/mnist      Runnable MNIST classifier (-model dense, cnn, or knn) with s
 _example/charrnn    Character-level LSTM text generation on the autograd engine
 _example/plasma     Demoscene-style terminal plasma rendered by a neural network
 _example/dot        Graphviz DOT export of the z = x + y graph
+_example/tensor     Tour of the n-d Tensor: broadcasting, batched MatMul, attention
 ```
 
 ## Usage
@@ -81,6 +85,23 @@ model.Compile(2, tensai.SoftmaxCrossEntropy{}, tensai.NewAdam(0.05))
 ```
 
 `SoftmaxCrossEntropy` expects targets as an `Mx1` matrix of class indices. Softmax is applied inside the loss, so `Predict` returns raw logits. Use argmax for classification.
+
+### Datasets
+
+```go
+ds, _ := tensai.NewDataset(inputs, targets)
+ds.Shuffle(rng)
+train, test, _ := ds.Split(0.2)          // views, no copying
+mean, std := train.Standardize()         // fit on train...
+test.StandardizeWith(mean, std)          // ...apply to test
+
+for epoch := 0; epoch < epochs; epoch++ {
+	train.Batches(32, rng, func(in, tgt *tensai.Matrix) error {
+		_, err := model.FitStep(in, tgt)
+		return err
+	})
+}
+```
 
 ### Convolution, regularization, and saving
 
@@ -164,6 +185,24 @@ for step := 0; step < epochs; step++ {
 
 Autograd parameters are saved and restored positionally with `tensai.SaveParamsFile("cell.json", cell.Params()...)` / `tensai.LoadParamsFile("cell.json", cell.Params()...)` — build the same cell, then load.
 
+### N-d tensors: broadcasting and batched MatMul
+
+`Tensor` generalizes `Matrix` to any rank. Element-wise ops broadcast NumPy-style, and `MatMul` multiplies whole stacks of matrices at once — the leading batch axes broadcast too, so a shared 2-D weight applies to every sequence in a batch in one call:
+
+```go
+x := tensai.NewTensor(4, 6, 3)                    // (batch, position, channel)
+mean, _ := tensai.NewTensorFromSlice([]float32{0.5, -1, 2}, 3)
+centered, _ := x.Sub(mean)                        // (4,6,3) - (3)   -> (4,6,3)
+h, _ := tensai.MatMul(centered, w)                // (4,6,3) @ (3,8) -> (4,6,8)
+
+kt, _ := k.Transpose()                            // swap the last two axes
+scores, _ := tensai.MatMul(q, kt)                 // (4,6,8) @ (4,8,6) -> (4,6,6)
+scores.Scale(1 / float32(math.Sqrt(8)))
+out, _ := tensai.MatMul(scores, v)                // attention for the whole batch
+```
+
+Tensors are contiguous and row-major; `Reshape` (with `-1` inference) and the `Matrix`/`Tensor` conversions are zero-copy views, while `Transpose` accepts an arbitrary axis permutation and materializes the result. See `_example/tensor` for the runnable version.
+
 ## Run
 
 ```bash
@@ -174,6 +213,7 @@ go run ./_example/spiral
 go run ./_example/iris
 go run ./_example/charrnn
 go run ./_example/plasma
+go run ./_example/tensor
 go test ./...
 
 # With the AVX2 SIMD kernel (Go 1.26+ / 1.27, amd64):

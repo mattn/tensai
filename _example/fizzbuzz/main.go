@@ -97,23 +97,21 @@ func main() {
 		batchSize = 128
 	)
 	rng := rand.New(rand.NewSource(1))
-	batchIn := tensai.NewMatrix(batchSize, numFeatures)
-	batchTgt := tensai.NewMatrix(batchSize, 1)
+	ds, err := tensai.NewDataset(trainIn, trainTgt)
+	if err != nil {
+		panic(err)
+	}
 	for epoch := 1; epoch <= epochs; epoch++ {
-		perm := rng.Perm(trainIn.Rows)
 		var lossSum float32
 		var steps int
-		for off := 0; off+batchSize <= len(perm); off += batchSize {
-			for i, r := range perm[off : off+batchSize] {
-				copy(batchIn.Data[i*numFeatures:(i+1)*numFeatures], trainIn.Data[r*numFeatures:(r+1)*numFeatures])
-				batchTgt.Data[i] = trainTgt.Data[r]
-			}
-			lossVal, err := model.FitStep(batchIn, batchTgt)
-			if err != nil {
-				panic(err)
-			}
+		err := ds.Batches(batchSize, rng, func(in, tgt *tensai.Matrix) error {
+			lossVal, err := model.FitStep(in, tgt)
 			lossSum += lossVal
 			steps++
+			return err
+		})
+		if err != nil {
+			panic(err)
 		}
 		if epoch == 1 || epoch%100 == 0 || epoch == epochs {
 			fmt.Printf("epoch %4d: loss=%.6f\n", epoch, lossSum/float32(steps))

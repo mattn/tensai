@@ -113,13 +113,6 @@ func matrices(data []sample) (*tensai.Matrix, *tensai.Matrix) {
 	return inputs, targets
 }
 
-func fillBatch(inputs, targets, batchInputs, batchTargets *tensai.Matrix, rows []int) {
-	for i, r := range rows {
-		copy(batchInputs.Data[i*featureCount:(i+1)*featureCount], inputs.Data[r*featureCount:(r+1)*featureCount])
-		batchTargets.Data[i] = targets.Data[r]
-	}
-}
-
 func argmaxRow(m *tensai.Matrix, row int) int {
 	best := 0
 	for c := 1; c < m.Cols; c++ {
@@ -167,20 +160,21 @@ func main() {
 	}
 
 	rng := rand.New(rand.NewSource(seed + 1))
-	batchInputs := tensai.NewMatrix(batchSize, featureCount)
-	batchTargets := tensai.NewMatrix(batchSize, 1)
+	ds, err := tensai.NewDataset(trainInputs, trainTargets)
+	if err != nil {
+		panic(err)
+	}
 	for epoch := 1; epoch <= epochs; epoch++ {
-		perm := rng.Perm(trainInputs.Rows)
 		var lossSum float32
 		var steps int
-		for off := 0; off+batchSize <= len(perm); off += batchSize {
-			fillBatch(trainInputs, trainTargets, batchInputs, batchTargets, perm[off:off+batchSize])
-			loss, err := model.FitStep(batchInputs, batchTargets)
-			if err != nil {
-				panic(err)
-			}
+		err := ds.Batches(batchSize, rng, func(in, tgt *tensai.Matrix) error {
+			loss, err := model.FitStep(in, tgt)
 			lossSum += loss
 			steps++
+			return err
+		})
+		if err != nil {
+			panic(err)
 		}
 		if epoch == 1 || epoch%150 == 0 || epoch == epochs {
 			fmt.Printf("epoch %4d: loss=%.6f\n", epoch, lossSum/float32(steps))
