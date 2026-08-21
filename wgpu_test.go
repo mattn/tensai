@@ -87,6 +87,116 @@ func TestGPUAdapterSelection(t *testing.T) {
 	}
 }
 
+func TestGPUTensorResident(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(11))
+
+	// A weight uploaded once serves several MatMuls without re-upload.
+	w := randTensor(rng, 64, 32)
+	gw, err := g.Upload(w)
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	defer gw.Free()
+	if !sameDims(gw.Shape(), []int{64, 32}) || gw.Size() != 64*32 {
+		t.Fatalf("shape/size: %v %d", gw.Shape(), gw.Size())
+	}
+	for i := 0; i < 3; i++ {
+		x := randTensor(rng, 4, 5, 64)
+		gx, err := g.Upload(x)
+		if err != nil {
+			t.Fatalf("upload x: %v", err)
+		}
+		gy, err := gx.MatMul(gw)
+		if err != nil {
+			t.Fatalf("resident matmul: %v", err)
+		}
+		got, err := gy.Download()
+		if err != nil {
+			t.Fatalf("download: %v", err)
+		}
+		want, err := MatMul(x, w)
+		if err != nil {
+			t.Fatalf("cpu matmul: %v", err)
+		}
+		if !sameDims(got.Shape, want.Shape) {
+			t.Fatalf("shape: got %v want %v", got.Shape, want.Shape)
+		}
+		for j := range want.Data {
+			if diff := math.Abs(float64(got.Data[j] - want.Data[j])); diff > 1e-4 {
+				t.Fatalf("round %d element %d: gpu=%v cpu=%v", i, j, got.Data[j], want.Data[j])
+			}
+		}
+		gy.Free()
+		gx.Free()
+	}
+}
+
+func TestGPUTensorChain(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(12))
+
+	// (a @ b) @ c entirely on the GPU: the intermediate never touches the
+	// host.
+	a, b, c := randTensor(rng, 2, 4, 8), randTensor(rng, 2, 8, 3), randTensor(rng, 2, 3, 6)
+	ga, err := g.Upload(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ga.Free()
+	gb, err := g.Upload(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gb.Free()
+	gc, err := g.Upload(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gc.Free()
+
+	ab, err := ga.MatMul(gb)
+	if err != nil {
+		t.Fatalf("a@b: %v", err)
+	}
+	defer ab.Free()
+	abc, err := ab.MatMul(gc)
+	if err != nil {
+		t.Fatalf("(a@b)@c: %v", err)
+	}
+	got, err := abc.Download()
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	wantAB, err := MatMul(a, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := MatMul(wantAB, c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(got.Data[i] - want.Data[i])); diff > 1e-4 {
+			t.Fatalf("element %d: gpu=%v cpu=%v", i, got.Data[i], want.Data[i])
+		}
+	}
+
+	if _, err := ab.MatMul(ab); err == nil {
+		t.Fatal("expected shape mismatch error for (2,4,3)@(2,4,3)")
+	}
+	abc.Free()
+	if _, err := abc.Download(); err == nil {
+		t.Fatal("expected error downloading a freed tensor")
+	}
+	if _, err := abc.MatMul(ga); err == nil {
+		t.Fatal("expected error using a freed tensor")
+	}
+	abc.Free() // second Free is a no-op
+}
+
 func TestGPUMatMulLarge(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()

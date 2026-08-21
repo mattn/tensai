@@ -32,3 +32,25 @@ func (g *GPU) MatMul(a, b *Tensor) (*Tensor, error) { return nil, errNoWGPU }
 
 // Close is a no-op in builds without the wgpu tag.
 func (g *GPU) Close() {}
+
+// GPUTensor is a GPU-resident tensor. This build has it disabled; build
+// with -tags wgpu or -tags wgpu24 to enable it.
+type GPUTensor struct{}
+
+// Upload always fails in builds without the wgpu tag.
+func (g *GPU) Upload(t *Tensor) (*GPUTensor, error) { return nil, errNoWGPU }
+
+// MatMul always fails in builds without the wgpu tag.
+func (t *GPUTensor) MatMul(o *GPUTensor) (*GPUTensor, error) { return nil, errNoWGPU }
+
+// Download always fails in builds without the wgpu tag.
+func (t *GPUTensor) Download() (*Tensor, error) { return nil, errNoWGPU }
+
+// Free is a no-op in builds without the wgpu tag.
+func (t *GPUTensor) Free() {}
+
+// Shape returns nil in builds without the wgpu tag.
+func (t *GPUTensor) Shape() []int { return nil }
+
+// Size returns 0 in builds without the wgpu tag.
+func (t *GPUTensor) Size() int { return 0 }
