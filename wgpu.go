@@ -504,127 +504,38 @@ func (g *GPU) Close() {
 	}
 }
 
-func (g *GPU) newBuffer(usage uint32, size uint64) uintptr {
-	desc := wgpuBufferDescriptor{usage: usage, size: size}
+// The primitives below back the shared GPUTensor layer in wgputensor.go;
+// their signatures match the wgpu24 bindings so that layer compiles
+// against either API generation.
+
+func (g *GPU) newBuffer(usage, size uint64) uintptr {
+	desc := wgpuBufferDescriptor{usage: uint32(usage), size: size}
 	buf := fnDeviceCreateBuffer(g.device, unsafe.Pointer(&desc))
 	runtime.KeepAlive(&desc)
 	return buf
 }
 
-// MatMul is the GPU version of the package-level MatMul: identical shape
-// and broadcasting semantics, executed as one compute dispatch. Inputs and
-// the result live in host memory; each call uploads the operands and reads
-// the product back, so it only pays off for large products.
-func (g *GPU) MatMul(a, b *Tensor) (*Tensor, error) {
-	na, nb := len(a.Shape), len(b.Shape)
-	if na < 2 || nb < 2 {
-		return nil, fmt.Errorf("tensai: matmul needs at least 2 axes: %v * %v", a.Shape, b.Shape)
-	}
-	m, k := a.Shape[na-2], a.Shape[na-1]
-	if b.Shape[nb-2] != k {
-		return nil, fmt.Errorf("tensai: matmul shape mismatch: %v * %v", a.Shape, b.Shape)
-	}
-	n := b.Shape[nb-1]
-	batch, err := broadcastShapes(a.Shape[:na-2], b.Shape[:nb-2])
-	if err != nil {
-		return nil, err
-	}
-	out := NewTensor(append(append([]int(nil), batch...), m, n)...)
-	batches := prodDims(batch)
-	if batches > 65535 {
-		return nil, fmt.Errorf("tensai: gpu matmul batch count %d exceeds 65535", batches)
-	}
+func (g *GPU) makeBindGroup(entries []wgpuBindGroupEntry) uintptr {
+	desc := wgpuBindGroupDescriptor{layout: g.layout, entryCount: uintptr(len(entries)), entries: &entries[0]}
+	bg := fnDeviceCreateBindGroup(g.device, unsafe.Pointer(&desc))
+	runtime.KeepAlive(&desc)
+	return bg
+}
 
-	// Element offsets of each batch's matrix in a and b.
-	as := broadcastStrides(a.Shape[:na-2], batch)
-	bs := broadcastStrides(b.Shape[:nb-2], batch)
-	offs := make([]uint32, 2*batches)
-	for bi := 0; bi < batches; bi++ {
-		offA, offB := 0, 0
-		for d, rem := len(batch)-1, bi; d >= 0; d-- {
-			i := rem % batch[d]
-			rem /= batch[d]
-			offA += i * as[d]
-			offB += i * bs[d]
-		}
-		offs[2*bi] = uint32(offA * m * k)
-		offs[2*bi+1] = uint32(offB * k * n)
-	}
-	params := [4]uint32{uint32(m), uint32(k), uint32(n), uint32(batches)}
-
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	wgpuMu.Lock()
-	defer wgpuMu.Unlock()
-	if g.closed {
-		return nil, errors.New("tensai: gpu is closed")
-	}
-	uncapturedCB = ""
-
-	outBytes := uint64(len(out.Data)) * 4
-	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
-	bufA := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(a.Data))*4)
-	bufB := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(b.Data))*4)
-	bufOffs := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
-	bufOut := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopySrc, outBytes)
-	bufRead := g.newBuffer(wgpuBufferUsageMapRead|wgpuBufferUsageCopyDst, outBytes)
-	defer func() {
-		for _, buf := range []uintptr{bufParams, bufA, bufB, bufOffs, bufOut, bufRead} {
-			if buf != 0 {
-				fnBufferRelease(buf)
-			}
-		}
-	}()
-
-	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
-	fnQueueWriteBuffer(g.queue, bufA, 0, unsafe.Pointer(&a.Data[0]), uintptr(len(a.Data))*4)
-	fnQueueWriteBuffer(g.queue, bufB, 0, unsafe.Pointer(&b.Data[0]), uintptr(len(b.Data))*4)
-	fnQueueWriteBuffer(g.queue, bufOffs, 0, unsafe.Pointer(&offs[0]), uintptr(len(offs))*4)
-
-	entries := [5]wgpuBindGroupEntry{
-		{binding: 0, buffer: bufParams, size: 16},
-		{binding: 1, buffer: bufA, size: uint64(len(a.Data)) * 4},
-		{binding: 2, buffer: bufB, size: uint64(len(b.Data)) * 4},
-		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
-		{binding: 4, buffer: bufOut, size: outBytes},
-	}
-	bgDesc := wgpuBindGroupDescriptor{layout: g.layout, entryCount: 5, entries: &entries[0]}
-	bindGroup := fnDeviceCreateBindGroup(g.device, unsafe.Pointer(&bgDesc))
-	runtime.KeepAlive(&entries)
-	runtime.KeepAlive(&bgDesc)
-	defer fnBindGroupRelease(bindGroup)
-
-	encoder := fnDeviceCreateCmdEncoder(g.device, nil)
-	pass := fnEncoderBeginComputePass(encoder, nil)
-	fnPassSetPipeline(pass, g.pipeline)
-	fnPassSetBindGroup(pass, 0, bindGroup, 0, nil)
-	fnPassDispatch(pass, uint32((n+7)/8), uint32((m+7)/8), uint32(batches))
-	fnPassEnd(pass)
-	fnPassRelease(pass)
-	fnEncoderCopyBuffer(encoder, bufOut, 0, bufRead, 0, outBytes)
-	cmd := fnEncoderFinish(encoder, nil)
-	fnCmdEncoderRelease(encoder)
-	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
-	fnCmdBufferRelease(cmd)
-
+// mapRead blocks until buf (usage MapRead) is mapped and returns the mapped
+// range; the caller must fnBufferUnmap when done.
+func (g *GPU) mapRead(buf uintptr, bytes uint64) (unsafe.Pointer, error) {
 	cbMapDone, cbMapOK = false, false
-	fnBufferMapAsync(bufRead, wgpuMapModeRead, 0, uintptr(outBytes), mapCB, nil)
+	fnBufferMapAsync(buf, wgpuMapModeRead, 0, uintptr(bytes), mapCB, nil)
 	for !cbMapDone {
 		fnDevicePoll(g.device, 1, nil)
 	}
 	if !cbMapOK {
-		return nil, fmt.Errorf("tensai: gpu matmul readback failed: %s", uncapturedCB)
+		return nil, fmt.Errorf("tensai: gpu readback failed: %s", uncapturedCB)
 	}
-	src := fnBufferGetConstMapped(bufRead, 0, uintptr(outBytes))
+	src := fnBufferGetConstMapped(buf, 0, uintptr(bytes))
 	if src == nil {
-		return nil, errors.New("tensai: gpu matmul: mapped range unavailable")
+		return nil, errors.New("tensai: gpu readback: mapped range unavailable")
 	}
-	copy(out.Data, unsafe.Slice((*Float)(src), len(out.Data)))
-	fnBufferUnmap(bufRead)
-	if uncapturedCB != "" {
-		return nil, fmt.Errorf("tensai: gpu matmul failed: %s", uncapturedCB)
-	}
-	runtime.KeepAlive(a)
-	runtime.KeepAlive(b)
-	return out, nil
+	return src, nil
 }

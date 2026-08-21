@@ -221,6 +221,19 @@ out, err := gpu.MatMul(a, b)
 
 On machines with both an integrated and a discrete GPU, pass a preference: `tensai.OpenGPU(tensai.GPULowPower)` steers to the iGPU, `tensai.GPUHighPerformance` to the dGPU (it is a hint — with a single adapter you always get that one).
 
+Buffers can also stay resident on the GPU, so a weight rides the bus once instead of on every call and intermediates never leave the device:
+
+```go
+gw, _ := gpu.Upload(w)              // weight uploaded once
+defer gw.Free()                     // GPU memory is not garbage collected
+gx, _ := gpu.Upload(x)
+h, _ := gx.MatMul(gw)               // chain freely; nothing touches the host
+out, _ := h.MatMul(gw2)
+result, _ := out.Download()         // one readback at the end
+```
+
+`gpu.MatMul(a, b)` is shorthand for Upload → MatMul → Download → Free. Residency matters most on discrete GPUs, where every transfer crosses PCIe; on shared-memory iGPUs the win is smaller and comes mainly from skipping intermediate readbacks.
+
 There is no cgo involved: the bindings load the [wgpu-native](https://github.com/gfx-rs/wgpu-native) shared library at runtime via `ebitengine/purego` (`dlopen` on linux/macOS, `LoadLibrary` on Windows). Download a **v22.1.0.5** release binary (the C API these bindings target), then either install it where the loader finds it or point `TENSAI_WGPU_LIB` at it:
 
 ```bash
