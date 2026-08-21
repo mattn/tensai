@@ -11,7 +11,7 @@
 - **SIMD acceleration** - AVX2 kernels written with Go's experimental `simd/archsimd` package: still pure Go, no cgo, no assembly files. Matmul, ReLU/LeakyReLU, Sigmoid/Tanh/Softmax (via a vectorized polynomial `exp`), GELU (via a vectorized `erf`), LayerNorm, and the Adam update are all 8-lane vectorized. Build with `GOEXPERIMENT=simd` on amd64 (Go 1.26 and 1.27 APIs both supported via build tags); every other build uses the portable fallbacks automatically
 - **Low-allocation training** - layers reuse their forward/backward scratch buffers across training steps (a full MLP step runs in ~29 allocations), so GC stays out of the training loop; `Predict` always returns freshly allocated results
 - **Layers** - `Embedding`, `Dense`, `Conv2D`, `MaxPool2D`, `BatchNorm`, `LayerNorm`, `Dropout`, plus `ReLU`, `LeakyReLU`, `GELU`, `Sigmoid`, `Tanh`, and `Softmax` activations
-- **WebGPU backend (experimental)** - build with `-tags wgpu` and `OpenGPU()` runs batched `MatMul` as a WGSL compute shader on any GPU wgpu-native reaches (Vulkan, Metal, D3D12 — AMD, Intel, Apple, NVIDIA). The bindings go through `ebitengine/purego`, so there is still no cgo and no C compiler: the wgpu-native shared library is dlopen-ed at runtime
+- **WebGPU backend (experimental)** - build with `-tags wgpu` (linux, macOS, Windows) and `OpenGPU()` runs batched `MatMul` as a WGSL compute shader on any GPU wgpu-native reaches (Vulkan, Metal, D3D12 — AMD, Intel, Apple, NVIDIA). The bindings go through `ebitengine/purego`, so there is still no cgo and no C compiler: the wgpu-native shared library is dlopen-ed at runtime
 - **Loss functions** - `MeanSquaredError` for regression, `SoftmaxCrossEntropy` for multi-class classification, and `BinaryCrossEntropy` for binary targets
 - **Optimizers** - momentum `SGD`, `Adam`, and `AdamW` (decoupled weight decay)
 - **k-NN baseline** - a `KNN` classifier whose distance matrix runs on the same SIMD matmul kernel; useful as a no-training baseline next to the networks
@@ -57,6 +57,7 @@ _example/charrnn    Character-level LSTM text generation on the autograd engine
 _example/plasma     Demoscene-style terminal plasma rendered by a neural network
 _example/dot        Graphviz DOT export of the z = x + y graph
 _example/tensor     Tour of the n-d Tensor: broadcasting, batched MatMul, attention
+_example/wgpu       WebGPU MatMul: adapter info, CPU cross-check, GPU vs CPU sweep
 ```
 
 ## Usage
@@ -208,7 +209,7 @@ Tensors are contiguous and row-major; `Reshape` (with `-1` inference) and the `M
 
 ### GPU MatMul over WebGPU (experimental)
 
-Building with `-tags wgpu` (linux/darwin) enables a GPU backend for batched `MatMul` with the same shape and broadcasting semantics as the CPU version:
+Building with `-tags wgpu` (linux/darwin/windows) enables a GPU backend for batched `MatMul` with the same shape and broadcasting semantics as the CPU version:
 
 ```go
 gpu, err := tensai.OpenGPU() // fails cleanly when no GPU / library is present
@@ -220,7 +221,7 @@ out, err := gpu.MatMul(a, b)
 
 On machines with both an integrated and a discrete GPU, pass a preference: `tensai.OpenGPU(tensai.GPULowPower)` steers to the iGPU, `tensai.GPUHighPerformance` to the dGPU (it is a hint — with a single adapter you always get that one).
 
-There is no cgo involved: the bindings dlopen the [wgpu-native](https://github.com/gfx-rs/wgpu-native) shared library at runtime via `ebitengine/purego`. Download a **v22.1.0.5** release binary (the C API these bindings target), then either install `libwgpu_native.so` where the loader finds it or point `TENSAI_WGPU_LIB` at it:
+There is no cgo involved: the bindings load the [wgpu-native](https://github.com/gfx-rs/wgpu-native) shared library at runtime via `ebitengine/purego` (`dlopen` on linux/macOS, `LoadLibrary` on Windows). Download a **v22.1.0.5** release binary (the C API these bindings target), then either install it where the loader finds it or point `TENSAI_WGPU_LIB` at it:
 
 ```bash
 curl -sLO https://github.com/gfx-rs/wgpu-native/releases/download/v22.1.0.5/wgpu-linux-x86_64-release.zip
@@ -228,7 +229,35 @@ unzip wgpu-linux-x86_64-release.zip -d wgpu
 TENSAI_WGPU_LIB=$PWD/wgpu/lib/libwgpu_native.so go test -tags wgpu ./...
 ```
 
-wgpu-native picks Vulkan on Linux/Windows and Metal on macOS, so AMD, Intel, Apple, and NVIDIA GPUs all work — as do CPU Vulkan implementations like lavapipe, which is how the tests run on machines without a GPU. Every call uploads the operands and reads the product back over the bus, so the GPU only pays off for large products; without the build tag `OpenGPU` returns an error and nothing else changes.
+On Windows, take `wgpu-windows-x86_64-msvc-release.zip` from the same release and point the variable at the `wgpu_native.dll` inside it (any `wgpu_native.dll` on `PATH` or next to the executable is found without the variable):
+
+```powershell
+$env:TENSAI_WGPU_LIB="$PWD\wgpu\lib\wgpu_native.dll"
+go run -tags wgpu ./_example/wgpu
+```
+
+`_example/wgpu -sweep` walks a ladder of sizes and marks where the GPU overtakes the CPU kernel. Because the CPU side is the same `dotRows` kernel the rest of the package uses, building the example twice compares all three implementations — portable Go, AVX2, and the GPU:
+
+```bash
+GOEXPERIMENT=nosimd go build -tags wgpu -o wgpu-nosimd ./_example/wgpu
+GOEXPERIMENT=simd   go build -tags wgpu -o wgpu-simd   ./_example/wgpu
+./wgpu-nosimd -sweep && ./wgpu-simd -sweep
+```
+
+On a Ryzen iGPU (AMD Radeon 780M, Vulkan) the crossover moves with the CPU kernel — the faster the CPU, the bigger the product has to be before the upload and readback pay for themselves:
+
+```
+             shape                   MFLOP        gpu        cpu   gpu/cpu
+mnist dense  1x100x784@784x128        20.1     2.52ms      491µs     0.19x
+tiny         1x128x128@128x128         4.2    3.356ms      353µs     0.11x
+small        1x512x512@512x512       268.4    4.523ms    4.499ms     0.99x
+medium       8x512x512@512x512      2147.5   15.894ms   49.388ms     3.11x   <- crossover (AVX2)
+huge         64x512x512@512x512    17179.9   121.01ms  392.146ms     3.24x
+```
+
+With the portable kernel instead of AVX2 the crossover arrives one rung earlier, at `small`. Either way a single MNIST layer is two orders of magnitude too small to bother.
+
+wgpu-native picks Vulkan on Linux, Vulkan or D3D12 on Windows, and Metal on macOS, so AMD, Intel, Apple, and NVIDIA GPUs all work — as do CPU Vulkan implementations like lavapipe, which is how the tests run on machines without a GPU. Every call uploads the operands and reads the product back over the bus, so the GPU only pays off for large products; without the build tag `OpenGPU` returns an error and nothing else changes.
 
 ## Run
 
@@ -242,6 +271,8 @@ go run ./_example/iris
 go run ./_example/charrnn
 go run ./_example/plasma
 go run ./_example/tensor
+go run -tags wgpu ./_example/wgpu          # needs wgpu-native, see above
+go run -tags wgpu ./_example/wgpu -sweep  # GPU vs CPU across sizes
 go test ./...
 
 # With the AVX2 SIMD kernel (Go 1.26+ / 1.27, amd64):

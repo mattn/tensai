@@ -1,4 +1,4 @@
-//go:build wgpu && (linux || darwin)
+//go:build wgpu && (linux || darwin || windows)
 
 package tensai
 
@@ -8,10 +8,11 @@ package tensai
 // Vulkan, Metal, or D3D12, so this covers AMD, Intel, Apple, and NVIDIA
 // GPUs (and CPU fallbacks like lavapipe) with one implementation.
 //
-// Build with -tags wgpu and put libwgpu_native.so / .dylib where the
-// dynamic loader finds it, or point TENSAI_WGPU_LIB at it. The bindings
-// target the wgpu-native v22.1.0.5 C API (the last release before the
-// callback-info API rework); use that release's binaries.
+// Build with -tags wgpu and put libwgpu_native.so, libwgpu_native.dylib,
+// or wgpu_native.dll where the dynamic loader finds it, or point
+// TENSAI_WGPU_LIB at it. The bindings target the wgpu-native v22.1.0.5 C
+// API (the last release before the callback-info API rework); use that
+// release's binaries.
 //
 // Only OpenGPU and the GPU methods are exported; everything else mirrors
 // webgpu.h struct layouts by hand, which is why this file is long.
@@ -252,8 +253,13 @@ func libCandidates() []string {
 	if p := os.Getenv("TENSAI_WGPU_LIB"); p != "" {
 		return []string{p}
 	}
-	if runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "darwin":
 		return []string{"libwgpu_native.dylib"}
+	case "windows":
+		// The release zip ships wgpu_native.dll; the name with the lib
+		// prefix turns up in MSYS2/MinGW-style installs.
+		return []string{"wgpu_native.dll", "libwgpu_native.dll"}
 	}
 	return []string{"libwgpu_native.so"}
 }
@@ -263,7 +269,7 @@ func loadWGPU() error {
 		var lib uintptr
 		var err error
 		for _, name := range libCandidates() {
-			lib, err = purego.Dlopen(name, purego.RTLD_NOW|purego.RTLD_GLOBAL)
+			lib, err = dlopenWGPU(name)
 			if err == nil {
 				break
 			}
