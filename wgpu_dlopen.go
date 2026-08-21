@@ -1,4 +1,4 @@
-//go:build wgpu && (linux || darwin)
+//go:build (wgpu || wgpu24) && (linux || darwin)
 
 package tensai
 

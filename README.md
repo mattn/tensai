@@ -259,6 +259,18 @@ With the portable kernel instead of AVX2 the crossover arrives one rung earlier,
 
 wgpu-native picks Vulkan on Linux, Vulkan or D3D12 on Windows, and Metal on macOS, so AMD, Intel, Apple, and NVIDIA GPUs all work — as do CPU Vulkan implementations like lavapipe, which is how the tests run on machines without a GPU. Every call uploads the operands and reads the product back over the bus, so the GPU only pays off for large products; without the build tag `OpenGPU` returns an error and nothing else changes.
 
+#### `-tags wgpu24`: the new wgpu-native API, and the real GPU inside WSL2
+
+`-tags wgpu24` (linux/darwin) builds the same `OpenGPU` API against the reworked wgpu-native C API instead — pair it with a **v29-series** release binary. The new API's payoff is `WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter`, which un-hides non-conformant Vulkan drivers. Concretely: Mesa's dozen (Vulkan-on-D3D12, shipped in the kisak-mesa PPA) exposes the real host GPU inside WSL2, but the v22 API hides it as non-conformant and falls back to lavapipe; the wgpu24 build reaches it:
+
+```bash
+VK_DRIVER_FILES=/path/to/dzn_icd.json \
+TENSAI_WGPU_LIB=$PWD/wgpu29/lib/libwgpu_native.so \
+    go run -tags wgpu24 ./_example/wgpu   # adapter: Microsoft Direct3D12 (AMD Radeon(TM) Graphics)
+```
+
+The new API passes structs by value, which the purego bindings can express through the SysV/AAPCS register conventions on linux/darwin but not portably on Windows — Windows stays on `-tags wgpu`, where D3D12 needs no translation layer anyway. When both tags are set, `wgpu24` wins.
+
 ## Run
 
 ```bash

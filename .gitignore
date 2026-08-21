@@ -3,6 +3,9 @@
 /mnist.tflite
 _example/charrnn/charrnn
 _example/dataset/dataset
+/wgpu
+/wgpu-nosimd
+/wgpu-simd
 /.agents/
 /.codex/
 _example/mnist/data/

@@ -1,21 +1,24 @@
-//go:build wgpu && !wgpu24 && (linux || darwin || windows)
+//go:build wgpu24 && (linux || darwin)
 
 package tensai
 
-// A WebGPU compute backend for batched MatMul, talking to the wgpu-native
-// shared library (https://github.com/gfx-rs/wgpu-native) through purego —
-// no cgo, no C compiler, just dlopen at runtime. wgpu-native routes to
-// Vulkan, Metal, or D3D12, so this covers AMD, Intel, Apple, and NVIDIA
-// GPUs (and CPU fallbacks like lavapipe) with one implementation.
+// The WebGPU compute backend against the reworked wgpu-native C API
+// (v24 and later; these bindings target the v29.0.1.1 release). Build with
+// -tags wgpu24 instead of -tags wgpu; the exported surface (OpenGPU, GPU,
+// GPUPower) is identical, so everything else — including _example/wgpu —
+// works unchanged.
 //
-// Build with -tags wgpu and put libwgpu_native.so, libwgpu_native.dylib,
-// or wgpu_native.dll where the dynamic loader finds it, or point
-// TENSAI_WGPU_LIB at it. The bindings target the wgpu-native v22.1.0.5 C
-// API (the last release before the callback-info API rework); use that
-// release's binaries.
+// Two things justify the second binding generation. The new API passes
+// WGPUStringView and callback-info structs by value, which purego can
+// express on linux/darwin amd64/arm64 (SysV/AAPCS pass small aggregates in
+// registers) but not portably on Windows — so this file is linux/darwin
+// only, and Windows stays on -tags wgpu with the v22 library. In exchange
+// the new API exposes WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter,
+// which un-hides non-conformant Vulkan drivers — concretely Mesa's dozen
+// (Vulkan-on-D3D12), the only route to the real GPU inside WSL2.
 //
-// Only OpenGPU and the GPU methods are exported; everything else mirrors
-// webgpu.h struct layouts by hand, which is why this file is long.
+// Use a wgpu-native v29-series shared library with this build; the v22
+// library will fail symbol registration cleanly.
 
 import (
 	"errors"
@@ -55,23 +58,46 @@ const (
 	GPUHighPerformance GPUPower = 2 // prefer the discrete GPU
 )
 
-// webgpu.h constants (v22.1.0.5).
+// v29 API constants. Flags widened to 64 bits, statuses now start at 1.
 const (
-	wgpuSTypeShaderModuleWGSLDescriptor = 0x00000006
+	wgpuSTypeShaderSourceWGSL = 0x00000002
+	wgpuSTypeInstanceExtras   = 0x00030004
 
-	wgpuBufferUsageMapRead = 0x00000001
-	wgpuBufferUsageCopySrc = 0x00000004
-	wgpuBufferUsageCopyDst = 0x00000008
-	wgpuBufferUsageUniform = 0x00000040
-	wgpuBufferUsageStorage = 0x00000080
+	wgpuBufferUsageMapRead uint64 = 0x01
+	wgpuBufferUsageCopySrc uint64 = 0x04
+	wgpuBufferUsageCopyDst uint64 = 0x08
+	wgpuBufferUsageUniform uint64 = 0x40
+	wgpuBufferUsageStorage uint64 = 0x80
 
-	wgpuMapModeRead = 0x00000001
+	wgpuMapModeRead uint64 = 0x01
 
-	wgpuStatusSuccess = 0 // shared by request-adapter/device and map-async
+	wgpuStatusSuccess = 1 // request-adapter/device and map-async alike
+
+	wgpuCallbackModeAllowProcessEvents = 2
+	wgpuCallbackModeAllowSpontaneous   = 3
+
+	wgpuInstanceFlagAllowNoncompliant uint64 = 1 << 3
+
+	wgpuStrlen = ^uintptr(0) // WGPU_STRLEN: treat data as null-terminated
 )
 
-// Hand-mirrored webgpu.h structs. Field order, widths, and padding must
-// match the 64-bit C layouts exactly.
+// Hand-mirrored v29 structs; field order, widths, and padding must match
+// the 64-bit C layouts exactly.
+
+type wgpuStringView struct {
+	data   *byte
+	length uintptr
+}
+
+// sv builds a WGPUStringView over a Go string. The returned backing slice
+// must be kept alive across the C call.
+func sv(s string) (wgpuStringView, []byte) {
+	if s == "" {
+		return wgpuStringView{}, nil
+	}
+	b := []byte(s)
+	return wgpuStringView{data: &b[0], length: uintptr(len(b))}, b
+}
 
 type wgpuChainedStruct struct {
 	next  uintptr
@@ -79,38 +105,100 @@ type wgpuChainedStruct struct {
 	_     uint32
 }
 
-type wgpuShaderModuleWGSLDescriptor struct {
+type wgpuInstanceExtras struct {
+	chain        wgpuChainedStruct
+	backends     uint64 // 0 = all
+	flags        uint64
+	dx12Compiler uint32
+	gles3Minor   uint32
+	glFence      uint32
+	_            uint32
+	dxcPath      wgpuStringView
+	dxcMaxSM     uint32
+	dx12Swap     uint32
+	budgetCreate uintptr
+	budgetLoss   uintptr
+	dhType       uint32 // WGPUNativeDisplayHandle, union flattened
+	_            uint32
+	dh1, dh2     uintptr
+}
+
+type wgpuInstanceDescriptor struct {
+	nextInChain          *wgpuInstanceExtras
+	requiredFeatureCount uintptr
+	requiredFeatures     uintptr
+	requiredLimits       uintptr
+}
+
+type wgpuRequestAdapterOptions struct {
+	nextInChain       uintptr
+	featureLevel      uint32 // 0 = undefined, defaults to Core
+	powerPreference   uint32
+	forceFallback     uint32
+	backendType       uint32
+	compatibleSurface uintptr
+}
+
+// wgpuCallbackInfo is the shared {mode, callback, userdata1, userdata2}
+// shape of WGPURequestAdapterCallbackInfo, WGPURequestDeviceCallbackInfo,
+// and WGPUBufferMapCallbackInfo. It is passed to the C API by value.
+type wgpuCallbackInfo struct {
+	nextInChain uintptr
+	mode        uint32
+	_           uint32
+	callback    uintptr
+	userdata1   uintptr
+	userdata2   uintptr
+}
+
+type wgpuUncapturedErrorCallbackInfo struct {
+	nextInChain uintptr
+	callback    uintptr
+	userdata1   uintptr
+	userdata2   uintptr
+}
+
+type wgpuDeviceDescriptor struct {
+	nextInChain          uintptr
+	label                wgpuStringView
+	requiredFeatureCount uintptr
+	requiredFeatures     uintptr
+	requiredLimits       uintptr
+	queueNext            uintptr // WGPUQueueDescriptor, inlined
+	queueLabel           wgpuStringView
+	lost                 wgpuCallbackInfo // WGPUDeviceLostCallbackInfo, same shape
+	uncaptured           wgpuUncapturedErrorCallbackInfo
+}
+
+type wgpuShaderSourceWGSL struct {
 	chain wgpuChainedStruct
-	code  *byte
+	code  wgpuStringView
 }
 
 type wgpuShaderModuleDescriptor struct {
-	nextInChain *wgpuShaderModuleWGSLDescriptor
-	label       uintptr
-	hintCount   uintptr
-	hints       uintptr
+	nextInChain *wgpuShaderSourceWGSL
+	label       wgpuStringView
 }
 
-type wgpuProgrammableStageDescriptor struct {
+type wgpuComputeState struct {
 	nextInChain   uintptr
 	module        uintptr
-	entryPoint    *byte
+	entryPoint    wgpuStringView
 	constantCount uintptr
 	constants     uintptr
 }
 
 type wgpuComputePipelineDescriptor struct {
 	nextInChain uintptr
-	label       uintptr
+	label       wgpuStringView
 	layout      uintptr // 0 = auto layout
-	compute     wgpuProgrammableStageDescriptor
+	compute     wgpuComputeState
 }
 
 type wgpuBufferDescriptor struct {
 	nextInChain      uintptr
-	label            uintptr
-	usage            uint32
-	_                uint32
+	label            wgpuStringView
+	usage            uint64
 	size             uint64
 	mappedAtCreation uint32
 	_                uint32
@@ -129,60 +217,39 @@ type wgpuBindGroupEntry struct {
 
 type wgpuBindGroupDescriptor struct {
 	nextInChain uintptr
-	label       uintptr
+	label       wgpuStringView
 	layout      uintptr
 	entryCount  uintptr
 	entries     *wgpuBindGroupEntry
 }
 
-type wgpuRequestAdapterOptions struct {
-	nextInChain       uintptr
-	compatibleSurface uintptr
-	powerPreference   uint32
-	backendType       uint32
-	forceFallback     uint32
-	_                 uint32
-}
-
 type wgpuAdapterInfo struct {
 	nextInChain  uintptr
-	vendor       uintptr
-	architecture uintptr
-	device       uintptr
-	description  uintptr
+	vendor       wgpuStringView
+	architecture wgpuStringView
+	device       wgpuStringView
+	description  wgpuStringView
 	backendType  uint32
 	adapterType  uint32
 	vendorID     uint32
 	deviceID     uint32
+	sgMin, sgMax uint32
 }
 
-type wgpuDeviceDescriptor struct {
-	nextInChain          uintptr
-	label                uintptr
-	requiredFeatureCount uintptr
-	requiredFeatures     uintptr
-	requiredLimits       uintptr
-	defaultQueueNext     uintptr // WGPUQueueDescriptor, inlined
-	defaultQueueLabel    uintptr
-	deviceLostCallback   uintptr
-	deviceLostUserdata   uintptr
-	errNext              uintptr // WGPUUncapturedErrorCallbackInfo, inlined
-	errCallback          uintptr
-	errUserdata          uintptr
-}
-
-// Function pointers resolved from the shared library.
+// Function pointers resolved from the shared library. RequestAdapter,
+// RequestDevice, and MapAsync take their callback-info struct by value and
+// return a WGPUFuture (a single uint64, ABI-identical to returning uint64).
 var (
-	fnCreateInstance          func(unsafe.Pointer) uintptr
-	fnInstanceRequestAdapter  func(uintptr, unsafe.Pointer, uintptr, unsafe.Pointer)
-	fnAdapterGetInfo          func(uintptr, unsafe.Pointer)
-	fnAdapterRequestDevice    func(uintptr, unsafe.Pointer, uintptr, unsafe.Pointer)
+	fnCreateInstance          func(*wgpuInstanceDescriptor) uintptr
+	fnInstanceRequestAdapter  func(uintptr, *wgpuRequestAdapterOptions, wgpuCallbackInfo) uint64
+	fnAdapterGetInfo          func(uintptr, *wgpuAdapterInfo) uint32
+	fnAdapterRequestDevice    func(uintptr, *wgpuDeviceDescriptor, wgpuCallbackInfo) uint64
 	fnDeviceGetQueue          func(uintptr) uintptr
-	fnDeviceCreateShaderMod   func(uintptr, unsafe.Pointer) uintptr
-	fnDeviceCreatePipeline    func(uintptr, unsafe.Pointer) uintptr
+	fnDeviceCreateShaderMod   func(uintptr, *wgpuShaderModuleDescriptor) uintptr
+	fnDeviceCreatePipeline    func(uintptr, *wgpuComputePipelineDescriptor) uintptr
 	fnPipelineGetLayout       func(uintptr, uint32) uintptr
-	fnDeviceCreateBuffer      func(uintptr, unsafe.Pointer) uintptr
-	fnDeviceCreateBindGroup   func(uintptr, unsafe.Pointer) uintptr
+	fnDeviceCreateBuffer      func(uintptr, *wgpuBufferDescriptor) uintptr
+	fnDeviceCreateBindGroup   func(uintptr, *wgpuBindGroupDescriptor) uintptr
 	fnDeviceCreateCmdEncoder  func(uintptr, unsafe.Pointer) uintptr
 	fnEncoderBeginComputePass func(uintptr, unsafe.Pointer) uintptr
 	fnPassSetPipeline         func(uintptr, uintptr)
@@ -193,7 +260,7 @@ var (
 	fnEncoderFinish           func(uintptr, unsafe.Pointer) uintptr
 	fnQueueSubmit             func(uintptr, uintptr, unsafe.Pointer)
 	fnQueueWriteBuffer        func(uintptr, uintptr, uint64, unsafe.Pointer, uintptr)
-	fnBufferMapAsync          func(uintptr, uint32, uintptr, uintptr, uintptr, unsafe.Pointer)
+	fnBufferMapAsync          func(uintptr, uint64, uintptr, uintptr, wgpuCallbackInfo) uint64
 	fnBufferGetConstMapped    func(uintptr, uintptr, uintptr) unsafe.Pointer
 	fnBufferUnmap             func(uintptr)
 	fnDevicePoll              func(uintptr, uint32, unsafe.Pointer) uint32
@@ -211,9 +278,8 @@ var (
 	fnInstanceRelease         func(uintptr)
 )
 
-// Callback plumbing. NewCallback slots are permanent, so they are created
-// once and route their results through package globals; wgpuMu serializes
-// every wgpu call sequence that uses them.
+// Callback plumbing, identical in spirit to the v22 file: NewCallback slots
+// are permanent, created once, routed through globals under wgpuMu.
 var (
 	wgpuMu       sync.Mutex
 	loadOnce     sync.Once
@@ -228,38 +294,36 @@ var (
 	adapterCB, deviceCB, mapCB, errorCB uintptr
 )
 
-func cstr(s string) *byte {
-	b := append([]byte(s), 0)
-	return &b[0]
-}
-
-func goString(p uintptr) string {
-	if p == 0 {
+// svString copies a WGPUStringView arriving from C as its two register
+// halves (data pointer, length).
+func svString(data, length uintptr) string {
+	if data == 0 || length == 0 {
 		return ""
 	}
-	// p is a C pointer, not a Go object; launder it past the unsafe rules.
-	ptr := *(*unsafe.Pointer)(unsafe.Pointer(&p))
-	var out []byte
-	for i := 0; ; i++ {
-		c := *(*byte)(unsafe.Add(ptr, i))
-		if c == 0 {
-			return string(out)
+	ptr := *(*unsafe.Pointer)(unsafe.Pointer(&data))
+	if length == wgpuStrlen {
+		var out []byte
+		for i := 0; ; i++ {
+			c := *(*byte)(unsafe.Add(ptr, i))
+			if c == 0 {
+				return string(out)
+			}
+			out = append(out, c)
 		}
-		out = append(out, c)
 	}
+	return string(unsafe.Slice((*byte)(ptr), length))
+}
+
+func viewString(v wgpuStringView) string {
+	return svString(uintptr(unsafe.Pointer(v.data)), v.length)
 }
 
 func libCandidates() []string {
 	if p := os.Getenv("TENSAI_WGPU_LIB"); p != "" {
 		return []string{p}
 	}
-	switch runtime.GOOS {
-	case "darwin":
+	if runtime.GOOS == "darwin" {
 		return []string{"libwgpu_native.dylib"}
-	case "windows":
-		// The release zip ships wgpu_native.dll; the name with the lib
-		// prefix turns up in MSYS2/MinGW-style installs.
-		return []string{"wgpu_native.dll", "libwgpu_native.dll"}
 	}
 	return []string{"libwgpu_native.so"}
 }
@@ -278,12 +342,12 @@ func loadWGPU() error {
 			loadErr = fmt.Errorf("tensai: cannot load wgpu-native (set TENSAI_WGPU_LIB): %w", err)
 			return
 		}
-		// Same symbol names, different ABI: calling a v24+ library through
-		// these v22 bindings crashes, so gate on the packed version number.
+		// Same symbol names, different ABI: calling a v22 library through
+		// these bindings crashes, so gate on the packed version number.
 		var fnGetVersion func() uint32
 		purego.RegisterLibFunc(&fnGetVersion, lib, "wgpuGetVersion")
-		if major := fnGetVersion() >> 24; major >= 24 {
-			loadErr = fmt.Errorf("tensai: wgpu-native v%d uses the reworked C API; build with -tags wgpu24 for it", major)
+		if major := fnGetVersion() >> 24; major < 24 {
+			loadErr = fmt.Errorf("tensai: wgpu-native v%d is too old for -tags wgpu24 (needs v24+); use -tags wgpu with it", major)
 			return
 		}
 		for _, f := range []struct {
@@ -330,30 +394,36 @@ func loadWGPU() error {
 			purego.RegisterLibFunc(f.ptr, lib, f.name)
 		}
 
-		adapterCB = purego.NewCallback(func(status uint32, adapter, message, userdata uintptr) uintptr {
+		// New-API callbacks receive WGPUStringView messages by value; on
+		// SysV/AAPCS a 16-byte aggregate arrives as two register words, so
+		// the Go side declares (data, length) pairs.
+		adapterCB = purego.NewCallback(func(status uint32, adapter, msgData, msgLen, ud1, ud2 uintptr) uintptr {
 			if status == wgpuStatusSuccess {
 				cbAdapter = adapter
 			} else {
-				cbFailMsg = goString(message)
+				cbFailMsg = svString(msgData, msgLen)
 			}
 			return 0
 		})
-		deviceCB = purego.NewCallback(func(status uint32, device, message, userdata uintptr) uintptr {
+		deviceCB = purego.NewCallback(func(status uint32, device, msgData, msgLen, ud1, ud2 uintptr) uintptr {
 			if status == wgpuStatusSuccess {
 				cbDevice = device
 			} else {
-				cbFailMsg = goString(message)
+				cbFailMsg = svString(msgData, msgLen)
 			}
 			return 0
 		})
-		mapCB = purego.NewCallback(func(status uint32, userdata uintptr) uintptr {
+		mapCB = purego.NewCallback(func(status uint32, msgData, msgLen, ud1, ud2 uintptr) uintptr {
 			cbMapDone = true
 			cbMapOK = status == wgpuStatusSuccess
+			if !cbMapOK && cbFailMsg == "" {
+				cbFailMsg = svString(msgData, msgLen)
+			}
 			return 0
 		})
-		errorCB = purego.NewCallback(func(errType uint32, message, userdata uintptr) uintptr {
+		errorCB = purego.NewCallback(func(device uintptr, errType uint32, msgData, msgLen, ud1, ud2 uintptr) uintptr {
 			if uncapturedCB == "" {
-				uncapturedCB = goString(message)
+				uncapturedCB = svString(msgData, msgLen)
 			}
 			return 0
 		})
@@ -390,7 +460,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // OpenGPU loads wgpu-native, picks an adapter, and compiles the matmul
 // pipeline. On machines with several GPUs an optional GPUPower steers the
 // choice: GPULowPower prefers the integrated GPU, GPUHighPerformance the
-// discrete one. The returned GPU is safe for concurrent use.
+// discrete one. Non-conformant Vulkan drivers (Mesa's dozen inside WSL2)
+// are allowed. The returned GPU is safe for concurrent use.
 func OpenGPU(power ...GPUPower) (*GPU, error) {
 	if err := loadWGPU(); err != nil {
 		return nil, err
@@ -399,7 +470,14 @@ func OpenGPU(power ...GPUPower) (*GPU, error) {
 	defer wgpuMu.Unlock()
 
 	g := &GPU{}
-	g.instance = fnCreateInstance(nil)
+	extras := wgpuInstanceExtras{
+		chain: wgpuChainedStruct{sType: wgpuSTypeInstanceExtras},
+		flags: wgpuInstanceFlagAllowNoncompliant,
+	}
+	iDesc := wgpuInstanceDescriptor{nextInChain: &extras}
+	g.instance = fnCreateInstance(&iDesc)
+	runtime.KeepAlive(&extras)
+	runtime.KeepAlive(&iDesc)
 	if g.instance == 0 {
 		return nil, errors.New("tensai: wgpuCreateInstance failed")
 	}
@@ -407,9 +485,11 @@ func OpenGPU(power ...GPUPower) (*GPU, error) {
 	if len(power) > 0 {
 		opts.powerPreference = uint32(power[0])
 	}
-	// wgpu-native invokes these callbacks synchronously, before returning.
+	// wgpu-native still fires these callbacks synchronously.
 	cbAdapter, cbDevice, cbFailMsg = 0, 0, ""
-	fnInstanceRequestAdapter(g.instance, unsafe.Pointer(&opts), adapterCB, nil)
+	fnInstanceRequestAdapter(g.instance, &opts, wgpuCallbackInfo{
+		mode: wgpuCallbackModeAllowSpontaneous, callback: adapterCB,
+	})
 	runtime.KeepAlive(&opts)
 	if cbAdapter == 0 {
 		g.Close()
@@ -418,27 +498,30 @@ func OpenGPU(power ...GPUPower) (*GPU, error) {
 	g.adapter = cbAdapter
 
 	// The info strings are tiny and OpenGPU runs once per process, so they
-	// are copied and never handed back to wgpuAdapterInfoFreeMembers (which
-	// takes the struct by value — off-limits without cgo).
+	// are copied and never handed back to wgpuAdapterInfoFreeMembers.
 	var info wgpuAdapterInfo
-	fnAdapterGetInfo(g.adapter, unsafe.Pointer(&info))
+	fnAdapterGetInfo(g.adapter, &info)
 	runtime.KeepAlive(&info)
-	g.name = goString(info.device)
+	g.name = viewString(info.device)
 	if g.name == "" {
-		g.name = goString(info.description)
+		g.name = viewString(info.description)
 	}
 	switch info.adapterType {
-	case 0:
-		g.name += " (discrete)"
 	case 1:
-		g.name += " (integrated)"
+		g.name += " (discrete)"
 	case 2:
+		g.name += " (integrated)"
+	case 3:
 		g.name += " (cpu)"
 	}
 
-	desc := wgpuDeviceDescriptor{errCallback: errorCB}
-	fnAdapterRequestDevice(g.adapter, unsafe.Pointer(&desc), deviceCB, nil)
-	runtime.KeepAlive(&desc)
+	dDesc := wgpuDeviceDescriptor{
+		uncaptured: wgpuUncapturedErrorCallbackInfo{callback: errorCB},
+	}
+	fnAdapterRequestDevice(g.adapter, &dDesc, wgpuCallbackInfo{
+		mode: wgpuCallbackModeAllowSpontaneous, callback: deviceCB,
+	})
+	runtime.KeepAlive(&dDesc)
 	if cbDevice == 0 {
 		g.Close()
 		return nil, fmt.Errorf("tensai: wgpu device request failed: %s", cbFailMsg)
@@ -447,23 +530,23 @@ func OpenGPU(power ...GPUPower) (*GPU, error) {
 	g.queue = fnDeviceGetQueue(g.device)
 
 	uncapturedCB = ""
-	code := cstr(matmulWGSL)
-	wgsl := wgpuShaderModuleWGSLDescriptor{
-		chain: wgpuChainedStruct{sType: wgpuSTypeShaderModuleWGSLDescriptor},
+	code, codeBuf := sv(matmulWGSL)
+	wgsl := wgpuShaderSourceWGSL{
+		chain: wgpuChainedStruct{sType: wgpuSTypeShaderSourceWGSL},
 		code:  code,
 	}
 	smDesc := wgpuShaderModuleDescriptor{nextInChain: &wgsl}
-	g.module = fnDeviceCreateShaderMod(g.device, unsafe.Pointer(&smDesc))
-	entry := cstr("main")
+	g.module = fnDeviceCreateShaderMod(g.device, &smDesc)
+	entry, entryBuf := sv("main")
 	pDesc := wgpuComputePipelineDescriptor{
-		compute: wgpuProgrammableStageDescriptor{module: g.module, entryPoint: entry},
+		compute: wgpuComputeState{module: g.module, entryPoint: entry},
 	}
-	g.pipeline = fnDeviceCreatePipeline(g.device, unsafe.Pointer(&pDesc))
+	g.pipeline = fnDeviceCreatePipeline(g.device, &pDesc)
 	runtime.KeepAlive(&wgsl)
 	runtime.KeepAlive(&smDesc)
 	runtime.KeepAlive(&pDesc)
-	runtime.KeepAlive(code)
-	runtime.KeepAlive(entry)
+	runtime.KeepAlive(codeBuf)
+	runtime.KeepAlive(entryBuf)
 	if g.pipeline == 0 || uncapturedCB != "" {
 		g.Close()
 		return nil, fmt.Errorf("tensai: wgpu pipeline creation failed: %s", uncapturedCB)
@@ -472,9 +555,9 @@ func OpenGPU(power ...GPUPower) (*GPU, error) {
 	return g, nil
 }
 
-// Name reports the adapter wgpu selected, e.g. "AMD Radeon 780M
-// (integrated)" — handy for checking which GPU a power preference landed
-// on.
+// Name reports the adapter wgpu selected, e.g. "Microsoft Direct3D12 (AMD
+// Radeon(TM) Graphics) (integrated)" — handy for checking which GPU a power
+// preference landed on.
 func (g *GPU) Name() string { return g.name }
 
 // Close releases the device and every object OpenGPU created. The GPU must
@@ -504,9 +587,9 @@ func (g *GPU) Close() {
 	}
 }
 
-func (g *GPU) newBuffer(usage uint32, size uint64) uintptr {
+func (g *GPU) newBuffer(usage, size uint64) uintptr {
 	desc := wgpuBufferDescriptor{usage: usage, size: size}
-	buf := fnDeviceCreateBuffer(g.device, unsafe.Pointer(&desc))
+	buf := fnDeviceCreateBuffer(g.device, &desc)
 	runtime.KeepAlive(&desc)
 	return buf
 }
@@ -589,7 +672,7 @@ func (g *GPU) MatMul(a, b *Tensor) (*Tensor, error) {
 		{binding: 4, buffer: bufOut, size: outBytes},
 	}
 	bgDesc := wgpuBindGroupDescriptor{layout: g.layout, entryCount: 5, entries: &entries[0]}
-	bindGroup := fnDeviceCreateBindGroup(g.device, unsafe.Pointer(&bgDesc))
+	bindGroup := fnDeviceCreateBindGroup(g.device, &bgDesc)
 	runtime.KeepAlive(&entries)
 	runtime.KeepAlive(&bgDesc)
 	defer fnBindGroupRelease(bindGroup)
@@ -607,13 +690,15 @@ func (g *GPU) MatMul(a, b *Tensor) (*Tensor, error) {
 	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
 	fnCmdBufferRelease(cmd)
 
-	cbMapDone, cbMapOK = false, false
-	fnBufferMapAsync(bufRead, wgpuMapModeRead, 0, uintptr(outBytes), mapCB, nil)
+	cbMapDone, cbMapOK, cbFailMsg = false, false, ""
+	fnBufferMapAsync(bufRead, wgpuMapModeRead, 0, uintptr(outBytes), wgpuCallbackInfo{
+		mode: wgpuCallbackModeAllowProcessEvents, callback: mapCB,
+	})
 	for !cbMapDone {
 		fnDevicePoll(g.device, 1, nil)
 	}
 	if !cbMapOK {
-		return nil, fmt.Errorf("tensai: gpu matmul readback failed: %s", uncapturedCB)
+		return nil, fmt.Errorf("tensai: gpu matmul readback failed: %s %s", cbFailMsg, uncapturedCB)
 	}
 	src := fnBufferGetConstMapped(bufRead, 0, uintptr(outBytes))
 	if src == nil {
