@@ -45,6 +45,7 @@ serialize.go        Model parameter save/load (JSON)
 tensai_test.go      Unit tests plus XOR convergence test
 features_test.go    Gradient checks and tests for the newer layers
 _example/helloworld Smallest possible program: add two values on the graph
+_example/dataset    Dataset workflow: shuffle, split, standardize, batches
 _example/xor        Runnable XOR training example
 _example/fizzbuzz   Runnable FizzBuzz classification example
 _example/spiral     Runnable 3-class spiral classification example
@@ -207,6 +208,7 @@ Tensors are contiguous and row-major; `Reshape` (with `-1` inference) and the `M
 
 ```bash
 go run ./_example/helloworld
+go run ./_example/dataset
 go run ./_example/xor
 go run ./_example/fizzbuzz
 go run ./_example/spiral
