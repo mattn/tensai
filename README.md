@@ -2,7 +2,7 @@
 
 # tensai - a tiny machine-learning framework in Go
 
-`tensai` is a small machine-learning framework for learning and experiments. It implements forward passes, backpropagation, and optimization in pure Go with no external dependencies.
+`tensai` is a small machine-learning framework for learning and experiments. It implements forward passes, backpropagation, and optimization in pure Go; the default build has no external dependencies (the optional `wgpu` build tag adds exactly one, cgo-free: `ebitengine/purego`).
 
 ## Features
 
@@ -11,6 +11,7 @@
 - **SIMD acceleration** - AVX2 kernels written with Go's experimental `simd/archsimd` package: still pure Go, no cgo, no assembly files. Matmul, ReLU/LeakyReLU, Sigmoid/Tanh/Softmax (via a vectorized polynomial `exp`), GELU (via a vectorized `erf`), LayerNorm, and the Adam update are all 8-lane vectorized. Build with `GOEXPERIMENT=simd` on amd64 (Go 1.26 and 1.27 APIs both supported via build tags); every other build uses the portable fallbacks automatically
 - **Low-allocation training** - layers reuse their forward/backward scratch buffers across training steps (a full MLP step runs in ~29 allocations), so GC stays out of the training loop; `Predict` always returns freshly allocated results
 - **Layers** - `Embedding`, `Dense`, `Conv2D`, `MaxPool2D`, `BatchNorm`, `LayerNorm`, `Dropout`, plus `ReLU`, `LeakyReLU`, `GELU`, `Sigmoid`, `Tanh`, and `Softmax` activations
+- **WebGPU backend (experimental)** - build with `-tags wgpu` and `OpenGPU()` runs batched `MatMul` as a WGSL compute shader on any GPU wgpu-native reaches (Vulkan, Metal, D3D12 — AMD, Intel, Apple, NVIDIA). The bindings go through `ebitengine/purego`, so there is still no cgo and no C compiler: the wgpu-native shared library is dlopen-ed at runtime
 - **Loss functions** - `MeanSquaredError` for regression, `SoftmaxCrossEntropy` for multi-class classification, and `BinaryCrossEntropy` for binary targets
 - **Optimizers** - momentum `SGD`, `Adam`, and `AdamW` (decoupled weight decay)
 - **k-NN baseline** - a `KNN` classifier whose distance matrix runs on the same SIMD matmul kernel; useful as a no-training baseline next to the networks
@@ -27,6 +28,7 @@
 go.mod              Module definition (github.com/mattn/tensai)
 tensor.go           Matrix and vector operations
 ndtensor.go         N-d Tensor: broadcasting element-wise ops, batched MatMul
+wgpu.go             WebGPU MatMul backend via purego + wgpu-native (build tag wgpu)
 dot_simd.go         AVX2 matmul kernel (GOEXPERIMENT=simd, amd64)
 dot_generic.go      Portable matmul kernel (all other builds)
 kernels.go          Scalar bodies of the element-wise kernels
@@ -203,6 +205,30 @@ out, _ := tensai.MatMul(scores, v)                // attention for the whole bat
 ```
 
 Tensors are contiguous and row-major; `Reshape` (with `-1` inference) and the `Matrix`/`Tensor` conversions are zero-copy views, while `Transpose` accepts an arbitrary axis permutation and materializes the result. See `_example/tensor` for the runnable version.
+
+### GPU MatMul over WebGPU (experimental)
+
+Building with `-tags wgpu` (linux/darwin) enables a GPU backend for batched `MatMul` with the same shape and broadcasting semantics as the CPU version:
+
+```go
+gpu, err := tensai.OpenGPU() // fails cleanly when no GPU / library is present
+if err != nil { /* fall back to tensai.MatMul */ }
+defer gpu.Close()
+fmt.Println(gpu.Name()) // e.g. "AMD Radeon 780M (integrated)"
+out, err := gpu.MatMul(a, b)
+```
+
+On machines with both an integrated and a discrete GPU, pass a preference: `tensai.OpenGPU(tensai.GPULowPower)` steers to the iGPU, `tensai.GPUHighPerformance` to the dGPU (it is a hint — with a single adapter you always get that one).
+
+There is no cgo involved: the bindings dlopen the [wgpu-native](https://github.com/gfx-rs/wgpu-native) shared library at runtime via `ebitengine/purego`. Download a **v22.1.0.5** release binary (the C API these bindings target), then either install `libwgpu_native.so` where the loader finds it or point `TENSAI_WGPU_LIB` at it:
+
+```bash
+curl -sLO https://github.com/gfx-rs/wgpu-native/releases/download/v22.1.0.5/wgpu-linux-x86_64-release.zip
+unzip wgpu-linux-x86_64-release.zip -d wgpu
+TENSAI_WGPU_LIB=$PWD/wgpu/lib/libwgpu_native.so go test -tags wgpu ./...
+```
+
+wgpu-native picks Vulkan on Linux/Windows and Metal on macOS, so AMD, Intel, Apple, and NVIDIA GPUs all work — as do CPU Vulkan implementations like lavapipe, which is how the tests run on machines without a GPU. Every call uploads the operands and reads the product back over the bus, so the GPU only pays off for large products; without the build tag `OpenGPU` returns an error and nothing else changes.
 
 ## Run
 
