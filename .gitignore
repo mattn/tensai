@@ -9,3 +9,6 @@ _example/mnist/data/
 /charrnn.json
 /graph.png
 /graph.svg
+_example/wgpu/wgpu
+*.exe
+/*.dll

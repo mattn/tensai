@@ -1,11 +1,12 @@
-//go:build !wgpu || (!linux && !darwin)
+//go:build !wgpu || (!linux && !darwin && !windows)
 
 package tensai
 
 import "errors"
 
 // GPU is the WebGPU compute backend. This build has it disabled; build with
-// -tags wgpu (linux or darwin) and see wgpu.go for the runtime requirements.
+// -tags wgpu (linux, darwin, or windows) and see wgpu.go for the runtime
+// requirements.
 type GPU struct{}
 
 // GPUPower tells OpenGPU which adapter to prefer; unused in builds without
