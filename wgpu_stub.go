@@ -33,6 +33,9 @@ func (g *GPU) MatMul(a, b *Tensor) (*Tensor, error) { return nil, errNoWGPU }
 // Close is a no-op in builds without the wgpu tag.
 func (g *GPU) Close() {}
 
+// StorageLimit returns 0 in builds without the wgpu tag.
+func (g *GPU) StorageLimit() uint64 { return 0 }
+
 // GPUTensor is a GPU-resident tensor. This build has it disabled; build
 // with -tags wgpu or -tags wgpu24 to enable it.
 type GPUTensor struct{}

@@ -32,15 +32,16 @@ import (
 // OpenGPU, use it from any goroutine (calls are serialized internally), and
 // Close it when done.
 type GPU struct {
-	mu       sync.Mutex
-	instance uintptr
-	adapter  uintptr
-	device   uintptr
-	queue    uintptr
-	module   uintptr
-	pipes    gpuPipelines
-	name     string
-	closed   bool
+	mu         sync.Mutex
+	instance   uintptr
+	adapter    uintptr
+	device     uintptr
+	queue      uintptr
+	module     uintptr
+	pipes      gpuPipelines
+	name       string
+	maxStorage uint64 // usable bytes per storage buffer, 0 = unknown
+	closed     bool
 }
 
 // GPUPower tells OpenGPU which adapter to prefer on machines with more than
@@ -155,6 +156,29 @@ type wgpuAdapterInfo struct {
 	deviceID     uint32
 }
 
+// wgpuLimits mirrors WGPULimits: 14 leading u32s, three u64 sizes split by
+// u32 runs. Only the named sizes are read; the rest ride along so the
+// adapter's limits can be requested back verbatim.
+type wgpuLimits struct {
+	u32a                        [14]uint32
+	maxUniformBufferBindingSize uint64
+	maxStorageBufferBindingSize uint64
+	u32b                        [3]uint32
+	_                           uint32
+	maxBufferSize               uint64
+	u32c                        [12]uint32
+}
+
+type wgpuSupportedLimits struct {
+	nextInChain uintptr
+	limits      wgpuLimits
+}
+
+type wgpuRequiredLimits struct {
+	nextInChain uintptr
+	limits      wgpuLimits
+}
+
 type wgpuDeviceDescriptor struct {
 	nextInChain          uintptr
 	label                uintptr
@@ -175,6 +199,7 @@ var (
 	fnCreateInstance          func(unsafe.Pointer) uintptr
 	fnInstanceRequestAdapter  func(uintptr, unsafe.Pointer, uintptr, unsafe.Pointer)
 	fnAdapterGetInfo          func(uintptr, unsafe.Pointer)
+	fnAdapterGetLimits        func(uintptr, unsafe.Pointer) uint32
 	fnAdapterRequestDevice    func(uintptr, unsafe.Pointer, uintptr, unsafe.Pointer)
 	fnDeviceGetQueue          func(uintptr) uintptr
 	fnDeviceCreateShaderMod   func(uintptr, unsafe.Pointer) uintptr
@@ -292,6 +317,7 @@ func loadWGPU() error {
 			{&fnCreateInstance, "wgpuCreateInstance"},
 			{&fnInstanceRequestAdapter, "wgpuInstanceRequestAdapter"},
 			{&fnAdapterGetInfo, "wgpuAdapterGetInfo"},
+			{&fnAdapterGetLimits, "wgpuAdapterGetLimits"},
 			{&fnAdapterRequestDevice, "wgpuAdapterRequestDevice"},
 			{&fnDeviceGetQueue, "wgpuDeviceGetQueue"},
 			{&fnDeviceCreateShaderMod, "wgpuDeviceCreateShaderModule"},
@@ -409,9 +435,19 @@ func OpenGPU(power ...GPUPower) (*GPU, error) {
 		g.name += " (cpu)"
 	}
 
+	// Request the adapter's own limits back so big storage buffers are not
+	// capped at the conservative defaults (128MiB bindings).
+	var sup wgpuSupportedLimits
 	desc := wgpuDeviceDescriptor{errCallback: errorCB}
+	var req wgpuRequiredLimits
+	if fnAdapterGetLimits(g.adapter, unsafe.Pointer(&sup)) == 1 {
+		req.limits = sup.limits
+		desc.requiredLimits = uintptr(unsafe.Pointer(&req))
+		g.maxStorage = min(sup.limits.maxStorageBufferBindingSize, sup.limits.maxBufferSize)
+	}
 	fnAdapterRequestDevice(g.adapter, unsafe.Pointer(&desc), deviceCB, nil)
 	runtime.KeepAlive(&desc)
+	runtime.KeepAlive(&req)
 	if cbDevice == 0 {
 		g.Close()
 		return nil, fmt.Errorf("tensai: wgpu device request failed: %s", cbFailMsg)
