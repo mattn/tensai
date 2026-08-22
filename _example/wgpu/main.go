@@ -9,8 +9,9 @@
 //	GOEXPERIMENT=nosimd go build -tags wgpu -o wgpu-nosimd ./_example/wgpu
 //	GOEXPERIMENT=simd   go build -tags wgpu -o wgpu-simd   ./_example/wgpu
 //
-// the first binary's cpu column is the portable Go kernel, the second's is
-// the AVX2 one, and the gpu column is the same either way.
+// the first binary's cpu column is the portable Go kernel and the second's
+// is the AVX2 one. gpu+xfer includes input uploads; resident reuses inputs
+// already on the device. Both GPU columns include the final download.
 //
 // The GPU path only exists in builds with -tags wgpu on linux, darwin, or
 // windows; anywhere else OpenGPU fails cleanly and this command explains
@@ -105,30 +106,64 @@ func timeOp(fn func() error) (time.Duration, error) {
 	}
 }
 
-// measure times one product on both backends, reporting the fastest of
-// reps windows each. The first GPU call also allocates buffers and warms
-// the driver's caches, so it is thrown away rather than timed.
-func measure(gpu *tensai.GPU, s shape, reps int) (gpuTime, cpuTime time.Duration, diff float64, err error) {
+// measure times the convenient upload/matmul/download path, the usual
+// resident-input GPU path, and the CPU. Resident timing still downloads the
+// result on every call, both to synchronize the GPU and to model inference
+// that consumes its final output on the host; only repeated input uploads are
+// removed. The first calls warm the driver's caches and are not timed.
+func measure(gpu *tensai.GPU, s shape, reps int) (transferTime, residentTime, cpuTime time.Duration, diff float64, err error) {
 	rng := rand.New(rand.NewSource(1))
 	a := randTensor(rng, s.batch, s.m, s.k)
 	w := randTensor(rng, s.k, s.n)
 
 	if _, err := gpu.MatMul(a, w); err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
-	var got, want *tensai.Tensor
-	gpuTime, cpuTime = time.Hour, time.Hour
+	ga, err := gpu.Upload(a)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	defer ga.Free()
+	gw, err := gpu.Upload(w)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	defer gw.Free()
+
+	var transferGot, residentGot, want *tensai.Tensor
+	residentOp := func() error {
+		out, e := ga.MatMul(gw)
+		if e != nil {
+			return e
+		}
+		defer out.Free()
+		residentGot, e = out.Download()
+		return e
+	}
+	if err := residentOp(); err != nil {
+		return 0, 0, 0, 0, err
+	}
+
+	transferTime, residentTime, cpuTime = time.Hour, time.Hour, time.Hour
 	for i := 0; i < reps; i++ {
 		d, err := timeOp(func() error {
 			var e error
-			got, e = gpu.MatMul(a, w)
+			transferGot, e = gpu.MatMul(a, w)
 			return e
 		})
 		if err != nil {
-			return 0, 0, 0, err
+			return 0, 0, 0, 0, err
 		}
-		if d < gpuTime {
-			gpuTime = d
+		if d < transferTime {
+			transferTime = d
+		}
+
+		d, err = timeOp(residentOp)
+		if err != nil {
+			return 0, 0, 0, 0, err
+		}
+		if d < residentTime {
+			residentTime = d
 		}
 
 		d, err = timeOp(func() error {
@@ -137,13 +172,14 @@ func measure(gpu *tensai.GPU, s shape, reps int) (gpuTime, cpuTime time.Duration
 			return e
 		})
 		if err != nil {
-			return 0, 0, 0, err
+			return 0, 0, 0, 0, err
 		}
 		if d < cpuTime {
 			cpuTime = d
 		}
 	}
-	return gpuTime, cpuTime, maxDiff(got, want), nil
+	diff = math.Max(maxDiff(transferGot, want), maxDiff(residentGot, want))
+	return transferTime, residentTime, cpuTime, diff, nil
 }
 
 // mflop counts the multiply-add pairs in one product, in millions.
@@ -152,33 +188,34 @@ func mflop(s shape) float64 {
 }
 
 func sweep(gpu *tensai.GPU, reps int) {
-	fmt.Printf("%-12s %-18s %10s %10s %10s %9s   %s\n",
-		"", "shape", "MFLOP", "gpu", "cpu", "gpu/cpu", "max diff")
+	fmt.Printf("%-12s %-18s %10s %10s %10s %10s %9s   %s\n",
+		"", "shape", "MFLOP", "gpu+xfer", "resident", "cpu", "res/cpu", "max diff")
 	crossed := false
 	for _, s := range ladder {
-		gpuTime, cpuTime, diff, err := measure(gpu, s, reps)
+		transferTime, residentTime, cpuTime, diff, err := measure(gpu, s, reps)
 		if err != nil {
 			fmt.Printf("%-12s %-18s %10s\n", s.label,
 				fmt.Sprintf("%dx%dx%d@%dx%d", s.batch, s.m, s.k, s.k, s.n), "failed: "+err.Error())
 			continue
 		}
-		ratio := float64(cpuTime) / float64(gpuTime)
+		ratio := float64(cpuTime) / float64(residentTime)
 		mark := ""
 		if ratio >= 1 && !crossed {
 			crossed = true
 			mark = "  <- gpu takes the lead here"
 		}
-		fmt.Printf("%-12s %-18s %10.1f %10s %10s %8.2fx   %.1e%s\n",
+		fmt.Printf("%-12s %-18s %10.1f %10s %10s %10s %8.2fx   %.1e%s\n",
 			s.label,
 			fmt.Sprintf("%dx%dx%d@%dx%d", s.batch, s.m, s.k, s.k, s.n),
 			mflop(s),
-			gpuTime.Round(time.Microsecond),
+			transferTime.Round(time.Microsecond),
+			residentTime.Round(time.Microsecond),
 			cpuTime.Round(time.Microsecond),
 			ratio, diff, mark)
 	}
 	if !crossed {
 		fmt.Println("\nthe CPU kernel won every size: this machine's GPU never")
-		fmt.Println("earns back the upload and readback at these shapes")
+		fmt.Println("earns back the dispatch and final readback at these shapes")
 	}
 }
 
@@ -231,23 +268,24 @@ func main() {
 	// (batch, m, k) @ (k, n) -> (batch, m, n) is a single dispatch with one
 	// upload of the weight.
 	s := shape{"", *batch, *m, *k, *n}
-	gpuTime, cpuTime, diff, err := measure(gpu, s, *reps)
+	transferTime, residentTime, cpuTime, diff, err := measure(gpu, s, *reps)
 	if err != nil {
 		panic(err)
 	}
 	fmt.Printf("a[%d %d %d] @ w[%d %d] = out[%d %d %d] (%.1f MFLOP)\n",
 		s.batch, s.m, s.k, s.k, s.n, s.batch, s.m, s.n, mflop(s))
-	fmt.Printf("  gpu: %v\n", gpuTime)
+	fmt.Printf("  gpu + input upload: %v\n", transferTime)
+	fmt.Printf("  gpu, resident inputs: %v\n", residentTime)
 	fmt.Printf("  cpu: %v\n", cpuTime)
 	fmt.Printf("  max |gpu - cpu|: %.2e\n", diff)
 
-	// Every call uploads both operands and reads the product back, so the
-	// GPU only wins once the arithmetic outgrows the transfer. Run -sweep
-	// to see where the two lines cross on this machine.
-	if ratio := float64(cpuTime) / float64(gpuTime); ratio >= 1 {
+	// The resident path still reads the final product back, so the GPU only
+	// wins once the arithmetic outgrows dispatch and readback. Run -sweep to
+	// compare that path with the convenient per-call upload path.
+	if ratio := float64(cpuTime) / float64(residentTime); ratio >= 1 {
 		fmt.Printf("\ngpu is %.2fx faster than the CPU kernel\n", ratio)
 	} else {
-		fmt.Printf("\ngpu is %.2fx slower than the CPU kernel: this product\n"+
-			"is too small to pay for the upload and readback\n", 1/ratio)
+		fmt.Printf("\ngpu with resident inputs is %.2fx slower than the CPU kernel:\n"+
+			"this product is too small to pay for dispatch and final readback\n", 1/ratio)
 	}
 }

@@ -258,7 +258,7 @@ $env:TENSAI_WGPU_LIB="$PWD\wgpu\lib\wgpu_native.dll"
 go run -tags wgpu ./_example/wgpu
 ```
 
-`_example/wgpu -sweep` walks a ladder of sizes and marks where the GPU overtakes the CPU kernel. Because the CPU side is the same `dotRows` kernel the rest of the package uses, building the example twice compares all three implementations — portable Go, AVX2, and the GPU:
+`_example/wgpu -sweep` walks a ladder of sizes and marks where the GPU overtakes the CPU kernel. It reports `gpu+xfer` for the convenient Upload → MatMul → Download call and `resident` for inputs uploaded once and reused (the final result is still downloaded each iteration). Because the CPU side is the same `dotRows` kernel the rest of the package uses, building the example twice compares portable Go, AVX2, and both GPU usage patterns:
 
 ```bash
 GOEXPERIMENT=nosimd go build -tags wgpu -o wgpu-nosimd ./_example/wgpu
@@ -266,20 +266,9 @@ GOEXPERIMENT=simd   go build -tags wgpu -o wgpu-simd   ./_example/wgpu
 ./wgpu-nosimd -sweep && ./wgpu-simd -sweep
 ```
 
-On a Ryzen iGPU (AMD Radeon 780M, Vulkan) the crossover moves with the CPU kernel — the faster the CPU, the bigger the product has to be before the upload and readback pay for themselves:
+The crossover moves with the CPU kernel, GPU driver, and transfer pattern. The `res/cpu` column and crossover marker use the resident-input timing, since that is the normal pattern for repeated inference. Small MNIST layers generally remain CPU-faster because dispatch and the final readback dominate them.
 
-```
-             shape                   MFLOP        gpu        cpu   gpu/cpu
-mnist dense  1x100x784@784x128        20.1     2.52ms      491µs     0.19x
-tiny         1x128x128@128x128         4.2    3.356ms      353µs     0.11x
-small        1x512x512@512x512       268.4    4.523ms    4.499ms     0.99x
-medium       8x512x512@512x512      2147.5   15.894ms   49.388ms     3.11x   <- crossover (AVX2)
-huge         64x512x512@512x512    17179.9   121.01ms  392.146ms     3.24x
-```
-
-With the portable kernel instead of AVX2 the crossover arrives one rung earlier, at `small`. Either way a single MNIST layer is two orders of magnitude too small to bother.
-
-wgpu-native picks Vulkan on Linux, Vulkan or D3D12 on Windows, and Metal on macOS, so AMD, Intel, Apple, and NVIDIA GPUs all work — as do CPU Vulkan implementations like lavapipe, which is how the tests run on machines without a GPU. Every call uploads the operands and reads the product back over the bus, so the GPU only pays off for large products; without the build tag `OpenGPU` returns an error and nothing else changes.
+wgpu-native picks Vulkan on Linux, Vulkan or D3D12 on Windows, and Metal on macOS, so AMD, Intel, Apple, and NVIDIA GPUs all work — as do CPU Vulkan implementations like lavapipe, which is how the tests run on machines without a GPU. `gpu.MatMul` uploads the operands and reads the product back on every call; `Upload` plus `GPUTensor.MatMul` keeps inputs and intermediates resident, so only the final result needs to cross the bus. Without the build tag `OpenGPU` returns an error and nothing else changes.
 
 #### `-tags wgpu24`: the new wgpu-native API, and the real GPU inside WSL2
 
