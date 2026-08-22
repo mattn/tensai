@@ -215,3 +215,151 @@ func (m *gpt2) reset() {
 		m.blocks[i].vc = nil
 	}
 }
+
+func layernormRows(x *tensai.Matrix, w, b []float32) *tensai.Matrix {
+	out := tensai.NewMatrix(x.Rows, x.Cols)
+	for r := 0; r < x.Rows; r++ {
+		copy(out.Data[r*x.Cols:(r+1)*x.Cols], layernorm(x.Data[r*x.Cols:(r+1)*x.Cols], w, b))
+	}
+	return out
+}
+
+func addBiasRows(x *tensai.Matrix, b []float32) {
+	for r := 0; r < x.Rows; r++ {
+		row := x.Data[r*x.Cols : (r+1)*x.Cols]
+		for i := range row {
+			row[i] += b[i]
+		}
+	}
+}
+
+func addInPlace(x, y *tensai.Matrix) {
+	for i := range x.Data {
+		x.Data[i] += y.Data[i]
+	}
+}
+
+func matmul(a, w *tensai.Matrix, bias []float32) *tensai.Matrix {
+	out, err := tensai.Dot(a, w)
+	if err != nil {
+		panic(err)
+	}
+	if bias != nil {
+		addBiasRows(out, bias)
+	}
+	return out
+}
+
+// cpuCausalMHA is multi-head causal attention over full (T, 768) q/k/v
+// matrices, the CPU half of the prefill.
+func cpuCausalMHA(q, k, v *tensai.Matrix) *tensai.Matrix {
+	T := q.Rows
+	out := tensai.NewMatrix(T, nEmbd)
+	scores := make([]float64, T)
+	for h := 0; h < nHead; h++ {
+		off := h * headSz
+		for i := 0; i < T; i++ {
+			maxs := math.Inf(-1)
+			for j := 0; j <= i; j++ {
+				var s float64
+				for c := 0; c < headSz; c++ {
+					s += float64(q.Data[i*nEmbd+off+c]) * float64(k.Data[j*nEmbd+off+c])
+				}
+				s /= 8
+				scores[j] = s
+				if s > maxs {
+					maxs = s
+				}
+			}
+			var sum float64
+			for j := 0; j <= i; j++ {
+				scores[j] = math.Exp(scores[j] - maxs)
+				sum += scores[j]
+			}
+			for j := 0; j <= i; j++ {
+				p := float32(scores[j] / sum)
+				for c := 0; c < headSz; c++ {
+					out.Data[i*nEmbd+off+c] += p * v.Data[j*nEmbd+off+c]
+				}
+			}
+		}
+	}
+	return out
+}
+
+// gpuCausalMHA runs the same attention as one masked multi-head dispatch
+// on resident tensors.
+func gpuCausalMHA(g *tensai.GPU, q, k, v *tensai.Matrix) *tensai.Matrix {
+	upload := func(m *tensai.Matrix) *tensai.GPUTensor {
+		t, err := g.Upload(m.Tensor())
+		if err != nil {
+			panic(err)
+		}
+		return t
+	}
+	gq, gk, gv := upload(q), upload(k), upload(v)
+	defer gq.Free()
+	defer gk.Free()
+	defer gv.Free()
+	got, err := gq.CausalMultiHeadAttention(gk, gv, nHead)
+	if err != nil {
+		panic(err)
+	}
+	defer got.Free()
+	t, err := got.Download()
+	if err != nil {
+		panic(err)
+	}
+	m, err := t.Matrix()
+	if err != nil {
+		panic(err)
+	}
+	return m
+}
+
+// prefill runs the whole prompt through the model in one batched pass,
+// filling the KV cache and returning the logits after the last token. The
+// matmuls run on tensai's Dot kernel; with a non-nil GPU the causal
+// attention of every block runs as one masked multi-head dispatch on the
+// GPU instead of the CPU loops.
+func (m *gpt2) prefill(tokens []int, g *tensai.GPU) []float32 {
+	T := len(tokens)
+	x := tensai.NewMatrix(T, nEmbd)
+	for t, tok := range tokens {
+		row := x.Data[t*nEmbd : (t+1)*nEmbd]
+		for i := range row {
+			row[i] = m.wte.Data[tok*nEmbd+i] + m.wpe.Data[t*nEmbd+i]
+		}
+	}
+
+	for li := range m.blocks {
+		b := &m.blocks[li]
+
+		qkv := matmul(layernormRows(x, b.ln1w, b.ln1b), b.attnW, b.attnB)
+		q := tensai.NewMatrix(T, nEmbd)
+		k := tensai.NewMatrix(T, nEmbd)
+		v := tensai.NewMatrix(T, nEmbd)
+		for t := 0; t < T; t++ {
+			copy(q.Data[t*nEmbd:(t+1)*nEmbd], qkv.Data[t*3*nEmbd:t*3*nEmbd+nEmbd])
+			copy(k.Data[t*nEmbd:(t+1)*nEmbd], qkv.Data[t*3*nEmbd+nEmbd:t*3*nEmbd+2*nEmbd])
+			copy(v.Data[t*nEmbd:(t+1)*nEmbd], qkv.Data[t*3*nEmbd+2*nEmbd:(t+1)*3*nEmbd])
+			b.kc = append(b.kc, k.Data[t*nEmbd:(t+1)*nEmbd])
+			b.vc = append(b.vc, v.Data[t*nEmbd:(t+1)*nEmbd])
+		}
+
+		var attn *tensai.Matrix
+		if g != nil {
+			attn = gpuCausalMHA(g, q, k, v)
+		} else {
+			attn = cpuCausalMHA(q, k, v)
+		}
+		addInPlace(x, matmul(attn, b.projW, b.projB))
+
+		h := matmul(layernormRows(x, b.ln2w, b.ln2b), b.fcW, b.fcB)
+		geluNew(h.Data)
+		addInPlace(x, matmul(h, b.fc2W, b.fc2B))
+	}
+
+	last := x.Data[(T-1)*nEmbd:]
+	return matvec(layernorm(last, m.lnfW, m.lnfB), m.wteT, nil)
+}

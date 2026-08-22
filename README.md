@@ -168,6 +168,8 @@ Hello, I'm a language model, not a programming language. I'm a language model. .
 
 The greedy continuation matches GPT-2's well-known reference output token for token, which pins the whole pipeline — reader, tokenizer, and forward pass — in one check.
 
+The prompt runs through the model as one batched pass; with `-gpu` (built with `-tags wgpu` or `wgpu24`) every block's causal multi-head attention becomes a single masked dispatch on the GPU. A 600-token prompt prefills 1.5x faster even through dozen inside WSL2; native drivers gain more.
+
 ### Automatic differentiation
 
 When a model doesn't fit the Sequential mold (weight sharing, custom losses, exotic architectures), build the computation directly and let reverse-mode autodiff derive the gradients:
@@ -266,7 +268,7 @@ out, _ := gq.Attention(gk, gv)                 // softmax(q@k^T/sqrt(d))@v, no h
 out, _ = gq.MultiHeadAttention(gk, gv, heads)  // packed (batch, seq, heads*dh) layout
 ```
 
-Multi-head attention carves each head out of the packed layout with strided kernels — the matmul kernels take explicit row strides and per-batch offsets — so no permute is ever materialized.
+Multi-head attention carves each head out of the packed layout with strided kernels — the matmul kernels take explicit row strides and per-batch offsets — so no permute is ever materialized. The causal variants (`CausalAttention`, `CausalMultiHeadAttention`) mask future positions inside the softmax kernel itself, with k and v allowed to hold more positions than q — the prompt-prefill and chunked-decode patterns of autoregressive models — so no mask tensor is ever built either.
 
 There is no cgo involved: the bindings load the [wgpu-native](https://github.com/gfx-rs/wgpu-native) shared library at runtime via `ebitengine/purego` (`dlopen` on linux/macOS, `LoadLibrary` on Windows). Download a **v22.1.0.5** release binary (the C API these bindings target), then either install it where the loader finds it or point `TENSAI_WGPU_LIB` at it:
 

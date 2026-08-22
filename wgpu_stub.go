@@ -63,6 +63,14 @@ func (q *GPUTensor) MultiHeadAttention(k, v *GPUTensor, heads int) (*GPUTensor, 
 	return nil, errNoWGPU
 }
 
+// CausalAttention always fails in builds without the wgpu tag.
+func (q *GPUTensor) CausalAttention(k, v *GPUTensor) (*GPUTensor, error) { return nil, errNoWGPU }
+
+// CausalMultiHeadAttention always fails in builds without the wgpu tag.
+func (q *GPUTensor) CausalMultiHeadAttention(k, v *GPUTensor, heads int) (*GPUTensor, error) {
+	return nil, errNoWGPU
+}
+
 // Download always fails in builds without the wgpu tag.
 func (t *GPUTensor) Download() (*Tensor, error) { return nil, errNoWGPU }
 
