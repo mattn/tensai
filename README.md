@@ -63,6 +63,7 @@ _example/dot        Graphviz DOT export of the z = x + y graph
 _example/tensor     Tour of the n-d Tensor: broadcasting, batched MatMul, attention
 _example/wgpu       WebGPU MatMul: adapter info, CPU cross-check, GPU vs CPU sweep
 _example/gpt2       The published GPT-2 (124M) checkpoint generating text in pure Go
+_example/qwen       Qwen2.5-0.5B-Instruct chatting in pure Go: RoPE, GQA, SwiGLU
 ```
 
 ## Usage
@@ -197,6 +198,14 @@ The greedy continuation matches GPT-2's well-known reference output token for to
 The prompt runs through the model as one batched pass; with `-gpu` (built with `-tags wgpu` or `wgpu24`) every block's causal multi-head attention becomes a single masked dispatch on the GPU. A 600-token prompt prefills 1.5x faster even through dozen inside WSL2; native drivers gain more.
 
 `-q8` quantizes the decode-path weights to int8 (weight-only, per-column scales) and doubles generation — 23 to 46 tok/s on the same machine — because decode streams the whole checkpoint per token and int8 pulls a quarter of the bytes. The text stays coherent but greedy decoding no longer reproduces the float32 reference tokens exactly; use the default float32 path for the reference check.
+
+`_example/qwen` does the same for a modern instruction-tuned model: Qwen2.5-0.5B-Instruct, with RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, its BF16 checkpoint loaded through the same safetensors reader and its ChatML template applied around the prompt. Dimensions come from config.json, so other Qwen2 sizes load unchanged if they fit in memory:
+
+```
+$ GOEXPERIMENT=simd go run ./_example/qwen -q8 -prompt "What is the capital of France?"
+The capital of France is Paris.
+43 tokens in 3.4s (12.6 tok/s)
+```
 
 ### Automatic differentiation
 
@@ -371,7 +380,8 @@ go run ./_example/iris
 go run ./_example/charrnn
 go run ./_example/plasma
 go run ./_example/tensor
-GOEXPERIMENT=simd go run ./_example/gpt2   # downloads the GPT-2 checkpoint (~550MB) on first run
+GOEXPERIMENT=simd go run ./_example/gpt2          # downloads the GPT-2 checkpoint (~550MB) on first run
+GOEXPERIMENT=simd go run ./_example/qwen -q8      # downloads Qwen2.5-0.5B-Instruct (~1GB) on first run
 go run -tags wgpu ./_example/wgpu          # needs wgpu-native, see above
 go run -tags wgpu ./_example/wgpu -sweep  # GPU vs CPU across sizes
 go test ./...
