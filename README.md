@@ -59,6 +59,7 @@ _example/plasma     Demoscene-style terminal plasma rendered by a neural network
 _example/dot        Graphviz DOT export of the z = x + y graph
 _example/tensor     Tour of the n-d Tensor: broadcasting, batched MatMul, attention
 _example/wgpu       WebGPU MatMul: adapter info, CPU cross-check, GPU vs CPU sweep
+_example/gpt2       The published GPT-2 (124M) checkpoint generating text in pure Go
 ```
 
 ## Usage
@@ -157,6 +158,15 @@ w, err := f.Tensor("model.layers.0.attention.wq.weight") // *tensai.Tensor
 ```
 
 `Names`, `Info`, and `Metadata` inspect a checkpoint without loading it; `Save`/`SaveFile` write F32 checkpoints that the reference implementation reads back bit-for-bit.
+
+`_example/gpt2` puts the reader to work on a real model: it downloads the published GPT-2 small (124M) checkpoint from Hugging Face, loads the weights through this package, tokenizes with a from-scratch byte-level BPE, and decodes with a KV cache — every matvec running on the same `Dot` kernel as the rest of tensai, at ~30 tok/s with the AVX2 build:
+
+```
+$ GOEXPERIMENT=simd go run ./_example/gpt2 -n 20
+Hello, I'm a language model, not a programming language. I'm a language model. ...
+```
+
+The greedy continuation matches GPT-2's well-known reference output token for token, which pins the whole pipeline — reader, tokenizer, and forward pass — in one check.
 
 ### Automatic differentiation
 
@@ -331,6 +341,7 @@ go run ./_example/iris
 go run ./_example/charrnn
 go run ./_example/plasma
 go run ./_example/tensor
+GOEXPERIMENT=simd go run ./_example/gpt2   # downloads the GPT-2 checkpoint (~550MB) on first run
 go run -tags wgpu ./_example/wgpu          # needs wgpu-native, see above
 go run -tags wgpu ./_example/wgpu -sweep  # GPU vs CPU across sizes
 go test ./...
