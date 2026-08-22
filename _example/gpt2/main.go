@@ -1,8 +1,8 @@
 // Command gpt2 runs the real, published GPT-2 small (124M) checkpoint in
 // pure Go: the weights load through tensai's encoding/safetensors reader,
-// the byte-level BPE tokenizer is implemented from vocab.json and
-// merges.txt, and every matvec in the transformer runs on tensai's Dot
-// kernel — build with GOEXPERIMENT=simd for the AVX2 version.
+// the text goes through tensai's tokenizer package (byte-level BPE from
+// tokenizer.json), and every matvec in the transformer runs on tensai's
+// Dot kernel — build with GOEXPERIMENT=simd for the AVX2 version.
 //
 // On first run it downloads the checkpoint (~550MB), vocabulary, and
 // merges from Hugging Face into -data. Then:
@@ -26,6 +26,7 @@ import (
 	"time"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/tokenizer"
 )
 
 const hfBase = "https://huggingface.co/openai-community/gpt2/resolve/main/"
@@ -125,8 +126,8 @@ func main() {
 		}
 	}
 
-	var paths [3]string
-	for i, name := range []string{"model.safetensors", "vocab.json", "merges.txt"} {
+	var paths [2]string
+	for i, name := range []string{"model.safetensors", "tokenizer.json"} {
 		p, err := fetch(*dataDir, name)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -135,7 +136,7 @@ func main() {
 		paths[i] = p
 	}
 
-	tok, err := newTokenizer(paths[1], paths[2])
+	tok, err := tokenizer.Load(paths[1])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

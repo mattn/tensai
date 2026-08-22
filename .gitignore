@@ -16,3 +16,4 @@ _example/gpt2/data/
 _example/wgpu/wgpu
 *.exe
 /*.dll
+tokenizer/testdata/
