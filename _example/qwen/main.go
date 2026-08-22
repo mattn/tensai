@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/pprof"
 	"sort"
 	"time"
 
@@ -159,6 +160,7 @@ func main() {
 	seed := flag.Int64("seed", 1, "sampling seed for -temp > 0")
 	q8 := flag.Bool("q8", false, "decode against int8-quantized weights")
 	q4 := flag.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
+	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile of generation to this file")
 	flag.Parse()
 
 	weights, err := fetchWeights(*dataDir)
@@ -213,6 +215,15 @@ func main() {
 	eot, _ := tok.ID("<|endoftext|>")
 	rng := rand.New(rand.NewSource(*seed))
 
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+	}
 	start = time.Now()
 	var logits []float32
 	for pos, id := range ids {

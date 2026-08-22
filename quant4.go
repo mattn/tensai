@@ -96,7 +96,7 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 			len(x), len(out), q.Rows, q.Cols)
 	}
 	half := q.Cols / 2
-	workers := dotWorkerCount(half, q.Rows, 1)
+	workers := matvecWorkerCount(half, q.Rows)
 	run := func(lo, hi int) {
 		q4matvecCols(out, x, q.Q, q.Scale, q.Cols, lo, hi, make([]Float, q.Cols))
 	}
