@@ -342,6 +342,113 @@ fn softmax_last(@builtin(workgroup_id) wid: vec3<u32>,
         sy[base + i] = sy[base + i] / total;
     }
 }
+
+// attn_causal fuses q@k^T, the causal softmax, and the value mix with an
+// online (flash-attention style) softmax, so the scores matrix is never
+// materialized. One 64-lane workgroup handles one (batch*head, query)
+// pair: per 64-wide kv tile the lanes first each compute one score and
+// reduce its max and sum, then switch axes and each accumulate one or two
+// output channels (dh up to 128), rescaling the running state as the max
+// grows. offs (binding 3) holds per-batch*head element offsets
+// (q, kv, out); rows in q, k, v, and out all stride by ap.d, so heads
+// stay packed.
+struct AttnParams {
+    seqQ: u32, seqKV: u32, dh: u32, d: u32,
+    rows: u32, off: u32, pad0: u32, pad1: u32,
+}
+@group(0) @binding(10) var<uniform> ap: AttnParams;
+@group(0) @binding(11) var<storage, read> aq: array<f32>;
+@group(0) @binding(12) var<storage, read> ak: array<f32>;
+@group(0) @binding(13) var<storage, read> av: array<f32>;
+@group(0) @binding(14) var<storage, read_write> aout: array<f32>;
+
+const AT = 64u;
+var<workgroup> qrow: array<f32, 128>;
+var<workgroup> ap_sc: array<f32, 64>;
+var<workgroup> ap_red: array<f32, 64>;
+
+@compute @workgroup_size(64, 1, 1)
+fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>,
+               @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.y * nwg.x + wid.x;
+    if (row >= ap.rows) {
+        return;
+    }
+    let bh = row / ap.seqQ;
+    let qi = row % ap.seqQ;
+    let offQ = offs[bh].x;
+    let offKV = offs[bh].y;
+    let offO = offs[bh].z;
+    let t = lid.x;
+    for (var c = t; c < ap.dh; c = c + 64u) {
+        qrow[c] = aq[offQ + qi * ap.d + c];
+    }
+    workgroupBarrier();
+    let limit = qi + ap.off + 1u;
+    let scale = inverseSqrt(f32(ap.dh));
+    var m = -3.40282e38;
+    var l = 0.0;
+    var acc0 = 0.0;
+    var acc1 = 0.0;
+    let tiles = (limit + AT - 1u) / AT;
+    for (var tt = 0u; tt < tiles; tt = tt + 1u) {
+        // Lane t scores kv position tt*64+t.
+        let j = tt * AT + t;
+        var s = -3.40282e38;
+        if (j < limit) {
+            var dot = 0.0;
+            for (var c = 0u; c < ap.dh; c = c + 1u) {
+                dot = dot + qrow[c] * ak[offKV + j * ap.d + c];
+            }
+            s = dot * scale;
+        }
+        ap_red[t] = s;
+        workgroupBarrier();
+        for (var r = 32u; r > 0u; r = r >> 1u) {
+            if (t < r) { ap_red[t] = max(ap_red[t], ap_red[t + r]); }
+            workgroupBarrier();
+        }
+        let mNew = max(m, ap_red[0]);
+        workgroupBarrier();
+        var p = 0.0;
+        if (j < limit) {
+            p = exp(s - mNew);
+        }
+        ap_sc[t] = p;
+        ap_red[t] = p;
+        workgroupBarrier();
+        for (var r = 32u; r > 0u; r = r >> 1u) {
+            if (t < r) { ap_red[t] = ap_red[t] + ap_red[t + r]; }
+            workgroupBarrier();
+        }
+        let tileSum = ap_red[0];
+        // exp underflows to zero on the first tile, where m is -inf-like.
+        let rescale = exp(m - mNew);
+        l = l * rescale + tileSum;
+        m = mNew;
+        // Lane t now accumulates output channels t and t+64.
+        acc0 = acc0 * rescale;
+        acc1 = acc1 * rescale;
+        let jEnd = min(limit, tt * AT + AT);
+        for (var jj = tt * AT; jj < jEnd; jj = jj + 1u) {
+            let pj = ap_sc[jj - tt * AT];
+            if (t < ap.dh) {
+                acc0 = acc0 + pj * av[offKV + jj * ap.d + t];
+            }
+            if (64u + t < ap.dh) {
+                acc1 = acc1 + pj * av[offKV + jj * ap.d + 64u + t];
+            }
+        }
+        workgroupBarrier();
+    }
+    if (t < ap.dh) {
+        aout[offO + qi * ap.d + t] = acc0 / l;
+    }
+    if (64u + t < ap.dh) {
+        aout[offO + qi * ap.d + 64u + t] = acc1 / l;
+    }
+}
 `
 
 // gpuPipelines holds one compute pipeline (and its auto bind-group layout)
@@ -349,9 +456,9 @@ fn softmax_last(@builtin(workgroup_id) wid: vec3<u32>,
 // struct.
 type gpuPipelines struct {
 	matmul, matmulT, matmulS, matmulTS             uintptr
-	scale, softmax                                 uintptr
+	scale, softmax, attn                           uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
-	layScale, laySoftmax                           uintptr
+	layScale, laySoftmax, layAttn                  uintptr
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -367,6 +474,7 @@ func (g *GPU) initPipelines() error {
 		{&g.pipes.matmulTS, &g.pipes.layMatmulTS, "matmul_ts"},
 		{&g.pipes.scale, &g.pipes.layScale, "scale_ip"},
 		{&g.pipes.softmax, &g.pipes.laySoftmax, "softmax_last"},
+		{&g.pipes.attn, &g.pipes.layAttn, "attn_causal"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -382,7 +490,7 @@ func (g *GPU) initPipelines() error {
 func (g *GPU) releasePipelines() {
 	for _, h := range []uintptr{
 		g.pipes.layMatmul, g.pipes.layMatmulT, g.pipes.layMatmulS,
-		g.pipes.layMatmulTS, g.pipes.layScale, g.pipes.laySoftmax,
+		g.pipes.layMatmulTS, g.pipes.layScale, g.pipes.laySoftmax, g.pipes.layAttn,
 	} {
 		if h != 0 {
 			fnLayoutRelease(h)
@@ -390,7 +498,7 @@ func (g *GPU) releasePipelines() {
 	}
 	for _, h := range []uintptr{
 		g.pipes.matmul, g.pipes.matmulT, g.pipes.matmulS,
-		g.pipes.matmulTS, g.pipes.scale, g.pipes.softmax,
+		g.pipes.matmulTS, g.pipes.scale, g.pipes.softmax, g.pipes.attn,
 	} {
 		if h != 0 {
 			fnPipelineRelease(h)
@@ -908,6 +1016,9 @@ func (q *GPUTensor) multiHeadAttention(k, v *GPUTensor, heads int, causal bool) 
 	batch := prodDims(q.shape[:nq-2])
 	dh := d / heads
 	bh := batch * heads
+	if causal && dh <= 128 {
+		return q.fusedCausalMHA(k, v, heads, batch, seq, seqKV, d, dh, bh)
+	}
 
 	// scores (batch*heads, seq, seqKV) = q_head @ k_head^T, each head a
 	// (seq x dh) sub-matrix with row stride d inside the packed layout.
@@ -953,6 +1064,69 @@ func (q *GPUTensor) multiHeadAttention(k, v *GPUTensor, heads int, causal bool) 
 	outShape := append(append([]int(nil), q.shape[:nq-2]...), seq, d)
 	return q.g.stridedMatMul(weights, v, outShape, false,
 		seq, seqKV, dh, bh, seqKV, d, d, offs2)
+}
+
+// fusedCausalMHA runs causal multi-head attention as one flash-attention
+// style dispatch: the scores matrix is never materialized, so memory use
+// is just q, k, v, and the output, independent of sequence length.
+func (q *GPUTensor) fusedCausalMHA(k, v *GPUTensor, heads, batch, seq, seqKV, d, dh, bh int) (*GPUTensor, error) {
+	offs := make([]uint32, 4*bh)
+	for b := 0; b < batch; b++ {
+		for h := 0; h < heads; h++ {
+			i := b*heads + h
+			offs[4*i] = uint32(b*seq*d + h*dh)
+			offs[4*i+1] = uint32(b*seqKV*d + h*dh)
+			offs[4*i+2] = uint32(b*seq*d + h*dh)
+		}
+	}
+	rows := bh * seq
+	params := [8]uint32{
+		uint32(seq), uint32(seqKV), uint32(dh), uint32(d),
+		uint32(rows), uint32(seqKV - seq), 0, 0,
+	}
+	outShape := append(append([]int(nil), q.shape[:len(q.shape)-2]...), seq, d)
+
+	g := q.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	outBytes := uint64(prodDims(outShape)) * 4
+	if err := g.checkSize(outBytes); err != nil {
+		return nil, err
+	}
+	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
+	bufOffs := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
+	bufOut := g.newBuffer(gpuTensorUsage, outBytes)
+	defer fnBufferRelease(bufParams)
+	defer fnBufferRelease(bufOffs)
+
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
+	fnQueueWriteBuffer(g.queue, bufOffs, 0, unsafe.Pointer(&offs[0]), uintptr(len(offs))*4)
+
+	entries := [6]wgpuBindGroupEntry{
+		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
+		{binding: 10, buffer: bufParams, size: 32},
+		{binding: 11, buffer: q.buf, size: uint64(q.Size()) * 4},
+		{binding: 12, buffer: k.buf, size: uint64(k.Size()) * 4},
+		{binding: 13, buffer: v.buf, size: uint64(v.Size()) * 4},
+		{binding: 14, buffer: bufOut, size: outBytes},
+	}
+	bindGroup := g.makeBindGroup(g.pipes.layAttn, entries[:])
+	runtime.KeepAlive(&entries)
+	defer fnBindGroupRelease(bindGroup)
+
+	x, y := split2D(rows)
+	if err := g.dispatch(g.pipes.attn, bindGroup, x, y, 1); err != nil {
+		fnBufferRelease(bufOut)
+		return nil, err
+	}
+	return &GPUTensor{g: g, buf: bufOut, shape: outShape}, nil
 }
 
 // MatMul is the GPU version of the package-level MatMul: identical shape
