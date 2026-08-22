@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strings"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
@@ -36,7 +37,7 @@ type qmat struct {
 	f    func(x, out []float32) error
 }
 
-func quantize(m *tensai.Matrix, bits int) *qmat {
+func quantizeMat(m *tensai.Matrix, bits int) *qmat {
 	switch bits {
 	case 8:
 		q := tensai.QuantizeMatrix(m)
@@ -86,12 +87,28 @@ func loadConfig(path string) (config, error) {
 	return c, nil
 }
 
-func loadQwen(cfgPath, weightsPath string) (*qwen, error) {
+// weightsFile is the part of safetensors.File and safetensors.Shards the
+// loader needs.
+type weightsFile interface {
+	Tensor(string) (*tensai.Tensor, error)
+	Close() error
+}
+
+// loadQwen reads a checkpoint — a single model.safetensors or a sharded
+// one via its index.json — quantizing each weight to `bits` (0 keeps
+// float32) as it loads, so the full float32 model never has to fit in
+// memory at once.
+func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return nil, err
 	}
-	f, err := safetensors.Open(weightsPath)
+	var f weightsFile
+	if strings.HasSuffix(weightsPath, ".index.json") {
+		f, err = safetensors.OpenSharded(weightsPath)
+	} else {
+		f, err = safetensors.Open(weightsPath)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -105,8 +122,8 @@ func loadQwen(cfgPath, weightsPath string) (*qwen, error) {
 		return t.Data
 	}
 	// HF Linear weights are [out, in]; transpose once so matvec sees
-	// [in, out].
-	lin := func(name string) *tensai.Matrix {
+	// [in, out], then quantize immediately so the float32 copy dies here.
+	linq := func(name string) (*tensai.Matrix, *qmat) {
 		t, err := f.Tensor(name)
 		if err != nil {
 			panic(err)
@@ -115,7 +132,11 @@ func loadQwen(cfgPath, weightsPath string) (*qwen, error) {
 		if err != nil {
 			panic(err)
 		}
-		return m.T()
+		w := m.T()
+		if bits == 0 {
+			return w, nil
+		}
+		return nil, quantizeMat(w, bits)
 	}
 
 	m := &qwen{cfg: cfg, headSz: cfg.HiddenSize / cfg.Heads}
@@ -123,14 +144,19 @@ func loadQwen(cfgPath, weightsPath string) (*qwen, error) {
 	if err != nil {
 		return nil, err
 	}
-	em, err := m.embed.Matrix()
-	if err != nil {
-		return nil, err
-	}
 	if cfg.TieEmbedding {
-		m.lmT = em.T()
+		em, err := m.embed.Matrix()
+		if err != nil {
+			return nil, err
+		}
+		lmT := em.T()
+		if bits == 0 {
+			m.lmT = lmT
+		} else {
+			m.qLmT = quantizeMat(lmT, bits)
+		}
 	} else {
-		m.lmT = lin("lm_head.weight")
+		m.lmT, m.qLmT = linq("lm_head.weight")
 	}
 	m.normW = vec("model.norm.weight")
 	m.blocks = make([]qblock, cfg.Layers)
@@ -139,33 +165,18 @@ func loadQwen(cfgPath, weightsPath string) (*qwen, error) {
 		p := fmt.Sprintf("model.layers.%d.", i)
 		b.ln1 = vec(p + "input_layernorm.weight")
 		b.ln2 = vec(p + "post_attention_layernorm.weight")
-		b.wq, b.bq = lin(p+"self_attn.q_proj.weight"), vec(p+"self_attn.q_proj.bias")
-		b.wk, b.bk = lin(p+"self_attn.k_proj.weight"), vec(p+"self_attn.k_proj.bias")
-		b.wv, b.bv = lin(p+"self_attn.v_proj.weight"), vec(p+"self_attn.v_proj.bias")
-		b.wo = lin(p + "self_attn.o_proj.weight")
-		b.wGate = lin(p + "mlp.gate_proj.weight")
-		b.wUp = lin(p + "mlp.up_proj.weight")
-		b.wDown = lin(p + "mlp.down_proj.weight")
+		b.wq, b.qq = linq(p + "self_attn.q_proj.weight")
+		b.bq = vec(p + "self_attn.q_proj.bias")
+		b.wk, b.qk = linq(p + "self_attn.k_proj.weight")
+		b.bk = vec(p + "self_attn.k_proj.bias")
+		b.wv, b.qv = linq(p + "self_attn.v_proj.weight")
+		b.bv = vec(p + "self_attn.v_proj.bias")
+		b.wo, b.qo = linq(p + "self_attn.o_proj.weight")
+		b.wGate, b.qGate = linq(p + "mlp.gate_proj.weight")
+		b.wUp, b.qUp = linq(p + "mlp.up_proj.weight")
+		b.wDown, b.qDown = linq(p + "mlp.down_proj.weight")
 	}
 	return m, nil
-}
-
-// quantize builds int8 or int4 twins of every matvec weight and frees the
-// float32 originals — decode never touches them again, and on larger
-// models the ~4x memory drop is the difference between RAM and swap.
-func (m *qwen) quantize(bits int) {
-	m.qLmT = quantize(m.lmT, bits)
-	m.lmT = nil
-	for i := range m.blocks {
-		b := &m.blocks[i]
-		b.qq, b.wq = quantize(b.wq, bits), nil
-		b.qk, b.wk = quantize(b.wk, bits), nil
-		b.qv, b.wv = quantize(b.wv, bits), nil
-		b.qo, b.wo = quantize(b.wo, bits), nil
-		b.qGate, b.wGate = quantize(b.wGate, bits), nil
-		b.qUp, b.wUp = quantize(b.wUp, bits), nil
-		b.qDown, b.wDown = quantize(b.wDown, bits), nil
-	}
 }
 
 func rmsnorm(x, w []float32, eps float64) []float32 {

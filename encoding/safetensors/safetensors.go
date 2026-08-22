@@ -19,6 +19,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
 
 	tensai "github.com/mattn/tensai"
@@ -294,6 +295,87 @@ func Save(w io.Writer, tensors map[string]*tensai.Tensor, meta map[string]string
 		}
 	}
 	return nil
+}
+
+// Shards is a checkpoint split across several safetensors files, as
+// described by a model.safetensors.index.json. It offers the same lazy
+// per-tensor access as File.
+type Shards struct {
+	files  map[string]*File // shard filename -> open file
+	byName map[string]*File // tensor name -> its shard
+	names  []string
+}
+
+// OpenSharded opens a sharded checkpoint via its index file (typically
+// model.safetensors.index.json); shard files are resolved relative to it.
+// Close the returned Shards when done.
+func OpenSharded(indexPath string) (*Shards, error) {
+	raw, err := os.ReadFile(indexPath)
+	if err != nil {
+		return nil, err
+	}
+	var idx struct {
+		WeightMap map[string]string `json:"weight_map"`
+	}
+	if err := json.Unmarshal(raw, &idx); err != nil {
+		return nil, fmt.Errorf("safetensors: parsing index: %w", err)
+	}
+	if len(idx.WeightMap) == 0 {
+		return nil, fmt.Errorf("safetensors: index has no weight_map")
+	}
+	dir := filepath.Dir(indexPath)
+	s := &Shards{files: map[string]*File{}, byName: map[string]*File{}}
+	for name, shard := range idx.WeightMap {
+		f, ok := s.files[shard]
+		if !ok {
+			f, err = Open(filepath.Join(dir, shard))
+			if err != nil {
+				s.Close()
+				return nil, err
+			}
+			s.files[shard] = f
+		}
+		if _, _, ok := f.Info(name); !ok {
+			s.Close()
+			return nil, fmt.Errorf("safetensors: index maps %q to %s, which lacks it", name, shard)
+		}
+		s.byName[name] = f
+		s.names = append(s.names, name)
+	}
+	sort.Strings(s.names)
+	return s, nil
+}
+
+// Close closes every shard.
+func (s *Shards) Close() error {
+	var first error
+	for _, f := range s.files {
+		if err := f.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// Names lists the tensor names, sorted.
+func (s *Shards) Names() []string { return append([]string(nil), s.names...) }
+
+// Info reports a tensor's dtype and shape without loading its data.
+func (s *Shards) Info(name string) (dtype string, shape []int, ok bool) {
+	f, found := s.byName[name]
+	if !found {
+		return "", nil, false
+	}
+	return f.Info(name)
+}
+
+// Tensor loads one tensor from its shard.
+func (s *Shards) Tensor(name string) (*tensai.Tensor, error) {
+	f, ok := s.byName[name]
+	if !ok {
+		return nil, fmt.Errorf("safetensors: no tensor %q", name)
+	}
+	return f.Tensor(name)
 }
 
 // SaveFile writes tensors to path via Save.
