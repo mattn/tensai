@@ -30,13 +30,34 @@ type config struct {
 	ModelType    string  `json:"model_type"`
 }
 
+// qmat abstracts the int8 and int4 twins behind one matvec call.
+type qmat struct {
+	cols int
+	f    func(x, out []float32) error
+}
+
+func quantize(m *tensai.Matrix, bits int) *qmat {
+	switch bits {
+	case 8:
+		q := tensai.QuantizeMatrix(m)
+		return &qmat{cols: q.Cols, f: q.MatVec}
+	case 4:
+		q, err := tensai.QuantizeMatrix4(m)
+		if err != nil {
+			panic(err)
+		}
+		return &qmat{cols: q.Cols, f: q.MatVec}
+	}
+	panic("unsupported quantization width")
+}
+
 type qblock struct {
 	ln1, ln2          []float32
 	wq, wk, wv, wo    *tensai.Matrix // [in, out] after transposing HF's [out, in]
 	bq, bk, bv        []float32
 	wGate, wUp, wDown *tensai.Matrix
-	qq, qk, qv, qo    *tensai.QMatrix
-	qGate, qUp, qDown *tensai.QMatrix
+	qq, qk, qv, qo    *qmat
+	qGate, qUp, qDown *qmat
 	kc, vc            [][]float32 // KV cache, kvHeads*headDim per position
 }
 
@@ -45,7 +66,7 @@ type qwen struct {
 	headSz int
 	embed  *tensai.Tensor // [vocab, hidden]
 	lmT    *tensai.Matrix // [hidden, vocab]
-	qLmT   *tensai.QMatrix
+	qLmT   *qmat
 	normW  []float32
 	blocks []qblock
 }
@@ -129,18 +150,21 @@ func loadQwen(cfgPath, weightsPath string) (*qwen, error) {
 	return m, nil
 }
 
-// quantize builds int8 twins of every matvec weight.
-func (m *qwen) quantize() {
-	m.qLmT = tensai.QuantizeMatrix(m.lmT)
+// quantize builds int8 or int4 twins of every matvec weight and frees the
+// float32 originals — decode never touches them again, and on larger
+// models the ~4x memory drop is the difference between RAM and swap.
+func (m *qwen) quantize(bits int) {
+	m.qLmT = quantize(m.lmT, bits)
+	m.lmT = nil
 	for i := range m.blocks {
 		b := &m.blocks[i]
-		b.qq = tensai.QuantizeMatrix(b.wq)
-		b.qk = tensai.QuantizeMatrix(b.wk)
-		b.qv = tensai.QuantizeMatrix(b.wv)
-		b.qo = tensai.QuantizeMatrix(b.wo)
-		b.qGate = tensai.QuantizeMatrix(b.wGate)
-		b.qUp = tensai.QuantizeMatrix(b.wUp)
-		b.qDown = tensai.QuantizeMatrix(b.wDown)
+		b.qq, b.wq = quantize(b.wq, bits), nil
+		b.qk, b.wk = quantize(b.wk, bits), nil
+		b.qv, b.wv = quantize(b.wv, bits), nil
+		b.qo, b.wo = quantize(b.wo, bits), nil
+		b.qGate, b.wGate = quantize(b.wGate, bits), nil
+		b.qUp, b.wUp = quantize(b.wUp, bits), nil
+		b.qDown, b.wDown = quantize(b.wDown, bits), nil
 	}
 }
 
@@ -157,12 +181,12 @@ func rmsnorm(x, w []float32, eps float64) []float32 {
 	return out
 }
 
-// mv computes x @ W (+ bias), on the int8 twin when it exists.
-func mv(x []float32, w *tensai.Matrix, q *tensai.QMatrix, bias []float32) []float32 {
+// mv computes x @ W (+ bias), on the quantized twin when it exists.
+func mv(x []float32, w *tensai.Matrix, q *qmat, bias []float32) []float32 {
 	var out []float32
 	if q != nil {
-		out = make([]float32, q.Cols)
-		if err := q.MatVec(x, out); err != nil {
+		out = make([]float32, q.cols)
+		if err := q.f(x, out); err != nil {
 			panic(err)
 		}
 	} else {

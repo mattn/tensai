@@ -109,6 +109,7 @@ func main() {
 	temp := flag.Float64("temp", 0, "sampling temperature; 0 = greedy")
 	seed := flag.Int64("seed", 1, "sampling seed for -temp > 0")
 	q8 := flag.Bool("q8", false, "decode against int8-quantized weights")
+	q4 := flag.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
 	flag.Parse()
 
 	var paths [3]string
@@ -132,13 +133,16 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "loaded %s (%d layers, hidden %d) in %v\n",
-		"qwen2.5-0.5b-instruct", model.cfg.Layers, model.cfg.HiddenSize,
-		time.Since(start).Round(time.Millisecond))
-	if *q8 {
+	fmt.Fprintf(os.Stderr, "loaded qwen2 (%d layers, hidden %d) in %v\n",
+		model.cfg.Layers, model.cfg.HiddenSize, time.Since(start).Round(time.Millisecond))
+	if *q8 || *q4 {
+		bits := 8
+		if *q4 {
+			bits = 4
+		}
 		start = time.Now()
-		model.quantize()
-		fmt.Fprintf(os.Stderr, "quantized to int8 in %v\n", time.Since(start).Round(time.Millisecond))
+		model.quantize(bits)
+		fmt.Fprintf(os.Stderr, "quantized to int%d in %v\n", bits, time.Since(start).Round(time.Millisecond))
 	}
 
 	text := *prompt
