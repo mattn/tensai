@@ -44,6 +44,7 @@ type GPU struct {
 	queue      uintptr
 	module     uintptr
 	pipes      gpuPipelines
+	readback   gpuReadbackBuffer
 	name       string
 	maxStorage uint64 // usable bytes per storage buffer, 0 = unknown
 	closed     bool
@@ -576,6 +577,7 @@ func (g *GPU) Close() {
 		return
 	}
 	g.closed = true
+	g.releaseReadback()
 	g.releasePipelines()
 	for _, r := range []struct {
 		fn func(uintptr)
