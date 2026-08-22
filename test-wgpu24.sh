@@ -58,6 +58,9 @@ export LD_LIBRARY_PATH=$DZN_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 echo "ok"
 
 export TENSAI_WGPU_LIB=$WGPU29
+# dzn warns "not a conformant Vulkan implementation" on every instance;
+# that is expected here, so keep the output clean.
+export MESA_VK_IGNORE_CONFORMANCE_WARNING=1
 
 # -count=1: VK_DRIVER_FILES is read by the C library, not by Go, so the
 # test cache cannot tell runs on different Vulkan drivers apart.
