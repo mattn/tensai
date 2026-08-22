@@ -23,6 +23,7 @@
 - **Serialization** - `Save`/`Load` (and `SaveFile`/`LoadFile`) round-trip trained Sequential parameters as JSON, including BatchNorm running statistics; `SaveParams`/`LoadParams` do the same for autograd parameters (RNN/LSTM/attention cells)
 - **TFLite export** - the `encoding/tflite` package marshals Sequential models (FP32, NHWC) into `.tflite` flatbuffers that run on the TFLite/LiteRT runtimes and [go-tflite](https://github.com/mattn/go-tflite), with the FlatBuffers writer implemented in-tree — still no dependencies
 - **safetensors** - `encoding/safetensors` reads the checkpoint format most published model weights ship in — lazily, one tensor at a time, with F16/BF16/F64 converted to float32 — and writes F32 checkpoints; interoperability is verified against the reference implementation in both directions. Also dependency-free
+- **ONNX export** - `encoding/onnx` marshals Sequential models into ONNX (opset 13, FP32) with a hand-written protobuf encoder; onnxruntime reproduces `Predict` to ~1e-7 relative error. ONNX convolutions are NCHW, which is tensai's own row layout, so nothing is reordered
 
 ## Layout
 
@@ -134,6 +135,16 @@ model.LoadFile("model.json")
 `Conv2D` and `MaxPool2D` treat each row as a channel-major image: `index = (channel*height + y)*width + x`. `Dropout` and `BatchNorm` switch automatically between training behavior (inside `Fit`/`FitStep`) and inference behavior (inside `Predict`).
 
 `Embedding` keeps the current matrix-only API: each input row is a token-id sequence, and the layer concatenates the looked-up embedding vectors across columns. For example, `Compile(4, ...)` plus `NewEmbedding(vocab, 8)` turns an `Mx4` token-id matrix into an `Mx32` dense feature matrix that can feed `LayerNorm`, `GELU`, and `Dense`.
+
+### ONNX export
+
+```go
+import tensaionnx "github.com/mattn/tensai/encoding/onnx"
+
+err := tensaionnx.MarshalFile("model.onnx", model)
+```
+
+Same layer support as the TFLite export (Dense, Conv2D, MaxPool2D, BatchNorm folded to Mul+Add, Dropout dropped, Softmax on dense features, and the ReLU/LeakyReLU/Sigmoid/Tanh activations), but no layout gotcha: ONNX convolutions are NCHW, which is exactly tensai's channel-major row layout, so the exported model consumes the same flattened rows tensai does, as a `[1, C, H, W]` tensor. Verified against onnxruntime to ~1e-7 relative error (see `encoding/onnx/verify_onnxruntime.py`).
 
 ### TFLite export
 
