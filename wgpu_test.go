@@ -463,6 +463,150 @@ func TestGPUMultiHeadAttention(t *testing.T) {
 	}
 }
 
+// cpuCausalAttention is single-head causal attention on the CPU: query i
+// attends to key positions 0..i+(seqKV-seqQ).
+func cpuCausalAttention(t *testing.T, q, k, v *Tensor) *Tensor {
+	t.Helper()
+	seq, d := q.Shape[0], q.Shape[1]
+	seqKV := k.Shape[0]
+	out := NewTensor(seq, d)
+	scores := make([]float64, seqKV)
+	for i := 0; i < seq; i++ {
+		limit := i + seqKV - seq + 1
+		maxs := math.Inf(-1)
+		for j := 0; j < limit; j++ {
+			var s float64
+			for c := 0; c < d; c++ {
+				s += float64(q.Data[i*d+c]) * float64(k.Data[j*d+c])
+			}
+			s /= math.Sqrt(float64(d))
+			scores[j] = s
+			if s > maxs {
+				maxs = s
+			}
+		}
+		var sum float64
+		for j := 0; j < limit; j++ {
+			scores[j] = math.Exp(scores[j] - maxs)
+			sum += scores[j]
+		}
+		for j := 0; j < limit; j++ {
+			p := float32(scores[j] / sum)
+			for c := 0; c < d; c++ {
+				out.Data[i*d+c] += p * v.Data[j*d+c]
+			}
+		}
+	}
+	return out
+}
+
+func TestGPUCausalAttention(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(19))
+
+	// Prefill shape: seqQ == seqKV, single head.
+	q, k, v := randTensor(rng, 6, 8), randTensor(rng, 6, 8), randTensor(rng, 6, 8)
+	gq, _ := g.Upload(q)
+	gk, _ := g.Upload(k)
+	gv, _ := g.Upload(v)
+	defer gq.Free()
+	defer gk.Free()
+	defer gv.Free()
+	out, err := gq.CausalAttention(gk, gv)
+	if err != nil {
+		t.Fatalf("causal attention: %v", err)
+	}
+	defer out.Free()
+	got, err := out.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := cpuCausalAttention(t, q, k, v)
+	for i := range want.Data {
+		if diff := math.Abs(float64(got.Data[i] - want.Data[i])); diff > 1e-4 {
+			t.Fatalf("element %d: gpu=%v cpu=%v", i, got.Data[i], want.Data[i])
+		}
+	}
+
+	// Chunked decode: 3 fresh queries against 7 cached positions.
+	q2, k2, v2 := randTensor(rng, 3, 8), randTensor(rng, 7, 8), randTensor(rng, 7, 8)
+	gq2, _ := g.Upload(q2)
+	gk2, _ := g.Upload(k2)
+	gv2, _ := g.Upload(v2)
+	defer gq2.Free()
+	defer gk2.Free()
+	defer gv2.Free()
+	out2, err := gq2.CausalAttention(gk2, gv2)
+	if err != nil {
+		t.Fatalf("causal attention kv>q: %v", err)
+	}
+	defer out2.Free()
+	got2, err := out2.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want2 := cpuCausalAttention(t, q2, k2, v2)
+	for i := range want2.Data {
+		if diff := math.Abs(float64(got2.Data[i] - want2.Data[i])); diff > 1e-4 {
+			t.Fatalf("kv>q element %d: gpu=%v cpu=%v", i, got2.Data[i], want2.Data[i])
+		}
+	}
+
+	if _, err := gq2.CausalAttention(gq2, gq2); err != nil {
+		t.Fatalf("seqKV == seqQ must be accepted: %v", err)
+	}
+	if _, err := gk2.CausalAttention(gq2, gq2); err == nil {
+		t.Fatal("expected error for seqKV < seqQ")
+	}
+}
+
+func TestGPUCausalMultiHead(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(20))
+
+	const seq, seqKV, heads, dh = 5, 9, 3, 4
+	const d = heads * dh
+	q, k, v := randTensor(rng, seq, d), randTensor(rng, seqKV, d), randTensor(rng, seqKV, d)
+	gq, _ := g.Upload(q)
+	gk, _ := g.Upload(k)
+	gv, _ := g.Upload(v)
+	defer gq.Free()
+	defer gk.Free()
+	defer gv.Free()
+	out, err := gq.CausalMultiHeadAttention(gk, gv, heads)
+	if err != nil {
+		t.Fatalf("causal mha: %v", err)
+	}
+	defer out.Free()
+	got, err := out.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Reference: slice heads out, run single-head causal attention.
+	want := NewTensor(seq, d)
+	for h := 0; h < heads; h++ {
+		slice := func(x *Tensor, rows int) *Tensor {
+			s := NewTensor(rows, dh)
+			for r := 0; r < rows; r++ {
+				copy(s.Data[r*dh:(r+1)*dh], x.Data[r*d+h*dh:r*d+(h+1)*dh])
+			}
+			return s
+		}
+		ho := cpuCausalAttention(t, slice(q, seq), slice(k, seqKV), slice(v, seqKV))
+		for r := 0; r < seq; r++ {
+			copy(want.Data[r*d+h*dh:r*d+(h+1)*dh], ho.Data[r*dh:(r+1)*dh])
+		}
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(got.Data[i] - want.Data[i])); diff > 1e-4 {
+			t.Fatalf("element %d: gpu=%v cpu=%v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
 func TestGPUDispatch2D(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()

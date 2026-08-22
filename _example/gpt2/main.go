@@ -24,6 +24,8 @@ import (
 	"path/filepath"
 	"sort"
 	"time"
+
+	tensai "github.com/mattn/tensai"
 )
 
 const hfBase = "https://huggingface.co/openai-community/gpt2/resolve/main/"
@@ -107,7 +109,20 @@ func main() {
 	n := flag.Int("n", 40, "tokens to generate")
 	temp := flag.Float64("temp", 0, "sampling temperature; 0 = greedy")
 	seed := flag.Int64("seed", 1, "sampling seed for -temp > 0")
+	useGPU := flag.Bool("gpu", false, "run prompt-prefill attention on the GPU (build with -tags wgpu or wgpu24)")
 	flag.Parse()
+
+	var gpu *tensai.GPU
+	if *useGPU {
+		g, err := tensai.OpenGPU()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "gpu unavailable, using cpu: %v\n", err)
+		} else {
+			defer g.Close()
+			fmt.Fprintf(os.Stderr, "gpu: %s\n", g.Name())
+			gpu = g
+		}
+	}
 
 	var paths [3]string
 	for i, name := range []string{"model.safetensors", "vocab.json", "merges.txt"} {
@@ -142,10 +157,8 @@ func main() {
 
 	fmt.Print(*prompt)
 	start = time.Now()
-	var logits []float32
-	for pos, id := range ids {
-		logits = model.step(id, pos)
-	}
+	logits := model.prefill(ids, gpu)
+	fmt.Fprintf(os.Stderr, "prefill: %d tokens in %v\n", len(ids), time.Since(start).Round(time.Millisecond))
 	steps := len(ids)
 	for i := 0; i < *n && steps < nCtx; i++ {
 		next := sample(logits, *temp, rng)

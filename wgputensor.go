@@ -283,7 +283,7 @@ fn scale_ip(@builtin(workgroup_id) wg: vec3<u32>,
     }
 }
 
-struct SoftParams { rows: u32, cols: u32 }
+struct SoftParams { rows: u32, cols: u32, qmod: u32, off: u32 }
 @group(0) @binding(7) var<uniform> sp: SoftParams;
 @group(0) @binding(8) var<storage, read> sx: array<f32>;
 @group(0) @binding(9) var<storage, read_write> sy: array<f32>;
@@ -302,8 +302,16 @@ fn softmax_last(@builtin(workgroup_id) wid: vec3<u32>,
         return;
     }
     let base = row * sp.cols;
+    // Causal masking: with qmod > 0, row's query index is row % qmod and
+    // it may attend to the first (query index + off + 1) columns; the rest
+    // get probability zero. limit is workgroup-uniform, so the barriers
+    // below stay in uniform control flow.
+    var limit = sp.cols;
+    if (sp.qmod > 0u) {
+        limit = min(sp.cols, (row % sp.qmod) + sp.off + 1u);
+    }
     var m = -3.40282e38;
-    for (var i = lid.x; i < sp.cols; i = i + 256u) {
+    for (var i = lid.x; i < limit; i = i + 256u) {
         m = max(m, sx[base + i]);
     }
     red[lid.x] = m;
@@ -315,10 +323,13 @@ fn softmax_last(@builtin(workgroup_id) wid: vec3<u32>,
     let rowMax = red[0];
     workgroupBarrier();
     var sum = 0.0;
-    for (var i = lid.x; i < sp.cols; i = i + 256u) {
+    for (var i = lid.x; i < limit; i = i + 256u) {
         let e = exp(sx[base + i] - rowMax);
         sy[base + i] = e;
         sum = sum + e;
+    }
+    for (var i = limit + lid.x; i < sp.cols; i = i + 256u) {
+        sy[base + i] = 0.0;
     }
     red[lid.x] = sum;
     workgroupBarrier();
@@ -327,7 +338,7 @@ fn softmax_last(@builtin(workgroup_id) wid: vec3<u32>,
         workgroupBarrier();
     }
     let total = red[0];
-    for (var i = lid.x; i < sp.cols; i = i + 256u) {
+    for (var i = lid.x; i < limit; i = i + 256u) {
         sy[base + i] = sy[base + i] / total;
     }
 }
@@ -757,6 +768,13 @@ func (t *GPUTensor) Scale(s Float) error {
 // Softmax applies a numerically stable softmax over the last axis,
 // returning a new GPU-resident tensor.
 func (t *GPUTensor) Softmax() (*GPUTensor, error) {
+	return t.softmax(0, 0)
+}
+
+// softmax optionally applies a causal mask: with qmod > 0, row r is query
+// index r%qmod and attends to the first r%qmod+off+1 columns; masked
+// columns come out as exactly zero.
+func (t *GPUTensor) softmax(qmod, off int) (*GPUTensor, error) {
 	if t.freed {
 		return nil, errors.New("tensai: gpu tensor already freed")
 	}
@@ -776,7 +794,7 @@ func (t *GPUTensor) Softmax() (*GPUTensor, error) {
 	uncapturedCB = ""
 
 	bytes := uint64(t.Size()) * 4
-	params := [4]uint32{uint32(rows), uint32(cols)}
+	params := [4]uint32{uint32(rows), uint32(cols), uint32(qmod), uint32(off)}
 	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
 	bufOut := g.newBuffer(gpuTensorUsage, bytes)
 	defer fnBufferRelease(bufParams)
@@ -803,18 +821,40 @@ func (t *GPUTensor) Softmax() (*GPUTensor, error) {
 // entirely on the GPU — the resident counterpart of the autograd Attention.
 // q, k, v are (batch..., seqLen, d) tensors; nothing touches host memory.
 func (q *GPUTensor) Attention(k, v *GPUTensor) (*GPUTensor, error) {
-	if len(q.shape) < 2 {
+	return q.attention(k, v, false)
+}
+
+// CausalAttention is Attention with a causal mask: query i attends only to
+// key positions 0..i+(seqKV-seqQ), so k and v may hold seqKV >= seqQ
+// positions with the queries aligned to their end — the prompt-prefill
+// pattern of autoregressive models.
+func (q *GPUTensor) CausalAttention(k, v *GPUTensor) (*GPUTensor, error) {
+	return q.attention(k, v, true)
+}
+
+func (q *GPUTensor) attention(k, v *GPUTensor, causal bool) (*GPUTensor, error) {
+	nq := len(q.shape)
+	if nq < 2 {
 		return nil, fmt.Errorf("tensai: attention needs at least 2 axes: %v", q.shape)
+	}
+	seq := q.shape[nq-2]
+	seqKV := k.shape[len(k.shape)-2]
+	if causal && seqKV < seq {
+		return nil, fmt.Errorf("tensai: causal attention needs seqKV >= seqQ, got %d < %d", seqKV, seq)
 	}
 	scores, err := q.MatMulT(k)
 	if err != nil {
 		return nil, err
 	}
 	defer scores.Free()
-	if err := scores.Scale(1 / sqrtF(Float(q.shape[len(q.shape)-1]))); err != nil {
+	if err := scores.Scale(1 / sqrtF(Float(q.shape[nq-1]))); err != nil {
 		return nil, err
 	}
-	weights, err := scores.Softmax()
+	qmod, off := 0, 0
+	if causal {
+		qmod, off = seq, seqKV-seq
+	}
+	weights, err := scores.softmax(qmod, off)
 	if err != nil {
 		return nil, err
 	}
@@ -828,6 +868,18 @@ func (q *GPUTensor) Attention(k, v *GPUTensor) (*GPUTensor, error) {
 // the result is (batch..., seqQ, d). Heads are carved out of the packed
 // layout with strided kernels, so no permute is ever materialized.
 func (q *GPUTensor) MultiHeadAttention(k, v *GPUTensor, heads int) (*GPUTensor, error) {
+	return q.multiHeadAttention(k, v, heads, false)
+}
+
+// CausalMultiHeadAttention is MultiHeadAttention with a causal mask: query
+// i attends only to key positions 0..i+(seqKV-seqQ), so k and v may hold
+// seqKV >= seqQ positions with the queries aligned to their end — the
+// prompt-prefill pattern of autoregressive models.
+func (q *GPUTensor) CausalMultiHeadAttention(k, v *GPUTensor, heads int) (*GPUTensor, error) {
+	return q.multiHeadAttention(k, v, heads, true)
+}
+
+func (q *GPUTensor) multiHeadAttention(k, v *GPUTensor, heads int, causal bool) (*GPUTensor, error) {
 	if q.freed || k.freed || v.freed {
 		return nil, errors.New("tensai: gpu tensor already freed")
 	}
@@ -850,6 +902,9 @@ func (q *GPUTensor) MultiHeadAttention(k, v *GPUTensor, heads int) (*GPUTensor, 
 	}
 	seq := q.shape[nq-2]
 	seqKV := k.shape[nq-2]
+	if causal && seqKV < seq {
+		return nil, fmt.Errorf("tensai: causal attention needs seqKV >= seqQ, got %d < %d", seqKV, seq)
+	}
 	batch := prodDims(q.shape[:nq-2])
 	dh := d / heads
 	bh := batch * heads
@@ -874,7 +929,11 @@ func (q *GPUTensor) MultiHeadAttention(k, v *GPUTensor, heads int) (*GPUTensor, 
 	if err := scores.Scale(1 / sqrtF(Float(dh))); err != nil {
 		return nil, err
 	}
-	weights, err := scores.Softmax()
+	qmod, off := 0, 0
+	if causal {
+		qmod, off = seq, seqKV-seq
+	}
+	weights, err := scores.softmax(qmod, off)
 	if err != nil {
 		return nil, err
 	}
