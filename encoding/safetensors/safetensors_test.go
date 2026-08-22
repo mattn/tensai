@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"math"
 	"math/rand"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -136,6 +137,68 @@ func TestDtypeConversions(t *testing.T) {
 	}
 	if len(d.Data) != 1 || math.Abs(float64(d.Data[0])-math.Pi) > 1e-7 {
 		t.Fatalf("f64 scalar: %v", d.Data)
+	}
+}
+
+func TestSharded(t *testing.T) {
+	rng := rand.New(rand.NewSource(2))
+	dir := t.TempDir()
+	mk := func(shape ...int) *tensai.Tensor {
+		x := tensai.NewTensor(shape...)
+		for i := range x.Data {
+			x.Data[i] = float32(rng.NormFloat64())
+		}
+		return x
+	}
+	a, b, c := mk(4, 6), mk(3), mk(2, 2, 2)
+	if err := SaveFile(filepath.Join(dir, "model-00001-of-00002.safetensors"),
+		map[string]*tensai.Tensor{"layer.a": a, "layer.b": b}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveFile(filepath.Join(dir, "model-00002-of-00002.safetensors"),
+		map[string]*tensai.Tensor{"layer.c": c}, nil); err != nil {
+		t.Fatal(err)
+	}
+	index := []byte(`{"metadata": {"total_size": 1}, "weight_map": {
+		"layer.a": "model-00001-of-00002.safetensors",
+		"layer.b": "model-00001-of-00002.safetensors",
+		"layer.c": "model-00002-of-00002.safetensors"}}`)
+	idxPath := filepath.Join(dir, "model.safetensors.index.json")
+	if err := os.WriteFile(idxPath, index, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := OpenSharded(idxPath)
+	if err != nil {
+		t.Fatalf("open sharded: %v", err)
+	}
+	defer s.Close()
+	if got := s.Names(); len(got) != 3 || got[0] != "layer.a" || got[2] != "layer.c" {
+		t.Fatalf("names: %v", got)
+	}
+	if _, shape, ok := s.Info("layer.c"); !ok || len(shape) != 3 {
+		t.Fatalf("info: %v %v", shape, ok)
+	}
+	for name, want := range map[string]*tensai.Tensor{"layer.a": a, "layer.b": b, "layer.c": c} {
+		got, err := s.Tensor(name)
+		if err != nil {
+			t.Fatalf("tensor %q: %v", name, err)
+		}
+		for i := range want.Data {
+			if got.Data[i] != want.Data[i] {
+				t.Fatalf("tensor %q element %d differs", name, i)
+			}
+		}
+	}
+	if _, err := s.Tensor("missing"); err == nil {
+		t.Fatal("expected error for missing tensor")
+	}
+
+	bad := []byte(`{"weight_map": {"layer.x": "model-00001-of-00002.safetensors"}}`)
+	badPath := filepath.Join(dir, "bad.index.json")
+	os.WriteFile(badPath, bad, 0o644)
+	if _, err := OpenSharded(badPath); err == nil {
+		t.Fatal("expected error for tensor missing from its shard")
 	}
 }
 

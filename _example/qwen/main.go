@@ -13,6 +13,7 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -60,6 +61,54 @@ func fetch(dir, name string) (string, error) {
 		return "", err
 	}
 	return path, os.Rename(tmp, path)
+}
+
+// fetchWeights returns the checkpoint path: a plain model.safetensors, or
+// for sharded models the index file after downloading every shard.
+func fetchWeights(dir string) (string, error) {
+	if p := filepath.Join(dir, "model.safetensors"); exists(p) {
+		return p, nil
+	}
+	idx := filepath.Join(dir, "model.safetensors.index.json")
+	if !exists(idx) {
+		// Try the single file first; fall back to the sharded index.
+		if p, err := fetch(dir, "model.safetensors"); err == nil {
+			return p, nil
+		}
+		if _, err := fetch(dir, "model.safetensors.index.json"); err != nil {
+			return "", err
+		}
+	}
+	raw, err := os.ReadFile(idx)
+	if err != nil {
+		return "", err
+	}
+	var parsed struct {
+		WeightMap map[string]string `json:"weight_map"`
+	}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return "", err
+	}
+	shards := map[string]bool{}
+	for _, s := range parsed.WeightMap {
+		shards[s] = true
+	}
+	names := make([]string, 0, len(shards))
+	for s := range shards {
+		names = append(names, s)
+	}
+	sort.Strings(names)
+	for _, s := range names {
+		if _, err := fetch(dir, s); err != nil {
+			return "", err
+		}
+	}
+	return idx, nil
+}
+
+func exists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }
 
 func sample(logits []float32, temp float64, rng *rand.Rand) int {
@@ -112,8 +161,13 @@ func main() {
 	q4 := flag.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
 	flag.Parse()
 
-	var paths [3]string
-	for i, name := range []string{"model.safetensors", "tokenizer.json", "config.json"} {
+	weights, err := fetchWeights(*dataDir)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	var paths [2]string
+	for i, name := range []string{"tokenizer.json", "config.json"} {
 		p, err := fetch(*dataDir, name)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -122,28 +176,30 @@ func main() {
 		paths[i] = p
 	}
 
-	tok, err := tokenizer.Load(paths[1])
+	tok, err := tokenizer.Load(paths[0])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+	bits := 0
+	if *q8 {
+		bits = 8
+	}
+	if *q4 {
+		bits = 4
 	}
 	start := time.Now()
-	model, err := loadQwen(paths[2], paths[0])
+	model, err := loadQwen(paths[1], weights, bits)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "loaded qwen2 (%d layers, hidden %d) in %v\n",
-		model.cfg.Layers, model.cfg.HiddenSize, time.Since(start).Round(time.Millisecond))
-	if *q8 || *q4 {
-		bits := 8
-		if *q4 {
-			bits = 4
-		}
-		start = time.Now()
-		model.quantize(bits)
-		fmt.Fprintf(os.Stderr, "quantized to int%d in %v\n", bits, time.Since(start).Round(time.Millisecond))
+	how := "float32"
+	if bits != 0 {
+		how = fmt.Sprintf("int%d", bits)
 	}
+	fmt.Fprintf(os.Stderr, "loaded qwen2 (%d layers, hidden %d) as %s in %v\n",
+		model.cfg.Layers, model.cfg.HiddenSize, how, time.Since(start).Round(time.Millisecond))
 
 	text := *prompt
 	if !*raw {
