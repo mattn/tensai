@@ -110,6 +110,7 @@ func main() {
 	temp := flag.Float64("temp", 0, "sampling temperature; 0 = greedy")
 	seed := flag.Int64("seed", 1, "sampling seed for -temp > 0")
 	useGPU := flag.Bool("gpu", false, "run prompt-prefill attention on the GPU (build with -tags wgpu or wgpu24)")
+	q8 := flag.Bool("q8", false, "decode against int8-quantized weights (weight-only, per-column scales)")
 	flag.Parse()
 
 	var gpu *tensai.GPU
@@ -146,6 +147,11 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "loaded gpt2 (124M) in %v\n", time.Since(start).Round(time.Millisecond))
+	if *q8 {
+		start = time.Now()
+		model.quantize()
+		fmt.Fprintf(os.Stderr, "quantized decode weights to int8 in %v\n", time.Since(start).Round(time.Millisecond))
+	}
 
 	ids := tok.Encode(*prompt)
 	if len(ids) == 0 || len(ids) >= nCtx {
