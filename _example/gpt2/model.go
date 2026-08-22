@@ -30,14 +30,50 @@ type block struct {
 	attnB, projB           []float32
 	fcB, fc2B              []float32
 	kc, vc                 [][]float32 // KV cache, one [768] per position
+
+	// int8 twins of the four weight matrices, used by decode when -q8.
+	qAttnW, qProjW, qFcW, qFc2W *tensai.QMatrix
 }
 
 type gpt2 struct {
 	wte, wpe   *tensai.Tensor // [50257,768], [1024,768]
 	wteT       *tensai.Matrix // [768,50257], for the tied lm head
+	qWteT      *tensai.QMatrix
 	lnfW, lnfB []float32
 	blocks     [nLayer]block
 	vocab      int
+}
+
+// quantize builds int8 twins of every decode-path weight. Prefill keeps
+// the float32 originals: it is one batched pass where the matmuls are
+// compute bound, while decode streams the whole checkpoint per token and
+// is bandwidth bound — exactly where int8 pays.
+func (m *gpt2) quantize() {
+	m.qWteT = tensai.QuantizeMatrix(m.wteT)
+	for i := range m.blocks {
+		b := &m.blocks[i]
+		b.qAttnW = tensai.QuantizeMatrix(b.attnW)
+		b.qProjW = tensai.QuantizeMatrix(b.projW)
+		b.qFcW = tensai.QuantizeMatrix(b.fcW)
+		b.qFc2W = tensai.QuantizeMatrix(b.fc2W)
+	}
+}
+
+// mv routes a decode matvec through the int8 weights when they exist.
+func mv(x []float32, w *tensai.Matrix, q *tensai.QMatrix, bias []float32) []float32 {
+	if q == nil {
+		return matvec(x, w, bias)
+	}
+	out := make([]float32, q.Cols)
+	if err := q.MatVec(x, out); err != nil {
+		panic(err)
+	}
+	if bias != nil {
+		for i := range out {
+			out[i] += bias[i]
+		}
+	}
+	return out
 }
 
 func loadModel(path string) (*gpt2, error) {
@@ -151,7 +187,7 @@ func (m *gpt2) step(token, pos int) []float32 {
 
 		// Attention with the KV cache: the single query row attends over
 		// every cached position, so causality holds by construction.
-		qkv := matvec(layernorm(x, b.ln1w, b.ln1b), b.attnW, b.attnB)
+		qkv := mv(layernorm(x, b.ln1w, b.ln1b), b.attnW, b.qAttnW, b.attnB)
 		k := make([]float32, nEmbd)
 		v := make([]float32, nEmbd)
 		copy(k, qkv[nEmbd:2*nEmbd])
@@ -191,21 +227,21 @@ func (m *gpt2) step(token, pos int) []float32 {
 				}
 			}
 		}
-		proj := matvec(attn, b.projW, b.projB)
+		proj := mv(attn, b.projW, b.qProjW, b.projB)
 		for i := range x {
 			x[i] += proj[i]
 		}
 
 		// MLP.
-		h := matvec(layernorm(x, b.ln2w, b.ln2b), b.fcW, b.fcB)
+		h := mv(layernorm(x, b.ln2w, b.ln2b), b.fcW, b.qFcW, b.fcB)
 		geluNew(h)
-		out := matvec(h, b.fc2W, b.fc2B)
+		out := mv(h, b.fc2W, b.qFc2W, b.fc2B)
 		for i := range x {
 			x[i] += out[i]
 		}
 	}
 
-	return matvec(layernorm(x, m.lnfW, m.lnfB), m.wteT, nil)
+	return mv(layernorm(x, m.lnfW, m.lnfB), m.wteT, m.qWteT, nil)
 }
 
 // reset clears the KV cache for a fresh sequence.
