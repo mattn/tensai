@@ -266,7 +266,20 @@ GOEXPERIMENT=simd   go build -tags wgpu -o wgpu-simd   ./_example/wgpu
 ./wgpu-nosimd -sweep && ./wgpu-simd -sweep
 ```
 
-The crossover moves with the CPU kernel, GPU driver, and transfer pattern. The `res/cpu` column and crossover marker use the resident-input timing, since that is the normal pattern for repeated inference. Small MNIST layers generally remain CPU-faster because dispatch and the final readback dominate them.
+The crossover moves with the CPU kernel, GPU driver, and transfer pattern. The `res/cpu` column and crossover marker use the resident-input timing, since that is the normal pattern for repeated inference. On a Ryzen iGPU (AMD Radeon 780M, native Windows, AVX2 CPU kernel) the register-tiled kernels put every rung of the ladder on the GPU side:
+
+```
+             shape                   MFLOP   gpu+xfer   resident        cpu   res/cpu
+mnist dense  1x100x784@784x128        20.1     1.51ms      597µs      652µs     1.09x
+mnist conv2  1x19600x72@72x16         45.2    1.388ms      763µs    2.354ms     3.09x
+tiny         1x128x128@128x128         4.2      432µs      302µs      410µs     1.36x
+small        1x512x512@512x512       268.4    1.331ms    1.216ms    6.865ms     5.65x
+medium       8x512x512@512x512      2147.5    8.053ms    6.297ms    71.56ms    11.36x
+large        32x512x512@512x512     8589.9    86.71ms   28.856ms  266.277ms     9.23x
+huge         64x512x512@512x512    17179.9  116.374ms   62.128ms  566.726ms     9.12x
+```
+
+Arithmetic no longer dominates the convenient path — `gpu+xfer` at `large` spends two thirds of its time on the bus — which is exactly what keeping inputs resident is for. Through a translation layer like dozen inside WSL2 the ratios shrink to roughly parity-to-3x, and on CPU Vulkan implementations the GPU path loses outright; measure on the driver you will ship on.
 
 wgpu-native picks Vulkan on Linux, Vulkan or D3D12 on Windows, and Metal on macOS, so AMD, Intel, Apple, and NVIDIA GPUs all work — as do CPU Vulkan implementations like lavapipe, which is how the tests run on machines without a GPU. `gpu.MatMul` uploads the operands and reads the product back on every call; `Upload` plus `GPUTensor.MatMul` keeps inputs and intermediates resident, so only the final result needs to cross the bus. Without the build tag `OpenGPU` returns an error and nothing else changes.
 
