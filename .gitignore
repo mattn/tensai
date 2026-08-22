@@ -10,7 +10,7 @@ _example/dataset/dataset
 /.codex/
 _example/mnist/data/
 _example/gpt2/data/
-_example/qwen/data/
+_example/qwen/data*/
 /charrnn.json
 /graph.png
 /graph.svg

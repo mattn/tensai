@@ -12,7 +12,7 @@
 - **Low-allocation training** - layers reuse their forward/backward scratch buffers across training steps (a full MLP step runs in ~29 allocations), so GC stays out of the training loop; `Predict` always returns freshly allocated results
 - **Layers** - `Embedding`, `Dense`, `Conv2D`, `MaxPool2D`, `BatchNorm`, `LayerNorm`, `Dropout`, plus `ReLU`, `LeakyReLU`, `GELU`, `Sigmoid`, `Tanh`, and `Softmax` activations
 - **WebGPU backend (experimental)** - build with `-tags wgpu` (linux, macOS, Windows) and `OpenGPU()` runs batched `MatMul` as a WGSL compute shader on any GPU wgpu-native reaches (Vulkan, Metal, D3D12 — AMD, Intel, Apple, NVIDIA). The bindings go through `ebitengine/purego`, so there is still no cgo and no C compiler: the wgpu-native shared library is dlopen-ed at runtime
-- **int8 quantization** - `QuantizeMatrix` / `QMatrix.MatVec` implement weight-only int8 with per-column scales and float32 accumulation. Inference matvecs are memory-bandwidth bound, and int8 weights stream four times less: the AVX2 kernel widens them in-register and roughly doubles decode throughput out of cache
+- **int8 / int4 quantization** - `QuantizeMatrix` / `QuantizeMatrix4` build weight-only quantized twins with float32 accumulation: int8 with per-column scales, int4 group-wise (64 rows per scale, nibble-packed for vector unpacking). Inference matvecs are memory-bandwidth bound; int8 roughly doubles decode throughput out of cache and int4 halves the weights again — the difference between a 7B model fitting in RAM or not
 - **Loss functions** - `MeanSquaredError` for regression, `SoftmaxCrossEntropy` for multi-class classification, and `BinaryCrossEntropy` for binary targets
 - **Optimizers** - momentum `SGD`, `Adam`, and `AdamW` (decoupled weight decay)
 - **k-NN baseline** - a `KNN` classifier whose distance matrix runs on the same SIMD matmul kernel; useful as a no-training baseline next to the networks
@@ -199,7 +199,7 @@ The prompt runs through the model as one batched pass; with `-gpu` (built with `
 
 `-q8` quantizes the decode-path weights to int8 (weight-only, per-column scales) and doubles generation — 23 to 46 tok/s on the same machine — because decode streams the whole checkpoint per token and int8 pulls a quarter of the bytes. The text stays coherent but greedy decoding no longer reproduces the float32 reference tokens exactly; use the default float32 path for the reference check.
 
-`_example/qwen` does the same for a modern instruction-tuned model: Qwen2.5-0.5B-Instruct, with RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, its BF16 checkpoint loaded through the same safetensors reader and its ChatML template applied around the prompt. Dimensions come from config.json, so other Qwen2 sizes load unchanged if they fit in memory:
+`_example/qwen` does the same for a modern instruction-tuned model: Qwen2.5-0.5B-Instruct, with RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, its BF16 checkpoint loaded through the same safetensors reader and its ChatML template applied around the prompt. Dimensions come from config.json, so other Qwen2 sizes load unchanged if they fit in memory — `-q4` (group-wise int4) frees the float32 weights after quantizing, so Qwen2.5-1.5B decodes out of about 2GB of RAM at ~4 tok/s:
 
 ```
 $ GOEXPERIMENT=simd go run ./_example/qwen -q8 -prompt "What is the capital of France?"
