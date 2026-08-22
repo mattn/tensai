@@ -21,6 +21,7 @@
 - **Recurrence and attention** - `RNNCell`, `LSTMCell`, and single-head `SelfAttention` built on the autograd engine, with backpropagation through time handled automatically
 - **Serialization** - `Save`/`Load` (and `SaveFile`/`LoadFile`) round-trip trained Sequential parameters as JSON, including BatchNorm running statistics; `SaveParams`/`LoadParams` do the same for autograd parameters (RNN/LSTM/attention cells)
 - **TFLite export** - the `encoding/tflite` package marshals Sequential models (FP32, NHWC) into `.tflite` flatbuffers that run on the TFLite/LiteRT runtimes and [go-tflite](https://github.com/mattn/go-tflite), with the FlatBuffers writer implemented in-tree — still no dependencies
+- **safetensors** - `encoding/safetensors` reads the checkpoint format most published model weights ship in — lazily, one tensor at a time, with F16/BF16/F64 converted to float32 — and writes F32 checkpoints; interoperability is verified against the reference implementation in both directions. Also dependency-free
 
 ## Layout
 
@@ -142,6 +143,20 @@ err := tensaitflite.MarshalFile("model.tflite", model)
 ```
 
 Supported layers: Dense, Conv2D (VALID/SAME padding), MaxPool2D, BatchNorm (folded into Mul+Add), Dropout (dropped), Softmax, and the ReLU/LeakyReLU/Sigmoid/Tanh activations. Exported convolutions follow TFLite's NHWC layout — feed the exported model NHWC input; weight reordering is handled during export. Outputs have been verified to match `Predict` to ~1e-7 relative error on the LiteRT interpreter (see `encoding/tflite/verify_litert.py`). Alias the import when combining with go-tflite, which also names its package `tflite`.
+
+### safetensors checkpoints
+
+`encoding/safetensors` opens the format published model weights usually ship in. Open parses only the header; each `Tensor` call reads just that tensor's bytes, so single tensors come out of multi-gigabyte checkpoints without loading the rest. F32 loads as-is and F16/BF16/F64 convert to tensai's float32:
+
+```go
+import "github.com/mattn/tensai/encoding/safetensors"
+
+f, err := safetensors.Open("model.safetensors")
+defer f.Close()
+w, err := f.Tensor("model.layers.0.attention.wq.weight") // *tensai.Tensor
+```
+
+`Names`, `Info`, and `Metadata` inspect a checkpoint without loading it; `Save`/`SaveFile` write F32 checkpoints that the reference implementation reads back bit-for-bit.
 
 ### Automatic differentiation
 
