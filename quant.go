@@ -2,8 +2,24 @@ package tensai
 
 import (
 	"fmt"
+	"runtime"
 	"sync"
 )
+
+// matvecWorkerCount sizes the worker pool for quantized matvecs. Unlike
+// dotWorkerCount's cap of 8 (tuned for training matmuls that share the
+// machine with other layers), a decode matvec is the only thing running,
+// so it may use every CPU.
+func matvecWorkerCount(cols, rows int) int {
+	if cols*rows < 1<<20 {
+		return 1
+	}
+	workers := runtime.NumCPU()
+	if workers > cols {
+		workers = cols
+	}
+	return workers
+}
 
 // QMatrix is a weight matrix quantized to int8 with one scale per output
 // column: W[i][j] ~= Float(Q[i*Cols+j]) * Scale[j]. Inference matvecs are
@@ -63,7 +79,7 @@ func (q *QMatrix) MatVec(x, out []Float) error {
 		return fmt.Errorf("tensai: qmatvec shape mismatch: x=%d out=%d, want %dx%d",
 			len(x), len(out), q.Rows, q.Cols)
 	}
-	workers := dotWorkerCount(q.Cols, q.Rows, 1)
+	workers := matvecWorkerCount(q.Cols, q.Rows)
 	if workers == 1 {
 		qmatvecCols(out, x, q.Q, q.Scale, q.Cols, 0, q.Cols)
 		return nil
