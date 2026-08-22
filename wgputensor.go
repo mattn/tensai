@@ -278,6 +278,48 @@ type GPUTensor struct {
 // copyable in (Upload) and out (Download).
 const gpuTensorUsage = wgpuBufferUsageStorage | wgpuBufferUsageCopySrc | wgpuBufferUsageCopyDst
 
+// gpuReadbackBuffer is the reusable MapRead staging buffer. Downloads are
+// serialized by GPU.mu and wgpuMu, and mapRead waits for the copy to finish,
+// so the buffer is idle again before it is returned to this slot.
+type gpuReadbackBuffer struct {
+	buf  uintptr
+	size uint64
+}
+
+// takeReadback returns an unmapped staging buffer at least bytes large. The
+// single retained buffer grows to the largest download seen by this GPU.
+// The caller holds GPU.mu and wgpuMu.
+func (g *GPU) takeReadback(bytes uint64) (uintptr, uint64) {
+	if g.readback.buf != 0 && g.readback.size >= bytes {
+		buf, capacity := g.readback.buf, g.readback.size
+		g.readback = gpuReadbackBuffer{}
+		return buf, capacity
+	}
+	if g.readback.buf != 0 {
+		fnBufferRelease(g.readback.buf)
+		g.readback = gpuReadbackBuffer{}
+	}
+	return g.newBuffer(wgpuBufferUsageMapRead|wgpuBufferUsageCopyDst, bytes), bytes
+}
+
+// putReadback retains a successfully unmapped staging buffer for the next
+// download. The caller holds GPU.mu and wgpuMu.
+func (g *GPU) putReadback(buf uintptr, size uint64) {
+	if g.readback.buf != 0 {
+		fnBufferRelease(g.readback.buf)
+	}
+	g.readback = gpuReadbackBuffer{buf: buf, size: size}
+}
+
+// releaseReadback drops the retained staging buffer during GPU.Close. The
+// caller holds wgpuMu.
+func (g *GPU) releaseReadback() {
+	if g.readback.buf != 0 {
+		fnBufferRelease(g.readback.buf)
+	}
+	g.readback = gpuReadbackBuffer{}
+}
+
 // StorageLimit reports how many bytes a single GPU buffer may hold under
 // the device limits negotiated at OpenGPU time (0 when unknown). Tensor
 // operations return an error instead of touching the driver when a buffer
@@ -337,8 +379,18 @@ func (t *GPUTensor) Download() (*Tensor, error) {
 	}
 	out := NewTensor(t.shape...)
 	bytes := uint64(len(out.Data)) * 4
-	staging := g.newBuffer(wgpuBufferUsageMapRead|wgpuBufferUsageCopyDst, bytes)
-	defer fnBufferRelease(staging)
+	staging, stagingSize := g.takeReadback(bytes)
+	if staging == 0 {
+		return nil, errors.New("tensai: gpu readback buffer allocation failed")
+	}
+	reuse := false
+	defer func() {
+		if reuse {
+			g.putReadback(staging, stagingSize)
+		} else {
+			fnBufferRelease(staging)
+		}
+	}()
 
 	encoder := fnDeviceCreateCmdEncoder(g.device, nil)
 	fnEncoderCopyBuffer(encoder, t.buf, 0, staging, 0, bytes)
@@ -353,6 +405,7 @@ func (t *GPUTensor) Download() (*Tensor, error) {
 	}
 	copy(out.Data, unsafe.Slice((*Float)(src), len(out.Data)))
 	fnBufferUnmap(staging)
+	reuse = true
 	return out, nil
 }
 
