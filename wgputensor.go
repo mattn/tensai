@@ -18,9 +18,9 @@ import (
 	"unsafe"
 )
 
-// gpuTile is the square tile edge of the matmul kernels; the WGSL
-// workgroup_size and the dispatches below must agree with it.
-const gpuTile = 16
+// gpuBlock is the square output-block edge one matmul workgroup produces;
+// the WGSL constants and the dispatches below must agree with it.
+const gpuBlock = 64
 
 // gpuKernelWG is the workgroup width of the 1-D kernels (scale, softmax).
 const gpuKernelWG = 256
@@ -32,11 +32,13 @@ const gpuKernelWG = 256
 // main / matmul_t multiply one (m x k) x (k x n) — respectively (n x k),
 // read transposed — pair per z-slice; per-batch input offsets come from a
 // lookup table so broadcast batches share data. Each 16x16 workgroup
-// streams tiles of a and b through workgroup memory, so every element
-// loaded from global memory is reused 16 times — the classic shared-memory
-// tiling. The tile loop count is uniform across the workgroup, so the
-// barriers inside are in uniform control flow; out-of-range lanes load
-// zeros and only the final store is guarded.
+// produces a 64x64 output block: it streams 64x16 tiles of a and 16x64
+// tiles of b through workgroup memory (shared-memory tiling), and each
+// thread accumulates a 4x4 register tile, so a value read from workgroup
+// memory feeds four multiplies instead of one (register tiling). The tile
+// loop count is uniform across the workgroup, so the barriers inside are
+// in uniform control flow; out-of-range lanes load zeros and only the
+// final store is guarded.
 //
 // scale_ip multiplies a buffer by a scalar in place. softmax_last runs one
 // workgroup per row: a strided max reduction, then exp and a sum
@@ -53,13 +55,149 @@ struct Params {
 @group(0) @binding(3) var<storage, read> offs: array<vec4<u32>>;
 @group(0) @binding(4) var<storage, read_write> outv: array<f32>;
 
-const TILE = 16u;
-var<workgroup> tileA: array<f32, 256>;
-var<workgroup> tileB: array<f32, 256>;
+const TILE = 16u; // k-depth of one shared tile
+const BLK = 64u;  // output block edge per workgroup
+const TT = 4u;    // per-thread register tile edge
+
+var<workgroup> tileA: array<f32, 1024>; // BLK x TILE
+var<workgroup> tileB: array<f32, 1024>; // TILE x BLK
 
 @compute @workgroup_size(16, 16, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>) {
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let batch = wid.z;
+    let offA = offs[batch].x;
+    let offB = offs[batch].y;
+    let offC = offs[batch].z;
+    let rowBase = wid.y * BLK + lid.y * TT;
+    let colBase = wid.x * BLK + lid.x * TT;
+    let li = lid.y * 16u + lid.x;
+    var acc: array<f32, 16>;
+    let tiles = (p.k + TILE - 1u) / TILE;
+    for (var t = 0u; t < tiles; t = t + 1u) {
+        // 256 threads cooperatively load the 1024-element a and b tiles,
+        // four elements each.
+        for (var i = 0u; i < 4u; i = i + 1u) {
+            let idx = li * 4u + i;
+            let ar = idx / TILE;
+            let ac = idx % TILE;
+            let gr = wid.y * BLK + ar;
+            let gc = t * TILE + ac;
+            if (gr < p.m && gc < p.k) {
+                tileA[idx] = a[offA + gr * p.lda + gc];
+            } else {
+                tileA[idx] = 0.0;
+            }
+            let br = idx / BLK;
+            let bc = idx % BLK;
+            let gkr = t * TILE + br;
+            let gbc = wid.x * BLK + bc;
+            if (gkr < p.k && gbc < p.n) {
+                tileB[idx] = b[offB + gkr * p.ldb + gbc];
+            } else {
+                tileB[idx] = 0.0;
+            }
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < TILE; kk = kk + 1u) {
+            var af: array<f32, 4>;
+            var bf: array<f32, 4>;
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                af[i] = tileA[(lid.y * TT + i) * TILE + kk];
+                bf[i] = tileB[kk * BLK + lid.x * TT + i];
+            }
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                for (var j = 0u; j < 4u; j = j + 1u) {
+                    acc[i * 4u + j] = acc[i * 4u + j] + af[i] * bf[j];
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let r = rowBase + i;
+            let c = colBase + j;
+            if (r < p.m && c < p.n) {
+                outv[offC + r * p.ldc + c] = acc[i * 4u + j];
+            }
+        }
+    }
+}
+
+@compute @workgroup_size(16, 16, 1)
+fn matmul_t(@builtin(local_invocation_id) lid: vec3<u32>,
+            @builtin(workgroup_id) wid: vec3<u32>) {
+    let batch = wid.z;
+    let offA = offs[batch].x;
+    let offB = offs[batch].y;
+    let offC = offs[batch].z;
+    let rowBase = wid.y * BLK + lid.y * TT;
+    let colBase = wid.x * BLK + lid.x * TT;
+    let li = lid.y * 16u + lid.x;
+    var acc: array<f32, 16>;
+    let tiles = (p.k + TILE - 1u) / TILE;
+    for (var t = 0u; t < tiles; t = t + 1u) {
+        for (var i = 0u; i < 4u; i = i + 1u) {
+            let idx = li * 4u + i;
+            let ar = idx / TILE;
+            let ac = idx % TILE;
+            let gr = wid.y * BLK + ar;
+            let gc = t * TILE + ac;
+            if (gr < p.m && gc < p.k) {
+                tileA[idx] = a[offA + gr * p.lda + gc];
+            } else {
+                tileA[idx] = 0.0;
+            }
+            // b holds n rows of length k (row stride ldb); transpose the
+            // tile while loading so the inner loop below is shared.
+            let br = idx / BLK;
+            let bc = idx % BLK;
+            let gkr = t * TILE + br;
+            let gbc = wid.x * BLK + bc;
+            if (gkr < p.k && gbc < p.n) {
+                tileB[idx] = b[offB + gbc * p.ldb + gkr];
+            } else {
+                tileB[idx] = 0.0;
+            }
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < TILE; kk = kk + 1u) {
+            var af: array<f32, 4>;
+            var bf: array<f32, 4>;
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                af[i] = tileA[(lid.y * TT + i) * TILE + kk];
+                bf[i] = tileB[kk * BLK + lid.x * TT + i];
+            }
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                for (var j = 0u; j < 4u; j = j + 1u) {
+                    acc[i * 4u + j] = acc[i * 4u + j] + af[i] * bf[j];
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let r = rowBase + i;
+            let c = colBase + j;
+            if (r < p.m && c < p.n) {
+                outv[offC + r * p.ldc + c] = acc[i * 4u + j];
+            }
+        }
+    }
+}
+
+// matmul_s / matmul_ts are the plain 16x16 shared-memory variants (one
+// output per thread). They win on small or skinny products, where 64x64
+// blocks would leave most of the workgroup idle; stridedMatMul picks the
+// kernel by shape.
+var<workgroup> tileSA: array<f32, 256>;
+var<workgroup> tileSB: array<f32, 256>;
+
+@compute @workgroup_size(16, 16, 1)
+fn matmul_s(@builtin(global_invocation_id) gid: vec3<u32>,
+            @builtin(local_invocation_id) lid: vec3<u32>) {
     let col = gid.x;
     let row = gid.y;
     let batch = gid.z;
@@ -71,19 +209,19 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     for (var t = 0u; t < tiles; t = t + 1u) {
         let ak = t * TILE + lid.x;
         if (row < p.m && ak < p.k) {
-            tileA[lid.y * TILE + lid.x] = a[offA + row * p.lda + ak];
+            tileSA[lid.y * TILE + lid.x] = a[offA + row * p.lda + ak];
         } else {
-            tileA[lid.y * TILE + lid.x] = 0.0;
+            tileSA[lid.y * TILE + lid.x] = 0.0;
         }
         let bk = t * TILE + lid.y;
         if (bk < p.k && col < p.n) {
-            tileB[lid.y * TILE + lid.x] = b[offB + bk * p.ldb + col];
+            tileSB[lid.y * TILE + lid.x] = b[offB + bk * p.ldb + col];
         } else {
-            tileB[lid.y * TILE + lid.x] = 0.0;
+            tileSB[lid.y * TILE + lid.x] = 0.0;
         }
         workgroupBarrier();
         for (var i = 0u; i < TILE; i = i + 1u) {
-            sum = sum + tileA[lid.y * TILE + i] * tileB[i * TILE + lid.x];
+            sum = sum + tileSA[lid.y * TILE + i] * tileSB[i * TILE + lid.x];
         }
         workgroupBarrier();
     }
@@ -93,9 +231,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 }
 
 @compute @workgroup_size(16, 16, 1)
-fn matmul_t(@builtin(global_invocation_id) gid: vec3<u32>,
-            @builtin(local_invocation_id) lid: vec3<u32>,
-            @builtin(workgroup_id) wid: vec3<u32>) {
+fn matmul_ts(@builtin(global_invocation_id) gid: vec3<u32>,
+             @builtin(local_invocation_id) lid: vec3<u32>,
+             @builtin(workgroup_id) wid: vec3<u32>) {
     let col = gid.x;
     let row = gid.y;
     let batch = gid.z;
@@ -107,23 +245,20 @@ fn matmul_t(@builtin(global_invocation_id) gid: vec3<u32>,
     for (var t = 0u; t < tiles; t = t + 1u) {
         let ak = t * TILE + lid.x;
         if (row < p.m && ak < p.k) {
-            tileA[lid.y * TILE + lid.x] = a[offA + row * p.lda + ak];
+            tileSA[lid.y * TILE + lid.x] = a[offA + row * p.lda + ak];
         } else {
-            tileA[lid.y * TILE + lid.x] = 0.0;
+            tileSA[lid.y * TILE + lid.x] = 0.0;
         }
-        // b holds n rows of length k (row stride ldb); store its tile
-        // transposed so the inner loop reads b^T while the global loads
-        // stay contiguous along k.
         let bcol = wid.x * TILE + lid.y;
         let bk = t * TILE + lid.x;
         if (bcol < p.n && bk < p.k) {
-            tileB[lid.x * TILE + lid.y] = b[offB + bcol * p.ldb + bk];
+            tileSB[lid.x * TILE + lid.y] = b[offB + bcol * p.ldb + bk];
         } else {
-            tileB[lid.x * TILE + lid.y] = 0.0;
+            tileSB[lid.x * TILE + lid.y] = 0.0;
         }
         workgroupBarrier();
         for (var i = 0u; i < TILE; i = i + 1u) {
-            sum = sum + tileA[lid.y * TILE + i] * tileB[i * TILE + lid.x];
+            sum = sum + tileSA[lid.y * TILE + i] * tileSB[i * TILE + lid.x];
         }
         workgroupBarrier();
     }
@@ -202,8 +337,10 @@ fn softmax_last(@builtin(workgroup_id) wid: vec3<u32>,
 // per kernel entry point. It is embedded in each binding generation's GPU
 // struct.
 type gpuPipelines struct {
-	matmul, matmulT, scale, softmax             uintptr
-	layMatmul, layMatmulT, layScale, laySoftmax uintptr
+	matmul, matmulT, matmulS, matmulTS             uintptr
+	scale, softmax                                 uintptr
+	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
+	layScale, laySoftmax                           uintptr
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -215,6 +352,8 @@ func (g *GPU) initPipelines() error {
 	}{
 		{&g.pipes.matmul, &g.pipes.layMatmul, "main"},
 		{&g.pipes.matmulT, &g.pipes.layMatmulT, "matmul_t"},
+		{&g.pipes.matmulS, &g.pipes.layMatmulS, "matmul_s"},
+		{&g.pipes.matmulTS, &g.pipes.layMatmulTS, "matmul_ts"},
 		{&g.pipes.scale, &g.pipes.layScale, "scale_ip"},
 		{&g.pipes.softmax, &g.pipes.laySoftmax, "softmax_last"},
 	} {
@@ -230,12 +369,18 @@ func (g *GPU) initPipelines() error {
 // releasePipelines drops every pipeline and layout; the caller holds
 // wgpuMu.
 func (g *GPU) releasePipelines() {
-	for _, h := range []uintptr{g.pipes.layMatmul, g.pipes.layMatmulT, g.pipes.layScale, g.pipes.laySoftmax} {
+	for _, h := range []uintptr{
+		g.pipes.layMatmul, g.pipes.layMatmulT, g.pipes.layMatmulS,
+		g.pipes.layMatmulTS, g.pipes.layScale, g.pipes.laySoftmax,
+	} {
 		if h != 0 {
 			fnLayoutRelease(h)
 		}
 	}
-	for _, h := range []uintptr{g.pipes.matmul, g.pipes.matmulT, g.pipes.scale, g.pipes.softmax} {
+	for _, h := range []uintptr{
+		g.pipes.matmul, g.pipes.matmulT, g.pipes.matmulS,
+		g.pipes.matmulTS, g.pipes.scale, g.pipes.softmax,
+	} {
 		if h != 0 {
 			fnPipelineRelease(h)
 		}
@@ -528,9 +673,23 @@ func (g *GPU) stridedMatMul(a, b *GPUTensor, outShape []int, transB bool, m, k, 
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
 	fnQueueWriteBuffer(g.queue, bufOffs, 0, unsafe.Pointer(&offs[0]), uintptr(len(offs))*4)
 
+	// The 64x64 register-tiled kernels win on big products. Skinny ones
+	// (m or n under half a block) would leave most of each workgroup
+	// idle, and products with only a handful of 64x64 blocks cannot fill
+	// the GPU at all — both take the plain 16x16 variants, whose grid has
+	// sixteen times the workgroups.
+	block := gpuBlock
 	pipe, lay := g.pipes.matmul, g.pipes.layMatmul
 	if transB {
 		pipe, lay = g.pipes.matmulT, g.pipes.layMatmulT
+	}
+	blocks := ((m + gpuBlock - 1) / gpuBlock) * ((n + gpuBlock - 1) / gpuBlock) * batches
+	if m < 32 || n < 32 || blocks < 16 {
+		block = 16
+		pipe, lay = g.pipes.matmulS, g.pipes.layMatmulS
+		if transB {
+			pipe, lay = g.pipes.matmulTS, g.pipes.layMatmulTS
+		}
 	}
 	entries := [5]wgpuBindGroupEntry{
 		{binding: 0, buffer: bufParams, size: 32},
@@ -544,7 +703,7 @@ func (g *GPU) stridedMatMul(a, b *GPUTensor, outShape []int, transB bool, m, k, 
 	defer fnBindGroupRelease(bindGroup)
 
 	err := g.dispatch(pipe, bindGroup,
-		uint32((n+gpuTile-1)/gpuTile), uint32((m+gpuTile-1)/gpuTile), uint32(batches))
+		uint32((n+block-1)/block), uint32((m+block-1)/block), uint32(batches))
 	if err != nil {
 		fnBufferRelease(bufOut)
 		return nil, err
