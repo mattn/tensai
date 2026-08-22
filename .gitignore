@@ -9,6 +9,7 @@ _example/dataset/dataset
 /.agents/
 /.codex/
 _example/mnist/data/
+_example/gpt2/data/
 /charrnn.json
 /graph.png
 /graph.svg
