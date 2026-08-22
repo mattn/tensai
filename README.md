@@ -24,6 +24,7 @@
 - **TFLite export** - the `encoding/tflite` package marshals Sequential models (FP32, NHWC) into `.tflite` flatbuffers that run on the TFLite/LiteRT runtimes and [go-tflite](https://github.com/mattn/go-tflite), with the FlatBuffers writer implemented in-tree — still no dependencies
 - **safetensors** - `encoding/safetensors` reads the checkpoint format most published model weights ship in — lazily, one tensor at a time, with F16/BF16/F64 converted to float32 — and writes F32 checkpoints; interoperability is verified against the reference implementation in both directions. Also dependency-free
 - **ONNX export** - `encoding/onnx` marshals Sequential models into ONNX (opset 13, FP32) with a hand-written protobuf encoder; onnxruntime reproduces `Predict` to ~1e-7 relative error. ONNX convolutions are NCHW, which is tensai's own row layout, so nothing is reordered
+- **Tokenizers** - the `tokenizer` package loads Hugging Face `tokenizer.json` files and implements the byte-level BPE family (GPT-2, Llama 3, Qwen, ...), including the split patterns Go's regexp cannot express, as hand-written scanners; encodings and decodings match the reference `tokenizers` library exactly on both split families
 
 ## Layout
 
@@ -135,6 +136,19 @@ model.LoadFile("model.json")
 `Conv2D` and `MaxPool2D` treat each row as a channel-major image: `index = (channel*height + y)*width + x`. `Dropout` and `BatchNorm` switch automatically between training behavior (inside `Fit`/`FitStep`) and inference behavior (inside `Predict`).
 
 `Embedding` keeps the current matrix-only API: each input row is a token-id sequence, and the layer concatenates the looked-up embedding vectors across columns. For example, `Compile(4, ...)` plus `NewEmbedding(vocab, 8)` turns an `Mx4` token-id matrix into an `Mx32` dense feature matrix that can feed `LayerNorm`, `GELU`, and `Dense`.
+
+### Tokenizers
+
+```go
+import "github.com/mattn/tensai/tokenizer"
+
+tok, err := tokenizer.Load("tokenizer.json") // the file models ship on Hugging Face
+ids := tok.Encode("Hello, I'm a language model,")
+text := tok.Decode(ids)
+eos, _ := tok.ID("<|endoftext|>")
+```
+
+Byte-level BPE as GPT-2, Llama 3, and Qwen use it. The pre-tokenization regexes these models declare need lookahead and inline case-insensitive groups that `regexp` cannot express, so the two patterns that exist in the wild — the GPT-2 split and the cl100k-style split — are hand-written scanners, and anything else is rejected rather than silently mis-tokenized. Special tokens are matched verbatim during encode. Verified against the reference `tokenizers` library: an adversarial corpus and 2000 fuzzed strings encode and decode identically for both GPT-2 and Qwen2.5 (see `tokenizer/verify_hf.py`). An NFC normalizer passes through — input is assumed already NFC, which virtually all real-world text is.
 
 ### ONNX export
 
