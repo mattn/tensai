@@ -29,6 +29,35 @@ type gpuQwen struct {
 	gpuLen int // cache positions currently valid on the GPU
 }
 
+// sliceQ copies a column range out of a fused quantized matrix: the GPU
+// path keeps q, k, v (and gate, up) as separate resident weights, and
+// per-column quantization makes the slice exact.
+func sliceQ(q *tensai.QMatrix, lo, hi int) *tensai.QMatrix {
+	pairs := (q.Rows + 1) / 2
+	cols := hi - lo
+	out := &tensai.QMatrix{
+		Rows:     q.Rows,
+		Cols:     cols,
+		Q:        make([]int8, pairs*2*cols+16),
+		Scale:    make([]float32, cols),
+		ColSum64: make([]int32, cols+8),
+	}
+	copy(out.Scale, q.Scale[lo:hi])
+	copy(out.ColSum64, q.ColSum64[lo:hi])
+	for i2 := 0; i2 < pairs; i2++ {
+		copy(out.Q[i2*2*cols:i2*2*cols+2*cols], q.Q[i2*2*q.Cols+2*lo:i2*2*q.Cols+2*hi])
+	}
+	return out
+}
+
+// vecRange slices a fused bias, staying nil for biasless models.
+func vecRange(v []float32, lo, hi int) []float32 {
+	if v == nil {
+		return nil
+	}
+	return v[lo:hi]
+}
+
 func must[T any](v T, err error) T {
 	if err != nil {
 		panic(err)
@@ -47,21 +76,25 @@ func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 		}
 		return must(g.Upload(&tensai.Tensor{Shape: []int{len(v)}, Data: v}))
 	}
+	hs := m.cfg.HiddenSize
+	inter := m.cfg.Intermediate
 	gq := &gpuQwen{m: m, g: g, nCtx: nCtx, layers: make([]gpuLayer, len(m.blocks))}
 	for i := range m.blocks {
 		b := &m.blocks[i]
-		if b.qq == nil || b.qq.q8 == nil {
+		if b.qQKV == nil || b.qQKV.q8 == nil {
 			return nil, fmt.Errorf("gpu decode needs int8 weights (run with -q8)")
 		}
 		l := &gq.layers[i]
 		l.ln1, l.ln2 = vec(b.ln1), vec(b.ln2)
-		l.bq, l.bk, l.bv = vec(b.bq), vec(b.bk), vec(b.bv)
-		l.qq = must(g.UploadQ8(b.qq.q8))
-		l.qk = must(g.UploadQ8(b.qk.q8))
-		l.qv = must(g.UploadQ8(b.qv.q8))
+		l.bq = vec(vecRange(b.bQKV, 0, hs))
+		l.bk = vec(vecRange(b.bQKV, hs, hs+kvDim))
+		l.bv = vec(vecRange(b.bQKV, hs+kvDim, hs+2*kvDim))
+		l.qq = must(g.UploadQ8(sliceQ(b.qQKV.q8, 0, hs)))
+		l.qk = must(g.UploadQ8(sliceQ(b.qQKV.q8, hs, hs+kvDim)))
+		l.qv = must(g.UploadQ8(sliceQ(b.qQKV.q8, hs+kvDim, hs+2*kvDim)))
 		l.qo = must(g.UploadQ8(b.qo.q8))
-		l.qGate = must(g.UploadQ8(b.qGate.q8))
-		l.qUp = must(g.UploadQ8(b.qUp.q8))
+		l.qGate = must(g.UploadQ8(sliceQ(b.qGU.q8, 0, inter)))
+		l.qUp = must(g.UploadQ8(sliceQ(b.qGU.q8, inter, 2*inter)))
 		l.qDown = must(g.UploadQ8(b.qDown.q8))
 		l.kc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
 		l.vc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
