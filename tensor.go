@@ -286,3 +286,22 @@ func (m *Matrix) Validate() error {
 	}
 	return nil
 }
+
+// DotVec returns the dot product of two equally long vectors, running on
+// the AVX2 FMA kernel in SIMD builds — the score kernel of attention over
+// a KV cache.
+func DotVec(a, b []Float) Float {
+	if len(a) != len(b) {
+		panic("tensai: DotVec length mismatch")
+	}
+	return dotVec(a, b)
+}
+
+// Axpy computes y += a*x elementwise over equally long vectors — the
+// weighted value accumulation of attention.
+func Axpy(a Float, x, y []Float) {
+	if len(x) != len(y) {
+		panic("tensai: Axpy length mismatch")
+	}
+	axpy(a, x, y)
+}

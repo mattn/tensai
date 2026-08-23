@@ -162,3 +162,19 @@ func lnBwdRowGeneric(out, g, xhat, gamma, gradGamma, gradBeta []Float, invStd Fl
 		out[c] = k * (n*dxhat - sumDXhat - xhat[c]*sumDXhatXhat)
 	}
 }
+
+// dotVecGeneric and axpyGeneric are the scalar bodies of the public
+// DotVec and Axpy vector helpers.
+func dotVecGeneric(a, b []Float) Float {
+	var s Float
+	for i := range a {
+		s += a[i] * b[i]
+	}
+	return s
+}
+
+func axpyGeneric(a Float, x, y []Float) {
+	for i := range x {
+		y[i] += a * x[i]
+	}
+}

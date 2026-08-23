@@ -30,3 +30,6 @@ func lnFwdRow(out, xhat, src, gamma, beta []Float, eps Float) Float {
 func lnBwdRow(out, g, xhat, gamma, gradGamma, gradBeta []Float, invStd Float) {
 	lnBwdRowGeneric(out, g, xhat, gamma, gradGamma, gradBeta, invStd)
 }
+
+func dotVec(a, b []Float) Float  { return dotVecGeneric(a, b) }
+func axpy(a Float, x, y []Float) { axpyGeneric(a, x, y) }
