@@ -261,6 +261,34 @@ func mmb(x, w *tensai.Matrix, q *qmat, bias []float32) *tensai.Matrix {
 	return out
 }
 
+// attendHead runs one head of cached-KV attention: SIMD dot-product
+// scores over the cache, a float64 softmax, and SIMD weighted value
+// accumulation into attn's slot for the head. Heads touch disjoint
+// output ranges, so callers fan heads out across goroutines freely.
+func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, scores []float64) {
+	qOff := h * m.headSz
+	kvOff := (h / group) * m.headSz
+	scale := 1 / math.Sqrt(float64(m.headSz))
+	qh := q[qOff : qOff+m.headSz]
+	maxs := math.Inf(-1)
+	for t := 0; t < steps; t++ {
+		s := float64(tensai.DotVec(qh, b.kc[t][kvOff:kvOff+m.headSz])) * scale
+		scores[t] = s
+		if s > maxs {
+			maxs = s
+		}
+	}
+	var sum float64
+	for t := 0; t < steps; t++ {
+		scores[t] = math.Exp(scores[t] - maxs)
+		sum += scores[t]
+	}
+	out := attn[qOff : qOff+m.headSz]
+	for t := 0; t < steps; t++ {
+		tensai.Axpy(float32(scores[t]/sum), b.vc[t][kvOff:kvOff+m.headSz], out)
+	}
+}
+
 // rope rotates one head in place, half-split style: pair (i, i+dh/2).
 func (m *qwen) rope(h []float32, pos int) {
 	half := m.headSz / 2
@@ -319,7 +347,6 @@ func (m *qwen) prefill(tokens []int, startPos int) []float32 {
 		// Causal attention: row t sees cache positions [0, startPos+t].
 		// Rows are independent, so they fan out across CPUs.
 		attn := tensai.NewMatrix(n, hs)
-		scale := 1 / math.Sqrt(float64(m.headSz))
 		var wg sync.WaitGroup
 		rowCh := make(chan int, n)
 		for t := 0; t < n; t++ {
@@ -330,39 +357,13 @@ func (m *qwen) prefill(tokens []int, startPos int) []float32 {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
+				scores := make([]float64, startPos+n)
 				for t := range rowCh {
 					steps := startPos + t + 1
-					scores := make([]float64, steps)
 					qr := q.Data[t*hs : (t+1)*hs]
-					ar := attn.Data[t*hs:]
+					ar := attn.Data[t*hs : (t+1)*hs]
 					for h := 0; h < cfg.Heads; h++ {
-						qOff := h * m.headSz
-						kvOff := (h / group) * m.headSz
-						maxs := math.Inf(-1)
-						for u := 0; u < steps; u++ {
-							var s float64
-							kt := b.kc[u]
-							for i := 0; i < m.headSz; i++ {
-								s += float64(qr[qOff+i]) * float64(kt[kvOff+i])
-							}
-							s *= scale
-							scores[u] = s
-							if s > maxs {
-								maxs = s
-							}
-						}
-						var sum float64
-						for u := 0; u < steps; u++ {
-							scores[u] = math.Exp(scores[u] - maxs)
-							sum += scores[u]
-						}
-						for u := 0; u < steps; u++ {
-							p := float32(scores[u] / sum)
-							vt := b.vc[u]
-							for i := 0; i < m.headSz; i++ {
-								ar[qOff+i] += p * vt[kvOff+i]
-							}
-						}
+						m.attendHead(b, qr, ar, h, group, steps, scores[:steps])
 					}
 				}
 			}()
@@ -416,35 +417,25 @@ func (m *qwen) step(token, pos int) []float32 {
 
 		attn := make([]float32, hs)
 		steps := len(b.kc)
-		scores := make([]float64, steps)
-		scale := 1 / math.Sqrt(float64(m.headSz))
-		for h := 0; h < cfg.Heads; h++ {
-			qOff := h * m.headSz
-			kvOff := (h / group) * m.headSz
-			maxs := math.Inf(-1)
-			for t := 0; t < steps; t++ {
-				var s float64
-				kt := b.kc[t]
-				for i := 0; i < m.headSz; i++ {
-					s += float64(q[qOff+i]) * float64(kt[kvOff+i])
-				}
-				s *= scale
-				scores[t] = s
-				if s > maxs {
-					maxs = s
-				}
+		// Short contexts run the heads serially; past that the goroutine
+		// cost disappears into the O(steps*headSz) work per head.
+		if workers := min(runtime.NumCPU(), cfg.Heads); workers > 1 && steps >= 64 {
+			var wg sync.WaitGroup
+			for w := 0; w < workers; w++ {
+				wg.Add(1)
+				go func(w int) {
+					defer wg.Done()
+					scores := make([]float64, steps)
+					for h := w; h < cfg.Heads; h += workers {
+						m.attendHead(b, q, attn, h, group, steps, scores)
+					}
+				}(w)
 			}
-			var sum float64
-			for t := 0; t < steps; t++ {
-				scores[t] = math.Exp(scores[t] - maxs)
-				sum += scores[t]
-			}
-			for t := 0; t < steps; t++ {
-				p := float32(scores[t] / sum)
-				vt := b.vc[t]
-				for i := 0; i < m.headSz; i++ {
-					attn[qOff+i] += p * vt[kvOff+i]
-				}
+			wg.Wait()
+		} else {
+			scores := make([]float64, steps)
+			for h := 0; h < cfg.Heads; h++ {
+				m.attendHead(b, q, attn, h, group, steps, scores)
 			}
 		}
 		proj := mv(attn, b.wo, b.qo, nil)

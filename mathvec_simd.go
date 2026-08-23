@@ -389,3 +389,41 @@ func lnBwdRow(out, g, xhat, gamma, gradGamma, gradBeta []Float, invStd Float) {
 	}
 	archsimd.ClearAVXUpperBits()
 }
+
+// dotVec is the 8-lane FMA dot product; the horizontal sum happens once
+// at the end.
+func dotVec(a, b []Float) Float {
+	if !hasAVX2 || len(a) < 16 {
+		return dotVecGeneric(a, b)
+	}
+	n := len(a) &^ 7
+	var acc archsimd.Float32x8
+	for i := 0; i < n; i += 8 {
+		acc = loadF32x8(a[i:]).MulAdd(loadF32x8(b[i:]), acc)
+	}
+	var buf [8]Float
+	storeF32x8(acc, buf[:])
+	archsimd.ClearAVXUpperBits()
+	s := buf[0] + buf[1] + buf[2] + buf[3] + buf[4] + buf[5] + buf[6] + buf[7]
+	for i := n; i < len(a); i++ {
+		s += a[i] * b[i]
+	}
+	return s
+}
+
+// axpy computes y += a*x, 8 lanes at a time.
+func axpy(a Float, x, y []Float) {
+	if !hasAVX2 || len(x) < 16 {
+		axpyGeneric(a, x, y)
+		return
+	}
+	av := archsimd.BroadcastFloat32x8(a)
+	n := len(x) &^ 7
+	for i := 0; i < n; i += 8 {
+		storeF32x8(loadF32x8(x[i:]).MulAdd(av, loadF32x8(y[i:])), y[i:])
+	}
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < len(x); i++ {
+		y[i] += a * x[i]
+	}
+}

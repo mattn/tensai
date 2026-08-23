@@ -589,3 +589,39 @@ func TestConvNetLearnsLineOrientation(t *testing.T) {
 		}
 	}
 }
+
+func TestDotVecAxpy(t *testing.T) {
+	rng := rand.New(rand.NewSource(81))
+	for _, n := range []int{0, 1, 7, 8, 15, 16, 64, 127, 1000} {
+		a := make([]Float, n)
+		b := make([]Float, n)
+		for i := range a {
+			a[i] = Float(rng.NormFloat64())
+			b[i] = Float(rng.NormFloat64())
+		}
+		var want float64
+		for i := range a {
+			want += float64(a[i]) * float64(b[i])
+		}
+		got := float64(DotVec(a, b))
+		if diff := math.Abs(got - want); diff > 1e-3*(1+math.Abs(want)) {
+			t.Fatalf("DotVec n=%d: got %v want %v", n, got, want)
+		}
+
+		y := make([]Float, n)
+		copy(y, b)
+		Axpy(0.5, a, y)
+		for i := range y {
+			want := b[i] + 0.5*a[i]
+			if diff := math.Abs(float64(y[i] - want)); diff > 1e-5 {
+				t.Fatalf("Axpy n=%d elem %d: got %v want %v", n, i, y[i], want)
+			}
+		}
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("expected panic on length mismatch")
+		}
+	}()
+	DotVec(make([]Float, 3), make([]Float, 4))
+}
