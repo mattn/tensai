@@ -26,6 +26,7 @@ type gpuQwen struct {
 	g      *tensai.GPU
 	layers []gpuLayer
 	nCtx   int
+	gpuLen int // cache positions currently valid on the GPU
 }
 
 func must[T any](v T, err error) T {
@@ -68,35 +69,66 @@ func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 	return gq, nil
 }
 
-// syncCache copies the CPU-side KV cache — the prompt prefill — into the
-// GPU caches, one upload per layer.
-func (gq *gpuQwen) syncCache() error {
+// syncUp copies CPU-side cache rows the GPU has not seen yet — a fresh
+// prompt prefill, or a chat turn's new tokens — into the GPU caches.
+func (gq *gpuQwen) syncUp() error {
 	kvDim := gq.m.cfg.KVHeads * gq.m.headSz
+	cpuLen := len(gq.m.blocks[0].kc)
+	if cpuLen > gq.nCtx {
+		return fmt.Errorf("prefill of %d tokens exceeds gpu cache of %d", cpuLen, gq.nCtx)
+	}
+	lo := gq.gpuLen
+	if cpuLen <= lo {
+		return nil
+	}
 	for i := range gq.layers {
 		cb := &gq.m.blocks[i]
-		if len(cb.kc) > gq.nCtx {
-			return fmt.Errorf("prefill of %d tokens exceeds gpu cache of %d", len(cb.kc), gq.nCtx)
-		}
 		for _, pair := range [2]struct {
 			rows [][]float32
 			dst  *tensai.GPUTensor
 		}{{cb.kc, gq.layers[i].kc}, {cb.vc, gq.layers[i].vc}} {
-			if len(pair.rows) == 0 {
-				continue
-			}
-			flat := &tensai.Tensor{Shape: []int{len(pair.rows), kvDim}, Data: make([]float32, len(pair.rows)*kvDim)}
-			for t, row := range pair.rows {
+			flat := &tensai.Tensor{Shape: []int{cpuLen - lo, kvDim}, Data: make([]float32, (cpuLen-lo)*kvDim)}
+			for t, row := range pair.rows[lo:] {
 				copy(flat.Data[t*kvDim:], row)
 			}
 			tmp, err := gq.g.Upload(flat)
 			if err != nil {
 				return err
 			}
-			err = tmp.CopyRowsInto(pair.dst, 0)
+			err = tmp.CopyRowsInto(pair.dst, lo*kvDim)
 			tmp.Free()
 			if err != nil {
 				return err
 			}
+		}
+	}
+	gq.gpuLen = cpuLen
+	return nil
+}
+
+// syncBack appends the rows GPU decoding produced since the CPU cache
+// last saw them, so the next turn's CPU prefill attends over the whole
+// conversation — the piece that lets -gpu and -chat compose.
+func (gq *gpuQwen) syncBack() error {
+	kvDim := gq.m.cfg.KVHeads * gq.m.headSz
+	cpuLen := len(gq.m.blocks[0].kc)
+	if gq.gpuLen <= cpuLen {
+		return nil
+	}
+	n := gq.gpuLen - cpuLen
+	for i := range gq.layers {
+		cb := &gq.m.blocks[i]
+		kt, err := gq.layers[i].kc.DownloadRange(cpuLen*kvDim, n*kvDim)
+		if err != nil {
+			return err
+		}
+		vt, err := gq.layers[i].vc.DownloadRange(cpuLen*kvDim, n*kvDim)
+		if err != nil {
+			return err
+		}
+		for t := 0; t < n; t++ {
+			cb.kc = append(cb.kc, kt.Data[t*kvDim:(t+1)*kvDim])
+			cb.vc = append(cb.vc, vt.Data[t*kvDim:(t+1)*kvDim])
 		}
 	}
 	return nil
@@ -150,6 +182,9 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 		}
 		k.Free()
 		v.Free()
+		if pos+1 > gq.gpuLen {
+			gq.gpuLen = pos + 1
+		}
 		attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, cfg.KVHeads, pos+1))
 		q.Free()
 		proj := must(l.qo.MatMul(attn))
