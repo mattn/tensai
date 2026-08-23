@@ -41,6 +41,9 @@ func must[T any](v T, err error) T {
 func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 	kvDim := m.cfg.KVHeads * m.headSz
 	vec := func(v []float32) *tensai.GPUTensor {
+		if v == nil { // llama: no attention biases
+			return nil
+		}
 		return must(g.Upload(&tensai.Tensor{Shape: []int{len(v)}, Data: v}))
 	}
 	gq := &gpuQwen{m: m, g: g, nCtx: nCtx, layers: make([]gpuLayer, len(m.blocks))}
@@ -122,14 +125,16 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 		k := must(l.qk.MatMul(a))
 		v := must(l.qv.MatMul(a))
 		a.Free()
-		if err := q.Add(l.bq); err != nil {
-			panic(err)
-		}
-		if err := k.Add(l.bk); err != nil {
-			panic(err)
-		}
-		if err := v.Add(l.bv); err != nil {
-			panic(err)
+		if l.bq != nil {
+			if err := q.Add(l.bq); err != nil {
+				panic(err)
+			}
+			if err := k.Add(l.bk); err != nil {
+				panic(err)
+			}
+			if err := v.Add(l.bv); err != nil {
+				panic(err)
+			}
 		}
 		if err := q.RoPE(m.headSz, pos, cfg.RopeTheta); err != nil {
 			panic(err)

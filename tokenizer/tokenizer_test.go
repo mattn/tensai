@@ -116,7 +116,7 @@ func TestParseErrors(t *testing.T) {
 // tokenizers library when they are present; generate them with
 // verify_hf.py (see its docstring) into testdata/.
 func TestAgainstHF(t *testing.T) {
-	for _, name := range []string{"gpt2", "qwen"} {
+	for _, name := range []string{"gpt2", "qwen", "smollm2"} {
 		tokPath := filepath.Join("testdata", name+".json")
 		refPath := filepath.Join("testdata", "ref_"+name+".json")
 		if _, err := os.Stat(tokPath); err != nil {

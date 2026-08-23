@@ -32,7 +32,10 @@ import (
 	"github.com/mattn/tensai/tokenizer"
 )
 
-const hfBase = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/"
+const defaultRepo = "Qwen/Qwen2.5-0.5B-Instruct"
+
+// hfBase is derived from the -repo flag before any download starts.
+var hfBase = "https://huggingface.co/" + defaultRepo + "/resolve/main/"
 
 func fetch(dir, name string) (string, error) {
 	path := filepath.Join(dir, name)
@@ -173,6 +176,7 @@ func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 
 func main() {
 	dataDir := flag.String("data", "_example/qwen/data", "directory for the downloaded model files")
+	repo := flag.String("repo", defaultRepo, "Hugging Face repo to download missing model files from")
 	prompt := flag.String("prompt", "What is the capital of France?", "user message (or raw prompt with -raw)")
 	system := flag.String("system", "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.", "system message for the chat template")
 	raw := flag.Bool("raw", false, "skip the chat template, complete the prompt as-is")
@@ -186,6 +190,7 @@ func main() {
 	gpu := flag.Bool("gpu", false, "decode on the GPU (requires -q8 and a wgpu build tag)")
 	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile of generation to this file")
 	flag.Parse()
+	hfBase = "https://huggingface.co/" + *repo + "/resolve/main/"
 
 	weights, err := fetchWeights(*dataDir)
 	if err != nil {

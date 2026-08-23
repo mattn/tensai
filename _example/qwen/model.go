@@ -1,10 +1,13 @@
 package main
 
-// Qwen2-family inference: pre-norm transformer blocks with RMSNorm, rotary
-// position embeddings, grouped-query attention, and a SwiGLU MLP, decoded
-// one token at a time with a KV cache. Dimensions come from config.json,
-// so any Qwen2 checkpoint that fits in memory works; every matvec runs on
-// tensai's Dot kernel or, with -q8, the int8 kernel.
+// Qwen2- and Llama-family inference: pre-norm transformer blocks with
+// RMSNorm, rotary position embeddings, grouped-query attention, and a
+// SwiGLU MLP, decoded one token at a time with a KV cache. The two
+// architectures share this exact block — Llama simply has no attention
+// biases — so dimensions come from config.json and any qwen2 or llama
+// checkpoint whose tokenizer.json is byte-level BPE works (SmolLM2, for
+// example); every matvec runs on tensai's Dot kernel or, with -q8, the
+// int8 kernel.
 
 import (
 	"encoding/json"
@@ -87,8 +90,8 @@ func loadConfig(path string) (config, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return c, err
 	}
-	if c.ModelType != "qwen2" {
-		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2)", c.ModelType)
+	if c.ModelType != "qwen2" && c.ModelType != "llama" {
+		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2 and llama)", c.ModelType)
 	}
 	return c, nil
 }
@@ -124,6 +127,15 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 		t, err := f.Tensor(name)
 		if err != nil {
 			panic(err)
+		}
+		return t.Data
+	}
+	// vecOpt returns nil for weights the architecture does not have —
+	// Llama-family checkpoints carry no attention biases.
+	vecOpt := func(name string) []float32 {
+		t, err := f.Tensor(name)
+		if err != nil {
+			return nil
 		}
 		return t.Data
 	}
@@ -172,11 +184,11 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 		b.ln1 = vec(p + "input_layernorm.weight")
 		b.ln2 = vec(p + "post_attention_layernorm.weight")
 		b.wq, b.qq = linq(p + "self_attn.q_proj.weight")
-		b.bq = vec(p + "self_attn.q_proj.bias")
+		b.bq = vecOpt(p + "self_attn.q_proj.bias")
 		b.wk, b.qk = linq(p + "self_attn.k_proj.weight")
-		b.bk = vec(p + "self_attn.k_proj.bias")
+		b.bk = vecOpt(p + "self_attn.k_proj.bias")
 		b.wv, b.qv = linq(p + "self_attn.v_proj.weight")
-		b.bv = vec(p + "self_attn.v_proj.bias")
+		b.bv = vecOpt(p + "self_attn.v_proj.bias")
 		b.wo, b.qo = linq(p + "self_attn.o_proj.weight")
 		b.wGate, b.qGate = linq(p + "mlp.gate_proj.weight")
 		b.wUp, b.qUp = linq(p + "mlp.up_proj.weight")

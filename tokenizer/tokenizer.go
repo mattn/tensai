@@ -43,6 +43,11 @@ type splitConfig struct {
 	letterPrefix   bool // [^\r\n\p{L}\p{N}]? before letters instead of " ?"
 	maxDigits      int  // 0: gpt2's " ?\p{N}+"; else \p{N}{1,maxDigits}
 	newlineRuns    bool // punct tail [\r\n]* and the \s*[\r\n]+ alternative
+	// individualDigits models HF's Digits(individual_digits) pre-tokenizer
+	// running before the ByteLevel split (SmolLM2 and friends): every digit
+	// is its own pre-token, so a digit never absorbs a preceding space, and
+	// whitespace running into a digit behaves as if at end of text.
+	individualDigits bool
 }
 
 var (
@@ -66,10 +71,11 @@ type jsonFile struct {
 }
 
 type preTok struct {
-	Type          string          `json:"type"`
-	UseRegex      *bool           `json:"use_regex"`
-	Pretokenizers json.RawMessage `json:"pretokenizers"`
-	Pattern       struct {
+	Type             string          `json:"type"`
+	UseRegex         *bool           `json:"use_regex"`
+	IndividualDigits *bool           `json:"individual_digits"`
+	Pretokenizers    json.RawMessage `json:"pretokenizers"`
+	Pattern          struct {
 		Regex string `json:"Regex"`
 	} `json:"pattern"`
 }
@@ -173,13 +179,24 @@ func detectSplit(raw json.RawMessage) (splitConfig, error) {
 		if err := json.Unmarshal(p.Pretokenizers, &subs); err != nil {
 			return gpt2Config, fmt.Errorf("tokenizer: parsing pre_tokenizer sequence: %w", err)
 		}
+		digits := false
 		for _, sub := range subs {
 			var sp preTok
 			if err := json.Unmarshal(sub, &sp); err != nil {
 				continue
 			}
-			if sp.Type == "Split" && sp.Pattern.Regex != "" {
+			switch {
+			case sp.Type == "Split" && sp.Pattern.Regex != "":
 				return classifyRegex(sp.Pattern.Regex)
+			case sp.Type == "Digits":
+				if sp.IndividualDigits == nil || !*sp.IndividualDigits {
+					return gpt2Config, fmt.Errorf("tokenizer: Digits without individual_digits is unsupported")
+				}
+				digits = true
+			case sp.Type == "ByteLevel" && (sp.UseRegex == nil || *sp.UseRegex):
+				cfg := gpt2Config
+				cfg.individualDigits = digits
+				return cfg, nil
 			}
 		}
 		return gpt2Config, fmt.Errorf("tokenizer: no Split pattern in pre_tokenizer sequence")
@@ -364,7 +381,13 @@ func (t *Tokenizer) split(s string) []string {
 			continue
 		}
 
-		// Numbers: " ?\p{N}+" (gpt2) or "\p{N}{1,max}" (cl100k).
+		// Numbers: " ?\p{N}+" (gpt2) or "\p{N}{1,max}" (cl100k), unless
+		// a Digits pre-tokenizer already isolated every digit.
+		if cfg.individualDigits && unicode.IsNumber(rs[j]) {
+			out = append(out, string(rs[j]))
+			i = j + 1
+			continue
+		}
 		if cfg.maxDigits > 0 {
 			if unicode.IsNumber(rs[j]) {
 				for j < len(rs) && j-start < cfg.maxDigits && unicode.IsNumber(rs[j]) {
@@ -376,7 +399,8 @@ func (t *Tokenizer) split(s string) []string {
 			}
 		} else {
 			d := j
-			if rs[d] == ' ' && d+1 < len(rs) && unicode.IsNumber(rs[d+1]) {
+			// A digit in its own segment never absorbs a space.
+			if rs[d] == ' ' && d+1 < len(rs) && unicode.IsNumber(rs[d+1]) && !cfg.individualDigits {
 				d++
 			}
 			if d < len(rs) && unicode.IsNumber(rs[d]) {
@@ -430,8 +454,10 @@ func (t *Tokenizer) split(s string) []string {
 			}
 		}
 		// "\s+(?!\S)" then "\s+": keep the last whitespace char for the
-		// following token when something follows.
-		if j < len(rs) && j-start > 1 {
+		// following token when something follows — but not for a digit,
+		// which under individualDigits sits in its own segment, leaving
+		// this run at a segment end.
+		if j < len(rs) && j-start > 1 && !(cfg.individualDigits && unicode.IsNumber(rs[j])) {
 			j--
 		}
 		if j == start {
