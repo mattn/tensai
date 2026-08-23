@@ -983,6 +983,58 @@ func (t *GPUTensor) Download() (*Tensor, error) {
 	return out, nil
 }
 
+// DownloadRange copies elements [off, off+n) back into host memory as a
+// flat tensor — reading freshly appended rows out of a resident cache
+// without moving the whole buffer. Like Download it flushes an open
+// batch first.
+func (t *GPUTensor) DownloadRange(off, n int) (*Tensor, error) {
+	if t.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if off < 0 || n <= 0 || off+n > t.Size() {
+		return nil, fmt.Errorf("tensai: download of %d elements at %d overflows %d", n, off, t.Size())
+	}
+	g := t.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	if err := g.flushLocked(); err != nil {
+		return nil, err
+	}
+	out := NewTensor(n)
+	bytes := uint64(n) * 4
+	staging, stagingSize := g.takeReadback(bytes)
+	if staging == 0 {
+		return nil, errors.New("tensai: gpu readback buffer allocation failed")
+	}
+	reuse := false
+	defer func() {
+		if reuse {
+			g.putReadback(staging, stagingSize)
+		} else {
+			fnBufferRelease(staging)
+		}
+	}()
+	encoder := fnDeviceCreateCmdEncoder(g.device, nil)
+	fnEncoderCopyBuffer(encoder, t.buf, uint64(off)*4, staging, 0, bytes)
+	cmd := fnEncoderFinish(encoder, nil)
+	fnCmdEncoderRelease(encoder)
+	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
+	fnCmdBufferRelease(cmd)
+	src, err := g.mapRead(staging, bytes)
+	if err != nil {
+		return nil, err
+	}
+	copy(out.Data, unsafe.Slice((*Float)(src), n))
+	fnBufferUnmap(staging)
+	reuse = true
+	return out, nil
+}
+
 // Free releases the GPU buffer (into the transient pool, from which the
 // next same-sized tensor will reuse it). The tensor must not be used
 // afterwards; calling Free again is a no-op.

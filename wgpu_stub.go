@@ -124,3 +124,6 @@ func (g *GPU) BeginBatch() error { return errNoWGPU }
 
 // Flush is a no-op in builds without the wgpu tag.
 func (g *GPU) Flush() error { return nil }
+
+// DownloadRange always fails in builds without the wgpu tag.
+func (t *GPUTensor) DownloadRange(off, n int) (*Tensor, error) { return nil, errNoWGPU }

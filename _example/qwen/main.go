@@ -265,10 +265,6 @@ func main() {
 	// still prefills on the CPU, and syncCache carries it over below.
 	var gq *gpuQwen
 	if *gpu {
-		if *chat {
-			fmt.Fprintln(os.Stderr, "-gpu does not support -chat yet (the CPU and GPU caches would diverge)")
-			os.Exit(1)
-		}
 		if bits != 8 {
 			fmt.Fprintln(os.Stderr, "-gpu requires -q8")
 			os.Exit(1)
@@ -330,9 +326,25 @@ func main() {
 			if !sc.Scan() || strings.TrimSpace(sc.Text()) == "" {
 				break
 			}
+			// Each turn's prompt prefills on the CPU; with -gpu the new
+			// cache rows sync up, the turn decodes on the device, and the
+			// rows it appended sync back for the next turn's prefill.
 			feed(tok.Encode("<|im_start|>user\n" + sc.Text() + "<|im_end|>\n<|im_start|>assistant\n"))
+			if gq != nil {
+				if err := gq.syncUp(); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+				stepFn = gq.step
+			}
 			generate(*n)
 			feed(tok.Encode("\n"))
+			if gq != nil {
+				if err := gq.syncBack(); err != nil {
+					fmt.Fprintln(os.Stderr, err)
+					os.Exit(1)
+				}
+			}
 			if steps >= nCtx-64 {
 				fmt.Fprintln(os.Stderr, "context window exhausted")
 				break
@@ -353,7 +365,7 @@ func main() {
 	feed(ids)
 	fmt.Fprintf(os.Stderr, "prefill: %v\n", time.Since(start).Round(time.Millisecond))
 	if gq != nil {
-		if err := gq.syncCache(); err != nil {
+		if err := gq.syncUp(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
