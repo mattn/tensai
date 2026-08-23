@@ -112,20 +112,99 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 	return nil
 }
 
-// MatMul computes out = x @ Q for a batch of activation rows, one MatVec
-// per row: correct and parallel, but without the int8 path's fourfold
-// weight amortization yet.
+// MatMul computes out = x @ Q for a batch of activation rows — the
+// prompt-prefill shape, mirroring QMatrix.MatMul: rows quantize to the
+// same 7-bit form MatVec uses and the kernel processes them in blocks of
+// four against one streaming pass over the nibbles.
 func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 	if x.Cols != q.Rows || out.Rows != x.Rows || out.Cols != q.Cols {
 		return fmt.Errorf("tensai: q4matmul shape mismatch: x %dx%d out %dx%d, want %dx%d",
 			x.Rows, x.Cols, out.Rows, out.Cols, q.Rows, q.Cols)
 	}
-	for r := 0; r < x.Rows; r++ {
-		if err := q.MatVec(x.Data[r*x.Cols:(r+1)*x.Cols], out.Data[r*q.Cols:(r+1)*q.Cols]); err != nil {
-			return err
+	rows := x.Rows
+	groups := (q.Rows + q4Group - 1) / q4Group
+	xus := make([][]uint8, rows)
+	sxs := make([]Float, rows)
+	gsums := make([][]int32, rows)
+	for r := 0; r < rows; r++ {
+		xus[r], sxs[r] = quantizeActs(x.Data[r*x.Cols : (r+1)*x.Cols])
+		gsums[r] = make([]int32, groups)
+		for i, u := range xus[r] {
+			gsums[r][min(i/q4Group, groups-1)] += int32(u) - 64
 		}
 	}
+	run := func(lo, hi int) {
+		var r int
+		for ; r+4 <= rows; r += 4 {
+			q4matmulCols4(out, xus[r:r+4], sxs[r:r+4], gsums[r:r+4], r, q.Q, q.Scale, q.Cols, lo, hi)
+		}
+		for ; r < rows; r++ {
+			q4matvecCols(out.Data[r*q.Cols:(r+1)*q.Cols], xus[r], sxs[r], gsums[r], q.Q, q.Scale, q.Cols, lo, hi)
+		}
+	}
+	workers := matvecWorkerCount(q.Cols, q.Rows)
+	if workers == 1 {
+		run(0, q.Cols)
+		return nil
+	}
+	chunk := ((q.Cols+workers-1)/workers + 7) &^ 7
+	var wg sync.WaitGroup
+	for lo := 0; lo < q.Cols; lo += chunk {
+		hi := min(lo+chunk, q.Cols)
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			run(lo, hi)
+		}(lo, hi)
+	}
+	wg.Wait()
 	return nil
+}
+
+// q4matmulCols4Generic is the four-row batched body: each nibble byte read
+// once feeds four output rows.
+func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 int, qw []uint8, scale []Float, cols, lo, hi int) {
+	for r := 0; r < 4; r++ {
+		clear(out.Data[(r0+r)*cols+lo : (r0+r)*cols+hi])
+	}
+	pairs := len(xus[0]) / 2
+	var acc [4][]int32
+	for r := range acc {
+		acc[r] = make([]int32, hi-lo)
+	}
+	for g := 0; g < len(gsums[0]); g++ {
+		ib := g * q4Group / 2
+		ie := min(ib+q4Group/2, pairs)
+		for r := range acc {
+			clear(acc[r])
+		}
+		for i2 := ib; i2 < ie; i2++ {
+			row := qw[i2*cols:]
+			for r := 0; r < 4; r++ {
+				x0 := int32(xus[r][2*i2]) - 64
+				x1 := int32(xus[r][2*i2+1]) - 64
+				a := acc[r]
+				for j := lo; j < hi; j++ {
+					b := row[j]
+					a[j-lo] += int32(b&0x0F)*x0 + int32(b>>4)*x1
+				}
+			}
+		}
+		srow := scale[g*cols:]
+		for r := 0; r < 4; r++ {
+			o := out.Data[(r0+r)*cols:]
+			corr := 8 * gsums[r][g]
+			for j := lo; j < hi; j++ {
+				o[j] += Float(acc[r][j-lo]-corr) * srow[j]
+			}
+		}
+	}
+	for r := 0; r < 4; r++ {
+		o := out.Data[(r0+r)*cols:]
+		for j := lo; j < hi; j++ {
+			o[j] *= sxs[r]
+		}
+	}
 }
 
 // q4matvecColsGeneric accumulates out[lo:hi] in pure Go over the same
