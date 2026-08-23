@@ -358,8 +358,43 @@ func (m *qwen) rope(h []float32, pos int) {
 // exactly what feeding the tokens through step one by one would — the
 // batched quantized matmul quantizes each activation row identically and
 // the attention loops match — but streams each weight matrix once per
-// batch instead of once per token.
+// batch instead of once per token. The lm_head runs only on the final
+// position.
 func (m *qwen) prefill(tokens []int, startPos int) []float32 {
+	x := m.forwardBatch(tokens, startPos)
+	hs := m.cfg.HiddenSize
+	last := x.Data[(len(tokens)-1)*hs : len(tokens)*hs]
+	return mv(rmsnorm(last, m.normW, m.cfg.RMSEps), m.lmT, m.qLmT, nil)
+}
+
+// prefillLogits is prefill with the lm_head applied to every position:
+// row t holds the next-token logits after tokens[0..t]. Speculative
+// decoding uses it to score a draft's proposals in one batched pass.
+func (m *qwen) prefillLogits(tokens []int, startPos int) *tensai.Matrix {
+	x := m.forwardBatch(tokens, startPos)
+	hs := m.cfg.HiddenSize
+	a := tensai.NewMatrix(x.Rows, hs)
+	for t := 0; t < x.Rows; t++ {
+		copy(a.Data[t*hs:(t+1)*hs], rmsnorm(x.Data[t*hs:(t+1)*hs], m.normW, m.cfg.RMSEps))
+	}
+	return mmb(a, m.lmT, m.qLmT, nil)
+}
+
+// truncate rolls the KV cache back to n positions — how speculative
+// decoding discards the tail a rejected draft left behind.
+func (m *qwen) truncate(n int) {
+	for i := range m.blocks {
+		b := &m.blocks[i]
+		if len(b.kc) > n {
+			b.kc = b.kc[:n]
+			b.vc = b.vc[:n]
+		}
+	}
+}
+
+// forwardBatch runs the transformer blocks over a batch of tokens,
+// extending the KV cache, and returns the hidden states.
+func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 	cfg := m.cfg
 	hs := cfg.HiddenSize
 	group := cfg.Heads / cfg.KVHeads
@@ -444,8 +479,7 @@ func (m *qwen) prefill(tokens []int, startPos int) []float32 {
 			x.Data[i] += down.Data[i]
 		}
 	}
-	last := x.Data[(n-1)*hs : n*hs]
-	return mv(rmsnorm(last, m.normW, cfg.RMSEps), m.lmT, m.qLmT, nil)
+	return x
 }
 
 // step feeds one token at position pos and returns the next-token logits.
