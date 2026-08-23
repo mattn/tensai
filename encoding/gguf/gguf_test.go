@@ -248,17 +248,17 @@ func TestBadInput(t *testing.T) {
 	w.u64(0)
 	w.str("kq")
 	w.u32(1)
-	w.u64(32)
-	w.u32(12) // Q4_K
+	w.u64(256)
+	w.u32(11) // Q3_K: real but not decoded here
 	w.u64(0)
 	f, err := NewFile(bytes.NewReader(w.buf.Bytes()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if typ, _, _ := f.Info("kq"); typ != "type12" {
+	if typ, _, _ := f.Info("kq"); typ != "type11" {
 		t.Fatalf("info: %q", typ)
 	}
 	if _, err := f.Tensor("kq"); err == nil {
-		t.Fatal("expected error for Q4_K")
+		t.Fatal("expected error for Q3_K")
 	}
 }
