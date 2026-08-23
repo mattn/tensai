@@ -123,6 +123,11 @@ func exists(p string) bool {
 // probability-sorted prefix whose mass reaches topP — so the long
 // low-probability tail (where repetition loops and derailments live)
 // never gets a lottery ticket. topP >= 1 keeps the whole distribution.
+//
+// Sorting all 150k vocabulary entries per token would dominate sampling,
+// so the nucleus is found through a histogram over probability exponents:
+// only the tokens above the crossing bucket — usually a few hundred —
+// ever get sorted, and the result is exactly the sorted-prefix nucleus.
 func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 	if temp <= 0 {
 		best := 0
@@ -133,38 +138,84 @@ func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 		}
 		return best
 	}
-	type cand struct {
-		id int
-		p  float64
-	}
-	cands := make([]cand, len(logits))
 	maxl := logits[0]
 	for _, v := range logits {
 		if v > maxl {
 			maxl = v
 		}
 	}
+	ps := make([]float64, len(logits))
 	var sum float64
 	for i, v := range logits {
 		p := math.Exp(float64(v-maxl) / temp)
-		cands[i] = cand{i, p}
+		ps[i] = p
 		sum += p
 	}
-	sort.Slice(cands, func(a, b int) bool { return cands[a].p > cands[b].p })
-	if topP < 1 {
-		var mass float64
-		cut := len(cands)
-		for i, c := range cands {
-			mass += c.p
-			if mass >= topP*sum {
-				cut = i + 1
-				break
+
+	if topP >= 1 {
+		// The full distribution needs no order at all — one CDF walk.
+		r := rng.Float64() * sum
+		for i, p := range ps {
+			r -= p
+			if r <= 0 {
+				return i
 			}
 		}
-		cands = cands[:cut]
-		sum = mass
+		return len(ps) - 1
 	}
-	r := rng.Float64() * sum
+
+	// Bucket the probability mass by exponent (p in (0, 1], so Ilogb is
+	// 0, -1, -2, ...) and find the bucket where the running mass crosses
+	// the nucleus target: every nucleus member has p in a bucket at or
+	// above the crossing.
+	const nb = 1100
+	var bsum [nb]float64
+	bucket := func(p float64) int {
+		b := -math.Ilogb(p)
+		if b < 0 {
+			b = 0
+		} else if b >= nb {
+			b = nb - 1
+		}
+		return b
+	}
+	for _, p := range ps {
+		if p > 0 {
+			bsum[bucket(p)] += p
+		}
+	}
+	target := topP * sum
+	var mass float64
+	cut := nb - 1
+	for b := 0; b < nb; b++ {
+		mass += bsum[b]
+		if mass >= target {
+			cut = b
+			break
+		}
+	}
+	type cand struct {
+		id int
+		p  float64
+	}
+	var cands []cand
+	for i, p := range ps {
+		if p > 0 && bucket(p) <= cut {
+			cands = append(cands, cand{i, p})
+		}
+	}
+	sort.Slice(cands, func(a, b int) bool { return cands[a].p > cands[b].p })
+	mass = 0
+	n := len(cands)
+	for i, c := range cands {
+		mass += c.p
+		if mass >= target {
+			n = i + 1
+			break
+		}
+	}
+	cands = cands[:n]
+	r := rng.Float64() * mass
 	for _, c := range cands {
 		r -= c.p
 		if r <= 0 {
