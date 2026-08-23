@@ -11,7 +11,8 @@ func TestQuantize4MatVec(t *testing.T) {
 	for _, c := range []struct{ rows, cols int }{
 		{768, 2304}, // parallel path
 		{64, 32},
-		{33, 10}, // partial final group, scalar tails
+		{33, 10}, // odd rows: pad pair, partial final group
+		{5, 7},   // odd columns, scalar tails everywhere
 		{1, 2},
 	} {
 		m := RandomMatrix(c.rows, c.cols, rng)
@@ -28,24 +29,23 @@ func TestQuantize4MatVec(t *testing.T) {
 			t.Fatalf("%dx%d: %v", c.rows, c.cols, err)
 		}
 
-		// Exact reference over the same quantized nibbles.
-		half := c.cols / 2
+		// Exact reference over the same nibbles and 7-bit activations.
+		xu, sx := quantizeActs(x)
 		groups := (c.rows + q4Group - 1) / q4Group
 		want := make([]float64, c.cols)
-		for g := 0; g < groups; g++ {
-			rlo, rhi := g*q4Group, min((g+1)*q4Group, c.rows)
-			for j := 0; j < c.cols; j++ {
-				var acc float64
+		for j := 0; j < c.cols; j++ {
+			for g := 0; g < groups; g++ {
+				rlo, rhi := g*q4Group, min((g+1)*q4Group, c.rows)
+				var acc, gs int64
 				for i := rlo; i < rhi; i++ {
-					b := q.Q[i*half+j%half]
-					n := int(b&0x0F) - 8
-					if j >= half {
-						n = int(b>>4) - 8
-					}
-					acc += float64(x[i]) * float64(n)
+					nib := int64(q.Q[(i/2)*c.cols+j]>>(4*(i%2))) & 0x0F
+					xs := int64(xu[i]) - 64
+					acc += nib * xs
+					gs += xs
 				}
-				want[j] += acc * float64(q.Scale[g*c.cols+j])
+				want[j] += float64(acc-8*gs) * float64(q.Scale[g*c.cols+j])
 			}
+			want[j] *= float64(sx)
 		}
 		var worst float64
 		for j := range want {
@@ -60,19 +60,25 @@ func TestQuantize4MatVec(t *testing.T) {
 				worst = d
 			}
 		}
-		if worst > 1.0 { // group-wise int4 stays close over these sizes
+		if worst > 2 { // int4 weights + 7-bit activations stay close
 			t.Fatalf("%dx%d: quantization error %v too large", c.rows, c.cols, worst)
 		}
 	}
 
-	if _, err := QuantizeMatrix4(NewMatrix(4, 3)); err == nil {
-		t.Fatal("expected error for odd column count")
-	}
-	q, err := QuantizeMatrix4(NewMatrix(4, 4))
+	q, err := QuantizeMatrix4(NewMatrix(4, 4)) // all zeros: scales are zero
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := q.MatVec(make([]Float, 3), make([]Float, 4)); err == nil {
+	out := make([]Float, 4)
+	if err := q.MatVec(make([]Float, 4), out); err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range out {
+		if v != 0 {
+			t.Fatalf("zero matrix produced %v", out)
+		}
+	}
+	if err := q.MatVec(make([]Float, 3), out); err == nil {
 		t.Fatal("expected shape mismatch error")
 	}
 }

@@ -2,56 +2,60 @@
 
 package tensai
 
-import (
-	"unsafe"
+import "simd/archsimd"
 
-	"simd/archsimd"
-)
-
-// AVX2 kernel for the 4-bit matvec: an 8-byte load carries 8 column pairs,
-// the low nibbles masked out directly and the high nibbles via a 16-bit
-// shift (AVX2 has no byte shift), both widened to float32 and FMA'd
-// against the broadcast activation. Group scales fold in vectorized at
-// each group boundary; the scalar tail runs through the generic body after
-// the vector state is cleared.
-func q4matvecCols(out, x []Float, qw []byte, scale []Float, cols, lo, hi int, tmp []Float) {
+// AVX2 kernel for the 4-bit matvec, sharing the u8 x s8 pairwise
+// multiply-add design of the int8 kernel: a load's low 8 bytes zero-extend
+// to u16 lanes, where masks and a shift split each byte's nibbles into the
+// adjacent-byte pair layout the multiply wants; the signed operand is the
+// broadcast 7-bit activation pair. Nibbles are at most 15, so pair sums
+// cannot approach saturation at any activation width. Each group of 32 row
+// pairs is one register-accumulated block: eight i32x8 accumulators cover
+// a 64-column tile (one cache line per pair row), and the group's scales
+// and offset correction fold in vectorized at the block boundary.
+func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, scale []Float, cols, lo, hi int) {
 	if !hasAVX2 {
-		q4matvecColsGeneric(out, x, qw, scale, cols, lo, hi, tmp)
+		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, cols, lo, hi)
 		return
 	}
-	half := cols / 2
-	vecEnd := lo + ((hi - lo) &^ 7)
+	pairs := len(xu) / 2
+	vecEnd := lo + ((hi - lo) &^ 63)
 	if vecEnd > lo {
-		mask := archsimd.BroadcastInt8x16(0x0F)
-		eight := archsimd.BroadcastFloat32x8(8)
+		mLo := archsimd.BroadcastUint16x8(0x000F)
+		mHi := archsimd.BroadcastUint16x8(0x0F00)
 		clear(out[lo:vecEnd])
-		clear(out[half+lo : half+vecEnd])
-		groups := (len(x) + q4Group - 1) / q4Group
-		for g := 0; g < groups; g++ {
-			rlo := g * q4Group
-			rhi := min(rlo+q4Group, len(x))
-			clear(tmp[lo:vecEnd])
-			clear(tmp[half+lo : half+vecEnd])
-			for i := rlo; i < rhi; i++ {
-				xv := archsimd.BroadcastFloat32x8(x[i])
-				row := qw[i*half:]
-				for j := lo; j < vecEnd; j += 8 {
-					v := loadI8x16(unsafe.Slice((*int8)(unsafe.Pointer(&row[j])), 16))
-					loNib := v.And(mask).ExtendLo8ToInt32().ConvertToFloat32().Sub(eight)
-					hiNib := v.AsUint16x8().ShiftAllRight(4).AsInt8x16().And(mask).ExtendLo8ToInt32().ConvertToFloat32().Sub(eight)
-					storeF32x8(loNib.MulAdd(xv, loadF32x8(tmp[j:])), tmp[j:])
-					storeF32x8(hiNib.MulAdd(xv, loadF32x8(tmp[half+j:])), tmp[half+j:])
+		for g := 0; g < len(gsum); g++ {
+			ib := g * q4Group / 2
+			ie := min(ib+q4Group/2, pairs)
+			corr := archsimd.BroadcastInt32x8(8 * gsum[g])
+			srow := scale[g*cols:]
+			for jt := lo; jt < vecEnd; jt += 64 {
+				var a [8]archsimd.Int32x8
+				for i2 := ib; i2 < ie; i2++ {
+					x0 := uint8(int8(int(xu[2*i2]) - 64))
+					x1 := uint8(int8(int(xu[2*i2+1]) - 64))
+					xp := archsimd.BroadcastUint16x8(uint16(x0) | uint16(x1)<<8).AsUint8x16().AsInt8x16()
+					row := qw[i2*cols+jt:]
+					for k := 0; k < 8; k++ {
+						v := loadU8x16(row[8*k:]).ExtendLo8ToUint16()
+						pair := v.And(mLo).Or(v.ShiftAllLeft(4).And(mHi))
+						a[k] = a[k].Add(pair.AsUint8x16().DotProductPairsSaturated(xp).ExtendToInt32())
+					}
+				}
+				for k := 0; k < 8; k++ {
+					j := jt + 8*k
+					f := a[k].Sub(corr).ConvertToFloat32().Mul(loadF32x8(srow[j:]))
+					storeF32x8(loadF32x8(out[j:]).Add(f), out[j:])
 				}
 			}
-			srow := scale[g*cols:]
-			for j := lo; j < vecEnd; j += 8 {
-				storeF32x8(loadF32x8(tmp[j:]).MulAdd(loadF32x8(srow[j:]), loadF32x8(out[j:])), out[j:])
-				storeF32x8(loadF32x8(tmp[half+j:]).MulAdd(loadF32x8(srow[half+j:]), loadF32x8(out[half+j:])), out[half+j:])
-			}
+		}
+		sxv := archsimd.BroadcastFloat32x8(sx)
+		for j := lo; j < vecEnd; j += 8 {
+			storeF32x8(loadF32x8(out[j:]).Mul(sxv), out[j:])
 		}
 	}
 	archsimd.ClearAVXUpperBits()
 	if vecEnd < hi {
-		q4matvecColsGeneric(out, x, qw, scale, cols, vecEnd, hi, tmp)
+		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, cols, vecEnd, hi)
 	}
 }
