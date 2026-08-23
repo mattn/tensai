@@ -25,17 +25,19 @@ func TestQuantizeMatVec(t *testing.T) {
 			t.Fatalf("%dx%d: %v", c.rows, c.cols, err)
 		}
 
-		// Exact reference over the same quantized weights: the kernel must
-		// match it to float rounding.
+		// Exact reference over the same quantized weights and the same
+		// 7-bit activations: the kernel must match it to float rounding.
+		xu, sx := quantizeActs(x)
 		want := make([]float64, c.cols)
 		for i := 0; i < c.rows; i++ {
 			for j := 0; j < c.cols; j++ {
-				want[j] += float64(x[i]) * float64(q.Q[i*c.cols+j])
+				w := q.Q[(i/2)*2*c.cols+2*j+i%2]
+				want[j] += float64(int(xu[i])-64) * float64(w)
 			}
 		}
 		var worst float64
 		for j := range want {
-			want[j] *= float64(q.Scale[j])
+			want[j] *= float64(q.Scale[j]) * float64(sx)
 			diff := math.Abs(float64(out[j]) - want[j])
 			if diff > 1e-3*(1+math.Abs(want[j])) {
 				t.Fatalf("%dx%d col %d: got %v want %v", c.rows, c.cols, j, out[j], want[j])
@@ -49,7 +51,7 @@ func TestQuantizeMatVec(t *testing.T) {
 				worst = d
 			}
 		}
-		if worst > 0.5 { // int8 error over a few hundred accumulations stays small
+		if worst > 2 { // int8 weights + 7-bit activations stay close
 			t.Fatalf("%dx%d: quantization error %v too large", c.rows, c.cols, worst)
 		}
 	}

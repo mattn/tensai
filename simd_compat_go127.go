@@ -23,6 +23,14 @@ func storeF32x8(v archsimd.Float32x8, s []Float) {
 	v.Store(s)
 }
 
+func loadI32x8(s []int32) archsimd.Int32x8 {
+	return archsimd.LoadInt32x8(s)
+}
+
+func storeI32x8(v archsimd.Int32x8, s []int32) {
+	v.Store(s)
+}
+
 func loadI8x16(s []int8) archsimd.Int8x16 {
 	return archsimd.LoadInt8x16(s)
 }
