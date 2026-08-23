@@ -189,29 +189,10 @@ func main() {
 	chat := flag.Bool("chat", false, "interactive multi-turn chat on stdin (the KV cache carries the conversation)")
 	gpu := flag.Bool("gpu", false, "decode on the GPU (requires -q8 and a wgpu build tag)")
 	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile of generation to this file")
+	ggufPath := flag.String("gguf", "", "load model and tokenizer from a single .gguf file instead of -data/-repo")
 	flag.Parse()
 	hfBase = "https://huggingface.co/" + *repo + "/resolve/main/"
 
-	weights, err := fetchWeights(*dataDir)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	var paths [2]string
-	for i, name := range []string{"tokenizer.json", "config.json"} {
-		p, err := fetch(*dataDir, name)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		paths[i] = p
-	}
-
-	tok, err := tokenizer.Load(paths[0])
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
 	bits := 0
 	if *q8 {
 		bits = 8
@@ -219,18 +200,47 @@ func main() {
 	if *q4 {
 		bits = 4
 	}
+
+	var tok *tokenizer.Tokenizer
+	var model *qwen
+	var err error
 	start := time.Now()
-	model, err := loadQwen(paths[1], weights, bits)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	if *ggufPath != "" {
+		model, tok, err = loadGGUF(*ggufPath, bits)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	} else {
+		weights, err := fetchWeights(*dataDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		var paths [2]string
+		for i, name := range []string{"tokenizer.json", "config.json"} {
+			p, err := fetch(*dataDir, name)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			paths[i] = p
+		}
+		if tok, err = tokenizer.Load(paths[0]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if model, err = loadQwen(paths[1], weights, bits); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
 	how := "float32"
 	if bits != 0 {
 		how = fmt.Sprintf("int%d", bits)
 	}
-	fmt.Fprintf(os.Stderr, "loaded qwen2 (%d layers, hidden %d) as %s in %v\n",
-		model.cfg.Layers, model.cfg.HiddenSize, how, time.Since(start).Round(time.Millisecond))
+	fmt.Fprintf(os.Stderr, "loaded %s (%d layers, hidden %d) as %s in %v\n",
+		model.cfg.ModelType, model.cfg.Layers, model.cfg.HiddenSize, how, time.Since(start).Round(time.Millisecond))
 
 	imEnd, _ := tok.ID("<|im_end|>")
 	eot, _ := tok.ID("<|endoftext|>")
