@@ -25,6 +25,7 @@ type config struct {
 	KVHeads      int     `json:"num_key_value_heads"`
 	RMSEps       float64 `json:"rms_norm_eps"`
 	RopeTheta    float64 `json:"rope_theta"`
+	MaxPos       int     `json:"max_position_embeddings"`
 	Vocab        int     `json:"vocab_size"`
 	TieEmbedding bool    `json:"tie_word_embeddings"`
 	EOS          int     `json:"eos_token_id"`

@@ -13,6 +13,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime/pprof"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/mattn/tensai/tokenizer"
@@ -160,6 +162,7 @@ func main() {
 	seed := flag.Int64("seed", 1, "sampling seed for -temp > 0")
 	q8 := flag.Bool("q8", false, "decode against int8-quantized weights")
 	q4 := flag.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
+	chat := flag.Bool("chat", false, "interactive multi-turn chat on stdin (the KV cache carries the conversation)")
 	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile of generation to this file")
 	flag.Parse()
 
@@ -203,14 +206,6 @@ func main() {
 	fmt.Fprintf(os.Stderr, "loaded qwen2 (%d layers, hidden %d) as %s in %v\n",
 		model.cfg.Layers, model.cfg.HiddenSize, how, time.Since(start).Round(time.Millisecond))
 
-	text := *prompt
-	if !*raw {
-		text = "<|im_start|>system\n" + *system + "<|im_end|>\n" +
-			"<|im_start|>user\n" + *prompt + "<|im_end|>\n" +
-			"<|im_start|>assistant\n"
-	}
-	ids := tok.Encode(text)
-	fmt.Fprintf(os.Stderr, "prompt: %d tokens\n", len(ids))
 	imEnd, _ := tok.ID("<|im_end|>")
 	eot, _ := tok.ID("<|endoftext|>")
 	rng := rand.New(rand.NewSource(*seed))
@@ -224,23 +219,71 @@ func main() {
 		pprof.StartCPUProfile(f)
 		defer pprof.StopCPUProfile()
 	}
-	start = time.Now()
+
+	nCtx := model.cfg.MaxPos
+	if nCtx == 0 {
+		nCtx = 4096
+	}
+
+	// feed pushes tokens through the model, extending the KV cache;
+	// generate then samples until an end token, which is also fed so the
+	// cache stays aligned with the template for the next turn.
+	steps := 0
 	var logits []float32
-	for pos, id := range ids {
-		logits = model.step(id, pos)
-	}
-	steps := len(ids)
-	for i := 0; i < *n; i++ {
-		next := sample(logits, *temp, rng)
-		if next == imEnd || next == eot {
-			break
+	feed := func(ids []int) {
+		for _, id := range ids {
+			logits = model.step(id, steps)
+			steps++
 		}
-		fmt.Print(tok.Decode([]int{next}))
-		logits = model.step(next, steps)
-		steps++
 	}
-	fmt.Println()
-	fmt.Fprintf(os.Stderr, "%d tokens in %v (%.1f tok/s)\n",
-		steps, time.Since(start).Round(time.Millisecond),
-		float64(steps)/time.Since(start).Seconds())
+	generate := func(limit int) {
+		start := time.Now()
+		gen := 0
+		for ; gen < limit && steps < nCtx-1; gen++ {
+			next := sample(logits, *temp, rng)
+			if next == imEnd || next == eot {
+				feed([]int{next})
+				break
+			}
+			fmt.Print(tok.Decode([]int{next}))
+			feed([]int{next})
+		}
+		fmt.Println()
+		fmt.Fprintf(os.Stderr, "(%d tokens, %.1f tok/s)\n",
+			gen, float64(gen)/time.Since(start).Seconds())
+	}
+
+	if *chat {
+		feed(tok.Encode("<|im_start|>system\n" + *system + "<|im_end|>\n"))
+		fmt.Fprintln(os.Stderr, "chat mode: type a message, empty line or Ctrl-D to quit")
+		sc := bufio.NewScanner(os.Stdin)
+		for {
+			fmt.Print("> ")
+			if !sc.Scan() || strings.TrimSpace(sc.Text()) == "" {
+				break
+			}
+			feed(tok.Encode("<|im_start|>user\n" + sc.Text() + "<|im_end|>\n<|im_start|>assistant\n"))
+			generate(*n)
+			feed(tok.Encode("\n"))
+			if steps >= nCtx-64 {
+				fmt.Fprintln(os.Stderr, "context window exhausted")
+				break
+			}
+		}
+		return
+	}
+
+	text := *prompt
+	if !*raw {
+		text = "<|im_start|>system\n" + *system + "<|im_end|>\n" +
+			"<|im_start|>user\n" + *prompt + "<|im_end|>\n" +
+			"<|im_start|>assistant\n"
+	}
+	ids := tok.Encode(text)
+	fmt.Fprintf(os.Stderr, "prompt: %d tokens\n", len(ids))
+	start = time.Now()
+	feed(ids)
+	generate(*n)
+	fmt.Fprintf(os.Stderr, "%d tokens total in %v\n",
+		steps, time.Since(start).Round(time.Millisecond))
 }
