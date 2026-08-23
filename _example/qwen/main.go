@@ -242,6 +242,8 @@ func main() {
 	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile of generation to this file")
 	ggufPath := flag.String("gguf", "", "load model and tokenizer from a single .gguf file instead of -data/-repo")
 	serveAddr := flag.String("serve", "", "serve an OpenAI-compatible /v1/chat/completions API on this address (e.g. :8080)")
+	draftDir := flag.String("draft", "", "data directory of a smaller draft model: speculative decoding (greedy only)")
+	specK := flag.Int("spec", 3, "draft tokens proposed per speculative step (3 fills one 4-row verification block)")
 	flag.Parse()
 	hfBase = "https://huggingface.co/" + *repo + "/resolve/main/"
 
@@ -293,6 +295,33 @@ func main() {
 	}
 	fmt.Fprintf(os.Stderr, "loaded %s (%d layers, hidden %d) as %s in %v\n",
 		model.cfg.ModelType, model.cfg.Layers, model.cfg.HiddenSize, how, time.Since(start).Round(time.Millisecond))
+
+	// The draft model shares the tokenizer, so it must come from the same
+	// family (0.5B drafting for 7B, say). Speculation verifies greedily.
+	var draftM *qwen
+	if *draftDir != "" {
+		if *temp > 0 || *gpu || *serveAddr != "" {
+			fmt.Fprintln(os.Stderr, "-draft requires greedy CPU decoding (-temp 0, no -gpu/-serve)")
+			os.Exit(1)
+		}
+		dw, err := fetchWeights(*draftDir)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		dc, err := fetch(*draftDir, "config.json")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		start := time.Now()
+		if draftM, err = loadQwen(dc, dw, bits); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "loaded draft (%d layers, hidden %d) in %v\n",
+			draftM.cfg.Layers, draftM.cfg.HiddenSize, time.Since(start).Round(time.Millisecond))
+	}
 
 	imEnd, _ := tok.ID("<|im_end|>")
 	eot, _ := tok.ID("<|endoftext|>")
@@ -351,16 +380,79 @@ func main() {
 	stepFn := model.step
 	feed := func(ids []int) {
 		if len(ids) > 1 {
+			if draftM != nil {
+				draftM.prefill(ids, steps)
+			}
 			logits = model.prefill(ids, steps)
 			steps += len(ids)
 			return
 		}
 		for _, id := range ids {
+			if draftM != nil {
+				draftM.step(id, steps)
+			}
 			logits = stepFn(id, steps)
 			steps++
 		}
 	}
+	// generateSpec emits tokens speculatively: the target's pending logits
+	// pick a token, the draft greedily proposes specK continuations, and
+	// one batched target pass scores them all — every agreed position is
+	// accepted, the first disagreement's row supplies the corrected next
+	// pick, and both KV caches roll back to the accepted length.
+	generateSpec := func(limit int) {
+		start := time.Now()
+		gen, accepted, proposed := 0, 0, 0
+		for gen < limit && steps < nCtx-2-*specK {
+			c0 := sample(logits, 0, 1, rng)
+			if c0 == imEnd || c0 == eot {
+				feed([]int{c0})
+				break
+			}
+			fmt.Print(tok.Decode([]int{c0}))
+			gen++
+			props := make([]int, 0, *specK)
+			dl := draftM.step(c0, steps)
+			for i := 0; i < *specK; i++ {
+				d := sample(dl, 0, 1, rng)
+				props = append(props, d)
+				dl = draftM.step(d, steps+1+i)
+			}
+			lm := model.prefillLogits(append([]int{c0}, props...), steps)
+			j, stop := 0, false
+			for ; j < len(props); j++ {
+				row := lm.Data[j*lm.Cols : (j+1)*lm.Cols]
+				if sample(row, 0, 1, rng) != props[j] {
+					break
+				}
+				if props[j] == imEnd || props[j] == eot {
+					j++
+					stop = true
+					break
+				}
+				fmt.Print(tok.Decode([]int{props[j]}))
+				gen++
+			}
+			accepted += j
+			proposed += len(props)
+			model.truncate(steps + 1 + j)
+			draftM.truncate(steps + 1 + j)
+			steps += 1 + j
+			logits = lm.Data[j*lm.Cols : (j+1)*lm.Cols]
+			if stop {
+				break
+			}
+		}
+		fmt.Println()
+		fmt.Fprintf(os.Stderr, "(%d tokens, %.1f tok/s, %d/%d drafts accepted)\n",
+			gen, float64(gen)/time.Since(start).Seconds(), accepted, proposed)
+	}
+
 	generate := func(limit int) {
+		if draftM != nil {
+			generateSpec(limit)
+			return
+		}
 		start := time.Now()
 		gen := 0
 		for ; gen < limit && steps < nCtx-1; gen++ {
