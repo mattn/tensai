@@ -160,6 +160,76 @@ func (q *QMatrix) MatVec(x, out []Float) error {
 	return nil
 }
 
+// MatMul computes out = x @ Q for a batch of activation rows — the
+// prompt-prefill shape. Each row quantizes to the same 7-bit form MatVec
+// uses, and the kernel processes rows in blocks of four against one
+// streaming pass over the weights, so the weight traffic that dominates a
+// single matvec amortizes across the batch.
+func (q *QMatrix) MatMul(x, out *Matrix) error {
+	if x.Cols != q.Rows || out.Rows != x.Rows || out.Cols != q.Cols {
+		return fmt.Errorf("tensai: qmatmul shape mismatch: x %dx%d out %dx%d, want %dx%d",
+			x.Rows, x.Cols, out.Rows, out.Cols, q.Rows, q.Cols)
+	}
+	rows := x.Rows
+	xus := make([][]uint8, rows)
+	sxs := make([]Float, rows)
+	for r := 0; r < rows; r++ {
+		xus[r], sxs[r] = quantizeActs(x.Data[r*x.Cols : (r+1)*x.Cols])
+	}
+	run := func(lo, hi int) {
+		var r int
+		for ; r+4 <= rows; r += 4 {
+			qmatmulCols4(out, xus[r:r+4], sxs[r:r+4], r, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
+		}
+		for ; r < rows; r++ {
+			qmatvecCols(out.Data[r*q.Cols:(r+1)*q.Cols], xus[r], sxs[r], q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
+		}
+	}
+	workers := matvecWorkerCount(q.Cols, q.Rows)
+	if workers == 1 {
+		run(0, q.Cols)
+		return nil
+	}
+	chunk := ((q.Cols+workers-1)/workers + 7) &^ 7
+	var wg sync.WaitGroup
+	for lo := 0; lo < q.Cols; lo += chunk {
+		hi := min(lo+chunk, q.Cols)
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			run(lo, hi)
+		}(lo, hi)
+	}
+	wg.Wait()
+	return nil
+}
+
+// qmatmulCols4Generic is the four-row batched body: one pass over the
+// weights feeds four output rows.
+func qmatmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []int8, scale []Float, colSum64 []int32, cols, lo, hi int) {
+	var acc [4][]int32
+	for r := range acc {
+		acc[r] = make([]int32, hi-lo)
+	}
+	pairs := len(xus[0]) / 2
+	for i2 := 0; i2 < pairs; i2++ {
+		row := qw[i2*2*cols:]
+		for r := 0; r < 4; r++ {
+			x0, x1 := int32(xus[r][2*i2]), int32(xus[r][2*i2+1])
+			a := acc[r]
+			for j := lo; j < hi; j++ {
+				a[j-lo] += x0*int32(row[2*j]) + x1*int32(row[2*j+1])
+			}
+		}
+	}
+	for r := 0; r < 4; r++ {
+		o := out.Data[(r0+r)*cols:]
+		for j := lo; j < hi; j++ {
+			o[j] = Float(acc[r][j-lo]-colSum64[j]) * scale[j] * sxs[r]
+		}
+	}
+}
+
 // qmatvecColsGeneric accumulates out[lo:hi] of the quantized product in
 // pure Go, over the same 7-bit activations as the AVX2 kernel so both
 // builds compute identical results. qmatvecCols (see quant_simd.go and

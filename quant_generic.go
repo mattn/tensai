@@ -8,3 +8,7 @@ package tensai
 func qmatvecCols(out []Float, xu []uint8, sx Float, qw []int8, scale []Float, colSum64 []int32, cols, lo, hi int) {
 	qmatvecColsGeneric(out, xu, sx, qw, scale, colSum64, cols, lo, hi)
 }
+
+func qmatmulCols4(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []int8, scale []Float, colSum64 []int32, cols, lo, hi int) {
+	qmatmulCols4Generic(out, xus, sxs, r0, qw, scale, colSum64, cols, lo, hi)
+}

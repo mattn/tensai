@@ -112,6 +112,22 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 	return nil
 }
 
+// MatMul computes out = x @ Q for a batch of activation rows, one MatVec
+// per row: correct and parallel, but without the int8 path's fourfold
+// weight amortization yet.
+func (q *Q4Matrix) MatMul(x, out *Matrix) error {
+	if x.Cols != q.Rows || out.Rows != x.Rows || out.Cols != q.Cols {
+		return fmt.Errorf("tensai: q4matmul shape mismatch: x %dx%d out %dx%d, want %dx%d",
+			x.Rows, x.Cols, out.Rows, out.Cols, q.Rows, q.Cols)
+	}
+	for r := 0; r < x.Rows; r++ {
+		if err := q.MatVec(x.Data[r*x.Cols:(r+1)*x.Cols], out.Data[r*q.Cols:(r+1)*q.Cols]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // q4matvecColsGeneric accumulates out[lo:hi] in pure Go over the same
 // 7-bit activations as the AVX2 kernel, so both builds agree exactly.
 // q4matvecCols (see quant4_simd.go and quant4_generic.go) dispatches to

@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"strings"
+	"sync"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
@@ -32,23 +34,25 @@ type config struct {
 	ModelType    string  `json:"model_type"`
 }
 
-// qmat abstracts the int8 and int4 twins behind one matvec call.
+// qmat abstracts the int8 and int4 twins behind one matvec call, plus the
+// batched form prefill uses.
 type qmat struct {
 	cols int
 	f    func(x, out []float32) error
+	mm   func(x, out *tensai.Matrix) error
 }
 
 func quantizeMat(m *tensai.Matrix, bits int) *qmat {
 	switch bits {
 	case 8:
 		q := tensai.QuantizeMatrix(m)
-		return &qmat{cols: q.Cols, f: q.MatVec}
+		return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul}
 	case 4:
 		q, err := tensai.QuantizeMatrix4(m)
 		if err != nil {
 			panic(err)
 		}
-		return &qmat{cols: q.Cols, f: q.MatVec}
+		return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul}
 	}
 	panic("unsupported quantization width")
 }
@@ -217,6 +221,33 @@ func mv(x []float32, w *tensai.Matrix, q *qmat, bias []float32) []float32 {
 	return out
 }
 
+// mmb is mv for a batch of rows: x @ W (+ bias per row), on the quantized
+// twin when it exists.
+func mmb(x, w *tensai.Matrix, q *qmat, bias []float32) *tensai.Matrix {
+	var out *tensai.Matrix
+	if q != nil {
+		out = tensai.NewMatrix(x.Rows, q.cols)
+		if err := q.mm(x, out); err != nil {
+			panic(err)
+		}
+	} else {
+		o, err := tensai.Dot(x, w)
+		if err != nil {
+			panic(err)
+		}
+		out = o
+	}
+	if bias != nil {
+		for r := 0; r < out.Rows; r++ {
+			row := out.Data[r*out.Cols : (r+1)*out.Cols]
+			for i := range bias {
+				row[i] += bias[i]
+			}
+		}
+	}
+	return out
+}
+
 // rope rotates one head in place, half-split style: pair (i, i+dh/2).
 func (m *qwen) rope(h []float32, pos int) {
 	half := m.headSz / 2
@@ -227,6 +258,123 @@ func (m *qwen) rope(h []float32, pos int) {
 		h[i] = float32(a*c - b*s)
 		h[i+half] = float32(b*c + a*s)
 	}
+}
+
+// prefill feeds a batch of tokens starting at startPos, extending the KV
+// cache, and returns the next-token logits after the last one. It computes
+// exactly what feeding the tokens through step one by one would — the
+// batched quantized matmul quantizes each activation row identically and
+// the attention loops match — but streams each weight matrix once per
+// batch instead of once per token.
+func (m *qwen) prefill(tokens []int, startPos int) []float32 {
+	cfg := m.cfg
+	hs := cfg.HiddenSize
+	group := cfg.Heads / cfg.KVHeads
+	kvDim := cfg.KVHeads * m.headSz
+	n := len(tokens)
+
+	x := tensai.NewMatrix(n, hs)
+	for t, tk := range tokens {
+		copy(x.Data[t*hs:(t+1)*hs], m.embed.Data[tk*hs:(tk+1)*hs])
+	}
+	a := tensai.NewMatrix(n, hs)
+	norm := func(w []float32) {
+		for t := 0; t < n; t++ {
+			copy(a.Data[t*hs:(t+1)*hs], rmsnorm(x.Data[t*hs:(t+1)*hs], w, cfg.RMSEps))
+		}
+	}
+	for li := range m.blocks {
+		b := &m.blocks[li]
+		norm(b.ln1)
+		q := mmb(a, b.wq, b.qq, b.bq)
+		k := mmb(a, b.wk, b.qk, b.bk)
+		v := mmb(a, b.wv, b.qv, b.bv)
+		for t := 0; t < n; t++ {
+			pos := startPos + t
+			qr := q.Data[t*hs:]
+			for h := 0; h < cfg.Heads; h++ {
+				m.rope(qr[h*m.headSz:(h+1)*m.headSz], pos)
+			}
+			kr := k.Data[t*kvDim : (t+1)*kvDim]
+			for h := 0; h < cfg.KVHeads; h++ {
+				m.rope(kr[h*m.headSz:(h+1)*m.headSz], pos)
+			}
+			b.kc = append(b.kc, kr)
+			b.vc = append(b.vc, v.Data[t*kvDim:(t+1)*kvDim])
+		}
+
+		// Causal attention: row t sees cache positions [0, startPos+t].
+		// Rows are independent, so they fan out across CPUs.
+		attn := tensai.NewMatrix(n, hs)
+		scale := 1 / math.Sqrt(float64(m.headSz))
+		var wg sync.WaitGroup
+		rowCh := make(chan int, n)
+		for t := 0; t < n; t++ {
+			rowCh <- t
+		}
+		close(rowCh)
+		for w := min(runtime.NumCPU(), n); w > 0; w-- {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for t := range rowCh {
+					steps := startPos + t + 1
+					scores := make([]float64, steps)
+					qr := q.Data[t*hs : (t+1)*hs]
+					ar := attn.Data[t*hs:]
+					for h := 0; h < cfg.Heads; h++ {
+						qOff := h * m.headSz
+						kvOff := (h / group) * m.headSz
+						maxs := math.Inf(-1)
+						for u := 0; u < steps; u++ {
+							var s float64
+							kt := b.kc[u]
+							for i := 0; i < m.headSz; i++ {
+								s += float64(qr[qOff+i]) * float64(kt[kvOff+i])
+							}
+							s *= scale
+							scores[u] = s
+							if s > maxs {
+								maxs = s
+							}
+						}
+						var sum float64
+						for u := 0; u < steps; u++ {
+							scores[u] = math.Exp(scores[u] - maxs)
+							sum += scores[u]
+						}
+						for u := 0; u < steps; u++ {
+							p := float32(scores[u] / sum)
+							vt := b.vc[u]
+							for i := 0; i < m.headSz; i++ {
+								ar[qOff+i] += p * vt[kvOff+i]
+							}
+						}
+					}
+				}
+			}()
+		}
+		wg.Wait()
+
+		proj := mmb(attn, b.wo, b.qo, nil)
+		for i := range x.Data {
+			x.Data[i] += proj.Data[i]
+		}
+
+		norm(b.ln2)
+		gate := mmb(a, b.wGate, b.qGate, nil)
+		up := mmb(a, b.wUp, b.qUp, nil)
+		for i, g0 := range gate.Data {
+			g := float64(g0)
+			gate.Data[i] = float32(g/(1+math.Exp(-g))) * up.Data[i]
+		}
+		down := mmb(gate, b.wDown, b.qDown, nil)
+		for i := range x.Data {
+			x.Data[i] += down.Data[i]
+		}
+	}
+	last := x.Data[(n-1)*hs : n*hs]
+	return mv(rmsnorm(last, m.normW, cfg.RMSEps), m.lmT, m.qLmT, nil)
 }
 
 // step feeds one token at position pos and returns the next-token logits.

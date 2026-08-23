@@ -231,6 +231,11 @@ func main() {
 	steps := 0
 	var logits []float32
 	feed := func(ids []int) {
+		if len(ids) > 1 {
+			logits = model.prefill(ids, steps)
+			steps += len(ids)
+			return
+		}
 		for _, id := range ids {
 			logits = model.step(id, steps)
 			steps++
@@ -283,6 +288,7 @@ func main() {
 	fmt.Fprintf(os.Stderr, "prompt: %d tokens\n", len(ids))
 	start = time.Now()
 	feed(ids)
+	fmt.Fprintf(os.Stderr, "prefill: %v\n", time.Since(start).Round(time.Millisecond))
 	generate(*n)
 	fmt.Fprintf(os.Stderr, "%d tokens total in %v\n",
 		steps, time.Since(start).Round(time.Millisecond))

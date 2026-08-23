@@ -141,3 +141,91 @@ func BenchmarkMatVecQ8(b *testing.B) {
 		}
 	}
 }
+
+func TestQMatMulBatch(t *testing.T) {
+	rng := rand.New(rand.NewSource(51))
+	for _, c := range []struct{ batch, rows, cols int }{
+		{9, 768, 2304}, // 4-row blocks plus a remainder
+		{4, 64, 33},    // scalar column tails
+		{2, 5, 8},      // pure remainder path
+	} {
+		w := RandomMatrix(c.rows, c.cols, rng)
+		q := QuantizeMatrix(w)
+		x := RandomMatrix(c.batch, c.rows, rng)
+		out := NewMatrix(c.batch, c.cols)
+		if err := q.MatMul(x, out); err != nil {
+			t.Fatalf("%v: %v", c, err)
+		}
+		// The batch must equal per-row MatVec bit for bit: identical
+		// activation quantization, identical integer accumulation.
+		row := make([]Float, c.cols)
+		for r := 0; r < c.batch; r++ {
+			if err := q.MatVec(x.Data[r*c.rows:(r+1)*c.rows], row); err != nil {
+				t.Fatal(err)
+			}
+			for j := range row {
+				if out.Data[r*c.cols+j] != row[j] {
+					t.Fatalf("%v row %d col %d: batch %v matvec %v", c, r, j, out.Data[r*c.cols+j], row[j])
+				}
+			}
+		}
+	}
+
+	q := QuantizeMatrix(NewMatrix(4, 4))
+	if err := q.MatMul(NewMatrix(2, 3), NewMatrix(2, 4)); err == nil {
+		t.Fatal("expected shape mismatch error")
+	}
+
+	q4, err := QuantizeMatrix4(RandomMatrix(64, 32, rng))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := RandomMatrix(3, 64, rng)
+	out := NewMatrix(3, 32)
+	if err := q4.MatMul(x, out); err != nil {
+		t.Fatal(err)
+	}
+	row := make([]Float, 32)
+	for r := 0; r < 3; r++ {
+		if err := q4.MatVec(x.Data[r*64:(r+1)*64], row); err != nil {
+			t.Fatal(err)
+		}
+		for j := range row {
+			if out.Data[r*32+j] != row[j] {
+				t.Fatalf("q4 row %d col %d differs", r, j)
+			}
+		}
+	}
+}
+
+// BenchmarkQ8Prefill measures the batched matmul against running the same
+// rows one matvec at a time — the prompt-prefill comparison.
+func BenchmarkQ8PrefillBatched(b *testing.B) {
+	rng := rand.New(rand.NewSource(52))
+	q := QuantizeMatrix(RandomMatrix(1536, 8960, rng))
+	x := RandomMatrix(64, 1536, rng)
+	out := NewMatrix(64, 8960)
+	b.SetBytes(int64(64 * 1536 * 8960))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := q.MatMul(x, out); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQ8PrefillRowwise(b *testing.B) {
+	rng := rand.New(rand.NewSource(52))
+	q := QuantizeMatrix(RandomMatrix(1536, 8960, rng))
+	x := RandomMatrix(64, 1536, rng)
+	out := NewMatrix(64, 8960)
+	b.SetBytes(int64(64 * 1536 * 8960))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for r := 0; r < 64; r++ {
+			if err := q.MatVec(x.Data[r*1536:(r+1)*1536], out.Data[r*8960:(r+1)*8960]); err != nil {
+				b.Fatal(err)
+			}
+		}
+	}
+}
