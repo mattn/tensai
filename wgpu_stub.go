@@ -82,3 +82,45 @@ func (t *GPUTensor) Shape() []int { return nil }
 
 // Size returns 0 in builds without the wgpu tag.
 func (t *GPUTensor) Size() int { return 0 }
+
+// RMSNorm always fails in builds without the wgpu tag.
+func (t *GPUTensor) RMSNorm(w *GPUTensor, eps float64) (*GPUTensor, error) { return nil, errNoWGPU }
+
+// RoPE always fails in builds without the wgpu tag.
+func (t *GPUTensor) RoPE(headSz, pos0 int, theta float64) error { return errNoWGPU }
+
+// Add always fails in builds without the wgpu tag.
+func (t *GPUTensor) Add(o *GPUTensor) error { return errNoWGPU }
+
+// SiluMul always fails in builds without the wgpu tag.
+func (t *GPUTensor) SiluMul(o *GPUTensor) error { return errNoWGPU }
+
+// CopyRowsInto always fails in builds without the wgpu tag.
+func (t *GPUTensor) CopyRowsInto(dst *GPUTensor, off int) error { return errNoWGPU }
+
+// GroupedCausalAttention always fails in builds without the wgpu tag.
+func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqKV int) (*GPUTensor, error) {
+	return nil, errNoWGPU
+}
+
+// GPUQMatrix is a GPU-resident int8 weight matrix. This build has it
+// disabled; build with -tags wgpu or -tags wgpu24 to enable it.
+type GPUQMatrix struct{}
+
+// UploadQ8 always fails in builds without the wgpu tag.
+func (g *GPU) UploadQ8(q *QMatrix) (*GPUQMatrix, error) { return nil, errNoWGPU }
+
+// MatMul always fails in builds without the wgpu tag.
+func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) { return nil, errNoWGPU }
+
+// Shape returns zeros in builds without the wgpu tag.
+func (q *GPUQMatrix) Shape() (int, int) { return 0, 0 }
+
+// Free is a no-op in builds without the wgpu tag.
+func (q *GPUQMatrix) Free() {}
+
+// BeginBatch always fails in builds without the wgpu tag.
+func (g *GPU) BeginBatch() error { return errNoWGPU }
+
+// Flush is a no-op in builds without the wgpu tag.
+func (g *GPU) Flush() error { return nil }

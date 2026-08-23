@@ -45,6 +45,8 @@ type GPU struct {
 	module     uintptr
 	pipes      gpuPipelines
 	readback   gpuReadbackBuffer
+	pool       gpuBufferPool
+	batchEnc   uintptr // open command encoder while batching, see BeginBatch
 	name       string
 	maxStorage uint64 // usable bytes per storage buffer, 0 = unknown
 	closed     bool
@@ -578,6 +580,7 @@ func (g *GPU) Close() {
 	}
 	g.closed = true
 	g.releaseReadback()
+	g.releasePool()
 	g.releasePipelines()
 	for _, r := range []struct {
 		fn func(uintptr)

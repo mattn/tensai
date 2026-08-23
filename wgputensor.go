@@ -350,11 +350,12 @@ fn softmax_last(@builtin(workgroup_id) wid: vec3<u32>,
 // reduce its max and sum, then switch axes and each accumulate one or two
 // output channels (dh up to 128), rescaling the running state as the max
 // grows. offs (binding 3) holds per-batch*head element offsets
-// (q, kv, out); rows in q, k, v, and out all stride by ap.d, so heads
-// stay packed.
+// (q, kv, out); rows in q and out stride by ap.d and rows in k and v by
+// ap.dkv, so heads stay packed and k/v may pack fewer heads than q
+// (grouped-query attention).
 struct AttnParams {
     seqQ: u32, seqKV: u32, dh: u32, d: u32,
-    rows: u32, off: u32, pad0: u32, pad1: u32,
+    rows: u32, off: u32, dkv: u32, pad1: u32,
 }
 @group(0) @binding(10) var<uniform> ap: AttnParams;
 @group(0) @binding(11) var<storage, read> aq: array<f32>;
@@ -399,7 +400,7 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
         if (j < limit) {
             var dot = 0.0;
             for (var c = 0u; c < ap.dh; c = c + 1u) {
-                dot = dot + qrow[c] * ak[offKV + j * ap.d + c];
+                dot = dot + qrow[c] * ak[offKV + j * ap.dkv + c];
             }
             s = dot * scale;
         }
@@ -434,10 +435,10 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
         for (var jj = tt * AT; jj < jEnd; jj = jj + 1u) {
             let pj = ap_sc[jj - tt * AT];
             if (t < ap.dh) {
-                acc0 = acc0 + pj * av[offKV + jj * ap.d + t];
+                acc0 = acc0 + pj * av[offKV + jj * ap.dkv + t];
             }
             if (64u + t < ap.dh) {
-                acc1 = acc1 + pj * av[offKV + jj * ap.d + 64u + t];
+                acc1 = acc1 + pj * av[offKV + jj * ap.dkv + 64u + t];
             }
         }
         workgroupBarrier();
@@ -507,6 +508,96 @@ fn qmatmul(@builtin(workgroup_id) wid: vec3<u32>,
         }
     }
 }
+
+// rmsnorm_row: one workgroup per row computes out = x * w / rms(x).
+struct NormParams { rows: u32, n: u32, eps: f32, pad: u32 }
+@group(0) @binding(20) var<uniform> np: NormParams;
+@group(0) @binding(21) var<storage, read> nx: array<f32>;
+@group(0) @binding(22) var<storage, read> nw: array<f32>;
+@group(0) @binding(23) var<storage, read_write> nout: array<f32>;
+
+var<workgroup> nred: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn rmsnorm_row(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>,
+               @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.y * nwg.x + wid.x;
+    if (row >= np.rows) {
+        return;
+    }
+    let base = row * np.n;
+    var ss = 0.0;
+    for (var i = lid.x; i < np.n; i = i + 256u) {
+        let v = nx[base + i];
+        ss = ss + v * v;
+    }
+    nred[lid.x] = ss;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (lid.x < s) { nred[lid.x] = nred[lid.x] + nred[lid.x + s]; }
+        workgroupBarrier();
+    }
+    let inv = inverseSqrt(nred[0] / f32(np.n) + np.eps);
+    for (var i = lid.x; i < np.n; i = i + 256u) {
+        nout[base + i] = nx[base + i] * inv * nw[i];
+    }
+}
+
+// rope_rows rotates every head of every row in place, half-split style:
+// element pair (c, c+headSz/2) of each head rotates by pos*theta^(-2c/headSz),
+// where row r sits at position pos0 + r.
+struct RopeParams { rows: u32, d: u32, headSz: u32, pos0: u32, theta: f32 }
+@group(0) @binding(24) var<uniform> rp: RopeParams;
+@group(0) @binding(25) var<storage, read_write> rx: array<f32>;
+
+@compute @workgroup_size(64, 1, 1)
+fn rope_rows(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let half = rp.headSz / 2u;
+    let pairs = (rp.d / rp.headSz) * half;
+    if (gid.x >= pairs || gid.y >= rp.rows) {
+        return;
+    }
+    let h = gid.x / half;
+    let c = gid.x % half;
+    let base = gid.y * rp.d + h * rp.headSz + c;
+    let freq = pow(rp.theta, -2.0 * f32(c) / f32(rp.headSz));
+    let ang = f32(rp.pos0 + gid.y) * freq;
+    let sn = sin(ang);
+    let cs = cos(ang);
+    let a = rx[base];
+    let b = rx[base + half];
+    rx[base] = a * cs - b * sn;
+    rx[base + half] = b * cs + a * sn;
+}
+
+// add_ip: dst += src, with src repeating when shorter (a row bias applied
+// to every row). silu_mul_ip: dst = silu(dst) * src, the SwiGLU joint.
+struct EltParams { count: u32, srcCount: u32 }
+@group(0) @binding(26) var<uniform> ep: EltParams;
+@group(0) @binding(27) var<storage, read_write> edst: array<f32>;
+@group(0) @binding(28) var<storage, read> esrc: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn add_ip(@builtin(workgroup_id) wg: vec3<u32>,
+          @builtin(num_workgroups) nwg: vec3<u32>,
+          @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx < ep.count) {
+        edst[idx] = edst[idx] + esrc[idx % ep.srcCount];
+    }
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn silu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>,
+               @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx < ep.count) {
+        let g = edst[idx];
+        edst[idx] = g / (1.0 + exp(-g)) * esrc[idx % ep.srcCount];
+    }
+}
 `
 
 // gpuPipelines holds one compute pipeline (and its auto bind-group layout)
@@ -515,8 +606,10 @@ fn qmatmul(@builtin(workgroup_id) wid: vec3<u32>,
 type gpuPipelines struct {
 	matmul, matmulT, matmulS, matmulTS             uintptr
 	scale, softmax, attn, qmatmul                  uintptr
+	rmsnorm, rope, addIP, siluMulIP                uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
 	layScale, laySoftmax, layAttn, layQmatmul      uintptr
+	layRmsnorm, layRope, layAddIP, laySiluMulIP    uintptr
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -534,6 +627,10 @@ func (g *GPU) initPipelines() error {
 		{&g.pipes.softmax, &g.pipes.laySoftmax, "softmax_last"},
 		{&g.pipes.attn, &g.pipes.layAttn, "attn_causal"},
 		{&g.pipes.qmatmul, &g.pipes.layQmatmul, "qmatmul"},
+		{&g.pipes.rmsnorm, &g.pipes.layRmsnorm, "rmsnorm_row"},
+		{&g.pipes.rope, &g.pipes.layRope, "rope_rows"},
+		{&g.pipes.addIP, &g.pipes.layAddIP, "add_ip"},
+		{&g.pipes.siluMulIP, &g.pipes.laySiluMulIP, "silu_mul_ip"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -550,7 +647,8 @@ func (g *GPU) releasePipelines() {
 	for _, h := range []uintptr{
 		g.pipes.layMatmul, g.pipes.layMatmulT, g.pipes.layMatmulS,
 		g.pipes.layMatmulTS, g.pipes.layScale, g.pipes.laySoftmax, g.pipes.layAttn,
-		g.pipes.layQmatmul,
+		g.pipes.layQmatmul, g.pipes.layRmsnorm, g.pipes.layRope,
+		g.pipes.layAddIP, g.pipes.laySiluMulIP,
 	} {
 		if h != 0 {
 			fnLayoutRelease(h)
@@ -559,7 +657,8 @@ func (g *GPU) releasePipelines() {
 	for _, h := range []uintptr{
 		g.pipes.matmul, g.pipes.matmulT, g.pipes.matmulS,
 		g.pipes.matmulTS, g.pipes.scale, g.pipes.softmax, g.pipes.attn,
-		g.pipes.qmatmul,
+		g.pipes.qmatmul, g.pipes.rmsnorm, g.pipes.rope,
+		g.pipes.addIP, g.pipes.siluMulIP,
 	} {
 		if h != 0 {
 			fnPipelineRelease(h)
@@ -568,15 +667,25 @@ func (g *GPU) releasePipelines() {
 }
 
 // dispatch runs one compute pass and pumps the error callback once; the
-// caller holds wgpuMu.
+// caller holds wgpuMu. Inside a batch (see BeginBatch) the pass is only
+// recorded — submission waits for Flush.
 func (g *GPU) dispatch(pipe, bindGroup uintptr, x, y, z uint32) error {
-	encoder := fnDeviceCreateCmdEncoder(g.device, nil)
+	encoder := g.batchEnc
+	if encoder == 0 {
+		encoder = fnDeviceCreateCmdEncoder(g.device, nil)
+	}
 	pass := fnEncoderBeginComputePass(encoder, nil)
 	fnPassSetPipeline(pass, pipe)
 	fnPassSetBindGroup(pass, 0, bindGroup, 0, nil)
 	fnPassDispatch(pass, x, y, z)
 	fnPassEnd(pass)
 	fnPassRelease(pass)
+	if g.batchEnc != 0 {
+		if uncapturedCB != "" {
+			return fmt.Errorf("tensai: gpu dispatch failed: %s", uncapturedCB)
+		}
+		return nil
+	}
 	cmd := fnEncoderFinish(encoder, nil)
 	fnCmdEncoderRelease(encoder)
 	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
@@ -586,6 +695,143 @@ func (g *GPU) dispatch(pipe, bindGroup uintptr, x, y, z uint32) error {
 		return fmt.Errorf("tensai: gpu dispatch failed: %s", uncapturedCB)
 	}
 	return nil
+}
+
+// BeginBatch opens a command encoder that collects every subsequent
+// operation on this GPU — compute dispatches and buffer copies — into one
+// submission, which Flush sends. One submission instead of hundreds is
+// the difference between a usable and an unusable decode step on drivers
+// with per-submit overhead. Operations inside a batch report validation
+// errors at Flush; Download flushes an open batch implicitly.
+func (g *GPU) BeginBatch() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return errors.New("tensai: gpu is closed")
+	}
+	if g.batchEnc != 0 {
+		return errors.New("tensai: gpu batch already open")
+	}
+	uncapturedCB = ""
+	g.batchEnc = fnDeviceCreateCmdEncoder(g.device, nil)
+	return nil
+}
+
+// Flush submits the batch opened by BeginBatch. Safe to call with no batch
+// open.
+func (g *GPU) Flush() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	return g.flushLocked()
+}
+
+// flushLocked submits and closes an open batch encoder; the caller holds
+// g.mu and wgpuMu.
+func (g *GPU) flushLocked() error {
+	if g.batchEnc == 0 {
+		return nil
+	}
+	encoder := g.batchEnc
+	g.batchEnc = 0
+	cmd := fnEncoderFinish(encoder, nil)
+	fnCmdEncoderRelease(encoder)
+	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
+	fnCmdBufferRelease(cmd)
+	fnDevicePoll(g.device, 0, nil)
+	g.drainPending()
+	if uncapturedCB != "" {
+		return fmt.Errorf("tensai: gpu batch failed: %s", uncapturedCB)
+	}
+	return nil
+}
+
+// gpuBufferPool recycles transient buffers — op parameter uniforms and
+// intermediate tensors — keyed by exact (usage, size). A decode step
+// allocates the same shapes every token, so after the first token every
+// request hits. While a batch is open, returned buffers wait in pending:
+// reuse writes go through fnQueueWriteBuffer, which jumps ahead of the
+// still-unsubmitted encoder, so a buffer must not be handed out again
+// until the batch that references it is flushed.
+type gpuBufferPool struct {
+	free    map[[2]uint64][]uintptr
+	pending []pooledBuf
+	bytes   uint64
+}
+
+type pooledBuf struct {
+	usage, size uint64
+	buf         uintptr
+}
+
+// gpuPoolMaxBytes caps the pooled total; beyond it buffers just release.
+const gpuPoolMaxBytes = 512 << 20
+
+// takeBuffer returns a pooled buffer of exactly this usage and size, or a
+// fresh one. The caller holds g.mu and wgpuMu.
+func (g *GPU) takeBuffer(usage, size uint64) uintptr {
+	key := [2]uint64{usage, size}
+	if l := g.pool.free[key]; len(l) > 0 {
+		buf := l[len(l)-1]
+		g.pool.free[key] = l[:len(l)-1]
+		g.pool.bytes -= size
+		return buf
+	}
+	return g.newBuffer(usage, size)
+}
+
+// putBuffer returns a buffer to the pool (or releases it past the cap).
+// The caller holds wgpuMu.
+func (g *GPU) putBuffer(usage, size uint64, buf uintptr) {
+	if g.closed || g.pool.bytes+size > gpuPoolMaxBytes {
+		fnBufferRelease(buf)
+		return
+	}
+	if g.batchEnc != 0 {
+		g.pool.pending = append(g.pool.pending, pooledBuf{usage, size, buf})
+		return
+	}
+	if g.pool.free == nil {
+		g.pool.free = make(map[[2]uint64][]uintptr)
+	}
+	key := [2]uint64{usage, size}
+	g.pool.free[key] = append(g.pool.free[key], buf)
+	g.pool.bytes += size
+}
+
+// drainPending moves batch-held buffers into the free lists once their
+// batch has been submitted. The caller holds wgpuMu.
+func (g *GPU) drainPending() {
+	for _, p := range g.pool.pending {
+		if g.pool.bytes+p.size > gpuPoolMaxBytes {
+			fnBufferRelease(p.buf)
+			continue
+		}
+		if g.pool.free == nil {
+			g.pool.free = make(map[[2]uint64][]uintptr)
+		}
+		key := [2]uint64{p.usage, p.size}
+		g.pool.free[key] = append(g.pool.free[key], p.buf)
+		g.pool.bytes += p.size
+	}
+	g.pool.pending = g.pool.pending[:0]
+}
+
+// releasePool drops every pooled buffer during Close. The caller holds
+// wgpuMu.
+func (g *GPU) releasePool() {
+	for _, l := range g.pool.free {
+		for _, buf := range l {
+			fnBufferRelease(buf)
+		}
+	}
+	for _, p := range g.pool.pending {
+		fnBufferRelease(p.buf)
+	}
+	g.pool = gpuBufferPool{}
 }
 
 // GPUTensor is a tensor whose data lives in GPU memory. Create one with
@@ -680,7 +926,7 @@ func (g *GPU) Upload(t *Tensor) (*GPUTensor, error) {
 	if err := g.checkSize(uint64(len(t.Data)) * 4); err != nil {
 		return nil, err
 	}
-	buf := g.newBuffer(gpuTensorUsage, uint64(len(t.Data))*4)
+	buf := g.takeBuffer(gpuTensorUsage, uint64(len(t.Data))*4)
 	if buf == 0 {
 		return nil, errors.New("tensai: gpu buffer allocation failed")
 	}
@@ -701,6 +947,9 @@ func (t *GPUTensor) Download() (*Tensor, error) {
 	defer wgpuMu.Unlock()
 	if g.closed {
 		return nil, errors.New("tensai: gpu is closed")
+	}
+	if err := g.flushLocked(); err != nil {
+		return nil, err
 	}
 	out := NewTensor(t.shape...)
 	bytes := uint64(len(out.Data)) * 4
@@ -734,8 +983,9 @@ func (t *GPUTensor) Download() (*Tensor, error) {
 	return out, nil
 }
 
-// Free releases the GPU buffer. The tensor must not be used afterwards;
-// calling Free again is a no-op.
+// Free releases the GPU buffer (into the transient pool, from which the
+// next same-sized tensor will reuse it). The tensor must not be used
+// afterwards; calling Free again is a no-op.
 func (t *GPUTensor) Free() {
 	wgpuMu.Lock()
 	defer wgpuMu.Unlock()
@@ -743,7 +993,7 @@ func (t *GPUTensor) Free() {
 		return
 	}
 	t.freed = true
-	fnBufferRelease(t.buf)
+	t.g.putBuffer(gpuTensorUsage, uint64(t.Size())*4, t.buf)
 }
 
 // MatMul multiplies two GPU-resident tensors with the same shape and
@@ -844,11 +1094,11 @@ func (g *GPU) stridedMatMul(a, b *GPUTensor, outShape []int, transB bool, m, k, 
 	if err := g.checkSize(outBytes); err != nil {
 		return nil, err
 	}
-	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
-	bufOffs := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
-	bufOut := g.newBuffer(gpuTensorUsage, outBytes)
-	defer fnBufferRelease(bufParams)
-	defer fnBufferRelease(bufOffs)
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
+	bufOffs := g.takeBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
+	bufOut := g.takeBuffer(gpuTensorUsage, outBytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
+	defer g.putBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4, bufOffs)
 
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
 	fnQueueWriteBuffer(g.queue, bufOffs, 0, unsafe.Pointer(&offs[0]), uintptr(len(offs))*4)
@@ -918,8 +1168,8 @@ func (t *GPUTensor) Scale(s Float) error {
 	uncapturedCB = ""
 
 	params := [4]uint32{uint32(count), math.Float32bits(float32(s))}
-	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
-	defer fnBufferRelease(bufParams)
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
 
 	entries := [2]wgpuBindGroupEntry{
@@ -964,9 +1214,9 @@ func (t *GPUTensor) softmax(qmod, off int) (*GPUTensor, error) {
 
 	bytes := uint64(t.Size()) * 4
 	params := [4]uint32{uint32(rows), uint32(cols), uint32(qmod), uint32(off)}
-	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
-	bufOut := g.newBuffer(gpuTensorUsage, bytes)
-	defer fnBufferRelease(bufParams)
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+	bufOut := g.takeBuffer(gpuTensorUsage, bytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
 
 	entries := [3]wgpuBindGroupEntry{
@@ -1143,7 +1393,7 @@ func (q *GPUTensor) fusedCausalMHA(k, v *GPUTensor, heads, batch, seq, seqKV, d,
 	rows := bh * seq
 	params := [8]uint32{
 		uint32(seq), uint32(seqKV), uint32(dh), uint32(d),
-		uint32(rows), uint32(seqKV - seq), 0, 0,
+		uint32(rows), uint32(seqKV - seq), uint32(d), 0,
 	}
 	outShape := append(append([]int(nil), q.shape[:len(q.shape)-2]...), seq, d)
 
@@ -1161,11 +1411,11 @@ func (q *GPUTensor) fusedCausalMHA(k, v *GPUTensor, heads, batch, seq, seqKV, d,
 	if err := g.checkSize(outBytes); err != nil {
 		return nil, err
 	}
-	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
-	bufOffs := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
-	bufOut := g.newBuffer(gpuTensorUsage, outBytes)
-	defer fnBufferRelease(bufParams)
-	defer fnBufferRelease(bufOffs)
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
+	bufOffs := g.takeBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
+	bufOut := g.takeBuffer(gpuTensorUsage, outBytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
+	defer g.putBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4, bufOffs)
 
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
 	fnQueueWriteBuffer(g.queue, bufOffs, 0, unsafe.Pointer(&offs[0]), uintptr(len(offs))*4)
@@ -1327,9 +1577,9 @@ func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 		return nil, err
 	}
 	params := [4]uint32{uint32(q.rows), uint32(q.cols), uint32(q.words), uint32(m)}
-	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
-	bufOut := g.newBuffer(gpuTensorUsage, outBytes)
-	defer fnBufferRelease(bufParams)
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+	bufOut := g.takeBuffer(gpuTensorUsage, outBytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
 
 	entries := [5]wgpuBindGroupEntry{
@@ -1350,4 +1600,280 @@ func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 		return nil, err
 	}
 	return &GPUTensor{g: g, buf: bufOut, shape: outShape}, nil
+}
+
+// RMSNorm normalizes each row of the last axis by its root mean square and
+// multiplies by the weight vector w (length = last axis), the pre-norm of
+// Llama-family transformer blocks. Returns a new GPU-resident tensor.
+func (t *GPUTensor) RMSNorm(w *GPUTensor, eps float64) (*GPUTensor, error) {
+	if t.freed || w.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	nd := len(t.shape)
+	if nd == 0 {
+		return nil, errors.New("tensai: rmsnorm needs at least 1 axis")
+	}
+	n := t.shape[nd-1]
+	if w.Size() != n {
+		return nil, fmt.Errorf("tensai: rmsnorm weight length %d != last axis %d", w.Size(), n)
+	}
+	rows := t.Size() / n
+	g := t.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	params := [4]uint32{uint32(rows), uint32(n), math.Float32bits(float32(eps)), 0}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+	bufOut := g.takeBuffer(gpuTensorUsage, uint64(t.Size())*4)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+
+	entries := [4]wgpuBindGroupEntry{
+		{binding: 20, buffer: bufParams, size: 16},
+		{binding: 21, buffer: t.buf, size: uint64(t.Size()) * 4},
+		{binding: 22, buffer: w.buf, size: uint64(w.Size()) * 4},
+		{binding: 23, buffer: bufOut, size: uint64(t.Size()) * 4},
+	}
+	bindGroup := g.makeBindGroup(g.pipes.layRmsnorm, entries[:])
+	runtime.KeepAlive(&entries)
+	defer fnBindGroupRelease(bindGroup)
+
+	x, y := split2D(rows)
+	if err := g.dispatch(g.pipes.rmsnorm, bindGroup, x, y, 1); err != nil {
+		fnBufferRelease(bufOut)
+		return nil, err
+	}
+	return &GPUTensor{g: g, buf: bufOut, shape: append([]int(nil), t.shape...)}, nil
+}
+
+// RoPE applies rotary position embeddings in place, half-split style: the
+// last axis divides into heads of headSz, and element pair (c, c+headSz/2)
+// of each head in row r rotates by (pos0+r) * theta^(-2c/headSz).
+func (t *GPUTensor) RoPE(headSz, pos0 int, theta float64) error {
+	if t.freed {
+		return errors.New("tensai: gpu tensor already freed")
+	}
+	nd := len(t.shape)
+	if nd == 0 {
+		return errors.New("tensai: rope needs at least 1 axis")
+	}
+	d := t.shape[nd-1]
+	if headSz <= 0 || headSz%2 != 0 || d%headSz != 0 {
+		return fmt.Errorf("tensai: rope head size %d does not divide axis %d", headSz, d)
+	}
+	rows := t.Size() / d
+	if rows > 65535 {
+		return fmt.Errorf("tensai: rope batch of %d rows exceeds 65535", rows)
+	}
+	g := t.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	params := [8]uint32{
+		uint32(rows), uint32(d), uint32(headSz), uint32(pos0),
+		math.Float32bits(float32(theta)), 0, 0, 0,
+	}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
+
+	entries := [2]wgpuBindGroupEntry{
+		{binding: 24, buffer: bufParams, size: 32},
+		{binding: 25, buffer: t.buf, size: uint64(t.Size()) * 4},
+	}
+	bindGroup := g.makeBindGroup(g.pipes.layRope, entries[:])
+	runtime.KeepAlive(&entries)
+	defer fnBindGroupRelease(bindGroup)
+
+	pairs := (d / headSz) * (headSz / 2)
+	return g.dispatch(g.pipes.rope, bindGroup, uint32((pairs+63)/64), uint32(rows), 1)
+}
+
+// eltwiseIP dispatches one of the two in-place elementwise kernels with o
+// as the second operand, repeating o when it is shorter (a row bias
+// against a batch of rows).
+func (t *GPUTensor) eltwiseIP(pipe, lay uintptr, o *GPUTensor) error {
+	if t.freed || o.freed {
+		return errors.New("tensai: gpu tensor already freed")
+	}
+	if t.g != o.g {
+		return errors.New("tensai: gpu tensors belong to different GPUs")
+	}
+	if o.Size() == 0 || t.Size()%o.Size() != 0 {
+		return fmt.Errorf("tensai: elementwise size mismatch: %d vs %d", t.Size(), o.Size())
+	}
+	g := t.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	params := [4]uint32{uint32(t.Size()), uint32(o.Size()), 0, 0}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+
+	entries := [3]wgpuBindGroupEntry{
+		{binding: 26, buffer: bufParams, size: 16},
+		{binding: 27, buffer: t.buf, size: uint64(t.Size()) * 4},
+		{binding: 28, buffer: o.buf, size: uint64(o.Size()) * 4},
+	}
+	bindGroup := g.makeBindGroup(lay, entries[:])
+	runtime.KeepAlive(&entries)
+	defer fnBindGroupRelease(bindGroup)
+
+	x, y := split2D((t.Size() + gpuKernelWG - 1) / gpuKernelWG)
+	return g.dispatch(pipe, bindGroup, x, y, 1)
+}
+
+// Add computes t += o elementwise in place. o may be shorter as long as
+// its size divides t's: it repeats, which applies a row bias to every row.
+func (t *GPUTensor) Add(o *GPUTensor) error {
+	return t.eltwiseIP(t.g.pipes.addIP, t.g.pipes.layAddIP, o)
+}
+
+// SiluMul computes t = silu(t) * o elementwise in place — the SwiGLU
+// joint, with t the gate projection and o the up projection.
+func (t *GPUTensor) SiluMul(o *GPUTensor) error {
+	return t.eltwiseIP(t.g.pipes.siluMulIP, t.g.pipes.laySiluMulIP, o)
+}
+
+// CopyRowsInto copies t's whole buffer into dst starting at element offset
+// off — appending freshly projected k/v rows to a preallocated cache
+// without leaving the device.
+func (t *GPUTensor) CopyRowsInto(dst *GPUTensor, off int) error {
+	if t.freed || dst.freed {
+		return errors.New("tensai: gpu tensor already freed")
+	}
+	if t.g != dst.g {
+		return errors.New("tensai: gpu tensors belong to different GPUs")
+	}
+	if off < 0 || off+t.Size() > dst.Size() {
+		return fmt.Errorf("tensai: copy of %d elements at %d overflows %d", t.Size(), off, dst.Size())
+	}
+	g := t.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+	if g.batchEnc != 0 {
+		fnEncoderCopyBuffer(g.batchEnc, t.buf, 0, dst.buf, uint64(off)*4, uint64(t.Size())*4)
+		return nil
+	}
+	encoder := fnDeviceCreateCmdEncoder(g.device, nil)
+	fnEncoderCopyBuffer(encoder, t.buf, 0, dst.buf, uint64(off)*4, uint64(t.Size())*4)
+	cmd := fnEncoderFinish(encoder, nil)
+	fnCmdEncoderRelease(encoder)
+	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
+	fnCmdBufferRelease(cmd)
+	if uncapturedCB != "" {
+		return fmt.Errorf("tensai: gpu copy failed: %s", uncapturedCB)
+	}
+	return nil
+}
+
+// GroupedCausalAttention is causal multi-head attention against a
+// KV cache that may pack fewer heads than the queries (grouped-query
+// attention) and hold more positions than are valid: q is (seq, heads*dh),
+// k and v hold at least seqKV rows of kvHeads*dh (extra cache capacity
+// beyond seqKV is ignored), and query i attends to positions
+// 0..i+(seqKV-seq). Head h reads kv head h/(heads/kvHeads). One fused
+// dispatch, dh at most 128.
+func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqKV int) (*GPUTensor, error) {
+	if q.freed || k.freed || v.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if q.g != k.g || q.g != v.g {
+		return nil, errors.New("tensai: gpu tensors belong to different GPUs")
+	}
+	nd := len(q.shape)
+	if nd == 0 {
+		return nil, errors.New("tensai: attention needs at least 1 axis")
+	}
+	d := q.shape[nd-1]
+	if heads <= 0 || kvHeads <= 0 || d%heads != 0 || heads%kvHeads != 0 {
+		return nil, fmt.Errorf("tensai: %d query heads / %d kv heads do not divide dimension %d", heads, kvHeads, d)
+	}
+	dh := d / heads
+	if dh > 128 {
+		return nil, fmt.Errorf("tensai: grouped attention head dimension %d exceeds 128", dh)
+	}
+	seq := q.Size() / d
+	kvDim := kvHeads * dh
+	if seqKV < seq {
+		return nil, fmt.Errorf("tensai: grouped attention needs seqKV >= seq, got %d < %d", seqKV, seq)
+	}
+	if k.Size() < seqKV*kvDim || v.Size() < seqKV*kvDim {
+		return nil, fmt.Errorf("tensai: kv cache of %d/%d elements is smaller than %d x %d", k.Size(), v.Size(), seqKV, kvDim)
+	}
+	group := heads / kvHeads
+	offs := make([]uint32, 4*heads)
+	for h := 0; h < heads; h++ {
+		offs[4*h] = uint32(h * dh)
+		offs[4*h+1] = uint32((h / group) * dh)
+		offs[4*h+2] = uint32(h * dh)
+	}
+	rows := heads * seq
+	params := [8]uint32{
+		uint32(seq), uint32(seqKV), uint32(dh), uint32(d),
+		uint32(rows), uint32(seqKV - seq), uint32(kvDim), 0,
+	}
+
+	g := q.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	outBytes := uint64(q.Size()) * 4
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
+	bufOffs := g.takeBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
+	bufOut := g.takeBuffer(gpuTensorUsage, outBytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
+	defer g.putBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4, bufOffs)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
+	fnQueueWriteBuffer(g.queue, bufOffs, 0, unsafe.Pointer(&offs[0]), uintptr(len(offs))*4)
+
+	entries := [6]wgpuBindGroupEntry{
+		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
+		{binding: 10, buffer: bufParams, size: 32},
+		{binding: 11, buffer: q.buf, size: uint64(q.Size()) * 4},
+		{binding: 12, buffer: k.buf, size: uint64(k.Size()) * 4},
+		{binding: 13, buffer: v.buf, size: uint64(v.Size()) * 4},
+		{binding: 14, buffer: bufOut, size: outBytes},
+	}
+	bindGroup := g.makeBindGroup(g.pipes.layAttn, entries[:])
+	runtime.KeepAlive(&entries)
+	defer fnBindGroupRelease(bindGroup)
+
+	x, y := split2D(rows)
+	if err := g.dispatch(g.pipes.attn, bindGroup, x, y, 1); err != nil {
+		fnBufferRelease(bufOut)
+		return nil, err
+	}
+	return &GPUTensor{g: g, buf: bufOut, shape: append([]int(nil), q.shape...)}, nil
 }

@@ -28,6 +28,7 @@ import (
 	"strings"
 	"time"
 
+	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/tokenizer"
 )
 
@@ -163,6 +164,7 @@ func main() {
 	q8 := flag.Bool("q8", false, "decode against int8-quantized weights")
 	q4 := flag.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
 	chat := flag.Bool("chat", false, "interactive multi-turn chat on stdin (the KV cache carries the conversation)")
+	gpu := flag.Bool("gpu", false, "decode on the GPU (requires -q8 and a wgpu build tag)")
 	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile of generation to this file")
 	flag.Parse()
 
@@ -225,11 +227,38 @@ func main() {
 		nCtx = 4096
 	}
 
+	// With -gpu the transformer blocks decode on the device; the prompt
+	// still prefills on the CPU, and syncCache carries it over below.
+	var gq *gpuQwen
+	if *gpu {
+		if *chat {
+			fmt.Fprintln(os.Stderr, "-gpu does not support -chat yet (the CPU and GPU caches would diverge)")
+			os.Exit(1)
+		}
+		if bits != 8 {
+			fmt.Fprintln(os.Stderr, "-gpu requires -q8")
+			os.Exit(1)
+		}
+		g, err := tensai.OpenGPU(tensai.GPUHighPerformance)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		defer g.Close()
+		start := time.Now()
+		if gq, err = newGPUQwen(model, g, nCtx); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Fprintf(os.Stderr, "uploaded to %s in %v\n", g.Name(), time.Since(start).Round(time.Millisecond))
+	}
+
 	// feed pushes tokens through the model, extending the KV cache;
 	// generate then samples until an end token, which is also fed so the
 	// cache stays aligned with the template for the next turn.
 	steps := 0
 	var logits []float32
+	stepFn := model.step
 	feed := func(ids []int) {
 		if len(ids) > 1 {
 			logits = model.prefill(ids, steps)
@@ -237,7 +266,7 @@ func main() {
 			return
 		}
 		for _, id := range ids {
-			logits = model.step(id, steps)
+			logits = stepFn(id, steps)
 			steps++
 		}
 	}
@@ -289,6 +318,13 @@ func main() {
 	start = time.Now()
 	feed(ids)
 	fmt.Fprintf(os.Stderr, "prefill: %v\n", time.Since(start).Round(time.Millisecond))
+	if gq != nil {
+		if err := gq.syncCache(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		stepFn = gq.step
+	}
 	generate(*n)
 	fmt.Fprintf(os.Stderr, "%d tokens total in %v\n",
 		steps, time.Since(start).Round(time.Millisecond))
