@@ -175,7 +175,7 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 	}
 	// Projection weights arrive [out, in] like HF's; transpose for the
 	// matvec and quantize immediately so the float32 copy dies here.
-	lin := func(name string, unpermute int) (*tensai.Matrix, *qmat) {
+	trans := func(name string, unpermute int) *tensai.Matrix {
 		m, err := tensor(name).Matrix()
 		if err != nil {
 			panic(err)
@@ -183,11 +183,16 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 		if unpermute > 0 {
 			unpermuteRows(m, unpermute)
 		}
-		w := m.T()
+		return m.T()
+	}
+	quant := func(w *tensai.Matrix) (*tensai.Matrix, *qmat) {
 		if bits == 0 {
 			return w, nil
 		}
 		return nil, quantizeMat(w, bits)
+	}
+	lin := func(name string, unpermute int) (*tensai.Matrix, *qmat) {
+		return quant(trans(name, unpermute))
 	}
 
 	// Only the llama architecture's q/k rows are stored permuted.
@@ -218,15 +223,20 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 		p := fmt.Sprintf("blk.%d.", i)
 		b.ln1 = tensor(p + "attn_norm.weight").Data
 		b.ln2 = tensor(p + "ffn_norm.weight").Data
-		b.wq, b.qq = lin(p+"attn_q.weight", qPerm)
-		b.bq = unpermuteVec(vecOpt(p+"attn_q.bias"), qPerm)
-		b.wk, b.qk = lin(p+"attn_k.weight", kPerm)
-		b.bk = unpermuteVec(vecOpt(p+"attn_k.bias"), kPerm)
-		b.wv, b.qv = lin(p+"attn_v.weight", 0)
-		b.bv = vecOpt(p + "attn_v.bias")
+		b.wQKV, b.qQKV = quant(hcat([]*tensai.Matrix{
+			trans(p+"attn_q.weight", qPerm),
+			trans(p+"attn_k.weight", kPerm),
+			trans(p+"attn_v.weight", 0),
+		}))
+		b.bQKV = catVec(
+			unpermuteVec(vecOpt(p+"attn_q.bias"), qPerm),
+			unpermuteVec(vecOpt(p+"attn_k.bias"), kPerm),
+			vecOpt(p+"attn_v.bias"))
 		b.wo, b.qo = lin(p+"attn_output.weight", 0)
-		b.wGate, b.qGate = lin(p+"ffn_gate.weight", 0)
-		b.wUp, b.qUp = lin(p+"ffn_up.weight", 0)
+		b.wGU, b.qGU = quant(hcat([]*tensai.Matrix{
+			trans(p+"ffn_gate.weight", 0),
+			trans(p+"ffn_up.weight", 0),
+		}))
 		b.wDown, b.qDown = lin(p+"ffn_down.weight", 0)
 	}
 	return m, tok, nil

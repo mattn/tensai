@@ -61,14 +61,18 @@ func quantizeMat(m *tensai.Matrix, bits int) *qmat {
 	panic("unsupported quantization width")
 }
 
+// qblock holds one layer's weights. The q, k, and v projections fuse
+// into one matrix (columns [q | k | v]) and gate/up into another, so a
+// decode step streams four weight matrices instead of seven — quantization
+// is per column, so the fused results are bit-identical to separate calls.
 type qblock struct {
-	ln1, ln2          []float32
-	wq, wk, wv, wo    *tensai.Matrix // [in, out] after transposing HF's [out, in]
-	bq, bk, bv        []float32
-	wGate, wUp, wDown *tensai.Matrix
-	qq, qk, qv, qo    *qmat
-	qGate, qUp, qDown *qmat
-	kc, vc            [][]float32 // KV cache, kvHeads*headDim per position
+	ln1, ln2   []float32
+	wQKV, wo   *tensai.Matrix // [in, out] after transposing HF's [out, in]
+	bQKV       []float32
+	wGU, wDown *tensai.Matrix
+	qQKV, qo   *qmat
+	qGU, qDown *qmat
+	kc, vc     [][]float32 // KV cache, kvHeads*headDim per position
 }
 
 type qwen struct {
@@ -156,6 +160,27 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 		}
 		return nil, quantizeMat(w, bits)
 	}
+	// linqFused transposes and column-concatenates several [out, in]
+	// weights into one [in, sum(out)] matrix before quantizing.
+	linqFused := func(names ...string) (*tensai.Matrix, *qmat) {
+		var parts []*tensai.Matrix
+		for _, name := range names {
+			t, err := f.Tensor(name)
+			if err != nil {
+				panic(err)
+			}
+			m, err := t.Matrix()
+			if err != nil {
+				panic(err)
+			}
+			parts = append(parts, m.T())
+		}
+		w := hcat(parts)
+		if bits == 0 {
+			return w, nil
+		}
+		return nil, quantizeMat(w, bits)
+	}
 
 	m := &qwen{cfg: cfg, headSz: cfg.HiddenSize / cfg.Heads}
 	m.embed, err = f.Tensor("model.embed_tokens.weight")
@@ -183,18 +208,45 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 		p := fmt.Sprintf("model.layers.%d.", i)
 		b.ln1 = vec(p + "input_layernorm.weight")
 		b.ln2 = vec(p + "post_attention_layernorm.weight")
-		b.wq, b.qq = linq(p + "self_attn.q_proj.weight")
-		b.bq = vecOpt(p + "self_attn.q_proj.bias")
-		b.wk, b.qk = linq(p + "self_attn.k_proj.weight")
-		b.bk = vecOpt(p + "self_attn.k_proj.bias")
-		b.wv, b.qv = linq(p + "self_attn.v_proj.weight")
-		b.bv = vecOpt(p + "self_attn.v_proj.bias")
+		b.wQKV, b.qQKV = linqFused(p+"self_attn.q_proj.weight", p+"self_attn.k_proj.weight", p+"self_attn.v_proj.weight")
+		b.bQKV = catVec(vecOpt(p+"self_attn.q_proj.bias"), vecOpt(p+"self_attn.k_proj.bias"), vecOpt(p+"self_attn.v_proj.bias"))
 		b.wo, b.qo = linq(p + "self_attn.o_proj.weight")
-		b.wGate, b.qGate = linq(p + "mlp.gate_proj.weight")
-		b.wUp, b.qUp = linq(p + "mlp.up_proj.weight")
+		b.wGU, b.qGU = linqFused(p+"mlp.gate_proj.weight", p+"mlp.up_proj.weight")
 		b.wDown, b.qDown = linq(p + "mlp.down_proj.weight")
 	}
 	return m, nil
+}
+
+// hcat concatenates matrices with equal rows along the columns.
+func hcat(parts []*tensai.Matrix) *tensai.Matrix {
+	rows := parts[0].Rows
+	cols := 0
+	for _, p := range parts {
+		cols += p.Cols
+	}
+	out := tensai.NewMatrix(rows, cols)
+	off := 0
+	for _, p := range parts {
+		for r := 0; r < rows; r++ {
+			copy(out.Data[r*cols+off:], p.Data[r*p.Cols:(r+1)*p.Cols])
+		}
+		off += p.Cols
+	}
+	return out
+}
+
+// catVec concatenates bias vectors; all-nil stays nil (llama).
+func catVec(vs ...[]float32) []float32 {
+	var out []float32
+	any := false
+	for _, v := range vs {
+		any = any || v != nil
+		out = append(out, v...)
+	}
+	if !any {
+		return nil
+	}
+	return out
 }
 
 func rmsnorm(x, w []float32, eps float64) []float32 {
@@ -324,24 +376,25 @@ func (m *qwen) prefill(tokens []int, startPos int) []float32 {
 			copy(a.Data[t*hs:(t+1)*hs], rmsnorm(x.Data[t*hs:(t+1)*hs], w, cfg.RMSEps))
 		}
 	}
+	qkvW := hs + 2*kvDim
 	for li := range m.blocks {
 		b := &m.blocks[li]
 		norm(b.ln1)
-		q := mmb(a, b.wq, b.qq, b.bq)
-		k := mmb(a, b.wk, b.qk, b.bk)
-		v := mmb(a, b.wv, b.qv, b.bv)
+		qkv := mmb(a, b.wQKV, b.qQKV, b.bQKV)
 		for t := 0; t < n; t++ {
 			pos := startPos + t
-			qr := q.Data[t*hs:]
+			row := qkv.Data[t*qkvW : (t+1)*qkvW]
+			qr := row[:hs]
 			for h := 0; h < cfg.Heads; h++ {
 				m.rope(qr[h*m.headSz:(h+1)*m.headSz], pos)
 			}
-			kr := k.Data[t*kvDim : (t+1)*kvDim]
+			kr := row[hs : hs+kvDim]
 			for h := 0; h < cfg.KVHeads; h++ {
 				m.rope(kr[h*m.headSz:(h+1)*m.headSz], pos)
 			}
-			b.kc = append(b.kc, kr)
-			b.vc = append(b.vc, v.Data[t*kvDim:(t+1)*kvDim])
+			// Copies detach the cache rows from the wide fused buffer.
+			b.kc = append(b.kc, append(make([]float32, 0, kvDim), kr...))
+			b.vc = append(b.vc, append(make([]float32, 0, kvDim), row[hs+kvDim:]...))
 		}
 
 		// Causal attention: row t sees cache positions [0, startPos+t].
@@ -360,7 +413,7 @@ func (m *qwen) prefill(tokens []int, startPos int) []float32 {
 				scores := make([]float64, startPos+n)
 				for t := range rowCh {
 					steps := startPos + t + 1
-					qr := q.Data[t*hs : (t+1)*hs]
+					qr := qkv.Data[t*qkvW : t*qkvW+hs]
 					ar := attn.Data[t*hs : (t+1)*hs]
 					for h := 0; h < cfg.Heads; h++ {
 						m.attendHead(b, qr, ar, h, group, steps, scores[:steps])
@@ -376,11 +429,15 @@ func (m *qwen) prefill(tokens []int, startPos int) []float32 {
 		}
 
 		norm(b.ln2)
-		gate := mmb(a, b.wGate, b.qGate, nil)
-		up := mmb(a, b.wUp, b.qUp, nil)
-		for i, g0 := range gate.Data {
-			g := float64(g0)
-			gate.Data[i] = float32(g/(1+math.Exp(-g))) * up.Data[i]
+		gu := mmb(a, b.wGU, b.qGU, nil)
+		inter := cfg.Intermediate
+		gate := tensai.NewMatrix(n, inter)
+		for t := 0; t < n; t++ {
+			row := gu.Data[t*2*inter:]
+			for i := 0; i < inter; i++ {
+				g := float64(row[i])
+				gate.Data[t*inter+i] = float32(g/(1+math.Exp(-g))) * row[inter+i]
+			}
 		}
 		down := mmb(gate, b.wDown, b.qDown, nil)
 		for i := range x.Data {
@@ -400,20 +457,24 @@ func (m *qwen) step(token, pos int) []float32 {
 	x := make([]float32, hs)
 	copy(x, m.embed.Data[token*hs:(token+1)*hs])
 
+	kvDim := cfg.KVHeads * m.headSz
 	for li := range m.blocks {
 		b := &m.blocks[li]
 		a := rmsnorm(x, b.ln1, cfg.RMSEps)
-		q := mv(a, b.wq, b.qq, b.bq)
-		k := mv(a, b.wk, b.qk, b.bk)
-		v := mv(a, b.wv, b.qv, b.bv)
+		qkv := mv(a, b.wQKV, b.qQKV, b.bQKV)
+		q := qkv[:hs]
+		k := qkv[hs : hs+kvDim]
+		v := qkv[hs+kvDim:]
 		for h := 0; h < cfg.Heads; h++ {
 			m.rope(q[h*m.headSz:(h+1)*m.headSz], pos)
 		}
 		for h := 0; h < cfg.KVHeads; h++ {
 			m.rope(k[h*m.headSz:(h+1)*m.headSz], pos)
 		}
-		b.kc = append(b.kc, k)
-		b.vc = append(b.vc, v)
+		// Copy k and v out of the fused row so the cache does not retain
+		// the whole qkv buffer per position.
+		b.kc = append(b.kc, append(make([]float32, 0, kvDim), k...))
+		b.vc = append(b.vc, append(make([]float32, 0, kvDim), v...))
 
 		attn := make([]float32, hs)
 		steps := len(b.kc)
@@ -444,8 +505,8 @@ func (m *qwen) step(token, pos int) []float32 {
 		}
 
 		a = rmsnorm(x, b.ln2, cfg.RMSEps)
-		gate := mv(a, b.wGate, b.qGate, nil)
-		up := mv(a, b.wUp, b.qUp, nil)
+		gu := mv(a, b.wGU, b.qGU, nil)
+		gate, up := gu[:cfg.Intermediate], gu[cfg.Intermediate:]
 		for i := range gate {
 			g := float64(gate[i])
 			gate[i] = float32(g/(1+math.Exp(-g))) * up[i] // silu(gate) * up
