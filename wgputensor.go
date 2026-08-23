@@ -449,6 +449,64 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
         aout[offO + qi * ap.d + 64u + t] = acc1 / l;
     }
 }
+
+// qmatmul multiplies f32 activation rows by an int8 weight matrix that
+// stays packed in GPU memory, four weights per u32, dequantizing in
+// registers: the weight traffic — which dominates a decode matvec — is a
+// quarter of the f32 kernel's. A 256-lane workgroup covers 16 packed words
+// (64 output columns) of one activation row, with each word's rows split
+// 16 ways: lane (rsub, wsub) strides the rows by 16 reading 16 adjacent
+// words per step (coalesced, 64 bytes), and a shared-memory reduction
+// folds the row splits before the guarded store. The split keeps a decode
+// matvec — parallelism = output columns only — wide enough to fill the
+// device.
+struct QMParams { rows: u32, cols: u32, words: u32, m: u32 }
+@group(0) @binding(15) var<uniform> qp: QMParams;
+@group(0) @binding(16) var<storage, read> qwt: array<u32>;
+@group(0) @binding(17) var<storage, read> qsc: array<f32>;
+@group(0) @binding(18) var<storage, read> qxv: array<f32>;
+@group(0) @binding(19) var<storage, read_write> qov: array<f32>;
+
+const QWG = 16u;    // packed words per workgroup
+const QSPLIT = 16u; // row splits sharing one word
+var<workgroup> qred: array<vec4<f32>, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn qmatmul(@builtin(workgroup_id) wid: vec3<u32>,
+           @builtin(local_invocation_id) lid: vec3<u32>) {
+    let w = wid.x * QWG + lid.x % QWG;
+    let rsub = lid.x / QWG;
+    let r = wid.y;
+    let xbase = r * qp.rows;
+    var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if (w < qp.words) {
+        for (var i = rsub; i < qp.rows; i = i + QSPLIT) {
+            let xv = qxv[xbase + i];
+            let pw = qwt[i * qp.words + w];
+            acc = acc + xv * vec4<f32>(
+                f32(i32(pw << 24u) >> 24u),
+                f32(i32(pw << 16u) >> 24u),
+                f32(i32(pw << 8u) >> 24u),
+                f32(i32(pw) >> 24u));
+        }
+    }
+    qred[lid.x] = acc;
+    workgroupBarrier();
+    // Lanes 0..15 each fold one word's sixteen partials; their w above is
+    // already wid.x*QWG + lid.x.
+    if (lid.x < QWG && w < qp.words) {
+        var sum = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        for (var v = 0u; v < QSPLIT; v = v + 1u) {
+            sum = sum + qred[v * QWG + lid.x];
+        }
+        let j = w * 4u;
+        for (var l = 0u; l < 4u; l = l + 1u) {
+            if (j + l < qp.cols) {
+                qov[r * qp.cols + j + l] = sum[l] * qsc[j + l];
+            }
+        }
+    }
+}
 `
 
 // gpuPipelines holds one compute pipeline (and its auto bind-group layout)
@@ -456,9 +514,9 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
 // struct.
 type gpuPipelines struct {
 	matmul, matmulT, matmulS, matmulTS             uintptr
-	scale, softmax, attn                           uintptr
+	scale, softmax, attn, qmatmul                  uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
-	layScale, laySoftmax, layAttn                  uintptr
+	layScale, laySoftmax, layAttn, layQmatmul      uintptr
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -475,6 +533,7 @@ func (g *GPU) initPipelines() error {
 		{&g.pipes.scale, &g.pipes.layScale, "scale_ip"},
 		{&g.pipes.softmax, &g.pipes.laySoftmax, "softmax_last"},
 		{&g.pipes.attn, &g.pipes.layAttn, "attn_causal"},
+		{&g.pipes.qmatmul, &g.pipes.layQmatmul, "qmatmul"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -491,6 +550,7 @@ func (g *GPU) releasePipelines() {
 	for _, h := range []uintptr{
 		g.pipes.layMatmul, g.pipes.layMatmulT, g.pipes.layMatmulS,
 		g.pipes.layMatmulTS, g.pipes.layScale, g.pipes.laySoftmax, g.pipes.layAttn,
+		g.pipes.layQmatmul,
 	} {
 		if h != 0 {
 			fnLayoutRelease(h)
@@ -499,6 +559,7 @@ func (g *GPU) releasePipelines() {
 	for _, h := range []uintptr{
 		g.pipes.matmul, g.pipes.matmulT, g.pipes.matmulS,
 		g.pipes.matmulTS, g.pipes.scale, g.pipes.softmax, g.pipes.attn,
+		g.pipes.qmatmul,
 	} {
 		if h != 0 {
 			fnPipelineRelease(h)
@@ -1151,4 +1212,142 @@ func (g *GPU) MatMul(a, b *Tensor) (*Tensor, error) {
 	}
 	defer gc.Free()
 	return gc.Download()
+}
+
+// GPUQMatrix is an int8-quantized weight matrix resident in GPU memory:
+// the packed weights of a QMatrix, four per u32 in plain row-major order,
+// plus the per-column scales. Upload one with UploadQ8 and multiply
+// activations into it with MatMul; the float32 weights never reach the
+// device.
+type GPUQMatrix struct {
+	g           *GPU
+	buf, scales uintptr
+	rows, cols  int
+	words       int // u32 words per weight row: ceil(cols/4)
+	freed       bool
+}
+
+// UploadQ8 packs a quantized matrix into GPU memory. The QMatrix's
+// interleaved row-pair layout (an AVX2 artifact) flattens back to row-major
+// on the way in.
+func (g *GPU) UploadQ8(q *QMatrix) (*GPUQMatrix, error) {
+	if q.Rows == 0 || q.Cols == 0 {
+		return nil, errors.New("tensai: cannot upload an empty matrix")
+	}
+	words := (q.Cols + 3) / 4
+	packed := make([]uint32, q.Rows*words)
+	for i := 0; i < q.Rows; i++ {
+		base := (i / 2) * 2 * q.Cols
+		for j := 0; j < q.Cols; j++ {
+			b := uint32(uint8(q.Q[base+2*j+i%2]))
+			packed[i*words+j/4] |= b << (8 * (j % 4))
+		}
+	}
+	scales := make([]float32, words*4)
+	for j, s := range q.Scale {
+		scales[j] = float32(s)
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	if err := g.checkSize(uint64(len(packed)) * 4); err != nil {
+		return nil, err
+	}
+	buf := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(packed))*4)
+	sbuf := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(scales))*4)
+	if buf == 0 || sbuf == 0 {
+		if buf != 0 {
+			fnBufferRelease(buf)
+		}
+		if sbuf != 0 {
+			fnBufferRelease(sbuf)
+		}
+		return nil, errors.New("tensai: gpu buffer allocation failed")
+	}
+	fnQueueWriteBuffer(g.queue, buf, 0, unsafe.Pointer(&packed[0]), uintptr(len(packed))*4)
+	fnQueueWriteBuffer(g.queue, sbuf, 0, unsafe.Pointer(&scales[0]), uintptr(len(scales))*4)
+	runtime.KeepAlive(&packed)
+	runtime.KeepAlive(&scales)
+	return &GPUQMatrix{g: g, buf: buf, scales: sbuf, rows: q.Rows, cols: q.Cols, words: words}, nil
+}
+
+// Shape returns (rows, cols).
+func (q *GPUQMatrix) Shape() (int, int) { return q.rows, q.cols }
+
+// Free releases the GPU buffers. Calling Free again is a no-op.
+func (q *GPUQMatrix) Free() {
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if q.freed {
+		return
+	}
+	q.freed = true
+	fnBufferRelease(q.buf)
+	fnBufferRelease(q.scales)
+}
+
+// MatMul computes x @ Q on the GPU: x's last axis must equal the weight
+// rows, and every leading axis is a batch of activation rows. Weights are
+// dequantized in registers, so only a quarter of the f32 weight bytes
+// cross the memory bus.
+func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
+	if q.freed || x.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if q.g != x.g {
+		return nil, errors.New("tensai: gpu tensors belong to different GPUs")
+	}
+	n := len(x.shape)
+	if n == 0 || x.shape[n-1] != q.rows {
+		return nil, fmt.Errorf("tensai: gpu qmatmul shape mismatch: %v @ %dx%d", x.shape, q.rows, q.cols)
+	}
+	m := x.Size() / q.rows
+	if m > 65535 {
+		return nil, fmt.Errorf("tensai: gpu qmatmul batch of %d rows exceeds 65535", m)
+	}
+	outShape := append(append([]int(nil), x.shape[:n-1]...), q.cols)
+
+	g := q.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	outBytes := uint64(m*q.cols) * 4
+	if err := g.checkSize(outBytes); err != nil {
+		return nil, err
+	}
+	params := [4]uint32{uint32(q.rows), uint32(q.cols), uint32(q.words), uint32(m)}
+	bufParams := g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+	bufOut := g.newBuffer(gpuTensorUsage, outBytes)
+	defer fnBufferRelease(bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+
+	entries := [5]wgpuBindGroupEntry{
+		{binding: 15, buffer: bufParams, size: 16},
+		{binding: 16, buffer: q.buf, size: uint64(q.rows*q.words) * 4},
+		{binding: 17, buffer: q.scales, size: uint64(q.words*4) * 4},
+		{binding: 18, buffer: x.buf, size: uint64(x.Size()) * 4},
+		{binding: 19, buffer: bufOut, size: outBytes},
+	}
+	bindGroup := g.makeBindGroup(g.pipes.layQmatmul, entries[:])
+	runtime.KeepAlive(&entries)
+	defer fnBindGroupRelease(bindGroup)
+
+	err := g.dispatch(g.pipes.qmatmul, bindGroup,
+		uint32((q.words+15)/16), uint32(m), 1)
+	if err != nil {
+		fnBufferRelease(bufOut)
+		return nil, err
+	}
+	return &GPUTensor{g: g, buf: bufOut, shape: outShape}, nil
 }
