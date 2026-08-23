@@ -190,6 +190,7 @@ func main() {
 	gpu := flag.Bool("gpu", false, "decode on the GPU (requires -q8 and a wgpu build tag)")
 	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile of generation to this file")
 	ggufPath := flag.String("gguf", "", "load model and tokenizer from a single .gguf file instead of -data/-repo")
+	serveAddr := flag.String("serve", "", "serve an OpenAI-compatible /v1/chat/completions API on this address (e.g. :8080)")
 	flag.Parse()
 	hfBase = "https://huggingface.co/" + *repo + "/resolve/main/"
 
@@ -259,6 +260,14 @@ func main() {
 	nCtx := model.cfg.MaxPos
 	if nCtx == 0 {
 		nCtx = 4096
+	}
+
+	if *serveAddr != "" {
+		if err := serve(*serveAddr, model, tok, *system, nCtx, *temp, *topP, imEnd, eot); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	// With -gpu the transformer blocks decode on the device; the prompt
