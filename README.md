@@ -345,6 +345,8 @@ huge         64x512x512@512x512    17179.9  116.374ms   62.128ms  566.726ms     
 
 Arithmetic no longer dominates the convenient path — `gpu+xfer` at `large` spends two thirds of its time on the bus — which is exactly what keeping inputs resident is for. Through a translation layer like dozen inside WSL2 the ratios shrink to roughly parity-to-3x, and on CPU Vulkan implementations the GPU path loses outright; measure on the driver you will ship on.
 
+Quantized weights stay quantized on the device too: `UploadQ8` packs a `QMatrix` four int8 weights per u32, and `GPUQMatrix.MatMul` dequantizes them in registers, so a decode matvec — whose cost is streaming the weights — moves a quarter of the f32 bytes. On the same iGPU through dozen it runs the matvec 2.2x faster than the resident f32 kernel.
+
 wgpu-native picks Vulkan on Linux, Vulkan or D3D12 on Windows, and Metal on macOS, so AMD, Intel, Apple, and NVIDIA GPUs all work — as do CPU Vulkan implementations like lavapipe, which is how the tests run on machines without a GPU. `gpu.MatMul` uploads the operands and reads the product back on every call; `Upload` plus `GPUTensor.MatMul` keeps inputs and intermediates resident, so only the final result needs to cross the bus. Without the build tag `OpenGPU` returns an error and nothing else changes.
 
 #### `-tags wgpu24`: the new wgpu-native API, and the real GPU inside WSL2

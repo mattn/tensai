@@ -678,3 +678,132 @@ func TestGPUMatMulLarge(t *testing.T) {
 		}
 	}
 }
+
+func TestGPUQ8MatMul(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+
+	rng := rand.New(rand.NewSource(61))
+	for _, c := range []struct{ m, rows, cols int }{
+		{1, 256, 512},
+		{3, 64, 33}, // cols not a multiple of 4: guarded tail
+		{5, 33, 7},  // odd rows: interleave pad must not leak
+	} {
+		w := RandomMatrix(c.rows, c.cols, rng)
+		q := QuantizeMatrix(w)
+		gq, err := g.UploadQ8(q)
+		if err != nil {
+			t.Fatalf("%v: %v", c, err)
+		}
+		x := randTensor(rng, c.m, c.rows)
+		gx, err := g.Upload(x)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := gq.MatMul(gx)
+		if err != nil {
+			t.Fatalf("%v: %v", c, err)
+		}
+		out, err := got.Download()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Reference: the same dequantized weights on the CPU. The GPU
+		// multiplies f32 activations (no 7-bit activation step), so the
+		// comparison is float tolerance, not bit equality.
+		for r := 0; r < c.m; r++ {
+			for j := 0; j < c.cols; j++ {
+				var want float64
+				for i := 0; i < c.rows; i++ {
+					wq := float64(q.Q[(i/2)*2*c.cols+2*j+i%2]) * float64(q.Scale[j])
+					want += float64(x.Data[r*c.rows+i]) * wq
+				}
+				gotv := float64(out.Data[r*c.cols+j])
+				if diff := math.Abs(gotv - want); diff > 1e-3*(1+math.Abs(want)) {
+					t.Fatalf("%v row %d col %d: gpu=%v cpu=%v", c, r, j, gotv, want)
+				}
+			}
+		}
+		got.Free()
+		gx.Free()
+		gq.Free()
+	}
+
+	q := QuantizeMatrix(RandomMatrix(8, 8, rng))
+	gq, err := g.UploadQ8(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gq.Free()
+	gx, err := g.Upload(randTensor(rng, 2, 7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gx.Free()
+	if _, err := gq.MatMul(gx); err == nil {
+		t.Fatal("expected shape mismatch error")
+	}
+}
+
+// BenchmarkGPUQ8MatVec measures the decode shape — one activation row
+// against a large resident weight — for the int8 kernel next to the f32
+// matmul it replaces. 2048x8192 keeps the f32 twin (64MB) under modest
+// device storage limits (dzn stops at 128MB).
+func BenchmarkGPUQ8MatVec(b *testing.B) {
+	g, err := OpenGPU()
+	if err != nil {
+		b.Skipf("wgpu unavailable: %v", err)
+	}
+	defer g.Close()
+	rng := rand.New(rand.NewSource(62))
+	w := RandomMatrix(2048, 8192, rng)
+	gq, err := g.UploadQ8(QuantizeMatrix(w))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer gq.Free()
+	gx, err := g.Upload(randTensor(rng, 1, 2048))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer gx.Free()
+	b.SetBytes(2048 * 8192)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, err := gq.MatMul(gx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		out.Free()
+	}
+}
+
+func BenchmarkGPUF32MatVec(b *testing.B) {
+	g, err := OpenGPU()
+	if err != nil {
+		b.Skipf("wgpu unavailable: %v", err)
+	}
+	defer g.Close()
+	rng := rand.New(rand.NewSource(62))
+	wt := randTensor(rng, 2048, 8192)
+	gw, err := g.Upload(wt)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer gw.Free()
+	gx, err := g.Upload(randTensor(rng, 1, 2048))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer gx.Free()
+	b.SetBytes(2048 * 8192 * 4)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, err := gx.MatMul(gw)
+		if err != nil {
+			b.Fatal(err)
+		}
+		out.Free()
+	}
+}
