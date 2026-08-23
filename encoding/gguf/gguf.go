@@ -1,0 +1,455 @@
+// Package gguf reads the GGUF model format (llama.cpp's container:
+// https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) — typed
+// metadata key/values followed by an aligned blob of tensors — with no
+// dependencies beyond the standard library.
+//
+// Reading is lazy: Open parses only the header, and each Tensor call reads
+// just that tensor's bytes. F32 comes back as-is; F16 and BF16 convert to
+// float32; the block-quantized types Q8_0, Q4_0, and Q4_1 dequantize to
+// float32 on the way out, which is how llama.cpp's published checkpoints
+// usually ship. Dimensions arrive in tensai's row-major order (GGUF stores
+// them fastest-varying first; this package reverses them), so a
+// token-embedding tensor reads as [vocab, hidden] just like the
+// safetensors reader would produce.
+//
+// One conversion artifact to know about: llama.cpp's converter permutes
+// the output rows of attention q and k projection weights into its
+// interleaved rotary-embedding order (HF row (head, half, i) lands at row
+// (head, i, half)). This package returns tensors exactly as stored;
+// consumers pairing GGUF weights with half-split RoPE code must undo that
+// permutation themselves.
+package gguf
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"sort"
+
+	tensai "github.com/mattn/tensai"
+)
+
+// Tensor encodings from the GGML type enum; only the ones this package
+// decodes are named.
+const (
+	typeF32  = 0
+	typeF16  = 1
+	typeQ4_0 = 2
+	typeQ4_1 = 3
+	typeQ8_0 = 8
+	typeBF16 = 30
+)
+
+var typeNames = map[uint32]string{
+	typeF32: "F32", typeF16: "F16", typeQ4_0: "Q4_0",
+	typeQ4_1: "Q4_1", typeQ8_0: "Q8_0", typeBF16: "BF16",
+}
+
+// blockSpec describes one quantization block: how many values it decodes
+// to and how many bytes it occupies.
+var blockSpec = map[uint32]struct{ values, bytes int64 }{
+	typeF32:  {1, 4},
+	typeF16:  {1, 2},
+	typeBF16: {1, 2},
+	typeQ8_0: {32, 2 + 32},     // f16 scale + 32 int8
+	typeQ4_0: {32, 2 + 16},     // f16 scale + 32 nibbles
+	typeQ4_1: {32, 2 + 2 + 16}, // f16 scale + f16 min + 32 nibbles
+}
+
+type tensorInfo struct {
+	name   string
+	shape  []int // row-major (reversed from the file's order)
+	typ    uint32
+	offset int64 // relative to the data section
+}
+
+// File is an open GGUF checkpoint. It keeps the underlying reader open and
+// loads tensor data on demand.
+type File struct {
+	r        io.ReaderAt
+	closer   io.Closer
+	kv       map[string]any
+	tensors  map[string]tensorInfo
+	names    []string
+	dataBase int64
+}
+
+// Open opens a GGUF file and parses its metadata and tensor directory.
+func Open(path string) (*File, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	g, err := NewFile(f)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	g.closer = f
+	return g, nil
+}
+
+// NewFile parses a GGUF checkpoint from a reader.
+func NewFile(r io.ReaderAt) (*File, error) {
+	d := &decoder{r: io.NewSectionReader(r, 0, 1<<62)}
+	if magic := d.u32(); magic != 0x46554747 { // "GGUF"
+		return nil, fmt.Errorf("gguf: bad magic 0x%08x", magic)
+	}
+	version := d.u32()
+	if version < 2 || version > 3 {
+		return nil, fmt.Errorf("gguf: unsupported version %d", version)
+	}
+	nTensors := d.u64()
+	nKV := d.u64()
+	if d.err != nil {
+		return nil, d.err
+	}
+	if nTensors > 1<<20 || nKV > 1<<20 {
+		return nil, fmt.Errorf("gguf: implausible header counts (%d tensors, %d keys)", nTensors, nKV)
+	}
+
+	g := &File{r: r, kv: make(map[string]any, nKV), tensors: make(map[string]tensorInfo, nTensors)}
+	for i := uint64(0); i < nKV; i++ {
+		key := d.str()
+		val := d.value(d.u32())
+		if d.err != nil {
+			return nil, fmt.Errorf("gguf: metadata %q: %w", key, d.err)
+		}
+		g.kv[key] = val
+	}
+	for i := uint64(0); i < nTensors; i++ {
+		var t tensorInfo
+		t.name = d.str()
+		nDims := d.u32()
+		if d.err == nil && nDims > 8 {
+			return nil, fmt.Errorf("gguf: tensor %q has %d dimensions", t.name, nDims)
+		}
+		dims := make([]int, nDims)
+		for j := range dims {
+			dims[j] = int(d.u64())
+		}
+		// GGUF stores ne[0] fastest-varying; tensai shapes are row-major.
+		t.shape = make([]int, nDims)
+		for j := range dims {
+			t.shape[nDims-1-uint32(j)] = dims[j]
+		}
+		t.typ = d.u32()
+		t.offset = int64(d.u64())
+		if d.err != nil {
+			return nil, fmt.Errorf("gguf: tensor %q: %w", t.name, d.err)
+		}
+		g.tensors[t.name] = t
+		g.names = append(g.names, t.name)
+	}
+	sort.Strings(g.names)
+
+	align := int64(32)
+	if v, ok := g.kv["general.alignment"]; ok {
+		if a, ok := toInt64(v); ok && a > 0 {
+			align = a
+		}
+	}
+	g.dataBase = (d.off + align - 1) / align * align
+	return g, nil
+}
+
+// Close closes the underlying file when the File was created by Open.
+func (f *File) Close() error {
+	if f.closer != nil {
+		return f.closer.Close()
+	}
+	return nil
+}
+
+// Names returns the tensor names in sorted order.
+func (f *File) Names() []string { return append([]string(nil), f.names...) }
+
+// KV returns a metadata value: string, bool, float64, int64, uint64 (and
+// float32/uint32/... as stored) or []any for arrays.
+func (f *File) KV(key string) (any, bool) {
+	v, ok := f.kv[key]
+	return v, ok
+}
+
+// Keys returns the metadata keys in sorted order.
+func (f *File) Keys() []string {
+	keys := make([]string, 0, len(f.kv))
+	for k := range f.kv {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// String returns a string metadata value.
+func (f *File) String(key string) (string, bool) {
+	s, ok := f.kv[key].(string)
+	return s, ok
+}
+
+// Int returns an integer metadata value regardless of its stored width.
+func (f *File) Int(key string) (int64, bool) {
+	v, ok := f.kv[key]
+	if !ok {
+		return 0, false
+	}
+	return toInt64(v)
+}
+
+// Float returns a float metadata value (accepting integer storage too).
+func (f *File) Float(key string) (float64, bool) {
+	switch v := f.kv[key].(type) {
+	case float32:
+		return float64(v), true
+	case float64:
+		return v, true
+	}
+	n, ok := f.Int(key)
+	return float64(n), ok
+}
+
+func toInt64(v any) (int64, bool) {
+	switch n := v.(type) {
+	case uint8:
+		return int64(n), true
+	case int8:
+		return int64(n), true
+	case uint16:
+		return int64(n), true
+	case int16:
+		return int64(n), true
+	case uint32:
+		return int64(n), true
+	case int32:
+		return int64(n), true
+	case uint64:
+		return int64(n), true
+	case int64:
+		return n, true
+	case bool:
+		if n {
+			return 1, true
+		}
+		return 0, true
+	}
+	return 0, false
+}
+
+// Info reports a tensor's type name and row-major shape.
+func (f *File) Info(name string) (typ string, shape []int, ok bool) {
+	t, ok := f.tensors[name]
+	if !ok {
+		return "", nil, false
+	}
+	typ, named := typeNames[t.typ]
+	if !named {
+		typ = fmt.Sprintf("type%d", t.typ)
+	}
+	return typ, append([]int(nil), t.shape...), true
+}
+
+// Tensor reads one tensor, dequantizing to float32.
+func (f *File) Tensor(name string) (*tensai.Tensor, error) {
+	t, ok := f.tensors[name]
+	if !ok {
+		return nil, fmt.Errorf("gguf: no tensor %q", name)
+	}
+	spec, ok := blockSpec[t.typ]
+	if !ok {
+		typ := typeNames[t.typ]
+		if typ == "" {
+			typ = fmt.Sprintf("type %d", t.typ)
+		}
+		return nil, fmt.Errorf("gguf: tensor %q: unsupported encoding %s", name, typ)
+	}
+	n := int64(1)
+	for _, d := range t.shape {
+		n *= int64(d)
+	}
+	if n%spec.values != 0 {
+		return nil, fmt.Errorf("gguf: tensor %q: %d values not a whole number of blocks", name, n)
+	}
+	raw := make([]byte, n/spec.values*spec.bytes)
+	if _, err := f.r.ReadAt(raw, f.dataBase+t.offset); err != nil {
+		return nil, fmt.Errorf("gguf: tensor %q: %w", name, err)
+	}
+	out := tensai.NewTensor(t.shape...)
+	dst := out.Data
+	switch t.typ {
+	case typeF32:
+		for i := range dst {
+			dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:]))
+		}
+	case typeF16:
+		for i := range dst {
+			dst[i] = f16to32(binary.LittleEndian.Uint16(raw[2*i:]))
+		}
+	case typeBF16:
+		for i := range dst {
+			dst[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[2*i:])) << 16)
+		}
+	case typeQ8_0:
+		for b := int64(0); b < n/32; b++ {
+			blk := raw[b*34:]
+			s := f16to32(binary.LittleEndian.Uint16(blk))
+			for i := 0; i < 32; i++ {
+				dst[b*32+int64(i)] = s * float32(int8(blk[2+i]))
+			}
+		}
+	case typeQ4_0:
+		for b := int64(0); b < n/32; b++ {
+			blk := raw[b*18:]
+			s := f16to32(binary.LittleEndian.Uint16(blk))
+			for i := 0; i < 16; i++ {
+				q := blk[2+i]
+				dst[b*32+int64(i)] = s * (float32(q&0x0F) - 8)
+				dst[b*32+int64(i)+16] = s * (float32(q>>4) - 8)
+			}
+		}
+	case typeQ4_1:
+		for b := int64(0); b < n/32; b++ {
+			blk := raw[b*20:]
+			s := f16to32(binary.LittleEndian.Uint16(blk))
+			m := f16to32(binary.LittleEndian.Uint16(blk[2:]))
+			for i := 0; i < 16; i++ {
+				q := blk[4+i]
+				dst[b*32+int64(i)] = s*float32(q&0x0F) + m
+				dst[b*32+int64(i)+16] = s*float32(q>>4) + m
+			}
+		}
+	}
+	return out, nil
+}
+
+// f16to32 converts an IEEE 754 half, subnormals and specials included.
+func f16to32(h uint16) float32 {
+	sign := uint32(h>>15) << 31
+	exp := uint32(h>>10) & 0x1f
+	mant := uint32(h) & 0x3ff
+	switch exp {
+	case 0:
+		if mant == 0 {
+			return math.Float32frombits(sign)
+		}
+		// Subnormal: renormalize.
+		e := uint32(127 - 15 + 1)
+		for mant&0x400 == 0 {
+			mant <<= 1
+			e--
+		}
+		return math.Float32frombits(sign | e<<23 | (mant&0x3ff)<<13)
+	case 0x1f:
+		return math.Float32frombits(sign | 0xff<<23 | mant<<13)
+	}
+	return math.Float32frombits(sign | (exp+127-15)<<23 | mant<<13)
+}
+
+// decoder reads the little-endian header sequentially, latching the first
+// error.
+type decoder struct {
+	r   *io.SectionReader
+	off int64
+	err error
+}
+
+func (d *decoder) read(b []byte) {
+	if d.err != nil {
+		return
+	}
+	if _, err := io.ReadFull(io.NewSectionReader(d.r, d.off, int64(len(b))), b); err != nil {
+		d.err = err
+		return
+	}
+	d.off += int64(len(b))
+}
+
+func (d *decoder) u32() uint32 {
+	var b [4]byte
+	d.read(b[:])
+	return binary.LittleEndian.Uint32(b[:])
+}
+
+func (d *decoder) u64() uint64 {
+	var b [8]byte
+	d.read(b[:])
+	return binary.LittleEndian.Uint64(b[:])
+}
+
+func (d *decoder) str() string {
+	n := d.u64()
+	if d.err != nil {
+		return ""
+	}
+	if n > 1<<24 {
+		d.err = fmt.Errorf("string of %d bytes", n)
+		return ""
+	}
+	b := make([]byte, n)
+	d.read(b)
+	return string(b)
+}
+
+// value decodes one metadata value of the given type tag.
+func (d *decoder) value(typ uint32) any {
+	switch typ {
+	case 0: // u8
+		var b [1]byte
+		d.read(b[:])
+		return b[0]
+	case 1: // i8
+		var b [1]byte
+		d.read(b[:])
+		return int8(b[0])
+	case 2: // u16
+		var b [2]byte
+		d.read(b[:])
+		return binary.LittleEndian.Uint16(b[:])
+	case 3: // i16
+		var b [2]byte
+		d.read(b[:])
+		return int16(binary.LittleEndian.Uint16(b[:]))
+	case 4:
+		return d.u32()
+	case 5:
+		return int32(d.u32())
+	case 6:
+		return math.Float32frombits(d.u32())
+	case 7:
+		var b [1]byte
+		d.read(b[:])
+		return b[0] != 0
+	case 8:
+		return d.str()
+	case 9: // array
+		elem := d.u32()
+		n := d.u64()
+		if d.err != nil {
+			return nil
+		}
+		if n > 1<<24 {
+			d.err = fmt.Errorf("array of %d elements", n)
+			return nil
+		}
+		arr := make([]any, n)
+		for i := range arr {
+			arr[i] = d.value(elem)
+			if d.err != nil {
+				return nil
+			}
+		}
+		return arr
+	case 10:
+		return d.u64()
+	case 11:
+		return int64(d.u64())
+	case 12:
+		bits := d.u64()
+		return math.Float64frombits(bits)
+	}
+	if d.err == nil {
+		d.err = fmt.Errorf("unknown value type %d", typ)
+	}
+	return nil
+}
