@@ -807,3 +807,232 @@ func BenchmarkGPUF32MatVec(b *testing.B) {
 		out.Free()
 	}
 }
+
+func TestGPUDecodeOps(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(71))
+
+	// RMSNorm against the scalar definition.
+	x := randTensor(rng, 3, 64)
+	w := randTensor(rng, 64)
+	gx, err := g.Upload(x)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gx.Free()
+	gw, err := g.Upload(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gw.Free()
+	gn, err := gx.RMSNorm(gw, 1e-6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gn.Free()
+	norm, err := gn.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for r := 0; r < 3; r++ {
+		var ss float64
+		for i := 0; i < 64; i++ {
+			v := float64(x.Data[r*64+i])
+			ss += v * v
+		}
+		inv := 1 / math.Sqrt(ss/64+1e-6)
+		for i := 0; i < 64; i++ {
+			want := float64(x.Data[r*64+i]) * inv * float64(w.Data[i])
+			if diff := math.Abs(float64(norm.Data[r*64+i]) - want); diff > 1e-4 {
+				t.Fatalf("rmsnorm row %d elem %d: got %v want %v", r, i, norm.Data[r*64+i], want)
+			}
+		}
+	}
+
+	// RoPE against the half-split rotation, rows at successive positions.
+	const headSz, d, rows, pos0 = 8, 16, 3, 5
+	rx := randTensor(rng, rows, d)
+	grx, err := g.Upload(rx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer grx.Free()
+	if err := grx.RoPE(headSz, pos0, 10000); err != nil {
+		t.Fatal(err)
+	}
+	rot, err := grx.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for r := 0; r < rows; r++ {
+		for h := 0; h < d/headSz; h++ {
+			for c := 0; c < headSz/2; c++ {
+				freq := math.Pow(10000, -2*float64(c)/float64(headSz))
+				sn, cs := math.Sincos(float64(pos0+r) * freq)
+				i := r*d + h*headSz + c
+				a, b := float64(rx.Data[i]), float64(rx.Data[i+headSz/2])
+				wantA := a*cs - b*sn
+				wantB := b*cs + a*sn
+				if math.Abs(float64(rot.Data[i])-wantA) > 1e-4 || math.Abs(float64(rot.Data[i+headSz/2])-wantB) > 1e-4 {
+					t.Fatalf("rope row %d head %d pair %d: got (%v,%v) want (%v,%v)",
+						r, h, c, rot.Data[i], rot.Data[i+headSz/2], wantA, wantB)
+				}
+			}
+		}
+	}
+
+	// Add with a broadcast bias, then SiluMul.
+	a := randTensor(rng, 3, 32)
+	bias := randTensor(rng, 32)
+	up := randTensor(rng, 3, 32)
+	ga, err := g.Upload(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ga.Free()
+	gb, err := g.Upload(bias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gb.Free()
+	gu, err := g.Upload(up)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gu.Free()
+	if err := ga.Add(gb); err != nil {
+		t.Fatal(err)
+	}
+	if err := ga.SiluMul(gu); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ga.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for r := 0; r < 3; r++ {
+		for i := 0; i < 32; i++ {
+			gv := float64(a.Data[r*32+i]) + float64(bias.Data[i])
+			want := gv / (1 + math.Exp(-gv)) * float64(up.Data[r*32+i])
+			if diff := math.Abs(float64(got.Data[r*32+i]) - want); diff > 1e-4 {
+				t.Fatalf("silu(add) row %d elem %d: got %v want %v", r, i, got.Data[r*32+i], want)
+			}
+		}
+	}
+
+	// CopyRowsInto: append rows into a larger cache at an offset.
+	cache, err := g.Upload(randTensor(rng, 8, 16))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.Free()
+	rowsT := randTensor(rng, 2, 16)
+	grows, err := g.Upload(rowsT)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer grows.Free()
+	if err := grows.CopyRowsInto(cache, 3*16); err != nil {
+		t.Fatal(err)
+	}
+	back, err := cache.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 32; i++ {
+		if back.Data[3*16+i] != rowsT.Data[i] {
+			t.Fatalf("copy elem %d: got %v want %v", i, back.Data[3*16+i], rowsT.Data[i])
+		}
+	}
+	if err := grows.CopyRowsInto(cache, 7*16); err == nil {
+		t.Fatal("expected overflow error")
+	}
+}
+
+func TestGPUGroupedCausalAttention(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(72))
+
+	const heads, kvHeads, dh = 4, 2, 8
+	const d, kvDim = heads * dh, kvHeads * dh
+	const seqKV, capacity = 6, 9 // cache holds more rows than are valid
+	group := heads / kvHeads
+	k := randTensor(rng, capacity, kvDim)
+	v := randTensor(rng, capacity, kvDim)
+	gk, err := g.Upload(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gk.Free()
+	gv, err := g.Upload(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gv.Free()
+
+	for _, seq := range []int{1, 3} { // decode and chunked prefill
+		q := randTensor(rng, seq, d)
+		gq, err := g.Upload(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := gq.GroupedCausalAttention(gk, gv, heads, kvHeads, seqKV)
+		if err != nil {
+			t.Fatalf("seq %d: %v", seq, err)
+		}
+		out, err := got.Download()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Scalar reference: same math as the CPU decode loop.
+		scale := 1 / math.Sqrt(dh)
+		for qi := 0; qi < seq; qi++ {
+			limit := qi + seqKV - seq + 1
+			for h := 0; h < heads; h++ {
+				kvOff := (h / group) * dh
+				scores := make([]float64, limit)
+				maxs := math.Inf(-1)
+				for j := 0; j < limit; j++ {
+					var s float64
+					for c := 0; c < dh; c++ {
+						s += float64(q.Data[qi*d+h*dh+c]) * float64(k.Data[j*kvDim+kvOff+c])
+					}
+					scores[j] = s * scale
+					maxs = math.Max(maxs, scores[j])
+				}
+				var sum float64
+				for j := range scores {
+					scores[j] = math.Exp(scores[j] - maxs)
+					sum += scores[j]
+				}
+				for c := 0; c < dh; c++ {
+					var want float64
+					for j := 0; j < limit; j++ {
+						want += scores[j] / sum * float64(v.Data[j*kvDim+kvOff+c])
+					}
+					gotv := float64(out.Data[qi*d+h*dh+c])
+					if diff := math.Abs(gotv - want); diff > 1e-4 {
+						t.Fatalf("seq %d query %d head %d chan %d: got %v want %v", seq, qi, h, c, gotv, want)
+					}
+				}
+			}
+		}
+		got.Free()
+		gq.Free()
+	}
+
+	gq, err := g.Upload(randTensor(rng, 1, d))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gq.Free()
+	if _, err := gq.GroupedCausalAttention(gk, gv, 3, 2, seqKV); err == nil {
+		t.Fatal("expected error: kv heads do not divide heads")
+	}
+	if _, err := gq.GroupedCausalAttention(gk, gv, heads, kvHeads, capacity+1); err == nil {
+		t.Fatal("expected error: seqKV beyond cache")
+	}
+}
