@@ -115,7 +115,12 @@ func exists(p string) bool {
 	return err == nil
 }
 
-func sample(logits []float32, temp float64, rng *rand.Rand) int {
+// sample picks the next token: greedy at temp <= 0, otherwise
+// temperature softmax restricted to the nucleus — the smallest
+// probability-sorted prefix whose mass reaches topP — so the long
+// low-probability tail (where repetition loops and derailments live)
+// never gets a lottery ticket. topP >= 1 keeps the whole distribution.
+func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 	if temp <= 0 {
 		best := 0
 		for i, v := range logits {
@@ -143,6 +148,19 @@ func sample(logits []float32, temp float64, rng *rand.Rand) int {
 		sum += p
 	}
 	sort.Slice(cands, func(a, b int) bool { return cands[a].p > cands[b].p })
+	if topP < 1 {
+		var mass float64
+		cut := len(cands)
+		for i, c := range cands {
+			mass += c.p
+			if mass >= topP*sum {
+				cut = i + 1
+				break
+			}
+		}
+		cands = cands[:cut]
+		sum = mass
+	}
 	r := rng.Float64() * sum
 	for _, c := range cands {
 		r -= c.p
@@ -160,6 +178,7 @@ func main() {
 	raw := flag.Bool("raw", false, "skip the chat template, complete the prompt as-is")
 	n := flag.Int("n", 256, "max tokens to generate")
 	temp := flag.Float64("temp", 0, "sampling temperature; 0 = greedy")
+	topP := flag.Float64("topp", 0.9, "nucleus sampling: keep the smallest set of tokens with this much probability mass (1 disables)")
 	seed := flag.Int64("seed", 1, "sampling seed for -temp > 0")
 	q8 := flag.Bool("q8", false, "decode against int8-quantized weights")
 	q4 := flag.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
@@ -274,7 +293,7 @@ func main() {
 		start := time.Now()
 		gen := 0
 		for ; gen < limit && steps < nCtx-1; gen++ {
-			next := sample(logits, *temp, rng)
+			next := sample(logits, *temp, *topP, rng)
 			if next == imEnd || next == eot {
 				feed([]int{next})
 				break
