@@ -16,6 +16,8 @@ from tokenizers import Tokenizer
 MODELS = {
     "gpt2": "https://huggingface.co/openai-community/gpt2/resolve/main/tokenizer.json",
     "qwen": "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json",
+    # llama-architecture model with a Digits(individual_digits) pre-tokenizer
+    "smollm2": "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct/resolve/main/tokenizer.json",
 }
 
 CORPUS = [
@@ -42,6 +44,8 @@ CORPUS = [
     "München Zürich naïve café résumé",
     "ends with spaces   ",
     "<|endoftext|> in the middle <|endoftext|>",
+    "digit torture: 1 22 333 a1 1a  5  x 6.7.8, ９８７ ①②③ 42nd",
+    " 1", "  1", "a  42", "abc123def", "3.14159", "\n5\t6 7",
 ]
 
 os.makedirs("testdata", exist_ok=True)
@@ -53,3 +57,14 @@ for name, url in MODELS.items():
     refs = [tok.encode(s).ids for s in CORPUS]
     json.dump({"corpus": CORPUS, "ids": refs}, open(f"testdata/ref_{name}.json", "w"))
     print(name, "ok")
+
+# Random-string fuzz reference for the Digits pre-tokenizer (TestSmolLM2Fuzz).
+import random
+
+random.seed(9)
+tok = Tokenizer.from_file("testdata/smollm2.json")
+alphabet = list("abz ABZ  019９①\t\n.,'!-_日本語é🎉'sTREx") + ["'ll", "42", " 7", "  88 "]
+corpus = ["".join(random.choice(alphabet) for _ in range(random.randint(1, 60))) for _ in range(2000)]
+json.dump({"corpus": corpus, "ids": [tok.encode(s).ids for s in corpus]},
+          open("testdata/ref_smollm2_fuzz.json", "w"))
+print("smollm2 fuzz ok")
