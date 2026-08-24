@@ -31,7 +31,7 @@ func TestQuantizeMatVec(t *testing.T) {
 		want := make([]float64, c.cols)
 		for i := 0; i < c.rows; i++ {
 			for j := 0; j < c.cols; j++ {
-				w := q.Q[(i/2)*2*c.cols+2*j+i%2]
+				w := q.Q[(i/4)*4*c.cols+4*j+i%4]
 				want[j] += float64(int(xu[i])-64) * float64(w)
 			}
 		}
@@ -145,9 +145,9 @@ func BenchmarkMatVecQ8(b *testing.B) {
 func TestQMatMulBatch(t *testing.T) {
 	rng := rand.New(rand.NewSource(51))
 	for _, c := range []struct{ batch, rows, cols int }{
-		{9, 768, 2304}, // 4-row blocks plus a remainder
-		{4, 64, 33},    // scalar column tails
-		{2, 5, 8},      // pure remainder path
+		{11, 768, 2304}, // 8-row blocks plus a remainder
+		{8, 64, 33},     // scalar column tails
+		{2, 5, 8},       // pure remainder path
 	} {
 		w := RandomMatrix(c.rows, c.cols, rng)
 		q := QuantizeMatrix(w)

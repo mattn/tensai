@@ -4,132 +4,94 @@ package tensai
 
 import "simd/archsimd"
 
-// AVX2 kernel for the quantized matvec, built on the u8 x s8 pairwise
-// multiply-add: the 7-bit offset activations of one row pair broadcast as
-// repeated (x_even, x_odd) bytes, one 16-byte load of the interleaved
-// weight layout covers 8 columns of the pair, and a single
-// DotProductPairsSaturated yields the 8 per-column pair sums — no
-// widening, masking, or shuffling of weights at all. Pair sums stay under
-// 127*127*2 so the saturating i16 never saturates; they widen to an i32
-// accumulator strip.
+// 256-bit AVX2 kernels for the int8 matvec and matmul over the quad-row
+// layout: a 32-byte weight load holds eight columns four rows deep, the
+// u8 x s8 pairwise multiply-add (VPMADDUBSW) against a broadcast
+// activation quad gives sixteen i16 pair sums, and the widening i16
+// pair-add (VPMADDWD by ones) folds them into eight per-column i32 lanes.
+// Two multiplies per 32 weight bytes, and no i16 saturation window to
+// manage: every quad widens to i32 immediately (pair sums stay under
+// 127*127*2, and the pair-add doubles that far inside i32).
 //
-// The loop nest keeps weight reads streaming: an outer block of 32 row
-// pairs, a middle loop over 32-column tiles (64 interleaved bytes — one
-// cache line per pair-row), and the pair rows inner with four i32x8
-// accumulators live in registers, flushed to the strip once per tile.
+// Scalar float instructions (SSE encodings) would pay AVX-SSE transition
+// penalties while the 256-bit registers are dirty, so integer scalar tails
+// run before ClearAVXUpperBits and float tails after.
+
+// qxQuad packs four consecutive 7-bit activations into the u32 a
+// broadcast turns into the unsigned multiply operand.
+func qxQuad(xu []uint8, i4 int) uint32 {
+	return uint32(xu[4*i4]) | uint32(xu[4*i4+1])<<8 | uint32(xu[4*i4+2])<<16 | uint32(xu[4*i4+3])<<24
+}
+
 func qmatvecCols(out []Float, xu []uint8, sx Float, qw []int8, scale []Float, colSum64 []int32, cols, lo, hi int) {
 	if !hasAVX2 {
 		qmatvecColsGeneric(out, xu, sx, qw, scale, colSum64, cols, lo, hi)
 		return
 	}
-	pairs := len(xu) / 2
-	acc := make([]int32, hi-lo)
+	quads := len(xu) / 4
+	ones := archsimd.BroadcastInt16x16(1)
 	vecEnd := lo + ((hi - lo) &^ 31)
-	const iBlock = 32
-	for ib := 0; ib < pairs; ib += iBlock {
-		ie := min(ib+iBlock, pairs)
-		for jt := lo; jt < vecEnd; jt += 32 {
-			var a0, a1, a2, a3 archsimd.Int32x8
-			for i2 := ib; i2 < ie; i2++ {
-				xp := archsimd.BroadcastUint16x8(uint16(xu[2*i2]) | uint16(xu[2*i2+1])<<8).AsUint8x16()
-				row := qw[i2*2*cols+2*jt:]
-				a0 = a0.Add(xp.DotProductPairsSaturated(loadI8x16(row)).ExtendToInt32())
-				a1 = a1.Add(xp.DotProductPairsSaturated(loadI8x16(row[16:])).ExtendToInt32())
-				a2 = a2.Add(xp.DotProductPairsSaturated(loadI8x16(row[32:])).ExtendToInt32())
-				a3 = a3.Add(xp.DotProductPairsSaturated(loadI8x16(row[48:])).ExtendToInt32())
-			}
-			s := acc[jt-lo:]
-			storeI32x8(loadI32x8(s).Add(a0), s)
-			storeI32x8(loadI32x8(s[8:]).Add(a1), s[8:])
-			storeI32x8(loadI32x8(s[16:]).Add(a2), s[16:])
-			storeI32x8(loadI32x8(s[24:]).Add(a3), s[24:])
+	for jt := lo; jt < vecEnd; jt += 32 {
+		var a0, a1, a2, a3 archsimd.Int32x8
+		for i4 := 0; i4 < quads; i4++ {
+			xp := archsimd.BroadcastUint32x8(qxQuad(xu, i4)).AsUint8x32()
+			row := qw[i4*4*cols+4*jt:]
+			a0 = a0.Add(xp.DotProductPairsSaturated(loadI8x32(row)).DotProductPairs(ones))
+			a1 = a1.Add(xp.DotProductPairsSaturated(loadI8x32(row[32:])).DotProductPairs(ones))
+			a2 = a2.Add(xp.DotProductPairsSaturated(loadI8x32(row[64:])).DotProductPairs(ones))
+			a3 = a3.Add(xp.DotProductPairsSaturated(loadI8x32(row[96:])).DotProductPairs(ones))
 		}
-		// Scalar tail columns: integer-only, safe while the vector upper
-		// state is dirty.
-		for i2 := ib; i2 < ie; i2++ {
-			x0, x1 := int32(xu[2*i2]), int32(xu[2*i2+1])
-			row := qw[i2*2*cols:]
-			for j := vecEnd; j < hi; j++ {
-				acc[j-lo] += x0*int32(row[2*j]) + x1*int32(row[2*j+1])
-			}
+		sxv := archsimd.BroadcastFloat32x8(sx)
+		for k, a := range [4]archsimd.Int32x8{a0, a1, a2, a3} {
+			j := jt + 8*k
+			f := a.Sub(loadI32x8(colSum64[j:])).ConvertToFloat32().Mul(loadF32x8(scale[j:])).Mul(sxv)
+			storeF32x8(f, out[j:])
 		}
-	}
-	sxv := archsimd.BroadcastFloat32x8(sx)
-	for j := lo; j < vecEnd; j += 8 {
-		v := loadI32x8(acc[j-lo:]).Sub(loadI32x8(colSum64[j:])).ConvertToFloat32()
-		storeF32x8(v.Mul(loadF32x8(scale[j:])).Mul(sxv), out[j:])
 	}
 	archsimd.ClearAVXUpperBits()
-	for j := vecEnd; j < hi; j++ {
-		out[j] = Float(acc[j-lo]-colSum64[j]) * scale[j] * sx
+	if vecEnd < hi {
+		qmatvecColsGeneric(out, xu, sx, qw, scale, colSum64, cols, vecEnd, hi)
 	}
 }
 
-// qmatmulCols4 is the batched kernel: two weight loads per 16-column step
-// feed eight multiply-adds, one pair per activation row, so the streaming
-// weight traffic amortizes fourfold.
-func qmatmulCols4(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []int8, scale []Float, colSum64 []int32, cols, lo, hi int) {
+// qmatmulRows8 is the eight-row batched form: per eight-column tile each
+// 32-byte weight load feeds eight broadcast activation quads, so the
+// weight stream that dominates a single matvec amortizes eightfold while
+// every row still costs just the two multiplies per load.
+func qmatmulRows8(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []int8, scale []Float, colSum64 []int32, cols, lo, hi int) {
 	if !hasAVX2 {
-		qmatmulCols4Generic(out, xus, sxs, r0, qw, scale, colSum64, cols, lo, hi)
+		qmatmulRows8Generic(out, xus, sxs, r0, qw, scale, colSum64, cols, lo, hi)
 		return
 	}
-	pairs := len(xus[0]) / 2
-	width := hi - lo
-	accs := make([]int32, 4*width)
-	vecEnd := lo + (width &^ 15)
-	const iBlock = 32
-	for ib := 0; ib < pairs; ib += iBlock {
-		ie := min(ib+iBlock, pairs)
-		for jt := lo; jt < vecEnd; jt += 16 {
-			var a00, a01, a10, a11, a20, a21, a30, a31 archsimd.Int32x8
-			for i2 := ib; i2 < ie; i2++ {
-				row := qw[i2*2*cols+2*jt:]
-				w0 := loadI8x16(row)
-				w1 := loadI8x16(row[16:])
-				xp := archsimd.BroadcastUint16x8(uint16(xus[0][2*i2]) | uint16(xus[0][2*i2+1])<<8).AsUint8x16()
-				a00 = a00.Add(xp.DotProductPairsSaturated(w0).ExtendToInt32())
-				a01 = a01.Add(xp.DotProductPairsSaturated(w1).ExtendToInt32())
-				xp = archsimd.BroadcastUint16x8(uint16(xus[1][2*i2]) | uint16(xus[1][2*i2+1])<<8).AsUint8x16()
-				a10 = a10.Add(xp.DotProductPairsSaturated(w0).ExtendToInt32())
-				a11 = a11.Add(xp.DotProductPairsSaturated(w1).ExtendToInt32())
-				xp = archsimd.BroadcastUint16x8(uint16(xus[2][2*i2]) | uint16(xus[2][2*i2+1])<<8).AsUint8x16()
-				a20 = a20.Add(xp.DotProductPairsSaturated(w0).ExtendToInt32())
-				a21 = a21.Add(xp.DotProductPairsSaturated(w1).ExtendToInt32())
-				xp = archsimd.BroadcastUint16x8(uint16(xus[3][2*i2]) | uint16(xus[3][2*i2+1])<<8).AsUint8x16()
-				a30 = a30.Add(xp.DotProductPairsSaturated(w0).ExtendToInt32())
-				a31 = a31.Add(xp.DotProductPairsSaturated(w1).ExtendToInt32())
-			}
-			for r, pair := range [4][2]archsimd.Int32x8{{a00, a01}, {a10, a11}, {a20, a21}, {a30, a31}} {
-				s := accs[r*width+jt-lo:]
-				storeI32x8(loadI32x8(s).Add(pair[0]), s)
-				storeI32x8(loadI32x8(s[8:]).Add(pair[1]), s[8:])
-			}
-		}
-		for i2 := ib; i2 < ie; i2++ {
-			row := qw[i2*2*cols:]
-			for r := 0; r < 4; r++ {
-				x0, x1 := int32(xus[r][2*i2]), int32(xus[r][2*i2+1])
-				a := accs[r*width:]
-				for j := vecEnd; j < hi; j++ {
-					a[j-lo] += x0*int32(row[2*j]) + x1*int32(row[2*j+1])
-				}
-			}
+	quads := len(xus[0]) / 4
+	// The packed activation quads per row, hoisted out of the tile loop.
+	var xq [8][]uint32
+	for r := 0; r < 8; r++ {
+		xq[r] = make([]uint32, quads)
+		for i4 := 0; i4 < quads; i4++ {
+			xq[r][i4] = qxQuad(xus[r], i4)
 		}
 	}
-	for r := 0; r < 4; r++ {
-		o := out.Data[(r0+r)*cols:]
-		sxv := archsimd.BroadcastFloat32x8(sxs[r])
-		a := accs[r*width:]
-		for j := lo; j < vecEnd; j += 8 {
-			v := loadI32x8(a[j-lo:]).Sub(loadI32x8(colSum64[j:])).ConvertToFloat32()
-			storeF32x8(v.Mul(loadF32x8(scale[j:])).Mul(sxv), o[j:])
+	ones := archsimd.BroadcastInt16x16(1)
+	vecEnd := lo + ((hi - lo) &^ 7)
+	for jt := lo; jt < vecEnd; jt += 8 {
+		var a [8]archsimd.Int32x8
+		for i4 := 0; i4 < quads; i4++ {
+			w := loadI8x32(qw[i4*4*cols+4*jt:])
+			for r := 0; r < 8; r++ {
+				xp := archsimd.BroadcastUint32x8(xq[r][i4]).AsUint8x32()
+				a[r] = a[r].Add(xp.DotProductPairsSaturated(w).DotProductPairs(ones))
+			}
+		}
+		cs := loadI32x8(colSum64[jt:])
+		sc := loadF32x8(scale[jt:])
+		for r := 0; r < 8; r++ {
+			f := a[r].Sub(cs).ConvertToFloat32().Mul(sc).Mul(archsimd.BroadcastFloat32x8(sxs[r]))
+			storeF32x8(f, out.Data[(r0+r)*cols+jt:])
 		}
 	}
 	archsimd.ClearAVXUpperBits()
-	for r := 0; r < 4; r++ {
-		o := out.Data[(r0+r)*cols:]
-		for j := vecEnd; j < hi; j++ {
-			o[j] = Float(accs[r*width+j-lo]-colSum64[j]) * scale[j] * sxs[r]
-		}
+	if vecEnd < hi {
+		qmatmulRows8Generic(out, xus, sxs, r0, qw, scale, colSum64, cols, vecEnd, hi)
 	}
 }

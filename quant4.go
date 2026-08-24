@@ -96,6 +96,7 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 			len(x), len(out), q.Rows, q.Cols)
 	}
 	xu, sx := quantizeActs(x)
+	xu = xu[:(q.Rows+1)&^1] // the int4 kernels expect pair padding
 	gsum := make([]int32, (q.Rows+q4Group-1)/q4Group)
 	for i, u := range xu {
 		gsum[min(i/q4Group, len(gsum)-1)] += int32(u) - 64
@@ -135,6 +136,7 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 	gsums := make([][]int32, rows)
 	for r := 0; r < rows; r++ {
 		xus[r], sxs[r] = quantizeActs(x.Data[r*x.Cols : (r+1)*x.Cols])
+		xus[r] = xus[r][:(q.Rows+1)&^1] // the int4 kernels expect pair padding
 		gsums[r] = make([]int32, groups)
 		for i, u := range xus[r] {
 			gsums[r][min(i/q4Group, groups-1)] += int32(u) - 64

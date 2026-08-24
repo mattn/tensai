@@ -716,7 +716,7 @@ func TestGPUQ8MatMul(t *testing.T) {
 			for j := 0; j < c.cols; j++ {
 				var want float64
 				for i := 0; i < c.rows; i++ {
-					wq := float64(q.Q[(i/2)*2*c.cols+2*j+i%2]) * float64(q.Scale[j])
+					wq := float64(q.Q[(i/4)*4*c.cols+4*j+i%4]) * float64(q.Scale[j])
 					want += float64(x.Data[r*c.rows+i]) * wq
 				}
 				gotv := float64(out.Data[r*c.cols+j])
