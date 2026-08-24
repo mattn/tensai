@@ -787,7 +787,7 @@ func (g *GPU) takeBuffer(usage, size uint64) uintptr {
 // The caller holds wgpuMu.
 func (g *GPU) putBuffer(usage, size uint64, buf uintptr) {
 	if g.closed || g.pool.bytes+size > gpuPoolMaxBytes {
-		fnBufferRelease(buf)
+		g.dropBuffer(buf)
 		return
 	}
 	if g.batchEnc != 0 {
@@ -807,7 +807,7 @@ func (g *GPU) putBuffer(usage, size uint64, buf uintptr) {
 func (g *GPU) drainPending() {
 	for _, p := range g.pool.pending {
 		if g.pool.bytes+p.size > gpuPoolMaxBytes {
-			fnBufferRelease(p.buf)
+			g.dropBuffer(p.buf)
 			continue
 		}
 		if g.pool.free == nil {
@@ -832,6 +832,68 @@ func (g *GPU) releasePool() {
 		fnBufferRelease(p.buf)
 	}
 	g.pool = gpuBufferPool{}
+	g.invalidateBindGroups()
+}
+
+// bgKey identifies a bind group by its layout and bound buffers. Decode
+// runs the same operations against the same (pooled, so handle-stable)
+// buffers every token, so almost every lookup hits after the first token.
+type bgKey struct {
+	layout uintptr
+	n      int
+	e      [6]struct {
+		binding uint32
+		buf     uintptr
+		size    uint64
+	}
+}
+
+// bgCacheMax caps the cache; overflow drops everything (simple, and far
+// beyond what a decode loop creates).
+const bgCacheMax = 8192
+
+// cachedBindGroup returns a bind group for the entries, creating and
+// retaining it on first use. Cached groups are owned by the cache — the
+// caller must not release them. The caller holds g.mu and wgpuMu.
+func (g *GPU) cachedBindGroup(layout uintptr, entries []wgpuBindGroupEntry) uintptr {
+	var key bgKey
+	key.layout = layout
+	key.n = len(entries)
+	for i, e := range entries {
+		key.e[i].binding = e.binding
+		key.e[i].buf = e.buffer
+		key.e[i].size = e.size
+	}
+	if bg, ok := g.bgCache[key]; ok {
+		return bg
+	}
+	if len(g.bgCache) >= bgCacheMax {
+		g.invalidateBindGroups()
+	}
+	bg := g.makeBindGroup(layout, entries)
+	if g.bgCache == nil {
+		g.bgCache = make(map[bgKey]uintptr)
+	}
+	g.bgCache[key] = bg
+	return bg
+}
+
+// invalidateBindGroups releases every cached bind group. It must run
+// whenever a buffer is truly released (dropBuffer), since a later
+// allocation may reuse the handle address and silently collide with a
+// stale cache entry. The caller holds wgpuMu.
+func (g *GPU) invalidateBindGroups() {
+	for _, bg := range g.bgCache {
+		fnBindGroupRelease(bg)
+	}
+	g.bgCache = nil
+}
+
+// dropBuffer releases a buffer for real (not into the pool) and
+// invalidates the bind-group cache. The caller holds wgpuMu.
+func (g *GPU) dropBuffer(buf uintptr) {
+	fnBufferRelease(buf)
+	g.invalidateBindGroups()
 }
 
 // GPUTensor is a tensor whose data lives in GPU memory. Create one with
@@ -867,7 +929,7 @@ func (g *GPU) takeReadback(bytes uint64) (uintptr, uint64) {
 		return buf, capacity
 	}
 	if g.readback.buf != 0 {
-		fnBufferRelease(g.readback.buf)
+		g.dropBuffer(g.readback.buf)
 		g.readback = gpuReadbackBuffer{}
 	}
 	return g.newBuffer(wgpuBufferUsageMapRead|wgpuBufferUsageCopyDst, bytes), bytes
@@ -877,7 +939,7 @@ func (g *GPU) takeReadback(bytes uint64) (uintptr, uint64) {
 // download. The caller holds GPU.mu and wgpuMu.
 func (g *GPU) putReadback(buf uintptr, size uint64) {
 	if g.readback.buf != 0 {
-		fnBufferRelease(g.readback.buf)
+		g.dropBuffer(g.readback.buf)
 	}
 	g.readback = gpuReadbackBuffer{buf: buf, size: size}
 }
@@ -1180,14 +1242,13 @@ func (g *GPU) stridedMatMul(a, b *GPUTensor, outShape []int, transB bool, m, k, 
 		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
 		{binding: 4, buffer: bufOut, size: outBytes},
 	}
-	bindGroup := g.makeBindGroup(lay, entries[:])
+	bindGroup := g.cachedBindGroup(lay, entries[:])
 	runtime.KeepAlive(&entries)
-	defer fnBindGroupRelease(bindGroup)
 
 	err := g.dispatch(pipe, bindGroup,
 		uint32((n+block-1)/block), uint32((m+block-1)/block), uint32(batches))
 	if err != nil {
-		fnBufferRelease(bufOut)
+		g.dropBuffer(bufOut)
 		return nil, err
 	}
 	return &GPUTensor{g: g, buf: bufOut, shape: outShape}, nil
@@ -1228,9 +1289,8 @@ func (t *GPUTensor) Scale(s Float) error {
 		{binding: 5, buffer: bufParams, size: 16},
 		{binding: 6, buffer: t.buf, size: uint64(count) * 4},
 	}
-	bindGroup := g.makeBindGroup(g.pipes.layScale, entries[:])
+	bindGroup := g.cachedBindGroup(g.pipes.layScale, entries[:])
 	runtime.KeepAlive(&entries)
-	defer fnBindGroupRelease(bindGroup)
 
 	x, y := split2D((count + gpuKernelWG - 1) / gpuKernelWG)
 	return g.dispatch(g.pipes.scale, bindGroup, x, y, 1)
@@ -1276,13 +1336,12 @@ func (t *GPUTensor) softmax(qmod, off int) (*GPUTensor, error) {
 		{binding: 8, buffer: t.buf, size: bytes},
 		{binding: 9, buffer: bufOut, size: bytes},
 	}
-	bindGroup := g.makeBindGroup(g.pipes.laySoftmax, entries[:])
+	bindGroup := g.cachedBindGroup(g.pipes.laySoftmax, entries[:])
 	runtime.KeepAlive(&entries)
-	defer fnBindGroupRelease(bindGroup)
 
 	x, y := split2D(rows)
 	if err := g.dispatch(g.pipes.softmax, bindGroup, x, y, 1); err != nil {
-		fnBufferRelease(bufOut)
+		g.dropBuffer(bufOut)
 		return nil, err
 	}
 	return &GPUTensor{g: g, buf: bufOut, shape: append([]int(nil), t.shape...)}, nil
@@ -1480,13 +1539,12 @@ func (q *GPUTensor) fusedCausalMHA(k, v *GPUTensor, heads, batch, seq, seqKV, d,
 		{binding: 13, buffer: v.buf, size: uint64(v.Size()) * 4},
 		{binding: 14, buffer: bufOut, size: outBytes},
 	}
-	bindGroup := g.makeBindGroup(g.pipes.layAttn, entries[:])
+	bindGroup := g.cachedBindGroup(g.pipes.layAttn, entries[:])
 	runtime.KeepAlive(&entries)
-	defer fnBindGroupRelease(bindGroup)
 
 	x, y := split2D(rows)
 	if err := g.dispatch(g.pipes.attn, bindGroup, x, y, 1); err != nil {
-		fnBufferRelease(bufOut)
+		g.dropBuffer(bufOut)
 		return nil, err
 	}
 	return &GPUTensor{g: g, buf: bufOut, shape: outShape}, nil
@@ -1589,8 +1647,8 @@ func (q *GPUQMatrix) Free() {
 		return
 	}
 	q.freed = true
-	fnBufferRelease(q.buf)
-	fnBufferRelease(q.scales)
+	q.g.dropBuffer(q.buf)
+	q.g.dropBuffer(q.scales)
 }
 
 // MatMul computes x @ Q on the GPU: x's last axis must equal the weight
@@ -1641,14 +1699,13 @@ func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 		{binding: 18, buffer: x.buf, size: uint64(x.Size()) * 4},
 		{binding: 19, buffer: bufOut, size: outBytes},
 	}
-	bindGroup := g.makeBindGroup(g.pipes.layQmatmul, entries[:])
+	bindGroup := g.cachedBindGroup(g.pipes.layQmatmul, entries[:])
 	runtime.KeepAlive(&entries)
-	defer fnBindGroupRelease(bindGroup)
 
 	err := g.dispatch(g.pipes.qmatmul, bindGroup,
 		uint32((q.words+15)/16), uint32(m), 1)
 	if err != nil {
-		fnBufferRelease(bufOut)
+		g.dropBuffer(bufOut)
 		return nil, err
 	}
 	return &GPUTensor{g: g, buf: bufOut, shape: outShape}, nil
@@ -1692,13 +1749,12 @@ func (t *GPUTensor) RMSNorm(w *GPUTensor, eps float64) (*GPUTensor, error) {
 		{binding: 22, buffer: w.buf, size: uint64(w.Size()) * 4},
 		{binding: 23, buffer: bufOut, size: uint64(t.Size()) * 4},
 	}
-	bindGroup := g.makeBindGroup(g.pipes.layRmsnorm, entries[:])
+	bindGroup := g.cachedBindGroup(g.pipes.layRmsnorm, entries[:])
 	runtime.KeepAlive(&entries)
-	defer fnBindGroupRelease(bindGroup)
 
 	x, y := split2D(rows)
 	if err := g.dispatch(g.pipes.rmsnorm, bindGroup, x, y, 1); err != nil {
-		fnBufferRelease(bufOut)
+		g.dropBuffer(bufOut)
 		return nil, err
 	}
 	return &GPUTensor{g: g, buf: bufOut, shape: append([]int(nil), t.shape...)}, nil
@@ -1745,9 +1801,8 @@ func (t *GPUTensor) RoPE(headSz, pos0 int, theta float64) error {
 		{binding: 24, buffer: bufParams, size: 32},
 		{binding: 25, buffer: t.buf, size: uint64(t.Size()) * 4},
 	}
-	bindGroup := g.makeBindGroup(g.pipes.layRope, entries[:])
+	bindGroup := g.cachedBindGroup(g.pipes.layRope, entries[:])
 	runtime.KeepAlive(&entries)
-	defer fnBindGroupRelease(bindGroup)
 
 	pairs := (d / headSz) * (headSz / 2)
 	return g.dispatch(g.pipes.rope, bindGroup, uint32((pairs+63)/64), uint32(rows), 1)
@@ -1786,9 +1841,8 @@ func (t *GPUTensor) eltwiseIP(pipe, lay uintptr, o *GPUTensor) error {
 		{binding: 27, buffer: t.buf, size: uint64(t.Size()) * 4},
 		{binding: 28, buffer: o.buf, size: uint64(o.Size()) * 4},
 	}
-	bindGroup := g.makeBindGroup(lay, entries[:])
+	bindGroup := g.cachedBindGroup(lay, entries[:])
 	runtime.KeepAlive(&entries)
-	defer fnBindGroupRelease(bindGroup)
 
 	x, y := split2D((t.Size() + gpuKernelWG - 1) / gpuKernelWG)
 	return g.dispatch(pipe, bindGroup, x, y, 1)
@@ -1918,13 +1972,12 @@ func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqK
 		{binding: 13, buffer: v.buf, size: uint64(v.Size()) * 4},
 		{binding: 14, buffer: bufOut, size: outBytes},
 	}
-	bindGroup := g.makeBindGroup(g.pipes.layAttn, entries[:])
+	bindGroup := g.cachedBindGroup(g.pipes.layAttn, entries[:])
 	runtime.KeepAlive(&entries)
-	defer fnBindGroupRelease(bindGroup)
 
 	x, y := split2D(rows)
 	if err := g.dispatch(g.pipes.attn, bindGroup, x, y, 1); err != nil {
-		fnBufferRelease(bufOut)
+		g.dropBuffer(bufOut)
 		return nil, err
 	}
 	return &GPUTensor{g: g, buf: bufOut, shape: append([]int(nil), q.shape...)}, nil
