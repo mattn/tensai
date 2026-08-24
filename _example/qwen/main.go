@@ -387,7 +387,7 @@ func main() {
 	// turn with an empty think block; -think leaves the block open so the
 	// model reasons first. Other models just open the turn.
 	asst := "<|im_start|>assistant\n"
-	if model.cfg.ModelType == "qwen3" && !*think {
+	if (model.cfg.ModelType == "qwen3" || model.cfg.ModelType == "smollm3") && !*think {
 		asst += "<think>\n\n</think>\n\n"
 	}
 

@@ -40,7 +40,7 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 	switch pre {
 	case "smollm":
 		preJSON = `{"type":"Sequence","pretokenizers":[{"type":"Digits","individual_digits":true},{"type":"ByteLevel","use_regex":true}]}`
-	case "qwen2", "llama-bpe", "llama3":
+	case "qwen2", "llama-bpe", "llama3", "smaug-bpe":
 		preJSON = `{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}}`
 	case "gpt-2", "olmo", "":
 		preJSON = `{"type":"ByteLevel","use_regex":true}`
@@ -132,8 +132,10 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 	defer g.Close()
 
 	arch, _ := g.String("general.architecture")
-	if arch != "llama" && arch != "qwen2" && arch != "qwen3" {
-		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2, qwen3, and llama)", arch)
+	switch arch {
+	case "llama", "qwen2", "qwen3", "smollm3":
+	default:
+		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2, qwen3, llama, and smollm3)", arch)
 	}
 	meta := func(key string) int64 {
 		n, _ := g.Int(arch + "." + key)
@@ -199,9 +201,10 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 		return quant(trans(name, unpermute))
 	}
 
-	// Only the llama architecture's q/k rows are stored permuted.
+	// Only llama-converter architectures store q/k rows permuted
+	// (llama.cpp's SmolLM3 converter subclasses the Llama one).
 	qPerm, kPerm := 0, 0
-	if arch == "llama" {
+	if arch == "llama" || arch == "smollm3" {
 		qPerm, kPerm = cfg.Heads, cfg.KVHeads
 	}
 	headSz := cfg.HiddenSize / cfg.Heads
@@ -249,6 +252,9 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 			got := loadGate.acquire(stage)
 			defer loadGate.release(got)
 			b := &m.blocks[i]
+			// SmolLM3 skips RoPE on every fourth layer; the GGUF carries no
+			// flag for it, matching llama.cpp's hardcoded rule.
+			b.noPE = arch == "smollm3" && i%4 == 3
 			p := fmt.Sprintf("blk.%d.", i)
 			b.ln1 = tensor(p + "attn_norm.weight").Data
 			b.ln2 = tensor(p + "ffn_norm.weight").Data
