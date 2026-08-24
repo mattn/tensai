@@ -5,10 +5,11 @@
 //
 // Reading is lazy: Open parses only the header, and each Tensor call reads
 // just that tensor's bytes. F32 comes back as-is; F16 and BF16 convert to
-// float32; the block-quantized types Q8_0, Q4_0, Q4_1, Q5_0, Q5_1 and the K-quants
-// Q4_K, Q5_K, and Q6_K dequantize to float32 on the way out, which covers
-// the encodings llama.cpp's published checkpoints usually ship (Q4_K_M and
-// Q5_K_M files mix Q4_K/Q5_K with Q6_K tensors). Dimensions arrive in tensai's row-major order (GGUF stores
+// float32; the block-quantized types Q8_0, Q4_0, Q4_1, Q5_0, Q5_1 and the
+// K-quants Q2_K through Q6_K plus IQ4_NL dequantize to float32 on the way
+// out, which covers the encodings llama.cpp's published checkpoints
+// usually ship (the Q2_K..Q5_K_M mixes, their Q6_K tensors, and the
+// IQ4_NL blocks imatrix mixes lean on). Dimensions arrive in tensai's row-major order (GGUF stores
 // them fastest-varying first; this package reverses them), so a
 // token-embedding tensor reads as [vocab, hidden] just like the
 // safetensors reader would produce.
@@ -35,17 +36,20 @@ import (
 // Tensor encodings from the GGML type enum; only the ones this package
 // decodes are named.
 const (
-	typeF32  = 0
-	typeF16  = 1
-	typeQ4_0 = 2
-	typeQ4_1 = 3
-	typeQ5_0 = 6
-	typeQ5_1 = 7
-	typeQ8_0 = 8
-	typeQ4_K = 12
-	typeQ5_K = 13
-	typeQ6_K = 14
-	typeBF16 = 30
+	typeF32   = 0
+	typeF16   = 1
+	typeQ4_0  = 2
+	typeQ4_1  = 3
+	typeQ5_0  = 6
+	typeQ5_1  = 7
+	typeQ8_0  = 8
+	typeQ2_K  = 10
+	typeQ3_K  = 11
+	typeQ4_K  = 12
+	typeQ5_K  = 13
+	typeQ6_K  = 14
+	typeIQ4NL = 20
+	typeBF16  = 30
 )
 
 var typeNames = map[uint32]string{
@@ -53,20 +57,24 @@ var typeNames = map[uint32]string{
 	typeQ4_1: "Q4_1", typeQ8_0: "Q8_0", typeBF16: "BF16",
 	typeQ4_K: "Q4_K", typeQ5_K: "Q5_K", typeQ6_K: "Q6_K",
 	typeQ5_0: "Q5_0", typeQ5_1: "Q5_1",
+	typeQ2_K: "Q2_K", typeQ3_K: "Q3_K", typeIQ4NL: "IQ4_NL",
 }
 
 // blockSpec describes one quantization block: how many values it decodes
 // to and how many bytes it occupies.
 var blockSpec = map[uint32]struct{ values, bytes int64 }{
-	typeF32:  {1, 4},
-	typeF16:  {1, 2},
-	typeBF16: {1, 2},
-	typeQ8_0: {32, 2 + 32},         // f16 scale + 32 int8
-	typeQ4_0: {32, 2 + 16},         // f16 scale + 32 nibbles
-	typeQ4_1: {32, 2 + 2 + 16},     // f16 scale + f16 min + 32 nibbles
-	typeQ5_0: {32, 2 + 4 + 16},     // f16 scale + high-bit plane + nibbles
-	typeQ5_1: {32, 2 + 2 + 4 + 16}, // + f16 min
-	// K-quants: 256-value super-blocks with 6- or 8-bit sub-scales.
+	typeF32:   {1, 4},
+	typeF16:   {1, 2},
+	typeBF16:  {1, 2},
+	typeQ8_0:  {32, 2 + 32},         // f16 scale + 32 int8
+	typeQ4_0:  {32, 2 + 16},         // f16 scale + 32 nibbles
+	typeQ4_1:  {32, 2 + 2 + 16},     // f16 scale + f16 min + 32 nibbles
+	typeQ5_0:  {32, 2 + 4 + 16},     // f16 scale + high-bit plane + nibbles
+	typeQ5_1:  {32, 2 + 2 + 4 + 16}, // + f16 min
+	typeIQ4NL: {32, 2 + 16},         // f16 scale + nibbles through a nonlinear table
+	// K-quants: 256-value super-blocks with quantized sub-scales.
+	typeQ2_K: {256, 16 + 64 + 2 + 2},       // 4-bit scale/min pairs, 2-bit quants
+	typeQ3_K: {256, 32 + 64 + 12 + 2},      // high-bit plane, 2-bit quants, 6-bit scales
 	typeQ4_K: {256, 2 + 2 + 12 + 128},      // d, dmin, packed scales, nibbles
 	typeQ5_K: {256, 2 + 2 + 12 + 32 + 128}, // + high bits
 	typeQ6_K: {256, 128 + 64 + 16 + 2},     // ql, qh, int8 scales, d
@@ -360,6 +368,24 @@ func (f *File) Tensor(name string) (*tensai.Tensor, error) {
 				dst[b*32+int64(i)+16] = s*float32(hi) + m
 			}
 		}
+	case typeIQ4NL:
+		for b := int64(0); b < n/32; b++ {
+			blk := raw[b*18:]
+			s := f16to32(binary.LittleEndian.Uint16(blk))
+			for i := 0; i < 16; i++ {
+				q := blk[2+i]
+				dst[b*32+int64(i)] = s * iq4nl[q&0x0F]
+				dst[b*32+int64(i)+16] = s * iq4nl[q>>4]
+			}
+		}
+	case typeQ2_K:
+		for b := int64(0); b < n/256; b++ {
+			dequantQ2K(raw[b*84:b*84+84], dst[b*256:b*256+256])
+		}
+	case typeQ3_K:
+		for b := int64(0); b < n/256; b++ {
+			dequantQ3K(raw[b*110:b*110+110], dst[b*256:b*256+256])
+		}
 	case typeQ4_K:
 		for b := int64(0); b < n/256; b++ {
 			dequantQ4K(raw[b*144:b*144+144], dst[b*256:b*256+256])
@@ -376,6 +402,10 @@ func (f *File) Tensor(name string) (*tensai.Tensor, error) {
 	return out, nil
 }
 
+// iq4nl is IQ4_NL's nonlinear codebook: sixteen levels spaced to match
+// the empirical weight distribution instead of uniformly.
+var iq4nl = [16]float32{-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}
+
 // scaleMinK4 unpacks the j-th 6-bit scale and min from a K-quant
 // super-block's 12 packed bytes (8 pairs: the first four pairs use the low
 // 6 bits of bytes 0-7, the last four splice nibbles of bytes 8-11 with the
@@ -385,6 +415,85 @@ func scaleMinK4(j int, q []byte) (sc, m uint8) {
 		return q[j] & 63, q[j+4] & 63
 	}
 	return q[j+4]&0x0F | q[j-4]>>6<<4, q[j+4]>>4 | q[j]>>6<<4
+}
+
+// dequantQ2K expands one 84-byte Q2_K super-block: sixteen 16-value
+// groups of 2-bit quants, each with a 4-bit scale and 4-bit min against
+// the super-block's two f16 factors.
+func dequantQ2K(blk []byte, dst []float32) {
+	scales := blk[:16]
+	qs := blk[16:80]
+	d := f16to32(binary.LittleEndian.Uint16(blk[80:]))
+	dmin := f16to32(binary.LittleEndian.Uint16(blk[82:]))
+	is := 0
+	y := 0
+	for n := 0; n < 256; n += 128 {
+		q := qs[n/4 : n/4+32]
+		for shift := 0; shift < 8; shift += 2 {
+			for _, half := range [2]int{0, 16} {
+				sc := scales[is]
+				is++
+				dl := d * float32(sc&0x0F)
+				ml := dmin * float32(sc>>4)
+				for l := 0; l < 16; l++ {
+					dst[y] = dl*float32(q[half+l]>>shift&3) - ml
+					y++
+				}
+			}
+		}
+	}
+}
+
+// dequantQ3K expands one 110-byte Q3_K super-block: 2-bit quants plus a
+// high-bit plane (an unset mask bit means subtract 4), with sixteen 6-bit
+// scales packed into twelve bytes.
+func dequantQ3K(blk []byte, dst []float32) {
+	hm := blk[:32]
+	qs := blk[32:96]
+	packed := blk[96:108]
+	d := f16to32(binary.LittleEndian.Uint16(blk[108:]))
+
+	// Unpack the twelve scale bytes into sixteen int8 values (stored
+	// offset by 32): the low 4 bits of bytes 0-7 pair with 2-bit fields of
+	// bytes 8-11, and the high 4 bits pair with the remaining fields.
+	a0 := binary.LittleEndian.Uint32(packed[0:])
+	a1 := binary.LittleEndian.Uint32(packed[4:])
+	tmp := binary.LittleEndian.Uint32(packed[8:])
+	const kmask1, kmask2 = 0x03030303, 0x0f0f0f0f
+	var aux [4]uint32
+	aux[0] = a0&kmask2 | tmp>>0&kmask1<<4
+	aux[1] = a1&kmask2 | tmp>>2&kmask1<<4
+	aux[2] = a0>>4&kmask2 | tmp>>4&kmask1<<4
+	aux[3] = a1>>4&kmask2 | tmp>>6&kmask1<<4
+	var scales [16]int8
+	for i, v := range aux {
+		scales[4*i+0] = int8(v)
+		scales[4*i+1] = int8(v >> 8)
+		scales[4*i+2] = int8(v >> 16)
+		scales[4*i+3] = int8(v >> 24)
+	}
+
+	is := 0
+	y := 0
+	m := byte(1)
+	for n := 0; n < 256; n += 128 {
+		q := qs[n/4 : n/4+32]
+		for shift := 0; shift < 8; shift += 2 {
+			for _, half := range [2]int{0, 16} {
+				dl := d * float32(int32(scales[is])-32)
+				is++
+				for l := 0; l < 16; l++ {
+					v := int32(q[half+l] >> shift & 3)
+					if hm[half+l]&m == 0 {
+						v -= 4
+					}
+					dst[y] = dl * float32(v)
+					y++
+				}
+			}
+			m <<= 1
+		}
+	}
 }
 
 // dequantQ4K expands one 144-byte Q4_K super-block into 256 floats:
