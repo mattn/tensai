@@ -203,11 +203,15 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 	// The worker cap bounds the float32 staging copies alive at once.
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, min(runtime.NumCPU(), 8))
+	stage := layerStage(cfg, m.headSz)
 	// The lm head — the largest single tensor — transposes and quantizes
 	// alongside the layers (its own column loop is parallel too).
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
+		got := loadGate.acquire(lmStage)
+		defer loadGate.release(got)
 		if cfg.TieEmbedding {
 			em, err := m.embed.Matrix()
 			if err != nil {
@@ -229,6 +233,8 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			got := loadGate.acquire(stage)
+			defer loadGate.release(got)
 			b := &m.blocks[i]
 			p := fmt.Sprintf("model.layers.%d.", i)
 			b.ln1 = vec(p + "input_layernorm.weight")
@@ -244,6 +250,57 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 	}
 	wg.Wait()
 	return m, nil
+}
+
+// memGate bounds the float32 staging bytes alive at once during a
+// parallel load: workers acquire their estimated footprint and block
+// until it fits the budget. A request larger than the whole budget is
+// capped, so it still runs — alone. Without this, eight workers each
+// staging a 7B-class layer (over a gigabyte of sources, transposes, and
+// fused copies apiece, and the untied lm head several times that) can
+// exhaust the machine outright.
+type memGate struct {
+	mu    sync.Mutex
+	cond  *sync.Cond
+	avail int64
+	total int64
+}
+
+func newMemGate(budget int64) *memGate {
+	g := &memGate{avail: budget, total: budget}
+	g.cond = sync.NewCond(&g.mu)
+	return g
+}
+
+func (g *memGate) acquire(n int64) int64 {
+	n = min(n, g.total)
+	g.mu.Lock()
+	for g.avail < n {
+		g.cond.Wait()
+	}
+	g.avail -= n
+	g.mu.Unlock()
+	return n
+}
+
+func (g *memGate) release(n int64) {
+	g.mu.Lock()
+	g.avail += n
+	g.mu.Unlock()
+	g.cond.Broadcast()
+}
+
+// loadGate is shared by both loaders; 2GB of in-flight staging keeps a
+// 16-core load fast for small models and a 7B load bounded.
+var loadGate = newMemGate(2 << 30)
+
+// layerStage estimates one layer's peak float32 staging: the largest
+// fused matrix (sources, transposes, and the concatenated copy overlap,
+// so roughly three times its bytes).
+func layerStage(cfg config, headSz int) int64 {
+	qkv := int64(cfg.HiddenSize) * int64(cfg.Heads*headSz+2*cfg.KVHeads*headSz)
+	gu := int64(cfg.HiddenSize) * int64(2*cfg.Intermediate)
+	return 3 * 4 * max(qkv, gu)
 }
 
 // hcat concatenates matrices with equal rows along the columns.
