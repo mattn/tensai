@@ -1076,7 +1076,7 @@ func TestGPUQ4MatMul(t *testing.T) {
 			for j := 0; j < c.cols; j++ {
 				var want float64
 				for i := 0; i < c.rows; i++ {
-					nib := float64(q.Q[(i/2)*c.cols+j]>>(4*(i%2))&0x0F) - 8
+					nib := float64(q.Q[(i/4)*2*c.cols+2*j+(i%4)/2]>>(4*(i%2))&0x0F) - 8
 					sc := float64(q.Scale[(i/64)*c.cols+j])
 					want += float64(x.Data[r*c.rows+i]) * nib * sc
 				}

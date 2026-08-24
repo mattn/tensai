@@ -40,17 +40,17 @@ type gpuQwen struct {
 // sliceQ4 copies a column range out of a fused 4-bit quantized matrix;
 // scales are per (group, column), so the slice is exact.
 func sliceQ4(q *tensai.Q4Matrix, lo, hi int) *tensai.Q4Matrix {
-	pairs := (q.Rows + 1) / 2
+	quads := (q.Rows + 3) / 4
 	groups := len(q.Scale) / q.Cols
 	cols := hi - lo
 	out := &tensai.Q4Matrix{
 		Rows:  q.Rows,
 		Cols:  cols,
-		Q:     make([]uint8, pairs*cols+16),
+		Q:     make([]uint8, quads*2*cols+32),
 		Scale: make([]float32, groups*cols),
 	}
-	for i2 := 0; i2 < pairs; i2++ {
-		copy(out.Q[i2*cols:i2*cols+cols], q.Q[i2*q.Cols+lo:i2*q.Cols+hi])
+	for i4 := 0; i4 < quads; i4++ {
+		copy(out.Q[i4*2*cols:i4*2*cols+2*cols], q.Q[i4*2*q.Cols+2*lo:i4*2*q.Cols+2*hi])
 	}
 	for g := 0; g < groups; g++ {
 		copy(out.Scale[g*cols:(g+1)*cols], q.Scale[g*q.Cols+lo:g*q.Cols+hi])

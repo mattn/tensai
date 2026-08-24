@@ -38,7 +38,7 @@ func TestQuantize4MatVec(t *testing.T) {
 				rlo, rhi := g*q4Group, min((g+1)*q4Group, c.rows)
 				var acc, gs int64
 				for i := rlo; i < rhi; i++ {
-					nib := int64(q.Q[(i/2)*c.cols+j]>>(4*(i%2))) & 0x0F
+					nib := int64(q.Q[(i/4)*2*c.cols+2*j+(i%4)/2]>>(4*(i%2))) & 0x0F
 					xs := int64(xu[i]) - 64
 					acc += nib * xs
 					gs += xs
