@@ -41,6 +41,7 @@ type GPU struct {
 	pipes      gpuPipelines
 	readback   gpuReadbackBuffer
 	pool       gpuBufferPool
+	bgCache    map[bgKey]uintptr
 	batchEnc   uintptr // open command encoder while batching, see BeginBatch
 	name       string
 	maxStorage uint64 // usable bytes per storage buffer, 0 = unknown
