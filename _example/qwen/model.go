@@ -26,6 +26,7 @@ import (
 type config struct {
 	HiddenSize   int     `json:"hidden_size"`
 	HeadDim      int     `json:"head_dim"`
+	NoRopeLayers []int   `json:"no_rope_layers"` // smollm3: 1 = RoPE, 0 = NoPE
 	Intermediate int     `json:"intermediate_size"`
 	Layers       int     `json:"num_hidden_layers"`
 	Heads        int     `json:"num_attention_heads"`
@@ -71,6 +72,7 @@ func quantizeMat(m *tensai.Matrix, bits int) *qmat {
 type qblock struct {
 	ln1, ln2     []float32
 	qNorm, kNorm []float32      // Qwen3 per-head QK-norm; nil otherwise
+	noPE         bool           // smollm3: every fourth layer skips RoPE
 	wQKV, wo     *tensai.Matrix // [in, out] after transposing HF's [out, in]
 	bQKV         []float32
 	wGU, wDown   *tensai.Matrix
@@ -98,8 +100,10 @@ func loadConfig(path string) (config, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return c, err
 	}
-	if c.ModelType != "qwen2" && c.ModelType != "llama" && c.ModelType != "qwen3" {
-		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2, qwen3, and llama)", c.ModelType)
+	switch c.ModelType {
+	case "qwen2", "qwen3", "llama", "smollm3":
+	default:
+		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2, qwen3, llama, and smollm3)", c.ModelType)
 	}
 	return c, nil
 }
@@ -236,6 +240,7 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 			got := loadGate.acquire(stage)
 			defer loadGate.release(got)
 			b := &m.blocks[i]
+			b.noPE = i < len(cfg.NoRopeLayers) && cfg.NoRopeLayers[i] == 0
 			p := fmt.Sprintf("model.layers.%d.", i)
 			b.ln1 = vec(p + "input_layernorm.weight")
 			b.ln2 = vec(p + "post_attention_layernorm.weight")
@@ -521,11 +526,13 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			kr := row[qDim : qDim+kvDim]
 			m.qkNorm(qr, b.qNorm)
 			m.qkNorm(kr, b.kNorm)
-			for h := 0; h < cfg.Heads; h++ {
-				m.rope(qr[h*m.headSz:(h+1)*m.headSz], pos)
-			}
-			for h := 0; h < cfg.KVHeads; h++ {
-				m.rope(kr[h*m.headSz:(h+1)*m.headSz], pos)
+			if !b.noPE {
+				for h := 0; h < cfg.Heads; h++ {
+					m.rope(qr[h*m.headSz:(h+1)*m.headSz], pos)
+				}
+				for h := 0; h < cfg.KVHeads; h++ {
+					m.rope(kr[h*m.headSz:(h+1)*m.headSz], pos)
+				}
 			}
 			// Copies detach the cache rows from the wide fused buffer.
 			b.kc = append(b.kc, append(make([]float32, 0, kvDim), kr...))
@@ -602,11 +609,13 @@ func (m *qwen) step(token, pos int) []float32 {
 		v := qkv[qDim+kvDim:]
 		m.qkNorm(q, b.qNorm)
 		m.qkNorm(k, b.kNorm)
-		for h := 0; h < cfg.Heads; h++ {
-			m.rope(q[h*m.headSz:(h+1)*m.headSz], pos)
-		}
-		for h := 0; h < cfg.KVHeads; h++ {
-			m.rope(k[h*m.headSz:(h+1)*m.headSz], pos)
+		if !b.noPE {
+			for h := 0; h < cfg.Heads; h++ {
+				m.rope(q[h*m.headSz:(h+1)*m.headSz], pos)
+			}
+			for h := 0; h < cfg.KVHeads; h++ {
+				m.rope(k[h*m.headSz:(h+1)*m.headSz], pos)
+			}
 		}
 		// Copy k and v out of the fused row so the cache does not retain
 		// the whole qkv buffer per position.

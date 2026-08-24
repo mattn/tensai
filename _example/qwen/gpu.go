@@ -24,6 +24,7 @@ type gpuMat interface {
 type gpuLayer struct {
 	ln1, ln2                          *tensai.GPUTensor
 	qNorm, kNorm                      *tensai.GPUTensor // Qwen3 QK-norm; nil otherwise
+	noPE                              bool
 	bq, bk, bv                        *tensai.GPUTensor
 	qq, qk, qv, qo, qGate, qUp, qDown gpuMat
 	kc, vc                            *tensai.GPUTensor // [nCtx, kvDim]
@@ -128,6 +129,7 @@ func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 			return nil, fmt.Errorf("gpu decode needs quantized weights (run with -q8 or -q4)")
 		}
 		l := &gq.layers[i]
+		l.noPE = b.noPE
 		l.ln1, l.ln2 = vec(b.ln1), vec(b.ln2)
 		l.qNorm, l.kNorm = vec(b.qNorm), vec(b.kNorm)
 		l.bq = vec(vecRange(b.bQKV, 0, hs))
@@ -197,11 +199,13 @@ func (gq *gpuQwen) prefill(tokens []int, startPos int) []float32 {
 			k.Free()
 			k = nk
 		}
-		if err := q.RoPE(m.headSz, startPos, cfg.RopeTheta); err != nil {
-			panic(err)
-		}
-		if err := k.RoPE(m.headSz, startPos, cfg.RopeTheta); err != nil {
-			panic(err)
+		if !l.noPE {
+			if err := q.RoPE(m.headSz, startPos, cfg.RopeTheta); err != nil {
+				panic(err)
+			}
+			if err := k.RoPE(m.headSz, startPos, cfg.RopeTheta); err != nil {
+				panic(err)
+			}
 		}
 		if err := k.CopyRowsInto(l.kc, startPos*kvDim); err != nil {
 			panic(err)
@@ -284,11 +288,13 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 			k.Free()
 			k = nk
 		}
-		if err := q.RoPE(m.headSz, pos, cfg.RopeTheta); err != nil {
-			panic(err)
-		}
-		if err := k.RoPE(m.headSz, pos, cfg.RopeTheta); err != nil {
-			panic(err)
+		if !l.noPE {
+			if err := q.RoPE(m.headSz, pos, cfg.RopeTheta); err != nil {
+				panic(err)
+			}
+			if err := k.RoPE(m.headSz, pos, cfg.RopeTheta); err != nil {
+				panic(err)
+			}
 		}
 		if err := k.CopyRowsInto(l.kc, pos*kvDim); err != nil {
 			panic(err)
