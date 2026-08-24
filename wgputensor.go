@@ -1663,8 +1663,8 @@ type GPUQMatrix struct {
 }
 
 // UploadQ8 packs a quantized matrix into GPU memory. The QMatrix's
-// interleaved row-pair layout (an AVX2 artifact) flattens back to row-major
-// on the way in.
+// interleaved row-quad layout (an AVX2 artifact) flattens back to
+// row-major on the way in.
 func (g *GPU) UploadQ8(q *QMatrix) (*GPUQMatrix, error) {
 	if q.Rows == 0 || q.Cols == 0 {
 		return nil, errors.New("tensai: cannot upload an empty matrix")
@@ -1672,9 +1672,9 @@ func (g *GPU) UploadQ8(q *QMatrix) (*GPUQMatrix, error) {
 	words := (q.Cols + 3) / 4
 	packed := make([]uint32, q.Rows*words)
 	for i := 0; i < q.Rows; i++ {
-		base := (i / 2) * 2 * q.Cols
+		base := (i / 4) * 4 * q.Cols
 		for j := 0; j < q.Cols; j++ {
-			b := uint32(uint8(q.Q[base+2*j+i%2]))
+			b := uint32(uint8(q.Q[base+4*j+i%4]))
 			packed[i*words+j/4] |= b << (8 * (j % 4))
 		}
 	}

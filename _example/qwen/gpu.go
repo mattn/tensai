@@ -62,19 +62,19 @@ func sliceQ4(q *tensai.Q4Matrix, lo, hi int) *tensai.Q4Matrix {
 // path keeps q, k, v (and gate, up) as separate resident weights, and
 // per-column quantization makes the slice exact.
 func sliceQ(q *tensai.QMatrix, lo, hi int) *tensai.QMatrix {
-	pairs := (q.Rows + 1) / 2
+	quads := (q.Rows + 3) / 4
 	cols := hi - lo
 	out := &tensai.QMatrix{
 		Rows:     q.Rows,
 		Cols:     cols,
-		Q:        make([]int8, pairs*2*cols+16),
+		Q:        make([]int8, quads*4*cols+32),
 		Scale:    make([]float32, cols),
 		ColSum64: make([]int32, cols+8),
 	}
 	copy(out.Scale, q.Scale[lo:hi])
 	copy(out.ColSum64, q.ColSum64[lo:hi])
-	for i2 := 0; i2 < pairs; i2++ {
-		copy(out.Q[i2*2*cols:i2*2*cols+2*cols], q.Q[i2*2*q.Cols+2*lo:i2*2*q.Cols+2*hi])
+	for i4 := 0; i4 < quads; i4++ {
+		copy(out.Q[i4*4*cols:i4*4*cols+4*cols], q.Q[i4*4*q.Cols+4*lo:i4*4*q.Cols+4*hi])
 	}
 	return out
 }
