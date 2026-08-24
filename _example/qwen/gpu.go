@@ -14,10 +14,17 @@ import (
 	tensai "github.com/mattn/tensai"
 )
 
+// gpuMat is the resident weight interface both quantization widths
+// satisfy.
+type gpuMat interface {
+	MatMul(*tensai.GPUTensor) (*tensai.GPUTensor, error)
+	Free()
+}
+
 type gpuLayer struct {
 	ln1, ln2                          *tensai.GPUTensor
 	bq, bk, bv                        *tensai.GPUTensor
-	qq, qk, qv, qo, qGate, qUp, qDown *tensai.GPUQMatrix
+	qq, qk, qv, qo, qGate, qUp, qDown gpuMat
 	kc, vc                            *tensai.GPUTensor // [nCtx, kvDim]
 }
 
@@ -27,6 +34,27 @@ type gpuQwen struct {
 	layers []gpuLayer
 	nCtx   int
 	gpuLen int // cache positions currently valid on the GPU
+}
+
+// sliceQ4 copies a column range out of a fused 4-bit quantized matrix;
+// scales are per (group, column), so the slice is exact.
+func sliceQ4(q *tensai.Q4Matrix, lo, hi int) *tensai.Q4Matrix {
+	pairs := (q.Rows + 1) / 2
+	groups := len(q.Scale) / q.Cols
+	cols := hi - lo
+	out := &tensai.Q4Matrix{
+		Rows:  q.Rows,
+		Cols:  cols,
+		Q:     make([]uint8, pairs*cols+16),
+		Scale: make([]float32, groups*cols),
+	}
+	for i2 := 0; i2 < pairs; i2++ {
+		copy(out.Q[i2*cols:i2*cols+cols], q.Q[i2*q.Cols+lo:i2*q.Cols+hi])
+	}
+	for g := 0; g < groups; g++ {
+		copy(out.Scale[g*cols:(g+1)*cols], q.Scale[g*q.Cols+lo:g*q.Cols+hi])
+	}
+	return out
 }
 
 // sliceQ copies a column range out of a fused quantized matrix: the GPU
@@ -79,23 +107,37 @@ func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 	hs := m.cfg.HiddenSize
 	inter := m.cfg.Intermediate
 	gq := &gpuQwen{m: m, g: g, nCtx: nCtx, layers: make([]gpuLayer, len(m.blocks))}
+	// upSlice uploads a column range of a fused weight in whichever width
+	// it was quantized to; up uploads a whole one.
+	upSlice := func(q *qmat, lo, hi int) gpuMat {
+		if q.q8 != nil {
+			return must(g.UploadQ8(sliceQ(q.q8, lo, hi)))
+		}
+		return must(g.UploadQ4(sliceQ4(q.q4, lo, hi)))
+	}
+	up := func(q *qmat) gpuMat {
+		if q.q8 != nil {
+			return must(g.UploadQ8(q.q8))
+		}
+		return must(g.UploadQ4(q.q4))
+	}
 	for i := range m.blocks {
 		b := &m.blocks[i]
-		if b.qQKV == nil || b.qQKV.q8 == nil {
-			return nil, fmt.Errorf("gpu decode needs int8 weights (run with -q8)")
+		if b.qQKV == nil || (b.qQKV.q8 == nil && b.qQKV.q4 == nil) {
+			return nil, fmt.Errorf("gpu decode needs quantized weights (run with -q8 or -q4)")
 		}
 		l := &gq.layers[i]
 		l.ln1, l.ln2 = vec(b.ln1), vec(b.ln2)
 		l.bq = vec(vecRange(b.bQKV, 0, hs))
 		l.bk = vec(vecRange(b.bQKV, hs, hs+kvDim))
 		l.bv = vec(vecRange(b.bQKV, hs+kvDim, hs+2*kvDim))
-		l.qq = must(g.UploadQ8(sliceQ(b.qQKV.q8, 0, hs)))
-		l.qk = must(g.UploadQ8(sliceQ(b.qQKV.q8, hs, hs+kvDim)))
-		l.qv = must(g.UploadQ8(sliceQ(b.qQKV.q8, hs+kvDim, hs+2*kvDim)))
-		l.qo = must(g.UploadQ8(b.qo.q8))
-		l.qGate = must(g.UploadQ8(sliceQ(b.qGU.q8, 0, inter)))
-		l.qUp = must(g.UploadQ8(sliceQ(b.qGU.q8, inter, 2*inter)))
-		l.qDown = must(g.UploadQ8(b.qDown.q8))
+		l.qq = upSlice(b.qQKV, 0, hs)
+		l.qk = upSlice(b.qQKV, hs, hs+kvDim)
+		l.qv = upSlice(b.qQKV, hs+kvDim, hs+2*kvDim)
+		l.qo = up(b.qo)
+		l.qGate = upSlice(b.qGU, 0, inter)
+		l.qUp = upSlice(b.qGU, inter, 2*inter)
+		l.qDown = up(b.qDown)
 		l.kc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
 		l.vc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
 	}

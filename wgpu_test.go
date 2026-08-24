@@ -1036,3 +1036,76 @@ func TestGPUGroupedCausalAttention(t *testing.T) {
 		t.Fatal("expected error: seqKV beyond cache")
 	}
 }
+
+func TestGPUQ4MatMul(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+
+	rng := rand.New(rand.NewSource(63))
+	for _, c := range []struct{ m, rows, cols int }{
+		{1, 256, 512}, // multiple full groups
+		{3, 100, 33},  // partial final group, guarded column tail
+		{2, 33, 7},    // odd rows: pad nibble must contribute zero
+	} {
+		w := RandomMatrix(c.rows, c.cols, rng)
+		q, err := QuantizeMatrix4(w)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gq, err := g.UploadQ4(q)
+		if err != nil {
+			t.Fatalf("%v: %v", c, err)
+		}
+		x := randTensor(rng, c.m, c.rows)
+		gx, err := g.Upload(x)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := gq.MatMul(gx)
+		if err != nil {
+			t.Fatalf("%v: %v", c, err)
+		}
+		out, err := got.Download()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Reference: the same dequantized nibbles on the CPU with f32
+		// activations (the GPU path skips the 7-bit activation step).
+		for r := 0; r < c.m; r++ {
+			for j := 0; j < c.cols; j++ {
+				var want float64
+				for i := 0; i < c.rows; i++ {
+					nib := float64(q.Q[(i/2)*c.cols+j]>>(4*(i%2))&0x0F) - 8
+					sc := float64(q.Scale[(i/64)*c.cols+j])
+					want += float64(x.Data[r*c.rows+i]) * nib * sc
+				}
+				gotv := float64(out.Data[r*c.cols+j])
+				if diff := math.Abs(gotv - want); diff > 1e-3*(1+math.Abs(want)) {
+					t.Fatalf("%v row %d col %d: gpu=%v cpu=%v", c, r, j, gotv, want)
+				}
+			}
+		}
+		got.Free()
+		gx.Free()
+		gq.Free()
+	}
+
+	q, err := QuantizeMatrix4(RandomMatrix(8, 8, rng))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gq, err := g.UploadQ4(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gq.Free()
+	gx, err := g.Upload(randTensor(rng, 2, 7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gx.Free()
+	if _, err := gq.MatMul(gx); err == nil {
+		t.Fatal("expected shape mismatch error")
+	}
+}

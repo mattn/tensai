@@ -238,7 +238,7 @@ func main() {
 	q8 := flag.Bool("q8", false, "decode against int8-quantized weights")
 	q4 := flag.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
 	chat := flag.Bool("chat", false, "interactive multi-turn chat on stdin (the KV cache carries the conversation)")
-	gpu := flag.Bool("gpu", false, "decode on the GPU (requires -q8 and a wgpu build tag)")
+	gpu := flag.Bool("gpu", false, "decode on the GPU (requires -q8 or -q4 and a wgpu build tag)")
 	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile of generation to this file")
 	ggufPath := flag.String("gguf", "", "load model and tokenizer from a single .gguf file instead of -data/-repo")
 	serveAddr := flag.String("serve", "", "serve an OpenAI-compatible /v1/chat/completions API on this address (e.g. :8080)")
@@ -354,8 +354,8 @@ func main() {
 	// still prefills on the CPU, and syncCache carries it over below.
 	var gq *gpuQwen
 	if *gpu {
-		if bits != 8 {
-			fmt.Fprintln(os.Stderr, "-gpu requires -q8")
+		if bits == 0 {
+			fmt.Fprintln(os.Stderr, "-gpu requires -q8 or -q4")
 			os.Exit(1)
 		}
 		g, err := tensai.OpenGPU(tensai.GPUHighPerformance)
