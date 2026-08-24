@@ -150,6 +150,32 @@ func repackQ8(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap fun
 	}
 }
 
+// repackQ4 copies a Q4_0 tensor's blocks — [out, in] with an f16 scale
+// and 32 offset-binary nibbles apiece (low nibbles first, then high) —
+// into columns [colOff, colOff+out) of a transposed Group-32 Q4Matrix.
+// The nibble encoding matches tensai's exactly, so this is integer work
+// plus one f16 widen per block.
+func repackQ4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+	nb := in / 32
+	for r := 0; r < out; r++ {
+		j := colOff + r
+		if colMap != nil {
+			j = colOff + colMap(r)
+		}
+		for b := 0; b < nb; b++ {
+			blk := raw[(r*nb+b)*18:]
+			dst.Scale[b*dst.Cols+j] = gguf.Float16(binary.LittleEndian.Uint16(blk))
+			for l := 0; l < 16; l++ {
+				q := blk[2+l]
+				iLo := b*32 + l
+				iHi := b*32 + l + 16
+				dst.Q[(iLo/4)*2*dst.Cols+2*j+(iLo%4)/2] |= (q & 0x0F) << (4 * (iLo % 2))
+				dst.Q[(iHi/4)*2*dst.Cols+2*j+(iHi%4)/2] |= (q >> 4) << (4 * (iHi % 2))
+			}
+		}
+	}
+}
+
 // unpermuteMap returns the llama rope unpermutation as a row index map,
 // or nil when heads is zero.
 func unpermuteMap(rows, heads int) func(int) int {
@@ -260,6 +286,51 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 		}
 		return true
 	}
+	// allQ4 is the int4 twin of allQ8.
+	allQ4 := func(names ...string) bool {
+		if bits != 4 || !direct {
+			return false
+		}
+		for _, name := range names {
+			if typ, _, ok := g.Info(name); !ok || typ != "Q4_0" {
+				return false
+			}
+		}
+		return true
+	}
+	// linDirect4 repacks Q4_0 tensors into a fused Group-32 Q4Matrix.
+	linDirect4 := func(names []string, perms []int) *qmat {
+		var outs []int
+		var in int
+		for _, name := range names {
+			_, shape, _ := g.Info(name)
+			outs = append(outs, shape[0])
+			in = shape[1]
+		}
+		total := 0
+		for _, o := range outs {
+			total += o
+		}
+		quads := (in + 3) / 4
+		groups := (in + 31) / 32
+		dst := &tensai.Q4Matrix{
+			Rows:  in,
+			Cols:  total,
+			Q:     make([]uint8, quads*2*total+32),
+			Scale: make([]float32, groups*total),
+			Group: 32,
+		}
+		colOff := 0
+		for i, name := range names {
+			_, raw, err := g.RawTensor(name)
+			if err != nil {
+				panic(err)
+			}
+			repackQ4(dst, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
+			colOff += outs[i]
+		}
+		return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
+	}
 	// linDirect repacks one or more Q8_0 tensors into a fused grouped-int8
 	// matrix, column ranges concatenated in order; perms maps each part's
 	// output rows (nil for none).
@@ -316,15 +387,23 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 				m.qLmT = linDirect([]string{"output.weight"}, []int{0})
 				return
 			}
+			if allQ4("output.weight") {
+				m.qLmT = linDirect4([]string{"output.weight"}, []int{0})
+				return
+			}
 			lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
 			got := loadGate.acquire(lmStage)
 			defer loadGate.release(got)
 			m.lmT, m.qLmT = lin("output.weight", 0)
 			return
 		}
-		// Tied embedding: the Q8_0 blocks repack directly too.
+		// Tied embedding: the quantized blocks repack directly too.
 		if allQ8("token_embd.weight") {
 			m.qLmT = linDirect([]string{"token_embd.weight"}, []int{0})
+			return
+		}
+		if allQ4("token_embd.weight") {
+			m.qLmT = linDirect4([]string{"token_embd.weight"}, []int{0})
 			return
 		}
 		lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
@@ -358,13 +437,21 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			b.ln2 = tensor(p + "ffn_norm.weight").Data
 			b.qNorm = vecOpt(p + "attn_q_norm.weight")
 			b.kNorm = vecOpt(p + "attn_k_norm.weight")
-			if allQ8(p+"attn_q.weight", p+"attn_k.weight", p+"attn_v.weight", p+"attn_output.weight", p+"ffn_gate.weight", p+"ffn_up.weight", p+"ffn_down.weight") {
+			layerNames := []string{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight", p + "attn_output.weight", p + "ffn_gate.weight", p + "ffn_up.weight", p + "ffn_down.weight"}
+			if allQ8(layerNames...) {
 				b.qQKV = linDirect(
 					[]string{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"},
 					[]int{qPerm, kPerm, 0})
 				b.qo = linDirect([]string{p + "attn_output.weight"}, []int{0})
 				b.qGU = linDirect([]string{p + "ffn_gate.weight", p + "ffn_up.weight"}, []int{0, 0})
 				b.qDown = linDirect([]string{p + "ffn_down.weight"}, []int{0})
+			} else if allQ4(layerNames...) {
+				b.qQKV = linDirect4(
+					[]string{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"},
+					[]int{qPerm, kPerm, 0})
+				b.qo = linDirect4([]string{p + "attn_output.weight"}, []int{0})
+				b.qGU = linDirect4([]string{p + "ffn_gate.weight", p + "ffn_up.weight"}, []int{0, 0})
+				b.qDown = linDirect4([]string{p + "ffn_down.weight"}, []int{0})
 			} else {
 				b.wQKV, b.qQKV = quant(hcat([]*tensai.Matrix{
 					trans(p+"attn_q.weight", qPerm),

@@ -25,9 +25,9 @@ func q4xQuad(xu []uint8, i4 int) uint32 {
 	return x0 | x1<<8 | x2<<16 | x3<<24
 }
 
-func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, scale []Float, cols, lo, hi int) {
+func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, scale []Float, group, cols, lo, hi int) {
 	if !hasAVX2 {
-		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, cols, lo, hi)
+		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, group, cols, lo, hi)
 		return
 	}
 	quads := len(xu) / 4
@@ -38,8 +38,8 @@ func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, s
 		ones := archsimd.BroadcastInt16x16(1)
 		clear(out[lo:vecEnd])
 		for g := 0; g < len(gsum); g++ {
-			ib := g * q4Group / 4
-			ie := min(ib+q4Group/4, quads)
+			ib := g * group / 4
+			ie := min(ib+group/4, quads)
 			corr := archsimd.BroadcastInt32x8(8 * gsum[g])
 			srow := scale[g*cols:]
 			for jt := lo; jt < vecEnd; jt += 32 {
@@ -67,16 +67,16 @@ func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, s
 	}
 	archsimd.ClearAVXUpperBits()
 	if vecEnd < hi {
-		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, cols, vecEnd, hi)
+		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, group, cols, vecEnd, hi)
 	}
 }
 
 // q4matmulCols4 is the four-row batched form: per eight-column tile each
 // sixteen-byte nibble load unpacks once and feeds four broadcast
 // activation quads, amortizing the nibble traffic fourfold.
-func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 int, qw []uint8, scale []Float, cols, lo, hi int) {
+func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 int, qw []uint8, scale []Float, group, cols, lo, hi int) {
 	if !hasAVX2 {
-		q4matmulCols4Generic(out, xus, sxs, gsums, r0, qw, scale, cols, lo, hi)
+		q4matmulCols4Generic(out, xus, sxs, gsums, r0, qw, scale, group, cols, lo, hi)
 		return
 	}
 	quads := len(xus[0]) / 4
@@ -96,8 +96,8 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 			clear(out.Data[(r0+r)*cols+lo : (r0+r)*cols+vecEnd])
 		}
 		for g := 0; g < len(gsums[0]); g++ {
-			ib := g * q4Group / 4
-			ie := min(ib+q4Group/4, quads)
+			ib := g * group / 4
+			ie := min(ib+group/4, quads)
 			srow := scale[g*cols:]
 			for jt := lo; jt < vecEnd; jt += 8 {
 				var a [4]archsimd.Int32x8
@@ -128,6 +128,6 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 	}
 	archsimd.ClearAVXUpperBits()
 	if vecEnd < hi {
-		q4matmulCols4Generic(out, xus, sxs, gsums, r0, qw, scale, cols, vecEnd, hi)
+		q4matmulCols4Generic(out, xus, sxs, gsums, r0, qw, scale, group, cols, vecEnd, hi)
 	}
 }
