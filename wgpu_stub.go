@@ -127,3 +127,19 @@ func (g *GPU) Flush() error { return nil }
 
 // DownloadRange always fails in builds without the wgpu tag.
 func (t *GPUTensor) DownloadRange(off, n int) (*Tensor, error) { return nil, errNoWGPU }
+
+// GPUQ4Matrix is a GPU-resident int4 weight matrix. This build has it
+// disabled; build with -tags wgpu or -tags wgpu24 to enable it.
+type GPUQ4Matrix struct{}
+
+// UploadQ4 always fails in builds without the wgpu tag.
+func (g *GPU) UploadQ4(q *Q4Matrix) (*GPUQ4Matrix, error) { return nil, errNoWGPU }
+
+// MatMul always fails in builds without the wgpu tag.
+func (q *GPUQ4Matrix) MatMul(x *GPUTensor) (*GPUTensor, error) { return nil, errNoWGPU }
+
+// Shape returns zeros in builds without the wgpu tag.
+func (q *GPUQ4Matrix) Shape() (int, int) { return 0, 0 }
+
+// Free is a no-op in builds without the wgpu tag.
+func (q *GPUQ4Matrix) Free() {}

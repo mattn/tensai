@@ -598,6 +598,79 @@ fn silu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
         edst[idx] = g / (1.0 + exp(-g)) * esrc[idx % ep.srcCount];
     }
 }
+
+// q4matmul multiplies f32 activation rows by an int4 weight matrix packed
+// four row-pair bytes per u32 (a byte holds one column's even row in the
+// low nibble and odd row in the high one, offset-binary). The -8 offset
+// subtracts in registers — no correction plane needed — and each group's
+// running partial folds with its (group, column) scale at the boundary.
+// Same shape as qmatmul: 16 words x 16 row-splits per 256-lane workgroup
+// with a shared-memory reduction.
+struct Q4MParams { rows: u32, cols: u32, words: u32, m: u32, groups: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(29) var<uniform> q4p: Q4MParams;
+@group(0) @binding(30) var<storage, read> q4w: array<u32>;
+@group(0) @binding(31) var<storage, read> q4sc: array<f32>;
+@group(0) @binding(32) var<storage, read> q4x: array<f32>;
+@group(0) @binding(33) var<storage, read_write> q4out: array<f32>;
+
+var<workgroup> q4red: array<vec4<f32>, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn q4matmul(@builtin(workgroup_id) wid: vec3<u32>,
+            @builtin(local_invocation_id) lid: vec3<u32>) {
+    let w = wid.x * 16u + lid.x % 16u;
+    let rsub = lid.x / 16u;
+    let r = wid.y;
+    let xbase = r * q4p.rows;
+    var total = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if (w < q4p.words) {
+        let pairs = (q4p.rows + 1u) / 2u;
+        var run = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        var g = 0xffffffffu;
+        for (var i2 = rsub; i2 < pairs; i2 = i2 + 16u) {
+            let gi = i2 / 32u; // q4Group/2 pair rows per group
+            if (gi != g) {
+                if (g != 0xffffffffu) {
+                    let sb = g * q4p.words * 4u + w * 4u;
+                    total = total + run * vec4<f32>(q4sc[sb], q4sc[sb + 1u], q4sc[sb + 2u], q4sc[sb + 3u]);
+                }
+                run = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+                g = gi;
+            }
+            let x0 = q4x[xbase + 2u * i2];
+            var x1 = 0.0;
+            if (2u * i2 + 1u < q4p.rows) {
+                x1 = q4x[xbase + 2u * i2 + 1u];
+            }
+            let pw = q4w[i2 * q4p.words + w];
+            let lo = vec4<f32>(
+                f32(pw & 0xFu), f32(pw >> 8u & 0xFu),
+                f32(pw >> 16u & 0xFu), f32(pw >> 24u & 0xFu)) - vec4<f32>(8.0, 8.0, 8.0, 8.0);
+            let hi = vec4<f32>(
+                f32(pw >> 4u & 0xFu), f32(pw >> 12u & 0xFu),
+                f32(pw >> 20u & 0xFu), f32(pw >> 28u & 0xFu)) - vec4<f32>(8.0, 8.0, 8.0, 8.0);
+            run = run + x0 * lo + x1 * hi;
+        }
+        if (g != 0xffffffffu) {
+            let sb = g * q4p.words * 4u + w * 4u;
+            total = total + run * vec4<f32>(q4sc[sb], q4sc[sb + 1u], q4sc[sb + 2u], q4sc[sb + 3u]);
+        }
+    }
+    q4red[lid.x] = total;
+    workgroupBarrier();
+    if (lid.x < 16u && w < q4p.words) {
+        var sum = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        for (var v = 0u; v < 16u; v = v + 1u) {
+            sum = sum + q4red[v * 16u + lid.x];
+        }
+        let j = w * 4u;
+        for (var l = 0u; l < 4u; l = l + 1u) {
+            if (j + l < q4p.cols) {
+                q4out[r * q4p.cols + j + l] = sum[l];
+            }
+        }
+    }
+}
 `
 
 // gpuPipelines holds one compute pipeline (and its auto bind-group layout)
@@ -606,10 +679,11 @@ fn silu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
 type gpuPipelines struct {
 	matmul, matmulT, matmulS, matmulTS             uintptr
 	scale, softmax, attn, qmatmul                  uintptr
-	rmsnorm, rope, addIP, siluMulIP                uintptr
+	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
 	layScale, laySoftmax, layAttn, layQmatmul      uintptr
 	layRmsnorm, layRope, layAddIP, laySiluMulIP    uintptr
+	layQ4matmul                                    uintptr
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -631,6 +705,7 @@ func (g *GPU) initPipelines() error {
 		{&g.pipes.rope, &g.pipes.layRope, "rope_rows"},
 		{&g.pipes.addIP, &g.pipes.layAddIP, "add_ip"},
 		{&g.pipes.siluMulIP, &g.pipes.laySiluMulIP, "silu_mul_ip"},
+		{&g.pipes.q4matmul, &g.pipes.layQ4matmul, "q4matmul"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -648,7 +723,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.layMatmul, g.pipes.layMatmulT, g.pipes.layMatmulS,
 		g.pipes.layMatmulTS, g.pipes.layScale, g.pipes.laySoftmax, g.pipes.layAttn,
 		g.pipes.layQmatmul, g.pipes.layRmsnorm, g.pipes.layRope,
-		g.pipes.layAddIP, g.pipes.laySiluMulIP,
+		g.pipes.layAddIP, g.pipes.laySiluMulIP, g.pipes.layQ4matmul,
 	} {
 		if h != 0 {
 			fnLayoutRelease(h)
@@ -658,7 +733,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.matmul, g.pipes.matmulT, g.pipes.matmulS,
 		g.pipes.matmulTS, g.pipes.scale, g.pipes.softmax, g.pipes.attn,
 		g.pipes.qmatmul, g.pipes.rmsnorm, g.pipes.rope,
-		g.pipes.addIP, g.pipes.siluMulIP,
+		g.pipes.addIP, g.pipes.siluMulIP, g.pipes.q4matmul,
 	} {
 		if h != 0 {
 			fnPipelineRelease(h)
@@ -1981,4 +2056,142 @@ func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqK
 		return nil, err
 	}
 	return &GPUTensor{g: g, buf: bufOut, shape: append([]int(nil), q.shape...)}, nil
+}
+
+// GPUQ4Matrix is an int4-quantized weight matrix resident in GPU memory:
+// the nibbles of a Q4Matrix packed four row-pair bytes per u32 with the
+// per-(group, column) scales alongside. The kernel subtracts the nibble
+// offset in registers and folds group scales at group boundaries, so a
+// matvec streams an eighth of the f32 weight bytes.
+type GPUQ4Matrix struct {
+	g           *GPU
+	buf, scales uintptr
+	rows, cols  int
+	words       int // u32 words per pair row: ceil(cols/4)
+	freed       bool
+}
+
+// UploadQ4 packs a 4-bit quantized matrix into GPU memory.
+func (g *GPU) UploadQ4(q *Q4Matrix) (*GPUQ4Matrix, error) {
+	if q.Rows == 0 || q.Cols == 0 {
+		return nil, errors.New("tensai: cannot upload an empty matrix")
+	}
+	pairs := (q.Rows + 1) / 2
+	words := (q.Cols + 3) / 4
+	packed := make([]uint32, pairs*words)
+	for i2 := 0; i2 < pairs; i2++ {
+		for j := 0; j < q.Cols; j++ {
+			packed[i2*words+j/4] |= uint32(q.Q[i2*q.Cols+j]) << (8 * (j % 4))
+		}
+	}
+	groups := (q.Rows + 63) / 64 // q4Group
+	scales := make([]float32, groups*words*4)
+	for gi := 0; gi < groups; gi++ {
+		copy(scales[gi*words*4:], q.Scale[gi*q.Cols:(gi+1)*q.Cols])
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	if err := g.checkSize(uint64(len(packed)) * 4); err != nil {
+		return nil, err
+	}
+	buf := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(packed))*4)
+	sbuf := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(scales))*4)
+	if buf == 0 || sbuf == 0 {
+		if buf != 0 {
+			fnBufferRelease(buf)
+		}
+		if sbuf != 0 {
+			fnBufferRelease(sbuf)
+		}
+		return nil, errors.New("tensai: gpu buffer allocation failed")
+	}
+	fnQueueWriteBuffer(g.queue, buf, 0, unsafe.Pointer(&packed[0]), uintptr(len(packed))*4)
+	fnQueueWriteBuffer(g.queue, sbuf, 0, unsafe.Pointer(&scales[0]), uintptr(len(scales))*4)
+	runtime.KeepAlive(&packed)
+	runtime.KeepAlive(&scales)
+	return &GPUQ4Matrix{g: g, buf: buf, scales: sbuf, rows: q.Rows, cols: q.Cols, words: words}, nil
+}
+
+// Shape returns (rows, cols).
+func (q *GPUQ4Matrix) Shape() (int, int) { return q.rows, q.cols }
+
+// Free releases the GPU buffers. Calling Free again is a no-op.
+func (q *GPUQ4Matrix) Free() {
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if q.freed {
+		return
+	}
+	q.freed = true
+	q.g.dropBuffer(q.buf)
+	q.g.dropBuffer(q.scales)
+}
+
+// MatMul computes x @ Q on the GPU: x's last axis must equal the weight
+// rows, and every leading axis is a batch of activation rows.
+func (q *GPUQ4Matrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
+	if q.freed || x.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if q.g != x.g {
+		return nil, errors.New("tensai: gpu tensors belong to different GPUs")
+	}
+	n := len(x.shape)
+	if n == 0 || x.shape[n-1] != q.rows {
+		return nil, fmt.Errorf("tensai: gpu q4matmul shape mismatch: %v @ %dx%d", x.shape, q.rows, q.cols)
+	}
+	m := x.Size() / q.rows
+	if m > 65535 {
+		return nil, fmt.Errorf("tensai: gpu q4matmul batch of %d rows exceeds 65535", m)
+	}
+	outShape := append(append([]int(nil), x.shape[:n-1]...), q.cols)
+
+	g := q.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	outBytes := uint64(m*q.cols) * 4
+	if err := g.checkSize(outBytes); err != nil {
+		return nil, err
+	}
+	groups := (q.rows + 63) / 64
+	params := [8]uint32{
+		uint32(q.rows), uint32(q.cols), uint32(q.words), uint32(m),
+		uint32(groups), 0, 0, 0,
+	}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
+	bufOut := g.takeBuffer(gpuTensorUsage, outBytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
+
+	pairs := (q.rows + 1) / 2
+	entries := [5]wgpuBindGroupEntry{
+		{binding: 29, buffer: bufParams, size: 32},
+		{binding: 30, buffer: q.buf, size: uint64(pairs*q.words) * 4},
+		{binding: 31, buffer: q.scales, size: uint64(groups*q.words*4) * 4},
+		{binding: 32, buffer: x.buf, size: uint64(x.Size()) * 4},
+		{binding: 33, buffer: bufOut, size: outBytes},
+	}
+	bindGroup := g.cachedBindGroup(g.pipes.layQ4matmul, entries[:])
+	runtime.KeepAlive(&entries)
+
+	err := g.dispatch(g.pipes.q4matmul, bindGroup,
+		uint32((q.words+15)/16), uint32(m), 1)
+	if err != nil {
+		g.dropBuffer(bufOut)
+		return nil, err
+	}
+	return &GPUTensor{g: g, buf: bufOut, shape: outShape}, nil
 }

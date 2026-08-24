@@ -43,7 +43,8 @@ type qmat struct {
 	cols int
 	f    func(x, out []float32) error
 	mm   func(x, out *tensai.Matrix) error
-	q8   *tensai.QMatrix // retained for GPU upload; nil for int4
+	q8   *tensai.QMatrix  // retained for GPU upload
+	q4   *tensai.Q4Matrix // likewise, for the int4 twin
 }
 
 func quantizeMat(m *tensai.Matrix, bits int) *qmat {
@@ -56,7 +57,7 @@ func quantizeMat(m *tensai.Matrix, bits int) *qmat {
 		if err != nil {
 			panic(err)
 		}
-		return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul}
+		return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, q4: q}
 	}
 	panic("unsupported quantization width")
 }
