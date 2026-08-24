@@ -23,6 +23,7 @@ type gpuMat interface {
 
 type gpuLayer struct {
 	ln1, ln2                          *tensai.GPUTensor
+	qNorm, kNorm                      *tensai.GPUTensor // Qwen3 QK-norm; nil otherwise
 	bq, bk, bv                        *tensai.GPUTensor
 	qq, qk, qv, qo, qGate, qUp, qDown gpuMat
 	kc, vc                            *tensai.GPUTensor // [nCtx, kvDim]
@@ -104,7 +105,7 @@ func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 		}
 		return must(g.Upload(&tensai.Tensor{Shape: []int{len(v)}, Data: v}))
 	}
-	hs := m.cfg.HiddenSize
+	hs := m.cfg.Heads * m.headSz // query dimension; equals hidden except qwen3
 	inter := m.cfg.Intermediate
 	gq := &gpuQwen{m: m, g: g, nCtx: nCtx, layers: make([]gpuLayer, len(m.blocks))}
 	// upSlice uploads a column range of a fused weight in whichever width
@@ -128,6 +129,7 @@ func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 		}
 		l := &gq.layers[i]
 		l.ln1, l.ln2 = vec(b.ln1), vec(b.ln2)
+		l.qNorm, l.kNorm = vec(b.qNorm), vec(b.kNorm)
 		l.bq = vec(vecRange(b.bQKV, 0, hs))
 		l.bk = vec(vecRange(b.bQKV, hs, hs+kvDim))
 		l.bv = vec(vecRange(b.bQKV, hs+kvDim, hs+2*kvDim))
@@ -186,6 +188,14 @@ func (gq *gpuQwen) prefill(tokens []int, startPos int) []float32 {
 			if err := v.Add(l.bv); err != nil {
 				panic(err)
 			}
+		}
+		if l.qNorm != nil {
+			nq := must(q.RMSNormEach(l.qNorm, cfg.RMSEps))
+			q.Free()
+			q = nq
+			nk := must(k.RMSNormEach(l.kNorm, cfg.RMSEps))
+			k.Free()
+			k = nk
 		}
 		if err := q.RoPE(m.headSz, startPos, cfg.RopeTheta); err != nil {
 			panic(err)
@@ -265,6 +275,14 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 			if err := v.Add(l.bv); err != nil {
 				panic(err)
 			}
+		}
+		if l.qNorm != nil {
+			nq := must(q.RMSNormEach(l.qNorm, cfg.RMSEps))
+			q.Free()
+			q = nq
+			nk := must(k.RMSNormEach(l.kNorm, cfg.RMSEps))
+			k.Free()
+			k = nk
 		}
 		if err := q.RoPE(m.headSz, pos, cfg.RopeTheta); err != nil {
 			panic(err)

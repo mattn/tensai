@@ -69,8 +69,9 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 	var specials []added
 	if arr, ok := typesAny.([]any); ok {
 		for id, tp := range arr {
-			// Type 3 marks control tokens (<|im_start|> and friends).
-			if n, ok := tp.(int32); ok && n == 3 && id < len(tokens) {
+			// Type 3 marks control tokens (<|im_start|> and friends), type
+			// 4 user-defined added tokens (Qwen3's <think> tags).
+			if n, ok := tp.(int32); ok && (n == 3 || n == 4) && id < len(tokens) {
 				specials = append(specials, added{ID: id, Content: tokens[id].(string)})
 			}
 		}
@@ -129,8 +130,8 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 	defer g.Close()
 
 	arch, _ := g.String("general.architecture")
-	if arch != "llama" && arch != "qwen2" {
-		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2 and llama)", arch)
+	if arch != "llama" && arch != "qwen2" && arch != "qwen3" {
+		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2, qwen3, and llama)", arch)
 	}
 	meta := func(key string) int64 {
 		n, _ := g.Int(arch + "." + key)
@@ -145,6 +146,7 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 	cfg.KVHeads = int(meta("attention.head_count_kv"))
 	cfg.MaxPos = int(meta("context_length"))
 	cfg.Vocab = int(meta("vocab_size"))
+	cfg.HeadDim = int(meta("attention.key_length"))
 	cfg.RMSEps, _ = g.Float(arch + ".attention.layer_norm_rms_epsilon")
 	cfg.RopeTheta, _ = g.Float(arch + ".rope.freq_base")
 	if cfg.RopeTheta == 0 {
@@ -200,7 +202,11 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 	if arch == "llama" {
 		qPerm, kPerm = cfg.Heads, cfg.KVHeads
 	}
-	m := &qwen{cfg: cfg, headSz: cfg.HiddenSize / cfg.Heads}
+	headSz := cfg.HiddenSize / cfg.Heads
+	if cfg.HeadDim != 0 {
+		headSz = cfg.HeadDim
+	}
+	m := &qwen{cfg: cfg, headSz: headSz}
 	m.embed = tensor("token_embd.weight")
 	if _, _, ok := g.Info("output.weight"); ok {
 		m.lmT, m.qLmT = lin("output.weight", 0)
@@ -223,6 +229,8 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 		p := fmt.Sprintf("blk.%d.", i)
 		b.ln1 = tensor(p + "attn_norm.weight").Data
 		b.ln2 = tensor(p + "ffn_norm.weight").Data
+		b.qNorm = vecOpt(p + "attn_q_norm.weight")
+		b.kNorm = vecOpt(p + "attn_k_norm.weight")
 		b.wQKV, b.qQKV = quant(hcat([]*tensai.Matrix{
 			trans(p+"attn_q.weight", qPerm),
 			trans(p+"attn_k.weight", kPerm),

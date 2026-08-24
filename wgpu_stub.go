@@ -143,3 +143,6 @@ func (q *GPUQ4Matrix) Shape() (int, int) { return 0, 0 }
 
 // Free is a no-op in builds without the wgpu tag.
 func (q *GPUQ4Matrix) Free() {}
+
+// RMSNormEach always fails in builds without the wgpu tag.
+func (t *GPUTensor) RMSNormEach(w *GPUTensor, eps float64) (*GPUTensor, error) { return nil, errNoWGPU }

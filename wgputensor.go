@@ -1835,6 +1835,52 @@ func (t *GPUTensor) RMSNorm(w *GPUTensor, eps float64) (*GPUTensor, error) {
 	return &GPUTensor{g: g, buf: bufOut, shape: append([]int(nil), t.shape...)}, nil
 }
 
+// RMSNormEach is RMSNorm over consecutive groups of len(w) elements
+// instead of whole rows of the last axis — Qwen3's per-head QK-norm,
+// where every head of a packed projection normalizes against the same
+// per-channel weights.
+func (t *GPUTensor) RMSNormEach(w *GPUTensor, eps float64) (*GPUTensor, error) {
+	if t.freed || w.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	n := w.Size()
+	if n == 0 || t.Size()%n != 0 {
+		return nil, fmt.Errorf("tensai: rmsnorm group of %d does not divide %d elements", n, t.Size())
+	}
+	rows := t.Size() / n
+	g := t.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	params := [4]uint32{uint32(rows), uint32(n), math.Float32bits(float32(eps)), 0}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+	bufOut := g.takeBuffer(gpuTensorUsage, uint64(t.Size())*4)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+
+	entries := [4]wgpuBindGroupEntry{
+		{binding: 20, buffer: bufParams, size: 16},
+		{binding: 21, buffer: t.buf, size: uint64(t.Size()) * 4},
+		{binding: 22, buffer: w.buf, size: uint64(n) * 4},
+		{binding: 23, buffer: bufOut, size: uint64(t.Size()) * 4},
+	}
+	bindGroup := g.cachedBindGroup(g.pipes.layRmsnorm, entries[:])
+	runtime.KeepAlive(&entries)
+
+	x, y := split2D(rows)
+	if err := g.dispatch(g.pipes.rmsnorm, bindGroup, x, y, 1); err != nil {
+		g.dropBuffer(bufOut)
+		return nil, err
+	}
+	return &GPUTensor{g: g, buf: bufOut, shape: append([]int(nil), t.shape...)}, nil
+}
+
 // RoPE applies rotary position embeddings in place, half-split style: the
 // last axis divides into heads of headSz, and element pair (c, c+headSz/2)
 // of each head in row r rotates by (pos0+r) * theta^(-2c/headSz).
