@@ -216,10 +216,14 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 	// transpose, and requantize are CPU-bound and independent per layer.
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, min(runtime.NumCPU(), 8))
+	stage := layerStage(cfg, headSz)
 	// The lm head loads alongside the layers.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
+		got := loadGate.acquire(lmStage)
+		defer loadGate.release(got)
 		if _, _, ok := g.Info("output.weight"); ok {
 			m.lmT, m.qLmT = lin("output.weight", 0)
 			return
@@ -242,6 +246,8 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
+			got := loadGate.acquire(stage)
+			defer loadGate.release(got)
 			b := &m.blocks[i]
 			p := fmt.Sprintf("blk.%d.", i)
 			b.ln1 = tensor(p + "attn_norm.weight").Data
