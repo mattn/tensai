@@ -12,6 +12,7 @@ package main
 // code sees HF row order.
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"runtime"
@@ -122,9 +123,55 @@ func unpermuteVec(v []float32, heads int) []float32 {
 	return m.Data
 }
 
+// repackQ8 copies a Q8_0 tensor's blocks — laid out [out, in] with one
+// f16 scale per 32 input values — into columns [colOff, colOff+out) of a
+// transposed Q8GMatrix, integer work only: the weights never pass through
+// float32. colMap permutes output rows on the way in (the llama-family
+// q/k rope unpermutation).
+func repackQ8(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+	nb := in / 32
+	for r := 0; r < out; r++ {
+		j := colOff + r
+		if colMap != nil {
+			j = colOff + colMap(r)
+		}
+		for b := 0; b < nb; b++ {
+			blk := raw[(r*nb+b)*34:]
+			dst.Scale[b*dst.Cols+j] = gguf.Float16(binary.LittleEndian.Uint16(blk))
+			var sum int32
+			for i := 0; i < 32; i++ {
+				w := int8(blk[2+i])
+				gi := b*32 + i
+				dst.Q[(gi/4)*4*dst.Cols+4*j+gi%4] = w
+				sum += int32(w)
+			}
+			dst.ColSum64[b*dst.Cols+j] = 64 * sum
+		}
+	}
+}
+
+// unpermuteMap returns the llama rope unpermutation as a row index map,
+// or nil when heads is zero.
+func unpermuteMap(rows, heads int) func(int) int {
+	if heads == 0 {
+		return nil
+	}
+	dim := rows / heads
+	half := dim / 2
+	return func(r int) int {
+		h := r / dim
+		c := r % dim
+		return h*dim + (c%2)*half + c/2
+	}
+}
+
 // loadGGUF builds the model and its tokenizer from a single .gguf file,
-// quantizing each weight to `bits` (0 keeps float32) as it loads.
-func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
+// quantizing each weight to `bits` (0 keeps float32) as it loads. With
+// bits == 8 and direct set, tensors stored as Q8_0 repack straight into
+// grouped-int8 matrices — no dequantize/requantize round trip, and finer
+// (32-row) scales than the float path would produce. The GPU path has no
+// grouped kernel yet, so -gpu passes direct=false.
+func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, error) {
 	g, err := gguf.Open(path)
 	if err != nil {
 		return nil, nil, err
@@ -200,6 +247,46 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 	lin := func(name string, unpermute int) (*tensai.Matrix, *qmat) {
 		return quant(trans(name, unpermute))
 	}
+	// allQ8 reports whether every named tensor is stored as Q8_0, the
+	// precondition for the direct repack.
+	allQ8 := func(names ...string) bool {
+		if bits != 8 || !direct {
+			return false
+		}
+		for _, name := range names {
+			if typ, _, ok := g.Info(name); !ok || typ != "Q8_0" {
+				return false
+			}
+		}
+		return true
+	}
+	// linDirect repacks one or more Q8_0 tensors into a fused grouped-int8
+	// matrix, column ranges concatenated in order; perms maps each part's
+	// output rows (nil for none).
+	linDirect := func(names []string, perms []int) *qmat {
+		var outs []int
+		var in int
+		for _, name := range names {
+			_, shape, _ := g.Info(name)
+			outs = append(outs, shape[0])
+			in = shape[1]
+		}
+		total := 0
+		for _, o := range outs {
+			total += o
+		}
+		dst := tensai.NewQ8GMatrix(in, total)
+		colOff := 0
+		for i, name := range names {
+			_, raw, err := g.RawTensor(name)
+			if err != nil {
+				panic(err)
+			}
+			repackQ8(dst, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
+			colOff += outs[i]
+		}
+		return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
+	}
 
 	// Only llama-converter architectures store q/k rows permuted
 	// (llama.cpp's SmolLM3 converter subclasses the Llama one).
@@ -224,14 +311,25 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
-		got := loadGate.acquire(lmStage)
-		defer loadGate.release(got)
 		if _, _, ok := g.Info("output.weight"); ok {
+			if allQ8("output.weight") {
+				m.qLmT = linDirect([]string{"output.weight"}, []int{0})
+				return
+			}
+			lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
+			got := loadGate.acquire(lmStage)
+			defer loadGate.release(got)
 			m.lmT, m.qLmT = lin("output.weight", 0)
 			return
 		}
-		// Tied embedding.
+		// Tied embedding: the Q8_0 blocks repack directly too.
+		if allQ8("token_embd.weight") {
+			m.qLmT = linDirect([]string{"token_embd.weight"}, []int{0})
+			return
+		}
+		lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
+		got := loadGate.acquire(lmStage)
+		defer loadGate.release(got)
 		em, err := m.embed.Matrix()
 		if err != nil {
 			panic(err)
@@ -260,21 +358,30 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 			b.ln2 = tensor(p + "ffn_norm.weight").Data
 			b.qNorm = vecOpt(p + "attn_q_norm.weight")
 			b.kNorm = vecOpt(p + "attn_k_norm.weight")
-			b.wQKV, b.qQKV = quant(hcat([]*tensai.Matrix{
-				trans(p+"attn_q.weight", qPerm),
-				trans(p+"attn_k.weight", kPerm),
-				trans(p+"attn_v.weight", 0),
-			}))
+			if allQ8(p+"attn_q.weight", p+"attn_k.weight", p+"attn_v.weight", p+"attn_output.weight", p+"ffn_gate.weight", p+"ffn_up.weight", p+"ffn_down.weight") {
+				b.qQKV = linDirect(
+					[]string{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"},
+					[]int{qPerm, kPerm, 0})
+				b.qo = linDirect([]string{p + "attn_output.weight"}, []int{0})
+				b.qGU = linDirect([]string{p + "ffn_gate.weight", p + "ffn_up.weight"}, []int{0, 0})
+				b.qDown = linDirect([]string{p + "ffn_down.weight"}, []int{0})
+			} else {
+				b.wQKV, b.qQKV = quant(hcat([]*tensai.Matrix{
+					trans(p+"attn_q.weight", qPerm),
+					trans(p+"attn_k.weight", kPerm),
+					trans(p+"attn_v.weight", 0),
+				}))
+				b.wo, b.qo = lin(p+"attn_output.weight", 0)
+				b.wGU, b.qGU = quant(hcat([]*tensai.Matrix{
+					trans(p+"ffn_gate.weight", 0),
+					trans(p+"ffn_up.weight", 0),
+				}))
+				b.wDown, b.qDown = lin(p+"ffn_down.weight", 0)
+			}
 			b.bQKV = catVec(
 				unpermuteVec(vecOpt(p+"attn_q.bias"), qPerm),
 				unpermuteVec(vecOpt(p+"attn_k.bias"), kPerm),
 				vecOpt(p+"attn_v.bias"))
-			b.wo, b.qo = lin(p+"attn_output.weight", 0)
-			b.wGU, b.qGU = quant(hcat([]*tensai.Matrix{
-				trans(p+"ffn_gate.weight", 0),
-				trans(p+"ffn_up.weight", 0),
-			}))
-			b.wDown, b.qDown = lin(p+"ffn_down.weight", 0)
 		}(i)
 	}
 	wg.Wait()
