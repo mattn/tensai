@@ -300,6 +300,44 @@ func (f *File) Info(name string) (typ string, shape []int, ok bool) {
 	return typ, append([]int(nil), t.shape...), true
 }
 
+// RawTensor returns a tensor's undecoded bytes and type name — the
+// quantized blocks exactly as stored, sliced from the mapping when the
+// file is memory-mapped (valid only until Close) and read fresh
+// otherwise. Consumers that keep quantized weights quantized repack from
+// this instead of paying Tensor's float32 detour.
+func (f *File) RawTensor(name string) (string, []byte, error) {
+	t, ok := f.tensors[name]
+	if !ok {
+		return "", nil, fmt.Errorf("gguf: no tensor %q", name)
+	}
+	spec, ok := blockSpec[t.typ]
+	if !ok {
+		return "", nil, fmt.Errorf("gguf: tensor %q: unsupported encoding type %d", name, t.typ)
+	}
+	n := int64(1)
+	for _, d := range t.shape {
+		n *= int64(d)
+	}
+	nbytes := n / spec.values * spec.bytes
+	typ := typeNames[t.typ]
+	if f.data != nil {
+		lo := f.dataBase + t.offset
+		if lo < 0 || lo+nbytes > int64(len(f.data)) {
+			return "", nil, fmt.Errorf("gguf: tensor %q extends past the file", name)
+		}
+		return typ, f.data[lo : lo+nbytes], nil
+	}
+	raw := make([]byte, nbytes)
+	if _, err := f.r.ReadAt(raw, f.dataBase+t.offset); err != nil {
+		return "", nil, fmt.Errorf("gguf: tensor %q: %w", name, err)
+	}
+	return typ, raw, nil
+}
+
+// Float16 widens an IEEE 754 half — exported for consumers decoding raw
+// quantized blocks, whose scales are stored as f16.
+func Float16(h uint16) float32 { return f16to32(h) }
+
 // Tensor reads one tensor, dequantizing to float32.
 func (f *File) Tensor(name string) (*tensai.Tensor, error) {
 	t, ok := f.tensors[name]

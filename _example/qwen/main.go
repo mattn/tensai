@@ -261,7 +261,7 @@ func main() {
 	var err error
 	start := time.Now()
 	if *ggufPath != "" {
-		model, tok, err = loadGGUF(*ggufPath, bits)
+		model, tok, err = loadGGUF(*ggufPath, bits, !*gpu)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
