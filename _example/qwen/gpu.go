@@ -144,69 +144,92 @@ func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 	return gq, nil
 }
 
-// syncUp copies CPU-side cache rows the GPU has not seen yet — a fresh
-// prompt prefill, or a chat turn's new tokens — into the GPU caches.
-func (gq *gpuQwen) syncUp() error {
-	kvDim := gq.m.cfg.KVHeads * gq.m.headSz
-	cpuLen := len(gq.m.blocks[0].kc)
-	if cpuLen > gq.nCtx {
-		return fmt.Errorf("prefill of %d tokens exceeds gpu cache of %d", cpuLen, gq.nCtx)
+// prefill feeds a batch of tokens through the GPU-resident blocks — the
+// batched twins of every decode op (row-batched RMSNorm and RoPE, the
+// multi-row quantized matmuls, causal attention with the queries aligned
+// to the cache end) — extending the resident KV cache and returning the
+// next-token logits after the last position. With this, -gpu never
+// touches the CPU KV cache at all.
+func (gq *gpuQwen) prefill(tokens []int, startPos int) []float32 {
+	m := gq.m
+	cfg := m.cfg
+	hs := cfg.HiddenSize
+	kvDim := cfg.KVHeads * m.headSz
+	n := len(tokens)
+	if startPos+n > gq.nCtx {
+		panic(fmt.Sprintf("prefill of %d tokens exceeds gpu cache of %d", startPos+n, gq.nCtx))
 	}
-	lo := gq.gpuLen
-	if cpuLen <= lo {
-		return nil
-	}
-	for i := range gq.layers {
-		cb := &gq.m.blocks[i]
-		for _, pair := range [2]struct {
-			rows [][]float32
-			dst  *tensai.GPUTensor
-		}{{cb.kc, gq.layers[i].kc}, {cb.vc, gq.layers[i].vc}} {
-			flat := &tensai.Tensor{Shape: []int{cpuLen - lo, kvDim}, Data: make([]float32, (cpuLen-lo)*kvDim)}
-			for t, row := range pair.rows[lo:] {
-				copy(flat.Data[t*kvDim:], row)
-			}
-			tmp, err := gq.g.Upload(flat)
-			if err != nil {
-				return err
-			}
-			err = tmp.CopyRowsInto(pair.dst, lo*kvDim)
-			tmp.Free()
-			if err != nil {
-				return err
-			}
-		}
-	}
-	gq.gpuLen = cpuLen
-	return nil
-}
 
-// syncBack appends the rows GPU decoding produced since the CPU cache
-// last saw them, so the next turn's CPU prefill attends over the whole
-// conversation — the piece that lets -gpu and -chat compose.
-func (gq *gpuQwen) syncBack() error {
-	kvDim := gq.m.cfg.KVHeads * gq.m.headSz
-	cpuLen := len(gq.m.blocks[0].kc)
-	if gq.gpuLen <= cpuLen {
-		return nil
+	flat := &tensai.Tensor{Shape: []int{n, hs}, Data: make([]float32, n*hs)}
+	for t, tk := range tokens {
+		copy(flat.Data[t*hs:], m.embed.Data[tk*hs:(tk+1)*hs])
 	}
-	n := gq.gpuLen - cpuLen
+	x := must(gq.g.Upload(flat))
+	defer x.Free()
+	if err := gq.g.BeginBatch(); err != nil {
+		panic(err)
+	}
 	for i := range gq.layers {
-		cb := &gq.m.blocks[i]
-		kt, err := gq.layers[i].kc.DownloadRange(cpuLen*kvDim, n*kvDim)
-		if err != nil {
-			return err
+		l := &gq.layers[i]
+		a := must(x.RMSNorm(l.ln1, cfg.RMSEps))
+		q := must(l.qq.MatMul(a))
+		k := must(l.qk.MatMul(a))
+		v := must(l.qv.MatMul(a))
+		a.Free()
+		if l.bq != nil {
+			if err := q.Add(l.bq); err != nil {
+				panic(err)
+			}
+			if err := k.Add(l.bk); err != nil {
+				panic(err)
+			}
+			if err := v.Add(l.bv); err != nil {
+				panic(err)
+			}
 		}
-		vt, err := gq.layers[i].vc.DownloadRange(cpuLen*kvDim, n*kvDim)
-		if err != nil {
-			return err
+		if err := q.RoPE(m.headSz, startPos, cfg.RopeTheta); err != nil {
+			panic(err)
 		}
-		for t := 0; t < n; t++ {
-			cb.kc = append(cb.kc, kt.Data[t*kvDim:(t+1)*kvDim])
-			cb.vc = append(cb.vc, vt.Data[t*kvDim:(t+1)*kvDim])
+		if err := k.RoPE(m.headSz, startPos, cfg.RopeTheta); err != nil {
+			panic(err)
 		}
+		if err := k.CopyRowsInto(l.kc, startPos*kvDim); err != nil {
+			panic(err)
+		}
+		if err := v.CopyRowsInto(l.vc, startPos*kvDim); err != nil {
+			panic(err)
+		}
+		k.Free()
+		v.Free()
+		attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, cfg.KVHeads, startPos+n))
+		q.Free()
+		proj := must(l.qo.MatMul(attn))
+		attn.Free()
+		if err := x.Add(proj); err != nil {
+			panic(err)
+		}
+		proj.Free()
+
+		a = must(x.RMSNorm(l.ln2, cfg.RMSEps))
+		gate := must(l.qGate.MatMul(a))
+		up := must(l.qUp.MatMul(a))
+		a.Free()
+		if err := gate.SiluMul(up); err != nil {
+			panic(err)
+		}
+		up.Free()
+		down := must(l.qDown.MatMul(gate))
+		gate.Free()
+		if err := x.Add(down); err != nil {
+			panic(err)
+		}
+		down.Free()
 	}
-	return nil
+	gq.gpuLen = startPos + n
+	// Only the final position's hidden state comes back; the download
+	// flushes the batch.
+	last := must(x.DownloadRange((n-1)*hs, hs))
+	return mv(rmsnorm(last.Data, m.normW, cfg.RMSEps), m.lmT, m.qLmT, nil)
 }
 
 // step feeds one token at position pos through the GPU-resident blocks and
