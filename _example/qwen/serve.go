@@ -61,15 +61,19 @@ func chatML(msgs []chatMessage, defaultSystem, asst string) string {
 }
 
 type server struct {
-	mu     sync.Mutex // one request drives the model at a time
-	model  *qwen
-	tok    tokenizerIface
-	system string
-	nCtx   int
-	temp   float64
-	topP   float64
-	imEnd  int
-	eot    int
+	mu      sync.Mutex // one request drives the model at a time
+	model   *qwen
+	tok     tokenizerIface
+	system  string
+	nCtx    int
+	temp    float64
+	topP    float64
+	imEnd   int
+	eot     int
+	asst    string // assistant-turn opening (Qwen3: may close thinking)
+	prefill func([]int, int) []float32
+	step    func(int, int) []float32
+	reset   func()
 }
 
 // tokenizerIface is the slice of the tokenizer the server needs.
@@ -78,9 +82,7 @@ type tokenizerIface interface {
 	Decode([]int) string
 }
 
-func serve(addr string, model *qwen, tok tokenizerIface, system string, nCtx int, temp, topP float64, imEnd, eot int) error {
-	s := &server{model: model, tok: tok, system: system, nCtx: nCtx,
-		temp: temp, topP: topP, imEnd: imEnd, eot: eot}
+func (s *server) listen(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", s.chatCompletions)
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
@@ -140,11 +142,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	rng := rand.New(rand.NewSource(seed))
 
-	asst := "<|im_start|>assistant\n"
-	if s.model.cfg.ModelType == "qwen3" {
-		asst += "<think>\n\n</think>\n\n"
-	}
-	ids := s.tok.Encode(chatML(req.Messages, s.system, asst))
+	ids := s.tok.Encode(chatML(req.Messages, s.system, s.asst))
 	if len(ids) >= s.nCtx-1 {
 		httpError(w, http.StatusBadRequest, fmt.Sprintf("prompt of %d tokens exceeds the %d-token context", len(ids), s.nCtx))
 		return
@@ -152,7 +150,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.model.reset()
+	s.reset()
 
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
@@ -178,11 +176,21 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	logits := s.model.prefill(ids, 0)
+	logits := s.prefill(ids, 0)
 	steps := len(ids)
 	var out []int
 	finish := "length"
+	ctx := r.Context()
 	for len(out) < limit && steps < s.nCtx-1 {
+		// A disconnected client stops the generation instead of holding
+		// the model for tokens nobody will read.
+		select {
+		case <-ctx.Done():
+			finish = "abort"
+			steps = s.nCtx // fall out below
+			continue
+		default:
+		}
 		next := sample(logits, temp, topP, rng)
 		if next == s.imEnd || next == s.eot {
 			finish = "stop"
@@ -192,8 +200,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if flush != nil {
 			flush(s.tok.Decode([]int{next}))
 		}
-		logits = s.model.step(next, steps)
+		logits = s.step(next, steps)
 		steps++
+	}
+	if finish == "abort" {
+		return
 	}
 
 	if req.Stream {

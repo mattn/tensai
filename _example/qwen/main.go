@@ -343,14 +343,6 @@ func main() {
 		nCtx = 4096
 	}
 
-	if *serveAddr != "" {
-		if err := serve(*serveAddr, model, tok, *system, nCtx, *temp, *topP, imEnd, eot); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
-	}
-
 	// With -gpu the transformer blocks decode on the device; the prompt
 	// still prefills on the CPU, and syncCache carries it over below.
 	var gq *gpuQwen
@@ -391,14 +383,43 @@ func main() {
 	// feed pushes tokens through the model, extending the KV cache;
 	// generate then samples until an end token, which is also fed so the
 	// cache stays aligned with the template for the next turn.
-	steps := 0
-	var logits []float32
+	// Qwen3's template disables its thinking mode by opening the assistant
+	// turn with an empty think block; -think leaves the block open so the
+	// model reasons first. Other models just open the turn.
+	asst := "<|im_start|>assistant\n"
+	if model.cfg.ModelType == "qwen3" && !*think {
+		asst += "<think>\n\n</think>\n\n"
+	}
+
 	stepFn := model.step
 	prefillFn := model.prefill
+	reset := func() {
+		model.reset()
+	}
 	if gq != nil {
 		stepFn = gq.step
 		prefillFn = gq.prefill
+		reset = func() {
+			model.reset()
+			gq.gpuLen = 0
+		}
 	}
+
+	if *serveAddr != "" {
+		s := &server{
+			model: model, tok: tok, system: *system, nCtx: nCtx,
+			temp: *temp, topP: *topP, imEnd: imEnd, eot: eot,
+			asst: asst, prefill: prefillFn, step: stepFn, reset: reset,
+		}
+		if err := s.listen(*serveAddr); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	steps := 0
+	var logits []float32
 	feed := func(ids []int) {
 		if len(ids) > 1 {
 			if draftM != nil {
@@ -488,14 +509,6 @@ func main() {
 		fmt.Println()
 		fmt.Fprintf(os.Stderr, "(%d tokens, %.1f tok/s)\n",
 			gen, float64(gen)/time.Since(start).Seconds())
-	}
-
-	// Qwen3's template disables its thinking mode by opening the assistant
-	// turn with an empty think block; -think leaves the block open so the
-	// model reasons first. Other models just open the turn.
-	asst := "<|im_start|>assistant\n"
-	if model.cfg.ModelType == "qwen3" && !*think {
-		asst += "<think>\n\n</think>\n\n"
 	}
 
 	if *chat {
