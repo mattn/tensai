@@ -23,6 +23,7 @@
 package gguf
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -31,6 +32,7 @@ import (
 	"sort"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/internal/mmapfile"
 )
 
 // Tensor encodings from the GGML type enum; only the ones this package
@@ -92,6 +94,8 @@ type tensorInfo struct {
 type File struct {
 	r        io.ReaderAt
 	closer   io.Closer
+	data     []byte // the whole file when memory-mapped; nil otherwise
+	unmap    func() error
 	kv       map[string]any
 	tensors  map[string]tensorInfo
 	names    []string
@@ -99,10 +103,25 @@ type File struct {
 }
 
 // Open opens a GGUF file and parses its metadata and tensor directory.
+// The file is memory-mapped where the platform allows, so tensor blocks
+// dequantize straight out of the page cache; otherwise reads go through
+// ReadAt.
 func Open(path string) (*File, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
+	}
+	if data, unmap, err := mmapfile.Map(f); err == nil {
+		g, err := NewFile(bytes.NewReader(data))
+		if err != nil {
+			unmap()
+			f.Close()
+			return nil, err
+		}
+		g.data = data
+		g.unmap = unmap
+		g.closer = f
+		return g, nil
 	}
 	g, err := NewFile(f)
 	if err != nil {
@@ -177,12 +196,21 @@ func NewFile(r io.ReaderAt) (*File, error) {
 	return g, nil
 }
 
-// Close closes the underlying file when the File was created by Open.
+// Close unmaps and closes the underlying file when the File was created
+// by Open.
 func (f *File) Close() error {
-	if f.closer != nil {
-		return f.closer.Close()
+	var err error
+	if f.unmap != nil {
+		err = f.unmap()
+		f.unmap = nil
+		f.data = nil
 	}
-	return nil
+	if f.closer != nil {
+		if cerr := f.closer.Close(); err == nil {
+			err = cerr
+		}
+	}
+	return err
 }
 
 // Names returns the tensor names in sorted order.
@@ -293,9 +321,19 @@ func (f *File) Tensor(name string) (*tensai.Tensor, error) {
 	if n%spec.values != 0 {
 		return nil, fmt.Errorf("gguf: tensor %q: %d values not a whole number of blocks", name, n)
 	}
-	raw := make([]byte, n/spec.values*spec.bytes)
-	if _, err := f.r.ReadAt(raw, f.dataBase+t.offset); err != nil {
-		return nil, fmt.Errorf("gguf: tensor %q: %w", name, err)
+	var raw []byte
+	nbytes := n / spec.values * spec.bytes
+	if f.data != nil {
+		lo := f.dataBase + t.offset
+		if lo < 0 || lo+nbytes > int64(len(f.data)) {
+			return nil, fmt.Errorf("gguf: tensor %q extends past the file", name)
+		}
+		raw = f.data[lo : lo+nbytes]
+	} else {
+		raw = make([]byte, nbytes)
+		if _, err := f.r.ReadAt(raw, f.dataBase+t.offset); err != nil {
+			return nil, fmt.Errorf("gguf: tensor %q: %w", name, err)
+		}
 	}
 	out := tensai.NewTensor(t.shape...)
 	dst := out.Data

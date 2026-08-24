@@ -13,6 +13,7 @@
 package safetensors
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"sort"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/internal/mmapfile"
 )
 
 // maxHeaderSize bounds the JSON header; the reference implementation
@@ -40,18 +42,34 @@ type entry struct {
 type File struct {
 	r       io.ReaderAt
 	closer  io.Closer
+	data    []byte // the whole file when memory-mapped; nil otherwise
+	unmap   func() error
 	entries map[string]entry
 	names   []string
 	meta    map[string]string
 	dataOff int64 // where the byte buffer starts
 }
 
-// Open opens a safetensors file, parsing its header. Close the returned
-// File when done.
+// Open opens a safetensors file, parsing its header. The file is
+// memory-mapped where the platform allows, so tensor bytes slice straight
+// out of the page cache; otherwise reads go through ReadAt. Close the
+// returned File when done.
 func Open(path string) (*File, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
+	}
+	if data, unmap, err := mmapfile.Map(f); err == nil {
+		sf, err := NewFile(bytes.NewReader(data))
+		if err != nil {
+			unmap()
+			f.Close()
+			return nil, err
+		}
+		sf.data = data
+		sf.unmap = unmap
+		sf.closer = f
+		return sf, nil
 	}
 	sf, err := NewFile(f)
 	if err != nil {
@@ -122,10 +140,18 @@ func NewFile(r io.ReaderAt) (*File, error) {
 // Close closes the underlying file when the File came from Open; it is a
 // no-op otherwise.
 func (f *File) Close() error {
-	if f.closer != nil {
-		return f.closer.Close()
+	var err error
+	if f.unmap != nil {
+		err = f.unmap()
+		f.unmap = nil
+		f.data = nil
 	}
-	return nil
+	if f.closer != nil {
+		if cerr := f.closer.Close(); err == nil {
+			err = cerr
+		}
+	}
+	return err
 }
 
 // Names lists the tensor names, sorted.
@@ -166,9 +192,18 @@ func (f *File) Tensor(name string) (*tensai.Tensor, error) {
 	if _, err := dtypeSize(e.Dtype); err != nil {
 		return nil, fmt.Errorf("%w (tensor %q)", err, name)
 	}
-	buf := make([]byte, e.DataOffsets[1]-e.DataOffsets[0])
-	if _, err := f.r.ReadAt(buf, f.dataOff+e.DataOffsets[0]); err != nil {
-		return nil, fmt.Errorf("safetensors: reading tensor %q: %w", name, err)
+	var buf []byte
+	if f.data != nil {
+		lo, hi := f.dataOff+e.DataOffsets[0], f.dataOff+e.DataOffsets[1]
+		if hi > int64(len(f.data)) || lo < 0 || lo > hi {
+			return nil, fmt.Errorf("safetensors: tensor %q extends past the file", name)
+		}
+		buf = f.data[lo:hi]
+	} else {
+		buf = make([]byte, e.DataOffsets[1]-e.DataOffsets[0])
+		if _, err := f.r.ReadAt(buf, f.dataOff+e.DataOffsets[0]); err != nil {
+			return nil, fmt.Errorf("safetensors: reading tensor %q: %w", name, err)
+		}
 	}
 	shape := e.Shape
 	if len(shape) == 0 {
