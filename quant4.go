@@ -24,6 +24,15 @@ type Q4Matrix struct {
 	Rows, Cols int
 	Q          []uint8 // row quads x 2*Cols, padded for 32-byte loads
 	Scale      []Float
+	Group      int // input rows per scale; 0 means the default q4Group (64)
+}
+
+// group returns the effective scale-group length.
+func (q *Q4Matrix) group() int {
+	if q.Group != 0 {
+		return q.Group
+	}
+	return q4Group
 }
 
 // QuantizeMatrix4 quantizes group-wise, symmetric with round-to-nearest.
@@ -98,13 +107,14 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 			len(x), len(out), q.Rows, q.Cols)
 	}
 	xu, sx := quantizeActs(x) // quad-padded, matching the weight layout
-	gsum := make([]int32, (q.Rows+q4Group-1)/q4Group)
+	grp := q.group()
+	gsum := make([]int32, (q.Rows+grp-1)/grp)
 	for i, u := range xu {
-		gsum[min(i/q4Group, len(gsum)-1)] += int32(u) - 64
+		gsum[min(i/grp, len(gsum)-1)] += int32(u) - 64
 	}
 	workers := matvecWorkerCount(q.Cols, q.Rows)
 	if workers == 1 {
-		q4matvecCols(out, xu, sx, gsum, q.Q, q.Scale, q.Cols, 0, q.Cols)
+		q4matvecCols(out, xu, sx, gsum, q.Q, q.Scale, grp, q.Cols, 0, q.Cols)
 		return nil
 	}
 	chunk := ((q.Cols+workers-1)/workers + 7) &^ 7
@@ -114,7 +124,7 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 		wg.Add(1)
 		go func(lo, hi int) {
 			defer wg.Done()
-			q4matvecCols(out, xu, sx, gsum, q.Q, q.Scale, q.Cols, lo, hi)
+			q4matvecCols(out, xu, sx, gsum, q.Q, q.Scale, grp, q.Cols, lo, hi)
 		}(lo, hi)
 	}
 	wg.Wait()
@@ -131,7 +141,8 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 			x.Rows, x.Cols, out.Rows, out.Cols, q.Rows, q.Cols)
 	}
 	rows := x.Rows
-	groups := (q.Rows + q4Group - 1) / q4Group
+	grp := q.group()
+	groups := (q.Rows + grp - 1) / grp
 	xus := make([][]uint8, rows)
 	sxs := make([]Float, rows)
 	gsums := make([][]int32, rows)
@@ -139,16 +150,16 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 		xus[r], sxs[r] = quantizeActs(x.Data[r*x.Cols : (r+1)*x.Cols])
 		gsums[r] = make([]int32, groups)
 		for i, u := range xus[r] {
-			gsums[r][min(i/q4Group, groups-1)] += int32(u) - 64
+			gsums[r][min(i/grp, groups-1)] += int32(u) - 64
 		}
 	}
 	run := func(lo, hi int) {
 		var r int
 		for ; r+4 <= rows; r += 4 {
-			q4matmulCols4(out, xus[r:r+4], sxs[r:r+4], gsums[r:r+4], r, q.Q, q.Scale, q.Cols, lo, hi)
+			q4matmulCols4(out, xus[r:r+4], sxs[r:r+4], gsums[r:r+4], r, q.Q, q.Scale, grp, q.Cols, lo, hi)
 		}
 		for ; r < rows; r++ {
-			q4matvecCols(out.Data[r*q.Cols:(r+1)*q.Cols], xus[r], sxs[r], gsums[r], q.Q, q.Scale, q.Cols, lo, hi)
+			q4matvecCols(out.Data[r*q.Cols:(r+1)*q.Cols], xus[r], sxs[r], gsums[r], q.Q, q.Scale, grp, q.Cols, lo, hi)
 		}
 	}
 	workers := matvecWorkerCount(q.Cols, q.Rows)
@@ -172,7 +183,7 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 
 // q4matmulCols4Generic is the four-row batched body: each nibble byte read
 // once feeds four output rows.
-func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 int, qw []uint8, scale []Float, cols, lo, hi int) {
+func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 int, qw []uint8, scale []Float, group, cols, lo, hi int) {
 	for r := 0; r < 4; r++ {
 		clear(out.Data[(r0+r)*cols+lo : (r0+r)*cols+hi])
 	}
@@ -182,8 +193,8 @@ func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int
 		acc[r] = make([]int32, hi-lo)
 	}
 	for g := 0; g < len(gsums[0]); g++ {
-		ib := g * q4Group / 4
-		ie := min(ib+q4Group/4, quads)
+		ib := g * group / 4
+		ie := min(ib+group/4, quads)
 		for r := range acc {
 			clear(acc[r])
 		}
@@ -223,13 +234,13 @@ func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int
 // 7-bit activations as the AVX2 kernel, so both builds agree exactly.
 // q4matvecCols (see quant4_simd.go and quant4_generic.go) dispatches to
 // the AVX2 kernel when available.
-func q4matvecColsGeneric(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, scale []Float, cols, lo, hi int) {
+func q4matvecColsGeneric(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, scale []Float, group, cols, lo, hi int) {
 	clear(out[lo:hi])
 	quads := len(xu) / 4
 	acc := make([]int32, hi-lo)
 	for g := 0; g < len(gsum); g++ {
-		ib := g * q4Group / 4
-		ie := min(ib+q4Group/4, quads)
+		ib := g * group / 4
+		ie := min(ib+group/4, quads)
 		clear(acc)
 		for i4 := ib; i4 < ie; i4++ {
 			x0 := int32(xu[4*i4]) - 64

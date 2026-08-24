@@ -2117,10 +2117,14 @@ type GPUQ4Matrix struct {
 	freed       bool
 }
 
-// UploadQ4 packs a 4-bit quantized matrix into GPU memory.
+// UploadQ4 packs a 4-bit quantized matrix into GPU memory. The kernel
+// folds scales on 64-row groups, so other group lengths are rejected.
 func (g *GPU) UploadQ4(q *Q4Matrix) (*GPUQ4Matrix, error) {
 	if q.Rows == 0 || q.Cols == 0 {
 		return nil, errors.New("tensai: cannot upload an empty matrix")
+	}
+	if q.Group != 0 && q.Group != 64 {
+		return nil, fmt.Errorf("tensai: gpu int4 kernel folds 64-row groups, not %d", q.Group)
 	}
 	pairs := (q.Rows + 1) / 2
 	words := (q.Cols + 3) / 4
