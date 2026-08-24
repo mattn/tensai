@@ -40,7 +40,8 @@ type QMatrix struct {
 }
 
 // QuantizeMatrix quantizes column-wise, symmetric around zero with
-// round-to-nearest.
+// round-to-nearest. Columns are independent, so large matrices split
+// across CPUs — quantize-at-load of a whole checkpoint is bound by this.
 func QuantizeMatrix(m *Matrix) *QMatrix {
 	pairs := (m.Rows + 1) / 2
 	q := &QMatrix{
@@ -50,7 +51,38 @@ func QuantizeMatrix(m *Matrix) *QMatrix {
 		Scale:    make([]Float, m.Cols),
 		ColSum64: make([]int32, m.Cols+8), // padded for 8-wide loads
 	}
-	for j := 0; j < m.Cols; j++ {
+	parallelCols(m.Rows, m.Cols, func(lo, hi int) {
+		quantizeColumns(m, q, lo, hi)
+	})
+	return q
+}
+
+// parallelCols splits [0, cols) across workers when the matrix is big
+// enough to pay for them.
+func parallelCols(rows, cols int, f func(lo, hi int)) {
+	workers := runtime.NumCPU()
+	if rows*cols < 1<<20 || workers <= 1 {
+		f(0, cols)
+		return
+	}
+	if workers > cols {
+		workers = cols
+	}
+	chunk := (cols + workers - 1) / workers
+	var wg sync.WaitGroup
+	for lo := 0; lo < cols; lo += chunk {
+		hi := min(lo+chunk, cols)
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			f(lo, hi)
+		}(lo, hi)
+	}
+	wg.Wait()
+}
+
+func quantizeColumns(m *Matrix, q *QMatrix, colLo, colHi int) {
+	for j := colLo; j < colHi; j++ {
 		var maxAbs Float
 		for i := 0; i < m.Rows; i++ {
 			v := m.Data[i*m.Cols+j]
@@ -81,7 +113,6 @@ func QuantizeMatrix(m *Matrix) *QMatrix {
 		}
 		q.ColSum64[j] = 64 * sum
 	}
-	return q
 }
 
 // quantizeActs maps an activation row to 7-bit offset-binary: round(x/sx)

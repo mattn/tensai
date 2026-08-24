@@ -14,6 +14,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"runtime"
+	"sync"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/gguf"
@@ -208,12 +210,24 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 	}
 	m := &qwen{cfg: cfg, headSz: headSz}
 	m.embed = tensor("token_embd.weight")
-	if _, _, ok := g.Info("output.weight"); ok {
-		m.lmT, m.qLmT = lin("output.weight", 0)
-	} else { // tied embedding
+	m.normW = tensor("output_norm.weight").Data
+	m.blocks = make([]qblock, cfg.Layers)
+	// Layers load concurrently, same as the safetensors path: dequantize,
+	// transpose, and requantize are CPU-bound and independent per layer.
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, min(runtime.NumCPU(), 8))
+	// The lm head loads alongside the layers.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if _, _, ok := g.Info("output.weight"); ok {
+			m.lmT, m.qLmT = lin("output.weight", 0)
+			return
+		}
+		// Tied embedding.
 		em, err := m.embed.Matrix()
 		if err != nil {
-			return nil, nil, err
+			panic(err)
 		}
 		lmT := em.T()
 		if bits == 0 {
@@ -221,31 +235,36 @@ func loadGGUF(path string, bits int) (*qwen, *tokenizer.Tokenizer, error) {
 		} else {
 			m.qLmT = quantizeMat(lmT, bits)
 		}
-	}
-	m.normW = tensor("output_norm.weight").Data
-	m.blocks = make([]qblock, cfg.Layers)
+	}()
 	for i := range m.blocks {
-		b := &m.blocks[i]
-		p := fmt.Sprintf("blk.%d.", i)
-		b.ln1 = tensor(p + "attn_norm.weight").Data
-		b.ln2 = tensor(p + "ffn_norm.weight").Data
-		b.qNorm = vecOpt(p + "attn_q_norm.weight")
-		b.kNorm = vecOpt(p + "attn_k_norm.weight")
-		b.wQKV, b.qQKV = quant(hcat([]*tensai.Matrix{
-			trans(p+"attn_q.weight", qPerm),
-			trans(p+"attn_k.weight", kPerm),
-			trans(p+"attn_v.weight", 0),
-		}))
-		b.bQKV = catVec(
-			unpermuteVec(vecOpt(p+"attn_q.bias"), qPerm),
-			unpermuteVec(vecOpt(p+"attn_k.bias"), kPerm),
-			vecOpt(p+"attn_v.bias"))
-		b.wo, b.qo = lin(p+"attn_output.weight", 0)
-		b.wGU, b.qGU = quant(hcat([]*tensai.Matrix{
-			trans(p+"ffn_gate.weight", 0),
-			trans(p+"ffn_up.weight", 0),
-		}))
-		b.wDown, b.qDown = lin(p+"ffn_down.weight", 0)
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			b := &m.blocks[i]
+			p := fmt.Sprintf("blk.%d.", i)
+			b.ln1 = tensor(p + "attn_norm.weight").Data
+			b.ln2 = tensor(p + "ffn_norm.weight").Data
+			b.qNorm = vecOpt(p + "attn_q_norm.weight")
+			b.kNorm = vecOpt(p + "attn_k_norm.weight")
+			b.wQKV, b.qQKV = quant(hcat([]*tensai.Matrix{
+				trans(p+"attn_q.weight", qPerm),
+				trans(p+"attn_k.weight", kPerm),
+				trans(p+"attn_v.weight", 0),
+			}))
+			b.bQKV = catVec(
+				unpermuteVec(vecOpt(p+"attn_q.bias"), qPerm),
+				unpermuteVec(vecOpt(p+"attn_k.bias"), kPerm),
+				vecOpt(p+"attn_v.bias"))
+			b.wo, b.qo = lin(p+"attn_output.weight", 0)
+			b.wGU, b.qGU = quant(hcat([]*tensai.Matrix{
+				trans(p+"ffn_gate.weight", 0),
+				trans(p+"ffn_up.weight", 0),
+			}))
+			b.wDown, b.qDown = lin(p+"ffn_down.weight", 0)
+		}(i)
 	}
+	wg.Wait()
 	return m, tok, nil
 }

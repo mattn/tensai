@@ -195,35 +195,54 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.TieEmbedding {
-		em, err := m.embed.Matrix()
-		if err != nil {
-			return nil, err
-		}
-		lmT := em.T()
-		if bits == 0 {
-			m.lmT = lmT
-		} else {
-			m.qLmT = quantizeMat(lmT, bits)
-		}
-	} else {
-		m.lmT, m.qLmT = linq("lm_head.weight")
-	}
 	m.normW = vec("model.norm.weight")
 	m.blocks = make([]qblock, cfg.Layers)
+	// Layers load concurrently: reads are ReadAt against one descriptor
+	// and the convert/transpose/quantize chain per tensor is CPU-bound, so
+	// this is where an otherwise serial load spends nearly all its time.
+	// The worker cap bounds the float32 staging copies alive at once.
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, min(runtime.NumCPU(), 8))
+	// The lm head — the largest single tensor — transposes and quantizes
+	// alongside the layers (its own column loop is parallel too).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if cfg.TieEmbedding {
+			em, err := m.embed.Matrix()
+			if err != nil {
+				panic(err)
+			}
+			lmT := em.T()
+			if bits == 0 {
+				m.lmT = lmT
+			} else {
+				m.qLmT = quantizeMat(lmT, bits)
+			}
+		} else {
+			m.lmT, m.qLmT = linq("lm_head.weight")
+		}
+	}()
 	for i := range m.blocks {
-		b := &m.blocks[i]
-		p := fmt.Sprintf("model.layers.%d.", i)
-		b.ln1 = vec(p + "input_layernorm.weight")
-		b.ln2 = vec(p + "post_attention_layernorm.weight")
-		b.qNorm = vecOpt(p + "self_attn.q_norm.weight")
-		b.kNorm = vecOpt(p + "self_attn.k_norm.weight")
-		b.wQKV, b.qQKV = linqFused(p+"self_attn.q_proj.weight", p+"self_attn.k_proj.weight", p+"self_attn.v_proj.weight")
-		b.bQKV = catVec(vecOpt(p+"self_attn.q_proj.bias"), vecOpt(p+"self_attn.k_proj.bias"), vecOpt(p+"self_attn.v_proj.bias"))
-		b.wo, b.qo = linq(p + "self_attn.o_proj.weight")
-		b.wGU, b.qGU = linqFused(p+"mlp.gate_proj.weight", p+"mlp.up_proj.weight")
-		b.wDown, b.qDown = linq(p + "mlp.down_proj.weight")
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			b := &m.blocks[i]
+			p := fmt.Sprintf("model.layers.%d.", i)
+			b.ln1 = vec(p + "input_layernorm.weight")
+			b.ln2 = vec(p + "post_attention_layernorm.weight")
+			b.qNorm = vecOpt(p + "self_attn.q_norm.weight")
+			b.kNorm = vecOpt(p + "self_attn.k_norm.weight")
+			b.wQKV, b.qQKV = linqFused(p+"self_attn.q_proj.weight", p+"self_attn.k_proj.weight", p+"self_attn.v_proj.weight")
+			b.bQKV = catVec(vecOpt(p+"self_attn.q_proj.bias"), vecOpt(p+"self_attn.k_proj.bias"), vecOpt(p+"self_attn.v_proj.bias"))
+			b.wo, b.qo = linq(p + "self_attn.o_proj.weight")
+			b.wGU, b.qGU = linqFused(p+"mlp.gate_proj.weight", p+"mlp.up_proj.weight")
+			b.wDown, b.qDown = linq(p + "mlp.down_proj.weight")
+		}(i)
 	}
+	wg.Wait()
 	return m, nil
 }
 
