@@ -242,6 +242,7 @@ func main() {
 	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile of generation to this file")
 	ggufPath := flag.String("gguf", "", "load model and tokenizer from a single .gguf file instead of -data/-repo")
 	serveAddr := flag.String("serve", "", "serve an OpenAI-compatible /v1/chat/completions API on this address (e.g. :8080)")
+	think := flag.Bool("think", false, "let Qwen3 models reason in a <think> block before answering")
 	draftDir := flag.String("draft", "", "data directory of a smaller draft model: speculative decoding (greedy only)")
 	specK := flag.Int("spec", 3, "draft tokens proposed per speculative step (3 fills one 4-row verification block)")
 	flag.Parse()
@@ -364,6 +365,21 @@ func main() {
 			os.Exit(1)
 		}
 		defer g.Close()
+		// The resident KV cache is two buffers per layer sized by the
+		// context; a long-context model (Qwen3 declares 40960 positions)
+		// would allocate several GB, so clamp to a 2GB total budget and to
+		// the device's per-buffer storage limit.
+		kvDim := model.cfg.KVHeads * model.headSz
+		maxCtx := (2 << 30) / (2 * model.cfg.Layers * kvDim * 4)
+		if lim := g.StorageLimit(); lim > 0 {
+			if perBuf := int(lim / uint64(kvDim*4)); perBuf < maxCtx {
+				maxCtx = perBuf
+			}
+		}
+		if maxCtx < nCtx {
+			fmt.Fprintf(os.Stderr, "gpu cache limited to %d positions by device memory\n", maxCtx)
+			nCtx = maxCtx
+		}
 		start := time.Now()
 		if gq, err = newGPUQwen(model, g, nCtx); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -474,6 +490,14 @@ func main() {
 			gen, float64(gen)/time.Since(start).Seconds())
 	}
 
+	// Qwen3's template disables its thinking mode by opening the assistant
+	// turn with an empty think block; -think leaves the block open so the
+	// model reasons first. Other models just open the turn.
+	asst := "<|im_start|>assistant\n"
+	if model.cfg.ModelType == "qwen3" && !*think {
+		asst += "<think>\n\n</think>\n\n"
+	}
+
 	if *chat {
 		feed(tok.Encode("<|im_start|>system\n" + *system + "<|im_end|>\n"))
 		fmt.Fprintln(os.Stderr, "chat mode: type a message, empty line or Ctrl-D to quit")
@@ -483,7 +507,7 @@ func main() {
 			if !sc.Scan() || strings.TrimSpace(sc.Text()) == "" {
 				break
 			}
-			feed(tok.Encode("<|im_start|>user\n" + sc.Text() + "<|im_end|>\n<|im_start|>assistant\n"))
+			feed(tok.Encode("<|im_start|>user\n" + sc.Text() + "<|im_end|>\n" + asst))
 			generate(*n)
 			feed(tok.Encode("\n"))
 			if steps >= nCtx-64 {
@@ -497,8 +521,7 @@ func main() {
 	text := *prompt
 	if !*raw {
 		text = "<|im_start|>system\n" + *system + "<|im_end|>\n" +
-			"<|im_start|>user\n" + *prompt + "<|im_end|>\n" +
-			"<|im_start|>assistant\n"
+			"<|im_start|>user\n" + *prompt + "<|im_end|>\n" + asst
 	}
 	ids := tok.Encode(text)
 	fmt.Fprintf(os.Stderr, "prompt: %d tokens\n", len(ids))

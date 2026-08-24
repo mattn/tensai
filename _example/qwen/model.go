@@ -1,13 +1,14 @@
 package main
 
-// Qwen2- and Llama-family inference: pre-norm transformer blocks with
-// RMSNorm, rotary position embeddings, grouped-query attention, and a
-// SwiGLU MLP, decoded one token at a time with a KV cache. The two
-// architectures share this exact block — Llama simply has no attention
-// biases — so dimensions come from config.json and any qwen2 or llama
-// checkpoint whose tokenizer.json is byte-level BPE works (SmolLM2, for
-// example); every matvec runs on tensai's Dot kernel or, with -q8, the
-// int8 kernel.
+// Qwen2-, Qwen3-, and Llama-family inference: pre-norm transformer
+// blocks with RMSNorm, rotary position embeddings, grouped-query
+// attention, and a SwiGLU MLP, decoded one token at a time with a KV
+// cache. The architectures share this block: Llama drops the attention
+// biases, and Qwen3 drops them too while adding per-head QK-norm and an
+// explicit head_dim (so the query dimension need not equal the hidden
+// size). Dimensions come from config.json and any such checkpoint whose
+// tokenizer.json is byte-level BPE works; every matvec runs on tensai's
+// Dot kernel or, with -q8, the int8 kernel.
 
 import (
 	"encoding/json"
@@ -24,6 +25,7 @@ import (
 
 type config struct {
 	HiddenSize   int     `json:"hidden_size"`
+	HeadDim      int     `json:"head_dim"`
 	Intermediate int     `json:"intermediate_size"`
 	Layers       int     `json:"num_hidden_layers"`
 	Heads        int     `json:"num_attention_heads"`
@@ -67,13 +69,14 @@ func quantizeMat(m *tensai.Matrix, bits int) *qmat {
 // decode step streams four weight matrices instead of seven — quantization
 // is per column, so the fused results are bit-identical to separate calls.
 type qblock struct {
-	ln1, ln2   []float32
-	wQKV, wo   *tensai.Matrix // [in, out] after transposing HF's [out, in]
-	bQKV       []float32
-	wGU, wDown *tensai.Matrix
-	qQKV, qo   *qmat
-	qGU, qDown *qmat
-	kc, vc     [][]float32 // KV cache, kvHeads*headDim per position
+	ln1, ln2     []float32
+	qNorm, kNorm []float32      // Qwen3 per-head QK-norm; nil otherwise
+	wQKV, wo     *tensai.Matrix // [in, out] after transposing HF's [out, in]
+	bQKV         []float32
+	wGU, wDown   *tensai.Matrix
+	qQKV, qo     *qmat
+	qGU, qDown   *qmat
+	kc, vc       [][]float32 // KV cache, kvHeads*headDim per position
 }
 
 type qwen struct {
@@ -95,8 +98,8 @@ func loadConfig(path string) (config, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return c, err
 	}
-	if c.ModelType != "qwen2" && c.ModelType != "llama" {
-		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2 and llama)", c.ModelType)
+	if c.ModelType != "qwen2" && c.ModelType != "llama" && c.ModelType != "qwen3" {
+		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2, qwen3, and llama)", c.ModelType)
 	}
 	return c, nil
 }
@@ -183,7 +186,11 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 		return nil, quantizeMat(w, bits)
 	}
 
-	m := &qwen{cfg: cfg, headSz: cfg.HiddenSize / cfg.Heads}
+	headSz := cfg.HiddenSize / cfg.Heads
+	if cfg.HeadDim != 0 {
+		headSz = cfg.HeadDim
+	}
+	m := &qwen{cfg: cfg, headSz: headSz}
 	m.embed, err = f.Tensor("model.embed_tokens.weight")
 	if err != nil {
 		return nil, err
@@ -209,6 +216,8 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 		p := fmt.Sprintf("model.layers.%d.", i)
 		b.ln1 = vec(p + "input_layernorm.weight")
 		b.ln2 = vec(p + "post_attention_layernorm.weight")
+		b.qNorm = vecOpt(p + "self_attn.q_norm.weight")
+		b.kNorm = vecOpt(p + "self_attn.k_norm.weight")
 		b.wQKV, b.qQKV = linqFused(p+"self_attn.q_proj.weight", p+"self_attn.k_proj.weight", p+"self_attn.v_proj.weight")
 		b.bQKV = catVec(vecOpt(p+"self_attn.q_proj.bias"), vecOpt(p+"self_attn.k_proj.bias"), vecOpt(p+"self_attn.v_proj.bias"))
 		b.wo, b.qo = linq(p + "self_attn.o_proj.weight")
@@ -342,6 +351,17 @@ func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, sco
 	}
 }
 
+// qkNorm applies Qwen3's per-head RMS normalization in place; w has one
+// weight per head channel. A nil w (qwen2, llama) is a no-op.
+func (m *qwen) qkNorm(v, w []float32) {
+	if w == nil {
+		return
+	}
+	for o := 0; o < len(v); o += m.headSz {
+		copy(v[o:o+m.headSz], rmsnorm(v[o:o+m.headSz], w, m.cfg.RMSEps))
+	}
+}
+
 // rope rotates one head in place, half-split style: pair (i, i+dh/2).
 func (m *qwen) rope(h []float32, pos int) {
 	half := m.headSz / 2
@@ -412,7 +432,8 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			copy(a.Data[t*hs:(t+1)*hs], rmsnorm(x.Data[t*hs:(t+1)*hs], w, cfg.RMSEps))
 		}
 	}
-	qkvW := hs + 2*kvDim
+	qDim := cfg.Heads * m.headSz
+	qkvW := qDim + 2*kvDim
 	for li := range m.blocks {
 		b := &m.blocks[li]
 		norm(b.ln1)
@@ -420,22 +441,24 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		for t := 0; t < n; t++ {
 			pos := startPos + t
 			row := qkv.Data[t*qkvW : (t+1)*qkvW]
-			qr := row[:hs]
+			qr := row[:qDim]
+			kr := row[qDim : qDim+kvDim]
+			m.qkNorm(qr, b.qNorm)
+			m.qkNorm(kr, b.kNorm)
 			for h := 0; h < cfg.Heads; h++ {
 				m.rope(qr[h*m.headSz:(h+1)*m.headSz], pos)
 			}
-			kr := row[hs : hs+kvDim]
 			for h := 0; h < cfg.KVHeads; h++ {
 				m.rope(kr[h*m.headSz:(h+1)*m.headSz], pos)
 			}
 			// Copies detach the cache rows from the wide fused buffer.
 			b.kc = append(b.kc, append(make([]float32, 0, kvDim), kr...))
-			b.vc = append(b.vc, append(make([]float32, 0, kvDim), row[hs+kvDim:]...))
+			b.vc = append(b.vc, append(make([]float32, 0, kvDim), row[qDim+kvDim:]...))
 		}
 
 		// Causal attention: row t sees cache positions [0, startPos+t].
 		// Rows are independent, so they fan out across CPUs.
-		attn := tensai.NewMatrix(n, hs)
+		attn := tensai.NewMatrix(n, qDim)
 		var wg sync.WaitGroup
 		rowCh := make(chan int, n)
 		for t := 0; t < n; t++ {
@@ -449,8 +472,8 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 				scores := make([]float64, startPos+n)
 				for t := range rowCh {
 					steps := startPos + t + 1
-					qr := qkv.Data[t*qkvW : t*qkvW+hs]
-					ar := attn.Data[t*hs : (t+1)*hs]
+					qr := qkv.Data[t*qkvW : t*qkvW+qDim]
+					ar := attn.Data[t*qDim : (t+1)*qDim]
 					for h := 0; h < cfg.Heads; h++ {
 						m.attendHead(b, qr, ar, h, group, steps, scores[:steps])
 					}
@@ -493,13 +516,16 @@ func (m *qwen) step(token, pos int) []float32 {
 	copy(x, m.embed.Data[token*hs:(token+1)*hs])
 
 	kvDim := cfg.KVHeads * m.headSz
+	qDim := cfg.Heads * m.headSz
 	for li := range m.blocks {
 		b := &m.blocks[li]
 		a := rmsnorm(x, b.ln1, cfg.RMSEps)
 		qkv := mv(a, b.wQKV, b.qQKV, b.bQKV)
-		q := qkv[:hs]
-		k := qkv[hs : hs+kvDim]
-		v := qkv[hs+kvDim:]
+		q := qkv[:qDim]
+		k := qkv[qDim : qDim+kvDim]
+		v := qkv[qDim+kvDim:]
+		m.qkNorm(q, b.qNorm)
+		m.qkNorm(k, b.kNorm)
 		for h := 0; h < cfg.Heads; h++ {
 			m.rope(q[h*m.headSz:(h+1)*m.headSz], pos)
 		}
@@ -511,7 +537,7 @@ func (m *qwen) step(token, pos int) []float32 {
 		b.kc = append(b.kc, append(make([]float32, 0, kvDim), k...))
 		b.vc = append(b.vc, append(make([]float32, 0, kvDim), v...))
 
-		attn := make([]float32, hs)
+		attn := make([]float32, qDim)
 		steps := len(b.kc)
 		// Short contexts run the heads serially; past that the goroutine
 		// cost disappears into the O(steps*headSz) work per head.

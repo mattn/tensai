@@ -42,8 +42,9 @@ func (m *qwen) reset() {
 }
 
 // chatML renders the messages through the same template the CLI uses,
-// ending with an open assistant turn.
-func chatML(msgs []chatMessage, defaultSystem string) string {
+// ending with an open assistant turn (asst carries the model-specific
+// opening, including Qwen3's empty think block).
+func chatML(msgs []chatMessage, defaultSystem, asst string) string {
 	var b strings.Builder
 	if len(msgs) == 0 || msgs[0].Role != "system" {
 		b.WriteString("<|im_start|>system\n" + defaultSystem + "<|im_end|>\n")
@@ -55,7 +56,7 @@ func chatML(msgs []chatMessage, defaultSystem string) string {
 		}
 		b.WriteString("<|im_start|>" + role + "\n" + m.Content + "<|im_end|>\n")
 	}
-	b.WriteString("<|im_start|>assistant\n")
+	b.WriteString(asst)
 	return b.String()
 }
 
@@ -139,7 +140,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	rng := rand.New(rand.NewSource(seed))
 
-	ids := s.tok.Encode(chatML(req.Messages, s.system))
+	asst := "<|im_start|>assistant\n"
+	if s.model.cfg.ModelType == "qwen3" {
+		asst += "<think>\n\n</think>\n\n"
+	}
+	ids := s.tok.Encode(chatML(req.Messages, s.system, asst))
 	if len(ids) >= s.nCtx-1 {
 		httpError(w, http.StatusBadRequest, fmt.Sprintf("prompt of %d tokens exceeds the %d-token context", len(ids), s.nCtx))
 		return
