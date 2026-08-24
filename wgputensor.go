@@ -2124,10 +2124,19 @@ func (g *GPU) UploadQ4(q *Q4Matrix) (*GPUQ4Matrix, error) {
 	}
 	pairs := (q.Rows + 1) / 2
 	words := (q.Cols + 3) / 4
+	// The CPU layout stores row quads (two nibble bytes per column); the
+	// kernel walks row pairs, so repack nibble pairs on the way in.
+	nib := func(i, j int) uint32 {
+		if i >= q.Rows {
+			return 8 // zero pad row
+		}
+		return uint32(q.Q[(i/4)*2*q.Cols+2*j+(i%4)/2]>>(4*(i%2))) & 0x0F
+	}
 	packed := make([]uint32, pairs*words)
 	for i2 := 0; i2 < pairs; i2++ {
 		for j := 0; j < q.Cols; j++ {
-			packed[i2*words+j/4] |= uint32(q.Q[i2*q.Cols+j]) << (8 * (j % 4))
+			b := nib(2*i2, j) | nib(2*i2+1, j)<<4
+			packed[i2*words+j/4] |= b << (8 * (j % 4))
 		}
 	}
 	groups := (q.Rows + 63) / 64 // q4Group

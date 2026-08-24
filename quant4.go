@@ -11,28 +11,30 @@ import (
 const q4Group = 64
 
 // Q4Matrix is a weight matrix quantized to 4 bits with one scale per
-// (64-row group, output column). The byte at (i/2)*Cols + j holds column j
-// of an interleaved row pair — row i (even) in the low nibble, row i+1 in
-// the high one, offset-binary (0..15 encodes -8..7), with a zero row
-// appended when Rows is odd. That pairing matches the u8 x s8 pairwise
-// multiply-add the AVX2 kernel is built on, the same W-A7 scheme as
-// QMatrix: activations quantize per call to 7 bits, and since nibbles are
-// at most 15 the i16 pair sums sit far inside saturation.
+// (64-row group, output column). Rows are stored in interleaved quads of
+// two bytes per column: byte (i/4)*2*Cols + 2*j + (i%4)/2 holds rows
+// i..i+3 of column j as four nibbles (each byte low nibble first),
+// offset-binary (0..15 encodes -8..7), zero rows padding the final quad.
+// The 256-bit kernel's nibble unpack turns those two bytes into four
+// consecutive u8 lanes — exactly QMatrix's quad layout — so the same
+// two-instruction multiply-add chain takes a column four rows deep, with
+// activations re-centered to signed bytes and the nibble offset folded
+// out through per-group activation sums.
 type Q4Matrix struct {
 	Rows, Cols int
-	Q          []uint8 // row pairs x Cols, padded for 16-byte loads
+	Q          []uint8 // row quads x 2*Cols, padded for 32-byte loads
 	Scale      []Float
 }
 
 // QuantizeMatrix4 quantizes group-wise, symmetric with round-to-nearest.
 // Columns split across CPUs for large matrices, like QuantizeMatrix.
 func QuantizeMatrix4(m *Matrix) (*Q4Matrix, error) {
-	pairs := (m.Rows + 1) / 2
+	quads := (m.Rows + 3) / 4
 	groups := (m.Rows + q4Group - 1) / q4Group
 	q := &Q4Matrix{
 		Rows:  m.Rows,
 		Cols:  m.Cols,
-		Q:     make([]uint8, pairs*m.Cols+16),
+		Q:     make([]uint8, quads*2*m.Cols+32),
 		Scale: make([]Float, groups*m.Cols),
 	}
 	parallelCols(m.Rows, m.Cols, func(lo, hi int) {
@@ -78,11 +80,11 @@ func quantize4Columns(m *Matrix, q *Q4Matrix, groups, colLo, colHi int) {
 						n = 7
 					}
 				}
-				q.Q[(i/2)*m.Cols+j] |= uint8(n+8) << (4 * (i % 2))
+				q.Q[(i/4)*2*m.Cols+2*j+(i%4)/2] |= uint8(n+8) << (4 * (i % 2))
 			}
 		}
-		if m.Rows%2 == 1 {
-			q.Q[(m.Rows/2)*m.Cols+j] |= 8 << 4 // zero weight for the pad row
+		for i := m.Rows; i < 4*((m.Rows+3)/4); i++ {
+			q.Q[(i/4)*2*m.Cols+2*j+(i%4)/2] |= 8 << (4 * (i % 2)) // zero pad rows
 		}
 	}
 }
@@ -95,8 +97,7 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 		return fmt.Errorf("tensai: q4matvec shape mismatch: x=%d out=%d, want %dx%d",
 			len(x), len(out), q.Rows, q.Cols)
 	}
-	xu, sx := quantizeActs(x)
-	xu = xu[:(q.Rows+1)&^1] // the int4 kernels expect pair padding
+	xu, sx := quantizeActs(x) // quad-padded, matching the weight layout
 	gsum := make([]int32, (q.Rows+q4Group-1)/q4Group)
 	for i, u := range xu {
 		gsum[min(i/q4Group, len(gsum)-1)] += int32(u) - 64
@@ -136,7 +137,6 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 	gsums := make([][]int32, rows)
 	for r := 0; r < rows; r++ {
 		xus[r], sxs[r] = quantizeActs(x.Data[r*x.Cols : (r+1)*x.Cols])
-		xus[r] = xus[r][:(q.Rows+1)&^1] // the int4 kernels expect pair padding
 		gsums[r] = make([]int32, groups)
 		for i, u := range xus[r] {
 			gsums[r][min(i/q4Group, groups-1)] += int32(u) - 64
@@ -176,26 +176,29 @@ func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int
 	for r := 0; r < 4; r++ {
 		clear(out.Data[(r0+r)*cols+lo : (r0+r)*cols+hi])
 	}
-	pairs := len(xus[0]) / 2
+	quads := len(xus[0]) / 4
 	var acc [4][]int32
 	for r := range acc {
 		acc[r] = make([]int32, hi-lo)
 	}
 	for g := 0; g < len(gsums[0]); g++ {
-		ib := g * q4Group / 2
-		ie := min(ib+q4Group/2, pairs)
+		ib := g * q4Group / 4
+		ie := min(ib+q4Group/4, quads)
 		for r := range acc {
 			clear(acc[r])
 		}
-		for i2 := ib; i2 < ie; i2++ {
-			row := qw[i2*cols:]
+		for i4 := ib; i4 < ie; i4++ {
+			row := qw[i4*2*cols:]
 			for r := 0; r < 4; r++ {
-				x0 := int32(xus[r][2*i2]) - 64
-				x1 := int32(xus[r][2*i2+1]) - 64
+				x0 := int32(xus[r][4*i4]) - 64
+				x1 := int32(xus[r][4*i4+1]) - 64
+				x2 := int32(xus[r][4*i4+2]) - 64
+				x3 := int32(xus[r][4*i4+3]) - 64
 				a := acc[r]
 				for j := lo; j < hi; j++ {
-					b := row[j]
-					a[j-lo] += int32(b&0x0F)*x0 + int32(b>>4)*x1
+					b0, b1 := row[2*j], row[2*j+1]
+					a[j-lo] += int32(b0&0x0F)*x0 + int32(b0>>4)*x1 +
+						int32(b1&0x0F)*x2 + int32(b1>>4)*x3
 				}
 			}
 		}
@@ -222,19 +225,22 @@ func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int
 // the AVX2 kernel when available.
 func q4matvecColsGeneric(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, scale []Float, cols, lo, hi int) {
 	clear(out[lo:hi])
-	pairs := len(xu) / 2
+	quads := len(xu) / 4
 	acc := make([]int32, hi-lo)
 	for g := 0; g < len(gsum); g++ {
-		ib := g * q4Group / 2
-		ie := min(ib+q4Group/2, pairs)
+		ib := g * q4Group / 4
+		ie := min(ib+q4Group/4, quads)
 		clear(acc)
-		for i2 := ib; i2 < ie; i2++ {
-			x0 := int32(xu[2*i2]) - 64
-			x1 := int32(xu[2*i2+1]) - 64
-			row := qw[i2*cols:]
+		for i4 := ib; i4 < ie; i4++ {
+			x0 := int32(xu[4*i4]) - 64
+			x1 := int32(xu[4*i4+1]) - 64
+			x2 := int32(xu[4*i4+2]) - 64
+			x3 := int32(xu[4*i4+3]) - 64
+			row := qw[i4*2*cols:]
 			for j := lo; j < hi; j++ {
-				b := row[j]
-				acc[j-lo] += int32(b&0x0F)*x0 + int32(b>>4)*x1
+				b0, b1 := row[2*j], row[2*j+1]
+				acc[j-lo] += int32(b0&0x0F)*x0 + int32(b0>>4)*x1 +
+					int32(b1&0x0F)*x2 + int32(b1>>4)*x3
 			}
 		}
 		srow := scale[g*cols:]
