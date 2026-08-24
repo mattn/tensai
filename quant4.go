@@ -25,6 +25,7 @@ type Q4Matrix struct {
 }
 
 // QuantizeMatrix4 quantizes group-wise, symmetric with round-to-nearest.
+// Columns split across CPUs for large matrices, like QuantizeMatrix.
 func QuantizeMatrix4(m *Matrix) (*Q4Matrix, error) {
 	pairs := (m.Rows + 1) / 2
 	groups := (m.Rows + q4Group - 1) / q4Group
@@ -34,7 +35,14 @@ func QuantizeMatrix4(m *Matrix) (*Q4Matrix, error) {
 		Q:     make([]uint8, pairs*m.Cols+16),
 		Scale: make([]Float, groups*m.Cols),
 	}
-	for j := 0; j < m.Cols; j++ {
+	parallelCols(m.Rows, m.Cols, func(lo, hi int) {
+		quantize4Columns(m, q, groups, lo, hi)
+	})
+	return q, nil
+}
+
+func quantize4Columns(m *Matrix, q *Q4Matrix, groups, colLo, colHi int) {
+	for j := colLo; j < colHi; j++ {
 		for g := 0; g < groups; g++ {
 			rlo := g * q4Group
 			rhi := min(rlo+q4Group, m.Rows)
@@ -77,7 +85,6 @@ func QuantizeMatrix4(m *Matrix) (*Q4Matrix, error) {
 			q.Q[(m.Rows/2)*m.Cols+j] |= 8 << 4 // zero weight for the pad row
 		}
 	}
-	return q, nil
 }
 
 // MatVec computes out = x @ Q for a single activation row: len(x) must be
