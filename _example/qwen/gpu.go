@@ -48,7 +48,11 @@ type gpuQwen struct {
 // contiguous tile blocks; anything else moves nibble by nibble.
 func sliceQ4(q *tensai.Q4Matrix, lo, hi int) *tensai.Q4Matrix {
 	quads := (q.Rows + 3) / 4
-	groups := len(q.Scale) / q.Cols
+	gsz := q.Group
+	if gsz == 0 {
+		gsz = 64
+	}
+	groups := (q.Rows + gsz - 1) / gsz
 	cols := hi - lo
 	out := tensai.NewQ4Matrix(q.Rows, cols, q.Group, false)
 	if lo%32 == 0 && cols%32 == 0 {
@@ -64,7 +68,9 @@ func sliceQ4(q *tensai.Q4Matrix, lo, hi int) *tensai.Q4Matrix {
 		}
 	}
 	for g := 0; g < groups; g++ {
-		copy(out.Scale[g*cols:(g+1)*cols], q.Scale[g*q.Cols+lo:g*q.Cols+hi])
+		for j := 0; j < cols; j++ {
+			out.Scale[out.TableIndex(g, j)] = q.Scale[q.TableIndex(g, lo+j)]
+		}
 	}
 	return out
 }
