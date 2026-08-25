@@ -3,7 +3,6 @@ package tensai
 import (
 	"fmt"
 	"math"
-	"sync"
 )
 
 // q4Group is the number of input rows sharing one scale. 64 keeps
@@ -193,17 +192,9 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 	}
 	// Tile-aligned chunks keep every worker's vector span inside whole
 	// layout tiles, and its memory walk sequential.
-	chunk := ((q.Cols+workers-1)/workers + q4Tile - 1) &^ (q4Tile - 1)
-	var wg sync.WaitGroup
-	for lo := 0; lo < q.Cols; lo += chunk {
-		hi := min(lo+chunk, q.Cols)
-		wg.Add(1)
-		go func(lo, hi int) {
-			defer wg.Done()
-			q4matvecCols(out, xu, xq, sx, gsum, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
-		}(lo, hi)
-	}
-	wg.Wait()
+	parallelChunks(q.Cols, workers, q4Tile, func(lo, hi int) {
+		q4matvecCols(out, xu, xq, sx, gsum, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
+	})
 	return nil
 }
 
@@ -245,17 +236,9 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 	}
 	// Tile-aligned, so the row-tail matvec's vector span starts on a
 	// layout tile like the batch kernel's 8-column steps do.
-	chunk := ((q.Cols+workers-1)/workers + q4Tile - 1) &^ (q4Tile - 1)
-	var wg sync.WaitGroup
-	for lo := 0; lo < q.Cols; lo += chunk {
-		hi := min(lo+chunk, q.Cols)
-		wg.Add(1)
-		go func(lo, hi int) {
-			defer wg.Done()
-			run(lo, hi)
-		}(lo, hi)
-	}
-	wg.Wait()
+	parallelChunks(q.Cols, workers, q4Tile, func(lo, hi int) {
+		run(lo, hi)
+	})
 	return nil
 }
 
