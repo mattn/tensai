@@ -43,6 +43,11 @@ type config struct {
 	// architecture — DeepSeek's R1 distills are qwen2/llama blocks that
 	// speak DeepSeek's turn markers. Set by the GGUF loader, never JSON.
 	ChatStyle string `json:"-"`
+	// MoE dimensions (qwen2moe/qwen3moe), from GGUF metadata.
+	NExpert     int `json:"-"`
+	NExpertUsed int `json:"-"`
+	MoeFF       int `json:"-"`
+	SharedFF    int `json:"-"`
 }
 
 // qmat abstracts the int8 and int4 twins behind one matvec call, plus the
@@ -88,7 +93,22 @@ type qblock struct {
 	wGU, wDown   *tensai.Matrix
 	qQKV, qo     *qmat
 	qGU, qDown   *qmat
-	kc, vc       [][]float32 // KV cache, kvHeads*headDim per position
+	// MoE: the router picks topK of the experts, whose small FFNs run in
+	// place of the dense gate/up/down; qwen2moe adds an always-on shared
+	// expert scaled by a sigmoid gate.
+	router     *tensai.Matrix // [hidden, nExpert], float — tiny
+	experts    []expertFFN
+	topK       int
+	normTopK   bool // qwen3moe renormalizes the top-k weights
+	sharedGU   *qmat
+	sharedDown *qmat
+	sharedGate []float32   // [hidden]; sigmoid(dot) scales the shared expert
+	kc, vc     [][]float32 // KV cache, kvHeads*headDim per position
+}
+
+// expertFFN is one expert's SwiGLU: fused gate|up and down projections.
+type expertFFN struct {
+	qGU, qDown *qmat
 }
 
 type qwen struct {
@@ -377,6 +397,79 @@ func activate(gate, up []float32, geglu bool) {
 	}
 }
 
+// moeFFN runs one token's activation through a block's sparse FFN: the
+// router's softmax picks topK experts, each contributes its SwiGLU
+// output scaled by its routing weight, and qwen2moe's shared expert
+// adds its sigmoid-gated output on top.
+func (m *qwen) moeFFN(b *qblock, a []float32) []float32 {
+	logits := mv(a, b.router, nil, nil)
+	// Softmax over all experts, per the HF reference; top-k picks from
+	// the probabilities.
+	maxL := logits[0]
+	for _, v := range logits[1:] {
+		maxL = max(maxL, v)
+	}
+	var sum float64
+	for i, v := range logits {
+		e := math.Exp(float64(v - maxL))
+		logits[i] = float32(e)
+		sum += e
+	}
+	inv := float32(1 / sum)
+	for i := range logits {
+		logits[i] *= inv
+	}
+	type pick struct {
+		e int
+		w float32
+	}
+	picks := make([]pick, 0, b.topK)
+	for e, w := range logits {
+		if len(picks) < b.topK {
+			picks = append(picks, pick{e, w})
+			continue
+		}
+		lo := 0
+		for i := 1; i < len(picks); i++ {
+			if picks[i].w < picks[lo].w {
+				lo = i
+			}
+		}
+		if w > picks[lo].w {
+			picks[lo] = pick{e, w}
+		}
+	}
+	if b.normTopK {
+		var ws float32
+		for _, p := range picks {
+			ws += p.w
+		}
+		for i := range picks {
+			picks[i].w /= ws
+		}
+	}
+	out := make([]float32, m.cfg.HiddenSize)
+	moeFF := m.cfg.MoeFF
+	for _, p := range picks {
+		ex := &b.experts[p.e]
+		gu := mv(a, nil, ex.qGU, nil)
+		gate, up := gu[:moeFF], gu[moeFF:]
+		tensai.SiluMul(gate, up)
+		d := mv(gate, nil, ex.qDown, nil)
+		tensai.Axpy(p.w, d, out)
+	}
+	if b.sharedGU != nil {
+		gu := mv(a, nil, b.sharedGU, nil)
+		sf := m.cfg.SharedFF
+		gate, up := gu[:sf], gu[sf:]
+		tensai.SiluMul(gate, up)
+		d := mv(gate, nil, b.sharedDown, nil)
+		g := float32(1 / (1 + math.Exp(-float64(tensai.DotVec(b.sharedGate, a)))))
+		tensai.Axpy(g, d, out)
+	}
+	return out
+}
+
 // mv computes x @ W (+ bias), on the quantized twin when it exists.
 func mv(x []float32, w *tensai.Matrix, q *qmat, bias []float32) []float32 {
 	var out []float32
@@ -608,15 +701,38 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		}
 
 		norm(b.ln2)
-		gu := mmb(a, b.wGU, b.qGU, nil)
-		inter := cfg.Intermediate
-		gate := tensai.NewMatrix(n, inter)
-		for t := 0; t < n; t++ {
-			row := gu.Data[t*2*inter:]
-			copy(gate.Data[t*inter:(t+1)*inter], row[:inter])
-			activate(gate.Data[t*inter:(t+1)*inter], row[inter:2*inter], b.geglu)
+		var down *tensai.Matrix
+		if len(b.experts) > 0 {
+			// Each row routes to its own experts, so the batch runs
+			// row-wise, rows spread across CPUs.
+			down = tensai.NewMatrix(n, hs)
+			var wg sync.WaitGroup
+			rowCh := make(chan int, n)
+			for t := 0; t < n; t++ {
+				rowCh <- t
+			}
+			close(rowCh)
+			for w := 0; w < min(runtime.NumCPU(), n); w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for t := range rowCh {
+						copy(down.Data[t*hs:(t+1)*hs], m.moeFFN(b, a.Data[t*hs:(t+1)*hs]))
+					}
+				}()
+			}
+			wg.Wait()
+		} else {
+			gu := mmb(a, b.wGU, b.qGU, nil)
+			inter := cfg.Intermediate
+			gate := tensai.NewMatrix(n, inter)
+			for t := 0; t < n; t++ {
+				row := gu.Data[t*2*inter:]
+				copy(gate.Data[t*inter:(t+1)*inter], row[:inter])
+				activate(gate.Data[t*inter:(t+1)*inter], row[inter:2*inter], b.geglu)
+			}
+			down = mmb(gate, b.wDown, b.qDown, nil)
 		}
-		down := mmb(gate, b.wDown, b.qDown, nil)
 		if b.postFFN != nil {
 			for t := 0; t < n; t++ {
 				copy(down.Data[t*hs:(t+1)*hs], rmsnorm(down.Data[t*hs:(t+1)*hs], b.postFFN, cfg.RMSEps))
@@ -694,10 +810,15 @@ func (m *qwen) step(token, pos int) []float32 {
 		}
 
 		a = rmsnorm(x, b.ln2, cfg.RMSEps)
-		gu := mv(a, b.wGU, b.qGU, nil)
-		gate, up := gu[:cfg.Intermediate], gu[cfg.Intermediate:]
-		activate(gate, up, b.geglu)
-		down := mv(gate, b.wDown, b.qDown, nil)
+		var down []float32
+		if len(b.experts) > 0 {
+			down = m.moeFFN(b, a)
+		} else {
+			gu := mv(a, b.wGU, b.qGU, nil)
+			gate, up := gu[:cfg.Intermediate], gu[cfg.Intermediate:]
+			activate(gate, up, b.geglu)
+			down = mv(gate, b.wDown, b.qDown, nil)
+		}
 		if b.postFFN != nil {
 			down = rmsnorm(down, b.postFFN, cfg.RMSEps)
 		}
