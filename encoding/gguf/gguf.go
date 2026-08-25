@@ -6,7 +6,7 @@
 // Reading is lazy: Open parses only the header, and each Tensor call reads
 // just that tensor's bytes. F32 comes back as-is; F16 and BF16 convert to
 // float32; the block-quantized types Q8_0, Q4_0, Q4_1, Q5_0, Q5_1 and the
-// K-quants Q2_K through Q6_K plus IQ4_NL dequantize to float32 on the way
+// K-quants Q2_K through Q6_K plus IQ4_NL and MXFP4 dequantize to float32 on the way
 // out, which covers the encodings llama.cpp's published checkpoints
 // usually ship (the Q2_K..Q5_K_M mixes, their Q6_K tensors, and the
 // IQ4_NL blocks imatrix mixes lean on). Dimensions arrive in tensai's row-major order (GGUF stores
@@ -52,6 +52,7 @@ const (
 	typeQ6_K  = 14
 	typeIQ4NL = 20
 	typeBF16  = 30
+	typeMXFP4 = 39
 )
 
 var typeNames = map[uint32]string{
@@ -60,6 +61,7 @@ var typeNames = map[uint32]string{
 	typeQ4_K: "Q4_K", typeQ5_K: "Q5_K", typeQ6_K: "Q6_K",
 	typeQ5_0: "Q5_0", typeQ5_1: "Q5_1",
 	typeQ2_K: "Q2_K", typeQ3_K: "Q3_K", typeIQ4NL: "IQ4_NL",
+	typeMXFP4: "MXFP4",
 }
 
 // blockSpec describes one quantization block: how many values it decodes
@@ -74,6 +76,7 @@ var blockSpec = map[uint32]struct{ values, bytes int64 }{
 	typeQ5_0:  {32, 2 + 4 + 16},     // f16 scale + high-bit plane + nibbles
 	typeQ5_1:  {32, 2 + 2 + 4 + 16}, // + f16 min
 	typeIQ4NL: {32, 2 + 16},         // f16 scale + nibbles through a nonlinear table
+	typeMXFP4: {32, 1 + 16},         // e8m0 exponent + fp4 codes through a nonlinear table
 	// K-quants: 256-value super-blocks with quantized sub-scales.
 	typeQ2_K: {256, 16 + 64 + 2 + 2},       // 4-bit scale/min pairs, 2-bit quants
 	typeQ3_K: {256, 32 + 64 + 12 + 2},      // high-bit plane, 2-bit quants, 6-bit scales
@@ -454,6 +457,18 @@ func (f *File) Tensor(name string) (*tensai.Tensor, error) {
 				dst[b*32+int64(i)+16] = s * iq4nl[q>>4]
 			}
 		}
+	case typeMXFP4:
+		for b := int64(0); b < n/32; b++ {
+			blk := raw[b*17:]
+			// E8M0 exponent; the table carries twice the FP4 values, so
+			// the factor halves.
+			s := float32(math.Ldexp(1, int(blk[0])-128))
+			for i := 0; i < 16; i++ {
+				q := blk[1+i]
+				dst[b*32+int64(i)] = s * mxfp4[q&0x0F]
+				dst[b*32+int64(i)+16] = s * mxfp4[q>>4]
+			}
+		}
 	case typeQ2_K:
 		for b := int64(0); b < n/256; b++ {
 			dequantQ2K(raw[b*84:b*84+84], dst[b*256:b*256+256])
@@ -481,6 +496,10 @@ func (f *File) Tensor(name string) (*tensai.Tensor, error) {
 // iq4nl is IQ4_NL's nonlinear codebook: sixteen levels spaced to match
 // the empirical weight distribution instead of uniformly.
 var iq4nl = [16]float32{-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113}
+
+// mxfp4 is the FP4 (E2M1) value table doubled onto an integer grid; the
+// per-block scale is halved to compensate.
+var mxfp4 = [16]float32{0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12}
 
 // scaleMinK4 unpacks the j-th 6-bit scale and min from a K-quant
 // super-block's 12 packed bytes (8 pairs: the first four pairs use the low
