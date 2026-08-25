@@ -142,15 +142,14 @@ func repackQ8(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap fun
 		}
 		for b := 0; b < nb; b++ {
 			blk := raw[(r*nb+b)*34:]
-			dst.Scale[b*dst.Cols+j] = gguf.Float16(binary.LittleEndian.Uint16(blk))
+			dst.Scale[dst.TableIndex(b, j)] = gguf.Float16(binary.LittleEndian.Uint16(blk))
 			var sum int32
 			for i := 0; i < 32; i++ {
 				w := int8(blk[2+i])
-				gi := b*32 + i
-				dst.Q[(gi/4)*4*dst.Cols+4*j+gi%4] = w
+				dst.Q[dst.Index(b*32+i, j)] = w
 				sum += int32(w)
 			}
-			dst.ColSum64[b*dst.Cols+j] = 64 * sum
+			dst.ColSum64[dst.TableIndex(b, j)] = 64 * sum
 		}
 	}
 }
@@ -279,13 +278,12 @@ func repackQ6K(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap fu
 			for is := 0; is < 16; is++ {
 				var sum int32
 				for k, w := range q[is*16 : is*16+16] {
-					gi := b*256 + is*16 + k
-					dst.Q[(gi/4)*4*dst.Cols+4*j+gi%4] = w
+					dst.Q[dst.Index(b*256+is*16+k, j)] = w
 					sum += int32(w)
 				}
 				g := b*16 + is
-				dst.Scale[g*dst.Cols+j] = d * float32(int8(sc[is]))
-				dst.ColSum64[g*dst.Cols+j] = 64 * sum
+				dst.Scale[dst.TableIndex(g, j)] = d * float32(int8(sc[is]))
+				dst.ColSum64[dst.TableIndex(g, j)] = 64 * sum
 			}
 		}
 	}
@@ -413,7 +411,7 @@ func repackQ4K8(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap f
 				}
 				g := b*8 + is
 				s8 := amax / 127
-				dst.Scale[g*dst.Cols+j] = s8
+				dst.Scale[dst.TableIndex(g, j)] = s8
 				if s8 == 0 {
 					continue
 				}
@@ -428,10 +426,9 @@ func repackQ4K8(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap f
 					}
 					n := int8(f)
 					sum += int32(n)
-					gi := b*256 + is*32 + k
-					dst.Q[(gi/4)*4*dst.Cols+4*j+gi%4] = n
+					dst.Q[dst.Index(b*256+is*32+k, j)] = n
 				}
-				dst.ColSum64[g*dst.Cols+j] = 64 * sum
+				dst.ColSum64[dst.TableIndex(g, j)] = 64 * sum
 			}
 		}
 	}
@@ -493,7 +490,7 @@ func repackQ5K8(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap f
 				}
 				g := b*8 + is
 				s8 := amax / 127
-				dst.Scale[g*dst.Cols+j] = s8
+				dst.Scale[dst.TableIndex(g, j)] = s8
 				if s8 == 0 {
 					continue
 				}
@@ -508,10 +505,9 @@ func repackQ5K8(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap f
 					}
 					n := int8(f)
 					sum += int32(n)
-					gi := b*256 + is*32 + k
-					dst.Q[(gi/4)*4*dst.Cols+4*j+gi%4] = n
+					dst.Q[dst.Index(b*256+is*32+k, j)] = n
 				}
-				dst.ColSum64[g*dst.Cols+j] = 64 * sum
+				dst.ColSum64[dst.TableIndex(g, j)] = 64 * sum
 			}
 		}
 	}
