@@ -42,7 +42,7 @@ func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, s
 			for g := 0; g < len(gsum); g++ {
 				ib := g * group / 4
 				ie := min(ib+group/4, quads)
-				gsf := archsimd.BroadcastFloat32x8(-Float(gsum[g]))
+				gsf := archsimd.BroadcastFloat32x8(Float(gsum[g]))
 				smrow := sm[g*cols:]
 				for jt := lo; jt < vecEnd; jt += 32 {
 					var a0, a1, a2, a3 archsimd.Int32x8
@@ -58,12 +58,18 @@ func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, s
 						v = loadU8x16(row[48:]).ExtendToUint16()
 						a3 = a3.Add(v.And(mLo).Or(v.ShiftAllLeft(4).And(mHi)).AsUint8x32().DotProductPairsSaturated(xp).DotProductPairs(ones))
 					}
-					for k, a := range [4]archsimd.Int32x8{a0, a1, a2, a3} {
-						j := jt + 8*k
-						u := loadU32x8(smrow[j:])
-						o := gsf.MulAdd(u.And(mMin).AsFloat32x8(), loadF32x8(out[j:]))
-						storeF32x8(a.ConvertToFloat32().MulAdd(u.ShiftAllLeft(16).AsFloat32x8(), o), out[j:])
-					}
+					u := loadU32x8(smrow[jt:])
+					f := a0.ConvertToFloat32().Mul(u.ShiftAllLeft(16).AsFloat32x8()).Sub(gsf.Mul(u.And(mMin).AsFloat32x8()))
+					storeF32x8(loadF32x8(out[jt:]).Add(f), out[jt:])
+					u = loadU32x8(smrow[jt+8:])
+					f = a1.ConvertToFloat32().Mul(u.ShiftAllLeft(16).AsFloat32x8()).Sub(gsf.Mul(u.And(mMin).AsFloat32x8()))
+					storeF32x8(loadF32x8(out[jt+8:]).Add(f), out[jt+8:])
+					u = loadU32x8(smrow[jt+16:])
+					f = a2.ConvertToFloat32().Mul(u.ShiftAllLeft(16).AsFloat32x8()).Sub(gsf.Mul(u.And(mMin).AsFloat32x8()))
+					storeF32x8(loadF32x8(out[jt+16:]).Add(f), out[jt+16:])
+					u = loadU32x8(smrow[jt+24:])
+					f = a3.ConvertToFloat32().Mul(u.ShiftAllLeft(16).AsFloat32x8()).Sub(gsf.Mul(u.And(mMin).AsFloat32x8()))
+					storeF32x8(loadF32x8(out[jt+24:]).Add(f), out[jt+24:])
 				}
 			}
 		} else {
@@ -86,11 +92,10 @@ func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, s
 						v = loadU8x16(row[48:]).ExtendToUint16()
 						a3 = a3.Add(v.And(mLo).Or(v.ShiftAllLeft(4).And(mHi)).AsUint8x32().DotProductPairsSaturated(xp).DotProductPairs(ones))
 					}
-					for k, a := range [4]archsimd.Int32x8{a0, a1, a2, a3} {
-						j := jt + 8*k
-						f := a.Sub(corr).ConvertToFloat32().Mul(loadF32x8(srow[j:]))
-						storeF32x8(loadF32x8(out[j:]).Add(f), out[j:])
-					}
+					storeF32x8(loadF32x8(out[jt:]).Add(a0.Sub(corr).ConvertToFloat32().Mul(loadF32x8(srow[jt:]))), out[jt:])
+					storeF32x8(loadF32x8(out[jt+8:]).Add(a1.Sub(corr).ConvertToFloat32().Mul(loadF32x8(srow[jt+8:]))), out[jt+8:])
+					storeF32x8(loadF32x8(out[jt+16:]).Add(a2.Sub(corr).ConvertToFloat32().Mul(loadF32x8(srow[jt+16:]))), out[jt+16:])
+					storeF32x8(loadF32x8(out[jt+24:]).Add(a3.Sub(corr).ConvertToFloat32().Mul(loadF32x8(srow[jt+24:]))), out[jt+24:])
 				}
 			}
 		}
@@ -126,6 +131,10 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 		mHi := archsimd.BroadcastUint16x16(0x0F00)
 		mMin := archsimd.BroadcastUint32x8(0xFFFF0000)
 		ones := archsimd.BroadcastInt16x16(1)
+		o0 := out.Data[r0*cols:]
+		o1 := out.Data[(r0+1)*cols:]
+		o2 := out.Data[(r0+2)*cols:]
+		o3 := out.Data[(r0+3)*cols:]
 		for r := 0; r < 4; r++ {
 			clear(out.Data[(r0+r)*cols+lo : (r0+r)*cols+vecEnd])
 		}
@@ -134,6 +143,10 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 				ib := g * group / 4
 				ie := min(ib+group/4, quads)
 				smrow := sm[g*cols:]
+				gsf0 := archsimd.BroadcastFloat32x8(Float(gsums[0][g]))
+				gsf1 := archsimd.BroadcastFloat32x8(Float(gsums[1][g]))
+				gsf2 := archsimd.BroadcastFloat32x8(Float(gsums[2][g]))
+				gsf3 := archsimd.BroadcastFloat32x8(Float(gsums[3][g]))
 				for jt := lo; jt < vecEnd; jt += 8 {
 					var a0, a1, a2, a3 archsimd.Int32x8
 					for i4 := ib; i4 < ie; i4++ {
@@ -148,12 +161,10 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 					u := loadU32x8(smrow[jt:])
 					sc := u.ShiftAllLeft(16).AsFloat32x8()
 					mn := u.And(mMin).AsFloat32x8()
-					for r, a := range [4]archsimd.Int32x8{a0, a1, a2, a3} {
-						gsf := archsimd.BroadcastFloat32x8(-Float(gsums[r][g]))
-						o := out.Data[(r0+r)*cols:]
-						f := gsf.MulAdd(mn, loadF32x8(o[jt:]))
-						storeF32x8(a.ConvertToFloat32().MulAdd(sc, f), o[jt:])
-					}
+					storeF32x8(loadF32x8(o0[jt:]).Add(a0.ConvertToFloat32().Mul(sc).Sub(gsf0.Mul(mn))), o0[jt:])
+					storeF32x8(loadF32x8(o1[jt:]).Add(a1.ConvertToFloat32().Mul(sc).Sub(gsf1.Mul(mn))), o1[jt:])
+					storeF32x8(loadF32x8(o2[jt:]).Add(a2.ConvertToFloat32().Mul(sc).Sub(gsf2.Mul(mn))), o2[jt:])
+					storeF32x8(loadF32x8(o3[jt:]).Add(a3.ConvertToFloat32().Mul(sc).Sub(gsf3.Mul(mn))), o3[jt:])
 				}
 			}
 		} else {
@@ -161,6 +172,10 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 				ib := g * group / 4
 				ie := min(ib+group/4, quads)
 				srow := scale[g*cols:]
+				corr0 := archsimd.BroadcastInt32x8(8 * gsums[0][g])
+				corr1 := archsimd.BroadcastInt32x8(8 * gsums[1][g])
+				corr2 := archsimd.BroadcastInt32x8(8 * gsums[2][g])
+				corr3 := archsimd.BroadcastInt32x8(8 * gsums[3][g])
 				for jt := lo; jt < vecEnd; jt += 8 {
 					var a0, a1, a2, a3 archsimd.Int32x8
 					for i4 := ib; i4 < ie; i4++ {
@@ -173,12 +188,10 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 						a3 = a3.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[3]).AsInt8x32()).DotProductPairs(ones))
 					}
 					sc := loadF32x8(srow[jt:])
-					for r, a := range [4]archsimd.Int32x8{a0, a1, a2, a3} {
-						corr := archsimd.BroadcastInt32x8(8 * gsums[r][g])
-						o := out.Data[(r0+r)*cols:]
-						f := a.Sub(corr).ConvertToFloat32().Mul(sc)
-						storeF32x8(loadF32x8(o[jt:]).Add(f), o[jt:])
-					}
+					storeF32x8(loadF32x8(o0[jt:]).Add(a0.Sub(corr0).ConvertToFloat32().Mul(sc)), o0[jt:])
+					storeF32x8(loadF32x8(o1[jt:]).Add(a1.Sub(corr1).ConvertToFloat32().Mul(sc)), o1[jt:])
+					storeF32x8(loadF32x8(o2[jt:]).Add(a2.Sub(corr2).ConvertToFloat32().Mul(sc)), o2[jt:])
+					storeF32x8(loadF32x8(o3[jt:]).Add(a3.Sub(corr3).ConvertToFloat32().Mul(sc)), o3[jt:])
 				}
 			}
 		}
