@@ -53,11 +53,20 @@ type splitConfig struct {
 	// is its own pre-token, so a digit never absorbs a preceding space, and
 	// whitespace running into a digit behaves as if at end of text.
 	individualDigits bool
+	// caseWords selects o200k's case-aware word alternatives: a run of
+	// uppercase-ish letters (any letter but ASCII a-z) then a run of
+	// lowercase-ish ones (any letter but ASCII A-Z), with contractions
+	// attaching as a suffix instead of splitting on their own.
+	caseWords bool
+	// punctSlash admits '/' into the punctuation run's newline tail
+	// (o200k's "[\r\n/]*").
+	punctSlash bool
 }
 
 var (
 	gpt2Config   = splitConfig{}
 	cl100kConfig = splitConfig{ciContractions: true, letterPrefix: true, maxDigits: 3, newlineRuns: true}
+	o200kConfig  = splitConfig{ciContractions: true, letterPrefix: true, maxDigits: 3, newlineRuns: true, caseWords: true, punctSlash: true}
 )
 
 // jsonFile mirrors the subset of tokenizer.json this package understands.
@@ -213,6 +222,9 @@ func classifyRegex(re string) (splitConfig, error) {
 	switch {
 	case strings.HasPrefix(re, `'s|'t|'re|'ve|'m|'ll|'d`):
 		return gpt2Config, nil
+	case strings.HasPrefix(re, `[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))*`):
+		// o200k (gpt-4o and friends), in llama.cpp's lookahead spelling.
+		return o200kConfig, nil
 	case strings.HasPrefix(re, `(?i:'s|'t|'re|'ve|'m|'ll|'d)`):
 		cfg := cl100kConfig
 		if strings.Contains(re, `\p{N}{1,3}`) {
@@ -359,8 +371,9 @@ func (t *Tokenizer) split(s string) []string {
 	var out []string
 	i := 0
 	for i < len(rs) {
-		// Contractions.
-		if rs[i] == '\'' && i+1 < len(rs) {
+		// Contractions — standalone alternatives in the gpt2/cl100k
+		// patterns; o200k attaches them to the word instead.
+		if !cfg.caseWords && rs[i] == '\'' && i+1 < len(rs) {
 			if n := matchContraction(rs[i:], cfg.ciContractions); n > 0 {
 				out = append(out, string(rs[i:i+n]))
 				i += n
@@ -382,8 +395,26 @@ func (t *Tokenizer) split(s string) []string {
 		}
 		if pfx < len(rs) && unicode.IsLetter(rs[pfx]) {
 			j = pfx
-			for j < len(rs) && unicode.IsLetter(rs[j]) {
-				j++
+			if cfg.caseWords {
+				// o200k: an uppercase-ish run (letters except ASCII a-z)
+				// then a lowercase-ish one (letters except ASCII A-Z) —
+				// the backtracking-free reading of its two alternatives —
+				// plus an optional contraction suffix.
+				for j < len(rs) && unicode.IsLetter(rs[j]) && !(rs[j] >= 'a' && rs[j] <= 'z') {
+					j++
+				}
+				for j < len(rs) && unicode.IsLetter(rs[j]) && !(rs[j] >= 'A' && rs[j] <= 'Z') {
+					j++
+				}
+				if j < len(rs) && rs[j] == '\'' {
+					if n := matchContraction(rs[j:], true); n > 0 {
+						j += n
+					}
+				}
+			} else {
+				for j < len(rs) && unicode.IsLetter(rs[j]) {
+					j++
+				}
 			}
 			out = append(out, string(rs[start:j]))
 			i = j
@@ -435,7 +466,7 @@ func (t *Tokenizer) split(s string) []string {
 				j++
 			}
 			if cfg.newlineRuns {
-				for j < len(rs) && (rs[j] == '\r' || rs[j] == '\n') {
+				for j < len(rs) && (rs[j] == '\r' || rs[j] == '\n' || (cfg.punctSlash && rs[j] == '/')) {
 					j++
 				}
 			}
