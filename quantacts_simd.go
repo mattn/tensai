@@ -15,9 +15,11 @@ func quantizeActsInto(x []Float, xu []uint8) Float {
 		return quantizeActsScalar(x, xu)
 	}
 	vecEnd := len(x) &^ 7
+	// Clearing the sign bit is Abs; the method only exists from Go 1.27.
+	mSign := archsimd.BroadcastInt32x8(0x7fffffff)
 	m := archsimd.BroadcastFloat32x8(0)
 	for i := 0; i < vecEnd; i += 8 {
-		m = m.Max(loadF32x8(x[i:]).Abs())
+		m = m.Max(loadF32x8(x[i:]).AsInt32x8().And(mSign).AsFloat32x8())
 	}
 	var mb [8]Float
 	storeF32x8(m, mb[:])
@@ -50,7 +52,7 @@ func quantizeActsInto(x []Float, xu []uint8) Float {
 	var buf [8]int32
 	for i := 0; i < vecEnd; i += 8 {
 		f := loadF32x8(x[i:])
-		iv := f.Abs().Mul(inv).Add(half).ConvertToInt32().Min(c63)
+		iv := f.AsInt32x8().And(mSign).AsFloat32x8().Mul(inv).Add(half).ConvertToInt32().Min(c63)
 		s := f.AsInt32x8().ShiftAllRight(31)
 		storeI32x8(iv.Xor(s).Sub(s).Add(c64), buf[:])
 		xu[i] = uint8(buf[0])
