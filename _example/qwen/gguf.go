@@ -1335,5 +1335,6 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 		}(i)
 	}
 	wg.Wait()
+	m.initRopeFreqs()
 	return m, tok, nil
 }
