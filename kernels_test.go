@@ -157,3 +157,24 @@ func TestLayerNormKernelMatchesGeneric(t *testing.T) {
 		}
 	}
 }
+
+func TestSiluMul(t *testing.T) {
+	rng := rand.New(rand.NewSource(21))
+	for _, n := range []int{1, 7, 8, 33, 1000} {
+		gate := make([]Float, n)
+		up := make([]Float, n)
+		want := make([]Float, n)
+		for i := range gate {
+			gate[i] = Float(rng.NormFloat64() * 4)
+			up[i] = Float(rng.NormFloat64())
+			g := float64(gate[i])
+			want[i] = Float(g/(1+math.Exp(-g))) * up[i]
+		}
+		SiluMul(gate, up)
+		for i := range gate {
+			if diff := math.Abs(float64(gate[i] - want[i])); diff > 2e-6*(1+math.Abs(float64(want[i]))) {
+				t.Fatalf("n=%d idx %d: got %v want %v", n, i, gate[i], want[i])
+			}
+		}
+	}
+}

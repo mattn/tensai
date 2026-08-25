@@ -50,6 +50,13 @@ func sigmoidFwdGeneric(dst, src []Float) {
 	}
 }
 
+// siluMulGeneric computes gate = silu(gate) * up, the SwiGLU gate.
+func siluMulGeneric(gate, up []Float) {
+	for i, g := range gate {
+		gate[i] = g / (1 + expF(-g)) * up[i]
+	}
+}
+
 // sigmoidBwdGeneric computes dst = grad * y * (1-y) from the forward output y.
 func sigmoidBwdGeneric(dst, grad, y []Float) {
 	for i, g := range grad {
