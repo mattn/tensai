@@ -181,6 +181,74 @@ func repackQ4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func
 	}
 }
 
+// repackQ50 copies a Q5_0 tensor's blocks — [out, in] with an f16 scale,
+// a 32-bit high-bit plane, and 32 offset-binary five-bit values apiece —
+// into columns of a transposed Group-32 Q8GMatrix: the 5-bit values
+// (offset removed they span -16..15) widen losslessly to int8.
+func repackQ50(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+	nb := in / 32
+	for r := 0; r < out; r++ {
+		j := colOff + r
+		if colMap != nil {
+			j = colOff + colMap(r)
+		}
+		for b := 0; b < nb; b++ {
+			blk := raw[(r*nb+b)*22:]
+			dst.Scale[dst.TableIndex(b, j)] = gguf.Float16(binary.LittleEndian.Uint16(blk))
+			qh := binary.LittleEndian.Uint32(blk[2:])
+			var sum int32
+			for i := 0; i < 16; i++ {
+				q := blk[6+i]
+				lo := int8(uint8(q&0x0F)|uint8(qh>>i<<4&0x10)) - 16
+				hi := int8(uint8(q>>4)|uint8(qh>>(i+12)&0x10)) - 16
+				dst.Q[dst.Index(b*32+i, j)] = lo
+				dst.Q[dst.Index(b*32+i+16, j)] = hi
+				sum += int32(lo) + int32(hi)
+			}
+			dst.ColSum64[dst.TableIndex(b, j)] = 64 * sum
+		}
+	}
+}
+
+// repackQ504 narrows a Q5_0 tensor into a transposed Group-32 symmetric
+// Q4Matrix: each five-bit value rounds to half its magnitude on the
+// nibble grid and the scale doubles, losing one bit of weight precision
+// with pure integer work.
+func repackQ504(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+	nb := in / 32
+	nib := func(v int) uint8 {
+		if v >= 0 {
+			v++
+		} else {
+			v--
+		}
+		v /= 2
+		if v > 7 {
+			v = 7
+		}
+		return uint8(v + 8)
+	}
+	for r := 0; r < out; r++ {
+		j := colOff + r
+		if colMap != nil {
+			j = colOff + colMap(r)
+		}
+		for b := 0; b < nb; b++ {
+			blk := raw[(r*nb+b)*22:]
+			dst.Scale[dst.TableIndex(b, j)] = 2 * gguf.Float16(binary.LittleEndian.Uint16(blk))
+			qh := binary.LittleEndian.Uint32(blk[2:])
+			for i := 0; i < 16; i++ {
+				q := blk[6+i]
+				lo := int(uint8(q&0x0F)|uint8(qh>>i<<4&0x10)) - 16
+				hi := int(uint8(q>>4)|uint8(qh>>(i+12)&0x10)) - 16
+				iLo, iHi := b*32+i, b*32+i+16
+				dst.Q[dst.Index(iLo, j)] |= nib(lo) << (4 * (iLo % 2))
+				dst.Q[dst.Index(iHi, j)] |= nib(hi) << (4 * (iHi % 2))
+			}
+		}
+	}
+}
+
 // ggufSPMTokenizer builds a SentencePiece tokenizer from the embedded
 // vocabulary, scores, and token types.
 func ggufSPMTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
@@ -594,9 +662,9 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 
 	arch, _ := g.String("general.architecture")
 	switch arch {
-	case "llama", "qwen2", "qwen3", "smollm3", "gemma3", "phi3":
+	case "llama", "qwen2", "qwen3", "smollm3", "gemma3", "phi3", "qwen2moe", "qwen3moe":
 	default:
-		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2, qwen3, llama, smollm3, gemma3, and phi3)", arch)
+		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2(+moe), qwen3(+moe), llama, smollm3, gemma3, and phi3)", arch)
 	}
 	meta := func(key string) int64 {
 		n, _ := g.Int(arch + "." + key)
@@ -621,6 +689,24 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 	if cfg.HiddenSize == 0 || cfg.Layers == 0 || cfg.Heads == 0 || cfg.KVHeads == 0 {
 		return nil, nil, fmt.Errorf("gguf is missing %s.* dimensions", arch)
 	}
+	if arch == "qwen2moe" || arch == "qwen3moe" {
+		cfg.NExpert = int(meta("expert_count"))
+		cfg.NExpertUsed = int(meta("expert_used_count"))
+		// Older conversions omit the expert dims; the tensors carry them.
+		if _, shape, ok := g.Info("blk.0.ffn_gate_exps.weight"); ok && len(shape) == 3 {
+			cfg.MoeFF = shape[1]
+		}
+		if _, shape, ok := g.Info("blk.0.ffn_gate_shexp.weight"); ok {
+			cfg.SharedFF = shape[0]
+		}
+		if cfg.NExpert == 0 || cfg.NExpertUsed == 0 || cfg.MoeFF == 0 {
+			return nil, nil, fmt.Errorf("gguf is missing %s expert dimensions", arch)
+		}
+		if bits == 0 || !direct {
+			return nil, nil, fmt.Errorf("%s needs -q8 or -q4 without -requant or -gpu (experts repack directly from the stored blocks)", arch)
+		}
+	}
+
 	// DeepSeek's R1 distills are stock qwen2/llama blocks speaking
 	// DeepSeek's turn markers; the embedded template gives them away.
 	if tpl, _ := g.String("tokenizer.chat_template"); strings.Contains(tpl, "<｜User｜>") {
@@ -952,6 +1038,97 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 		return quant(hcat(parts))
 	}
 
+	// moeExpert repacks one expert's plane of the named 3D tensors —
+	// [nExpert, out, in], each expert's slab contiguous — into a fused
+	// quantized matrix, choosing the destination by the stored type the
+	// way linDirectAuto does (Q8_0 stays int8 under either width).
+	moeExpert := func(names []string, e int) *qmat {
+		rowBytes := func(typ string, in int) int {
+			switch typ {
+			case "Q8_0":
+				return in / 32 * 34
+			case "Q4_0":
+				return in / 32 * 18
+			case "Q5_0":
+				return in / 32 * 22
+			case "Q4_K":
+				return in / 256 * 144
+			case "Q5_K":
+				return in / 256 * 176
+			case "Q6_K":
+				return in / 256 * 210
+			}
+			return 0
+		}
+		typ0, shape0, ok := g.Info(names[0])
+		if !ok || len(shape0) != 3 {
+			panic(fmt.Sprintf("moe: %s is not a 3D expert tensor", names[0]))
+		}
+		in := shape0[2]
+		var outs []int
+		total := 0
+		for _, name := range names {
+			typ, shape, ok := g.Info(name)
+			if !ok || typ != typ0 || shape[2] != in {
+				panic(fmt.Sprintf("moe: %s disagrees with %s in type or shape", name, names[0]))
+			}
+			outs = append(outs, shape[1])
+			total += shape[1]
+		}
+		rb := rowBytes(typ0, in)
+		if rb == 0 {
+			panic(fmt.Sprintf("moe: expert tensor %s stored as %s is unsupported", names[0], typ0))
+		}
+		var q4 *tensai.Q4Matrix
+		var q8 *tensai.Q8GMatrix
+		var pack func(raw []byte, out, colOff int)
+		switch {
+		case typ0 == "Q8_0":
+			q8 = tensai.NewQ8GMatrix(in, total, 0)
+			pack = func(raw []byte, out, colOff int) { repackQ8(q8, raw, out, in, colOff, nil) }
+		case typ0 == "Q4_0":
+			q4 = tensai.NewQ4Matrix(in, total, 32, false)
+			pack = func(raw []byte, out, colOff int) { repackQ4(q4, raw, out, in, colOff, nil) }
+		case typ0 == "Q5_0" && bits == 8:
+			q8 = tensai.NewQ8GMatrix(in, total, 0)
+			pack = func(raw []byte, out, colOff int) { repackQ50(q8, raw, out, in, colOff, nil) }
+		case typ0 == "Q5_0":
+			q4 = tensai.NewQ4Matrix(in, total, 32, false)
+			pack = func(raw []byte, out, colOff int) { repackQ504(q4, raw, out, in, colOff, nil) }
+		case typ0 == "Q4_K" && bits == 8:
+			q8 = tensai.NewQ8GMatrix(in, total, 0)
+			pack = func(raw []byte, out, colOff int) { repackQ4K8(q8, raw, out, in, colOff, nil) }
+		case typ0 == "Q4_K":
+			q4 = tensai.NewQ4Matrix(in, total, 32, true)
+			pack = func(raw []byte, out, colOff int) { repackQ4K(q4, raw, out, in, colOff, nil) }
+		case typ0 == "Q5_K" && bits == 8:
+			q8 = tensai.NewQ8GMatrix(in, total, 0)
+			pack = func(raw []byte, out, colOff int) { repackQ5K8(q8, raw, out, in, colOff, nil) }
+		case typ0 == "Q5_K":
+			q4 = tensai.NewQ4Matrix(in, total, 32, true)
+			pack = func(raw []byte, out, colOff int) { repackQ5K4(q4, raw, out, in, colOff, nil) }
+		case typ0 == "Q6_K" && bits == 8:
+			q8 = tensai.NewQ8GMatrix(in, total, 16)
+			pack = func(raw []byte, out, colOff int) { repackQ6K(q8, raw, out, in, colOff, nil) }
+		default: // Q6_K under -q4
+			q4 = tensai.NewQ4Matrix(in, total, 32, true)
+			pack = func(raw []byte, out, colOff int) { repackQ6K4(q4, raw, out, in, colOff, nil) }
+		}
+		colOff := 0
+		for i, name := range names {
+			_, raw, err := g.RawTensor(name)
+			if err != nil {
+				panic(err)
+			}
+			pack(raw[e*rb*outs[i]:], outs[i], colOff)
+			colOff += outs[i]
+		}
+		if q8 != nil {
+			return &qmat{cols: q8.Cols, f: q8.MatVec, mm: q8.MatMul}
+		}
+		return &qmat{cols: q4.Cols, f: q4.MatVec, mm: q4.MatMul}
+	}
+
 	// Only llama-converter architectures store q/k rows permuted
 	// (llama.cpp's SmolLM3 converter subclasses the Llama one).
 	qPerm, kPerm := 0, 0
@@ -1052,14 +1229,31 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 					[]int{qPerm, kPerm, 0})
 			}
 			b.wo, b.qo = linAuto([]string{p + "attn_output.weight"}, []int{0})
-			if _, _, ok := g.Info(p + "ffn_gate.weight"); ok {
-				b.wGU, b.qGU = linAuto([]string{p + "ffn_gate.weight", p + "ffn_up.weight"}, []int{0, 0})
-			} else {
-				// Phi-3 fuses gate and up into one ffn_up, gate rows first —
-				// transposed, exactly the [gate | up] column split downstream.
-				b.wGU, b.qGU = linAuto([]string{p + "ffn_up.weight"}, []int{0})
+			switch {
+			case cfg.NExpert > 0:
+				b.topK = cfg.NExpertUsed
+				b.normTopK = arch == "qwen3moe"
+				b.router = trans(p+"ffn_gate_inp.weight", 0)
+				b.experts = make([]expertFFN, cfg.NExpert)
+				for e := range b.experts {
+					b.experts[e].qGU = moeExpert([]string{p + "ffn_gate_exps.weight", p + "ffn_up_exps.weight"}, e)
+					b.experts[e].qDown = moeExpert([]string{p + "ffn_down_exps.weight"}, e)
+				}
+				if arch == "qwen2moe" {
+					_, b.sharedGU = linAuto([]string{p + "ffn_gate_shexp.weight", p + "ffn_up_shexp.weight"}, []int{0, 0})
+					_, b.sharedDown = linAuto([]string{p + "ffn_down_shexp.weight"}, []int{0})
+					b.sharedGate = vecOpt(p + "ffn_gate_inp_shexp.weight")
+				}
+			default:
+				if _, _, ok := g.Info(p + "ffn_gate.weight"); ok {
+					b.wGU, b.qGU = linAuto([]string{p + "ffn_gate.weight", p + "ffn_up.weight"}, []int{0, 0})
+				} else {
+					// Phi-3 fuses gate and up into one ffn_up, gate rows first —
+					// transposed, exactly the [gate | up] column split downstream.
+					b.wGU, b.qGU = linAuto([]string{p + "ffn_up.weight"}, []int{0})
+				}
+				b.wDown, b.qDown = linAuto([]string{p + "ffn_down.weight"}, []int{0})
 			}
-			b.wDown, b.qDown = linAuto([]string{p + "ffn_down.weight"}, []int{0})
 			b.bQKV = catVec(
 				unpermuteVec(vecOpt(p+"attn_q.bias"), qPerm),
 				unpermuteVec(vecOpt(p+"attn_k.bias"), kPerm),
