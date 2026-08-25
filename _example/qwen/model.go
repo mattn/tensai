@@ -62,21 +62,38 @@ type qmat struct {
 	cols int
 	f    func(x, out []float32) error
 	mm   func(x, out *tensai.Matrix) error
-	q8   *tensai.QMatrix  // retained for GPU upload
-	q4   *tensai.Q4Matrix // likewise, for the int4 twin
+	q8   *tensai.QMatrix     // retained for GPU upload
+	q4   *tensai.Q4Matrix    // likewise, for the int4 twin
+	q8g  *tensai.Q8GMatrix   // retained for the repack cache
+	mx   *tensai.MXFP4Matrix // likewise
+}
+
+func qmatQ8(q *tensai.QMatrix) *qmat {
+	return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, q8: q}
+}
+
+func qmatQ4(q *tensai.Q4Matrix) *qmat {
+	return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, q4: q}
+}
+
+func qmatQ8G(q *tensai.Q8GMatrix) *qmat {
+	return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, q8g: q}
+}
+
+func qmatMX(q *tensai.MXFP4Matrix) *qmat {
+	return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, mx: q}
 }
 
 func quantizeMat(m *tensai.Matrix, bits int) *qmat {
 	switch bits {
 	case 8:
-		q := tensai.QuantizeMatrix(m)
-		return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, q8: q}
+		return qmatQ8(tensai.QuantizeMatrix(m))
 	case 4:
 		q, err := tensai.QuantizeMatrix4(m)
 		if err != nil {
 			panic(err)
 		}
-		return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, q4: q}
+		return qmatQ4(q)
 	}
 	panic("unsupported quantization width")
 }

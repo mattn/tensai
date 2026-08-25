@@ -16,7 +16,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 
@@ -672,13 +674,48 @@ func unpermuteMap(rows, heads int) func(int) int {
 	}
 }
 
+// blockShape sets the per-layer facts that derive from the config and
+// architecture rather than from tensors, shared by the tensor load and
+// the repack-cache path (which skips the tensors entirely).
+func blockShape(b *qblock, cfg config, i int) {
+	arch := cfg.ModelType
+	// SmolLM3 skips RoPE on every fourth layer; the GGUF carries no
+	// flag for it, matching llama.cpp's hardcoded rule.
+	b.noPE = arch == "smollm3" && i%4 == 3
+	switch arch {
+	case "gemma3":
+		// Five of every six layers attend over a sliding window
+		// with the local rope base; the sixth is global. Sandwich
+		// norms and the gelu-tanh gate round out the block. (The
+		// converter already folds Gemma's +1 into norm weights.)
+		b.geglu = true
+		if (i+1)%6 != 0 {
+			b.window = cfg.SlidingWin
+			b.ropeTheta = 10000
+		}
+	case "gpt-oss":
+		// Even layers slide a 128-token window, the attention sinks
+		// absorbing the mass that would have gone beyond it.
+		if i%2 == 0 {
+			b.window = cfg.SlidingWin
+		}
+	}
+	if cfg.NExpert > 0 {
+		b.topK = cfg.NExpertUsed
+		b.normTopK = arch == "qwen3moe"
+		b.softmaxK = arch == "gpt-oss"
+		b.oaiGLU = arch == "gpt-oss"
+		b.experts = make([]expertFFN, cfg.NExpert)
+	}
+}
+
 // loadGGUF builds the model and its tokenizer from a single .gguf file,
 // quantizing each weight to `bits` (0 keeps float32) as it loads. With
 // bits == 8 and direct set, tensors stored as Q8_0 repack straight into
 // grouped-int8 matrices — no dequantize/requantize round trip, and finer
 // (32-row) scales than the float path would produce. The GPU path has no
 // grouped kernel yet, so -gpu passes direct=false.
-func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, error) {
+func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Tokenizer, error) {
 	g, err := gguf.Open(path)
 	if err != nil {
 		return nil, nil, err
@@ -884,7 +921,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 				repackQ5K8(dst, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
 				colOff += outs[i]
 			}
-			return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
+			return qmatQ8G(dst)
 		}
 		dst := tensai.NewQ4Matrix(in, total, 32, true)
 		colOff := 0
@@ -896,7 +933,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			repackQ5K4(dst, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
 			colOff += outs[i]
 		}
-		return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
+		return qmatQ4(dst)
 	}
 	// allQ6K gates the Q6_K repacks; the requested bit width picks the
 	// destination (lossless int8 for -q8, narrowed int4 for -q4).
@@ -938,7 +975,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 				repackQ6K(dst, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
 				colOff += outs[i]
 			}
-			return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
+			return qmatQ8G(dst)
 		}
 		dst := tensai.NewQ4Matrix(in, total, 32, true)
 		colOff := 0
@@ -950,7 +987,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			repackQ6K4(dst, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
 			colOff += outs[i]
 		}
-		return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
+		return qmatQ4(dst)
 	}
 	// linDirect4K repacks Q4_K tensors into a fused min-form Q4Matrix
 	// under -q4, or a fused Group-32 Q8GMatrix under -q8.
@@ -977,7 +1014,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 				repackQ4K8(dst, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
 				colOff += outs[i]
 			}
-			return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
+			return qmatQ8G(dst)
 		}
 		dst := tensai.NewQ4Matrix(in, total, 32, true)
 		colOff := 0
@@ -989,7 +1026,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			repackQ4K(dst, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
 			colOff += outs[i]
 		}
-		return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
+		return qmatQ4(dst)
 	}
 	// linDirect4 repacks Q4_0 tensors into a fused Group-32 Q4Matrix.
 	linDirect4 := func(names []string, perms []int) *qmat {
@@ -1014,7 +1051,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			repackQ4(dst, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
 			colOff += outs[i]
 		}
-		return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
+		return qmatQ4(dst)
 	}
 	// linDirect repacks one or more Q8_0 tensors into a fused grouped-int8
 	// matrix, column ranges concatenated in order; perms maps each part's
@@ -1041,7 +1078,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			repackQ8(dst, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
 			colOff += outs[i]
 		}
-		return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
+		return qmatQ8G(dst)
 	}
 
 	// linDirectAuto picks the direct repack a fused weight group
@@ -1165,12 +1202,12 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			colOff += outs[i]
 		}
 		if mx != nil {
-			return &qmat{cols: mx.Cols, f: mx.MatVec, mm: mx.MatMul}
+			return qmatMX(mx)
 		}
 		if q8 != nil {
-			return &qmat{cols: q8.Cols, f: q8.MatVec, mm: q8.MatMul}
+			return qmatQ8G(q8)
 		}
-		return &qmat{cols: q4.Cols, f: q4.MatVec, mm: q4.MatMul}
+		return qmatQ4(q4)
 	}
 
 	// Only llama-converter architectures store q/k rows permuted
@@ -1182,6 +1219,17 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 	headSz := cfg.HiddenSize / cfg.Heads
 	if cfg.HeadDim != 0 {
 		headSz = cfg.HeadDim
+	}
+	// A valid repack cache stands in for the whole tensor load: the
+	// weights map straight from the cache file as clean pages.
+	useCache := cache && bits != 0
+	cpath := cachePath(path, bits, direct)
+	if useCache {
+		if m, err := loadWeightCache(cpath, path, bits, direct, cfg, headSz); err == nil {
+			return m, tok, nil
+		} else if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "repack cache unusable (%v); repacking\n", err)
+		}
 	}
 	m := &qwen{cfg: cfg, headSz: headSz}
 	m.embed = tensor("token_embd.weight")
@@ -1243,20 +1291,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			got := loadGate.acquire(stage)
 			defer loadGate.release(got)
 			b := &m.blocks[i]
-			// SmolLM3 skips RoPE on every fourth layer; the GGUF carries no
-			// flag for it, matching llama.cpp's hardcoded rule.
-			b.noPE = arch == "smollm3" && i%4 == 3
-			if arch == "gemma3" {
-				// Five of every six layers attend over a sliding window
-				// with the local rope base; the sixth is global. Sandwich
-				// norms and the gelu-tanh gate round out the block. (The
-				// converter already folds Gemma's +1 into norm weights.)
-				b.geglu = true
-				if (i+1)%6 != 0 {
-					b.window = cfg.SlidingWin
-					b.ropeTheta = 10000
-				}
-			}
+			blockShape(b, cfg, i)
 			p := fmt.Sprintf("blk.%d.", i)
 			b.ln1 = tensor(p + "attn_norm.weight").Data
 			if arch == "gpt-oss" {
@@ -1267,9 +1302,6 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 				b.ln2 = tensor(p + "post_attention_norm.weight").Data
 				b.sinks = vecOpt(p + "attn_sinks.weight")
 				b.bo = vecOpt(p + "attn_output.bias")
-				if i%2 == 0 {
-					b.window = cfg.SlidingWin
-				}
 			} else {
 				b.ln2 = tensor(p + "ffn_norm.weight").Data
 				b.postAttn = vecOpt(p + "post_attention_norm.weight")
@@ -1289,10 +1321,6 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			b.wo, b.qo = linAuto([]string{p + "attn_output.weight"}, []int{0})
 			switch {
 			case cfg.NExpert > 0:
-				b.topK = cfg.NExpertUsed
-				b.normTopK = arch == "qwen3moe"
-				b.softmaxK = arch == "gpt-oss"
-				b.oaiGLU = arch == "gpt-oss"
 				b.router = trans(p+"ffn_gate_inp.weight", 0)
 				b.routerBias = vecOpt(p + "ffn_gate_inp.bias")
 				var gateB, upB, downB []float32
@@ -1301,7 +1329,6 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 					upB = tensor(p + "ffn_up_exps.bias").Data
 					downB = tensor(p + "ffn_down_exps.bias").Data
 				}
-				b.experts = make([]expertFFN, cfg.NExpert)
 				for e := range b.experts {
 					b.experts[e].qGU = moeExpert([]string{p + "ffn_gate_exps.weight", p + "ffn_up_exps.weight"}, e)
 					b.experts[e].qDown = moeExpert([]string{p + "ffn_down_exps.weight"}, e)
@@ -1345,5 +1372,18 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 	}
 	wg.Wait()
 	m.initRopeFreqs()
+	if useCache {
+		// Write the cache and serve this run from it too: the freshly
+		// repacked weights sit in anonymous memory the kernel can only
+		// evict through swap, while the same bytes in the file are
+		// clean, droppable pages.
+		if err := writeWeightCache(cpath, path, bits, direct, m); err != nil {
+			fmt.Fprintf(os.Stderr, "repack cache not written: %v\n", err)
+		} else if m2, err := loadWeightCache(cpath, path, bits, direct, cfg, headSz); err == nil {
+			fmt.Fprintf(os.Stderr, "repack cache written: %s\n", cpath)
+			m = m2
+			debug.FreeOSMemory()
+		}
+	}
 	return m, tok, nil
 }
