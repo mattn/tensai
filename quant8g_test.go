@@ -7,14 +7,17 @@ import (
 )
 
 // buildQ8G quantizes a float matrix group-wise into the Q8G layout, the
-// way a GGUF Q8_0 repack would (each 32-row group of a column shares one
-// scale).
-func buildQ8G(m *Matrix) *Q8GMatrix {
-	q := NewQ8GMatrix(m.Rows, m.Cols)
-	groups := (m.Rows + q8Group - 1) / q8Group
+// way a GGUF Q8_0 repack would (each `group`-row group of a column
+// shares one scale; 0 means the default 32).
+func buildQ8G(m *Matrix, group int) *Q8GMatrix {
+	q := NewQ8GMatrix(m.Rows, m.Cols, group)
+	if group == 0 {
+		group = q8Group
+	}
+	groups := (m.Rows + group - 1) / group
 	for j := 0; j < m.Cols; j++ {
 		for g := 0; g < groups; g++ {
-			rlo, rhi := g*q8Group, min((g+1)*q8Group, m.Rows)
+			rlo, rhi := g*group, min((g+1)*group, m.Rows)
 			var maxAbs Float
 			for i := rlo; i < rhi; i++ {
 				v := m.Data[i*m.Cols+j]
@@ -50,14 +53,20 @@ func buildQ8G(m *Matrix) *Q8GMatrix {
 
 func TestQ8GMatVecAndMatMul(t *testing.T) {
 	rng := rand.New(rand.NewSource(91))
-	for _, c := range []struct{ rows, cols int }{
-		{768, 2304}, // parallel path, many groups
-		{100, 33},   // partial final group, scalar tails
-		{33, 10},    // odd rows inside one full group plus a stub
-		{5, 7},
+	for _, c := range []struct{ rows, cols, group int }{
+		{768, 2304, 0}, // parallel path, many groups
+		{100, 33, 0},   // partial final group, scalar tails
+		{33, 10, 0},    // odd rows inside one full group plus a stub
+		{5, 7, 0},
+		{768, 2304, 16}, // finer scale groups: the GGUF Q6_K repack
+		{100, 33, 16},
 	} {
 		m := RandomMatrix(c.rows, c.cols, rng)
-		q := buildQ8G(m)
+		q := buildQ8G(m, c.group)
+		group := c.group
+		if group == 0 {
+			group = q8Group
+		}
 		x := make([]Float, c.rows)
 		for i := range x {
 			x[i] = Float(rng.NormFloat64())
@@ -69,11 +78,11 @@ func TestQ8GMatVecAndMatMul(t *testing.T) {
 
 		// Exact reference over the same weights and 7-bit activations.
 		xu, sx := quantizeActs(x)
-		groups := (c.rows + q8Group - 1) / q8Group
+		groups := (c.rows + group - 1) / group
 		for j := 0; j < c.cols; j++ {
 			var want float64
 			for g := 0; g < groups; g++ {
-				rlo, rhi := g*q8Group, min((g+1)*q8Group, c.rows)
+				rlo, rhi := g*group, min((g+1)*group, c.rows)
 				var acc int64
 				for i := rlo; i < rhi; i++ {
 					w := int64(q.Q[(i/4)*4*c.cols+4*j+i%4])
@@ -114,7 +123,7 @@ func TestQ8GMatVecAndMatMul(t *testing.T) {
 		}
 	}
 
-	q := NewQ8GMatrix(8, 8)
+	q := NewQ8GMatrix(8, 8, 0)
 	if err := q.MatVec(make([]Float, 7), make([]Float, 8)); err == nil {
 		t.Fatal("expected shape mismatch error")
 	}

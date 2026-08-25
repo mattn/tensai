@@ -211,6 +211,157 @@ func ggufSPMTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 	return tokenizer.NewSPM(tokens, scores, types, pre)
 }
 
+// kScaleMin unpacks the is-th 6-bit scale and min from a K-quant
+// super-block's twelve packed bytes.
+func kScaleMin(is int, q []byte) (sc, mn uint8) {
+	if is < 4 {
+		return q[is] & 63, q[is+4] & 63
+	}
+	return q[is+4]&0x0F | q[is-4]>>6<<4, q[is+4]>>4 | q[is]>>6<<4
+}
+
+// repackQ4K copies a Q4_K tensor's super-blocks — [out, in] with eight
+// 32-value sub-groups per 256, each carrying a 6-bit scale and min
+// against two f16 super-factors — into columns of a transposed Group-32
+// min-form Q4Matrix. Nibbles copy raw; only the per-group scale and min
+// tables touch floats.
+func repackQ4K(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+	nb := in / 256
+	for r := 0; r < out; r++ {
+		j := colOff + r
+		if colMap != nil {
+			j = colOff + colMap(r)
+		}
+		for b := 0; b < nb; b++ {
+			blk := raw[(r*nb+b)*144:]
+			d := gguf.Float16(binary.LittleEndian.Uint16(blk))
+			dmin := gguf.Float16(binary.LittleEndian.Uint16(blk[2:]))
+			scales := blk[4:16]
+			qs := blk[16:144]
+			for is := 0; is < 8; is++ {
+				sc, mn := kScaleMin(is, scales)
+				g := b*8 + is
+				dst.Scale[g*dst.Cols+j] = d * float32(sc)
+				dst.Min[g*dst.Cols+j] = dmin * float32(mn)
+			}
+			for c := 0; c < 4; c++ {
+				for l := 0; l < 32; l++ {
+					q := qs[32*c+l]
+					iLo := b*256 + 64*c + l
+					iHi := iLo + 32
+					dst.Q[(iLo/4)*2*dst.Cols+2*j+(iLo%4)/2] |= (q & 0x0F) << (4 * (iLo % 2))
+					dst.Q[(iHi/4)*2*dst.Cols+2*j+(iHi%4)/2] |= (q >> 4) << (4 * (iHi % 2))
+				}
+			}
+		}
+	}
+}
+
+// repackQ6K copies a Q6_K tensor's super-blocks — [out, in] with sixteen
+// 16-value sub-groups per 256, each carrying an int8 scale against one
+// f16 super-factor — into columns of a transposed Group-16 Q8GMatrix.
+// The 6-bit values land in int8 exactly (they span ±32 after the offset),
+// so only the per-group scale table touches floats.
+func repackQ6K(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+	nb := in / 256
+	var q [256]int8
+	for r := 0; r < out; r++ {
+		j := colOff + r
+		if colMap != nil {
+			j = colOff + colMap(r)
+		}
+		for b := 0; b < nb; b++ {
+			blk := raw[(r*nb+b)*210:]
+			sc := blk[192:208]
+			d := gguf.Float16(binary.LittleEndian.Uint16(blk[208:]))
+			decodeQ6K(blk, &q)
+			for is := 0; is < 16; is++ {
+				var sum int32
+				for k, w := range q[is*16 : is*16+16] {
+					gi := b*256 + is*16 + k
+					dst.Q[(gi/4)*4*dst.Cols+4*j+gi%4] = w
+					sum += int32(w)
+				}
+				g := b*16 + is
+				dst.Scale[g*dst.Cols+j] = d * float32(int8(sc[is]))
+				dst.ColSum64[g*dst.Cols+j] = 64 * sum
+			}
+		}
+	}
+}
+
+// decodeQ6K unpacks one 210-byte Q6_K super-block's 256 6-bit values
+// (offset removed, scales not applied) into q.
+func decodeQ6K(blk []byte, q *[256]int8) {
+	ql := blk[:128]
+	qh := blk[128:192]
+	for n := 0; n < 256; n += 128 {
+		qln := ql[n/2 : n/2+64]
+		qhn := qh[n/4 : n/4+32]
+		for l := 0; l < 32; l++ {
+			q[n+l] = int8(qln[l]&0x0F|qhn[l]>>0&3<<4) - 32
+			q[n+l+32] = int8(qln[l+32]&0x0F|qhn[l]>>2&3<<4) - 32
+			q[n+l+64] = int8(qln[l]>>4|qhn[l]>>4&3<<4) - 32
+			q[n+l+96] = int8(qln[l+32]>>4|qhn[l]>>6&3<<4) - 32
+		}
+	}
+}
+
+// repackQ6K4 narrows a Q6_K tensor — sixteen contiguous 16-value
+// sub-groups per 256, each with an int8 scale against one f16
+// super-factor — into columns of a transposed Group-32 min-form
+// Q4Matrix, the same shape the Q4_K repack produces. Each pair of
+// sub-groups renormalizes onto [0, 15] against its own span, losing at
+// most two bits of weight precision, and the values stream straight
+// from the mmap'd blocks — no float tensor is ever materialized. Used
+// when -q4 asks for a 4-bit runtime; -q8 keeps all six bits via
+// repackQ6K. (A Group-16 destination would preserve slightly more, but
+// folding every 16 rows costs ~25% of decode throughput.)
+func repackQ6K4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+	nb := in / 256
+	var q [256]int8
+	var v [32]float32
+	for r := 0; r < out; r++ {
+		j := colOff + r
+		if colMap != nil {
+			j = colOff + colMap(r)
+		}
+		for b := 0; b < nb; b++ {
+			blk := raw[(r*nb+b)*210:]
+			sc := blk[192:208]
+			d := gguf.Float16(binary.LittleEndian.Uint16(blk[208:]))
+			decodeQ6K(blk, &q)
+			for p := 0; p < 8; p++ {
+				t1 := d * float32(int8(sc[2*p]))
+				t2 := d * float32(int8(sc[2*p+1]))
+				for k, w := range q[p*32 : p*32+16] {
+					v[k] = t1 * float32(w)
+				}
+				for k, w := range q[p*32+16 : p*32+32] {
+					v[16+k] = t2 * float32(w)
+				}
+				vmin, vmax := v[0], v[0]
+				for _, w := range v[1:] {
+					vmin, vmax = min(vmin, w), max(vmax, w)
+				}
+				g := b*8 + p
+				scale := (vmax - vmin) / 15
+				dst.Scale[g*dst.Cols+j] = scale
+				dst.Min[g*dst.Cols+j] = -vmin
+				if scale == 0 {
+					continue
+				}
+				inv := 1 / scale
+				for k, w := range v {
+					nib := uint8((w-vmin)*inv + 0.5)
+					gi := b*256 + p*32 + k
+					dst.Q[(gi/4)*2*dst.Cols+2*j+(gi%4)/2] |= nib << (4 * (gi % 2))
+				}
+			}
+		}
+	}
+}
+
 // unpermuteMap returns the llama rope unpermutation as a row index map,
 // or nil when heads is zero.
 func unpermuteMap(rows, heads int) func(int) int {
@@ -334,6 +485,117 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 		}
 		return true
 	}
+	// allQ4K gates the Q4_K repack: every tensor Q4_K with the input
+	// dimension a whole number of 256-value super-blocks.
+	allQ4K := func(names ...string) bool {
+		if bits != 4 || !direct {
+			return false
+		}
+		for _, name := range names {
+			typ, shape, ok := g.Info(name)
+			if !ok || typ != "Q4_K" || shape[1]%256 != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	// allQ6K gates the Q6_K repacks; the requested bit width picks the
+	// destination (lossless int8 for -q8, narrowed int4 for -q4).
+	allQ6K := func(names ...string) bool {
+		if !direct {
+			return false
+		}
+		for _, name := range names {
+			typ, shape, ok := g.Info(name)
+			if !ok || typ != "Q6_K" || shape[1]%256 != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	// linDirect6K repacks Q6_K tensors: into a fused Group-16 Q8GMatrix
+	// under -q8 (int8 holds the 6-bit values exactly), or a Group-32
+	// min-form Q4Matrix under -q4 (spans renormalized to nibbles).
+	linDirect6K := func(names []string, perms []int) *qmat {
+		var outs []int
+		var in int
+		for _, name := range names {
+			_, shape, _ := g.Info(name)
+			outs = append(outs, shape[0])
+			in = shape[1]
+		}
+		total := 0
+		for _, o := range outs {
+			total += o
+		}
+		if bits == 8 {
+			dst := tensai.NewQ8GMatrix(in, total, 16)
+			colOff := 0
+			for i, name := range names {
+				_, raw, err := g.RawTensor(name)
+				if err != nil {
+					panic(err)
+				}
+				repackQ6K(dst, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
+				colOff += outs[i]
+			}
+			return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
+		}
+		quads := (in + 3) / 4
+		groups := (in + 31) / 32
+		dst := &tensai.Q4Matrix{
+			Rows:  in,
+			Cols:  total,
+			Q:     make([]uint8, quads*2*total+32),
+			Scale: make([]float32, groups*total),
+			Min:   make([]float32, groups*total),
+			Group: 32,
+		}
+		colOff := 0
+		for i, name := range names {
+			_, raw, err := g.RawTensor(name)
+			if err != nil {
+				panic(err)
+			}
+			repackQ6K4(dst, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
+			colOff += outs[i]
+		}
+		return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
+	}
+	// linDirect4K repacks Q4_K tensors into a fused min-form Q4Matrix.
+	linDirect4K := func(names []string, perms []int) *qmat {
+		var outs []int
+		var in int
+		for _, name := range names {
+			_, shape, _ := g.Info(name)
+			outs = append(outs, shape[0])
+			in = shape[1]
+		}
+		total := 0
+		for _, o := range outs {
+			total += o
+		}
+		quads := (in + 3) / 4
+		groups := (in + 31) / 32
+		dst := &tensai.Q4Matrix{
+			Rows:  in,
+			Cols:  total,
+			Q:     make([]uint8, quads*2*total+32),
+			Scale: make([]float32, groups*total),
+			Min:   make([]float32, groups*total),
+			Group: 32,
+		}
+		colOff := 0
+		for i, name := range names {
+			_, raw, err := g.RawTensor(name)
+			if err != nil {
+				panic(err)
+			}
+			repackQ4K(dst, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
+			colOff += outs[i]
+		}
+		return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
+	}
 	// linDirect4 repacks Q4_0 tensors into a fused Group-32 Q4Matrix.
 	linDirect4 := func(names []string, perms []int) *qmat {
 		var outs []int
@@ -382,7 +644,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 		for _, o := range outs {
 			total += o
 		}
-		dst := tensai.NewQ8GMatrix(in, total)
+		dst := tensai.NewQ8GMatrix(in, total, 0)
 		colOff := 0
 		for i, name := range names {
 			_, raw, err := g.RawTensor(name)
@@ -434,6 +696,14 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 				m.qLmT = linDirect4([]string{"output.weight"}, []int{0})
 				return
 			}
+			if allQ4K("output.weight") {
+				m.qLmT = linDirect4K([]string{"output.weight"}, []int{0})
+				return
+			}
+			if allQ6K("output.weight") {
+				m.qLmT = linDirect6K([]string{"output.weight"}, []int{0})
+				return
+			}
 			lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
 			got := loadGate.acquire(lmStage)
 			defer loadGate.release(got)
@@ -447,6 +717,14 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 		}
 		if allQ4("token_embd.weight") {
 			m.qLmT = linDirect4([]string{"token_embd.weight"}, []int{0})
+			return
+		}
+		if allQ4K("token_embd.weight") {
+			m.qLmT = linDirect4K([]string{"token_embd.weight"}, []int{0})
+			return
+		}
+		if allQ6K("token_embd.weight") {
+			m.qLmT = linDirect6K([]string{"token_embd.weight"}, []int{0})
 			return
 		}
 		lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
@@ -493,34 +771,32 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			b.kNorm = vecOpt(p + "attn_k_norm.weight")
 			b.postAttn = vecOpt(p + "post_attention_norm.weight")
 			b.postFFN = vecOpt(p + "post_ffw_norm.weight")
-			layerNames := []string{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight", p + "attn_output.weight", p + "ffn_gate.weight", p + "ffn_up.weight", p + "ffn_down.weight"}
-			if allQ8(layerNames...) {
-				b.qQKV = linDirect(
-					[]string{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"},
-					[]int{qPerm, kPerm, 0})
-				b.qo = linDirect([]string{p + "attn_output.weight"}, []int{0})
-				b.qGU = linDirect([]string{p + "ffn_gate.weight", p + "ffn_up.weight"}, []int{0, 0})
-				b.qDown = linDirect([]string{p + "ffn_down.weight"}, []int{0})
-			} else if allQ4(layerNames...) {
-				b.qQKV = linDirect4(
-					[]string{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"},
-					[]int{qPerm, kPerm, 0})
-				b.qo = linDirect4([]string{p + "attn_output.weight"}, []int{0})
-				b.qGU = linDirect4([]string{p + "ffn_gate.weight", p + "ffn_up.weight"}, []int{0, 0})
-				b.qDown = linDirect4([]string{p + "ffn_down.weight"}, []int{0})
-			} else {
-				b.wQKV, b.qQKV = quant(hcat([]*tensai.Matrix{
-					trans(p+"attn_q.weight", qPerm),
-					trans(p+"attn_k.weight", kPerm),
-					trans(p+"attn_v.weight", 0),
-				}))
-				b.wo, b.qo = lin(p+"attn_output.weight", 0)
-				b.wGU, b.qGU = quant(hcat([]*tensai.Matrix{
-					trans(p+"ffn_gate.weight", 0),
-					trans(p+"ffn_up.weight", 0),
-				}))
-				b.wDown, b.qDown = lin(p+"ffn_down.weight", 0)
+			// Each fused weight group picks the best route it qualifies
+			// for: a direct repack when the stored blocks line up with a
+			// runtime layout, the float detour otherwise.
+			linAuto := func(names []string, perms []int) (*tensai.Matrix, *qmat) {
+				switch {
+				case allQ8(names...):
+					return nil, linDirect(names, perms)
+				case allQ4(names...):
+					return nil, linDirect4(names, perms)
+				case allQ4K(names...):
+					return nil, linDirect4K(names, perms)
+				case allQ6K(names...):
+					return nil, linDirect6K(names, perms)
+				}
+				var parts []*tensai.Matrix
+				for i, name := range names {
+					parts = append(parts, trans(name, perms[i]))
+				}
+				return quant(hcat(parts))
 			}
+			b.wQKV, b.qQKV = linAuto(
+				[]string{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"},
+				[]int{qPerm, kPerm, 0})
+			b.wo, b.qo = linAuto([]string{p + "attn_output.weight"}, []int{0})
+			b.wGU, b.qGU = linAuto([]string{p + "ffn_gate.weight", p + "ffn_up.weight"}, []int{0, 0})
+			b.wDown, b.qDown = linAuto([]string{p + "ffn_down.weight"}, []int{0})
 			b.bQKV = catVec(
 				unpermuteVec(vecOpt(p+"attn_q.bias"), qPerm),
 				unpermuteVec(vecOpt(p+"attn_k.bias"), kPerm),
