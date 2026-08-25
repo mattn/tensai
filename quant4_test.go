@@ -162,19 +162,23 @@ func TestQuantize4Group32(t *testing.T) {
 		}
 
 		// Batch equals per-row MatVec bit for bit at this group length too.
-		xb := RandomMatrix(6, c.rows, rng)
-		ob := NewMatrix(6, c.cols)
-		if err := q.MatMul(xb, ob); err != nil {
-			t.Fatal(err)
-		}
-		row := make([]Float, c.cols)
-		for r := 0; r < 6; r++ {
-			if err := q.MatVec(xb.Data[r*c.rows:(r+1)*c.rows], row); err != nil {
+		// 6 pads to one eight-row block, 9 runs a block plus a padded
+		// tail, 12 a block plus the exact four-row kernel.
+		for _, batch := range []int{6, 9, 12} {
+			xb := RandomMatrix(batch, c.rows, rng)
+			ob := NewMatrix(batch, c.cols)
+			if err := q.MatMul(xb, ob); err != nil {
 				t.Fatal(err)
 			}
-			for j := range row {
-				if ob.Data[r*c.cols+j] != row[j] {
-					t.Fatalf("%v row %d col %d differs", c, r, j)
+			row := make([]Float, c.cols)
+			for r := 0; r < batch; r++ {
+				if err := q.MatVec(xb.Data[r*c.rows:(r+1)*c.rows], row); err != nil {
+					t.Fatal(err)
+				}
+				for j := range row {
+					if ob.Data[r*c.cols+j] != row[j] {
+						t.Fatalf("%v batch %d row %d col %d differs", c, batch, r, j)
+					}
 				}
 			}
 		}
@@ -262,19 +266,23 @@ func TestQuantize4MinForm(t *testing.T) {
 			}
 		}
 
-		xb := RandomMatrix(6, c.rows, rng)
-		ob := NewMatrix(6, c.cols)
-		if err := q.MatMul(xb, ob); err != nil {
-			t.Fatal(err)
-		}
-		row := make([]Float, c.cols)
-		for r := 0; r < 6; r++ {
-			if err := q.MatVec(xb.Data[r*c.rows:(r+1)*c.rows], row); err != nil {
+		// 6 pads to one eight-row block, 9 runs a block plus a padded
+		// tail, 12 a block plus the exact four-row kernel.
+		for _, batch := range []int{6, 9, 12} {
+			xb := RandomMatrix(batch, c.rows, rng)
+			ob := NewMatrix(batch, c.cols)
+			if err := q.MatMul(xb, ob); err != nil {
 				t.Fatal(err)
 			}
-			for j := range row {
-				if ob.Data[r*c.cols+j] != row[j] {
-					t.Fatalf("%v row %d col %d differs", c, r, j)
+			row := make([]Float, c.cols)
+			for r := 0; r < batch; r++ {
+				if err := q.MatVec(xb.Data[r*c.rows:(r+1)*c.rows], row); err != nil {
+					t.Fatal(err)
+				}
+				for j := range row {
+					if ob.Data[r*c.cols+j] != row[j] {
+						t.Fatalf("%v batch %d row %d col %d differs", c, batch, r, j)
+					}
 				}
 			}
 		}

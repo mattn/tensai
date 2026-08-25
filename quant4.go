@@ -228,29 +228,41 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 			gsums[r][min(i/grp, groups-1)] += int32(u) - 64
 		}
 	}
-	// See padRows8: the row tail pads to one full block over a shared
-	// scratch matrix so the weights stream once.
+	// See padRows8: the row tail pads to a full block over a shared
+	// scratch matrix so the weights stream once. A tail of exactly four
+	// takes the four-row kernel instead of padding to eight — the madd
+	// work scales with padded rows too, and speculative decoding's
+	// four-row verification block must not pay double.
 	var pxus [][]uint8
 	var psxs []Float
 	var pgs [][]int32
 	var scratch *Matrix
-	if rows%4 != 0 {
-		t := rows - rows%4
+	rem := rows % 8
+	if rem != 0 && rem != 4 {
+		t := rows - rem
 		pxus, psxs, scratch = padRows8(xus[t:], sxs[t:], len(xus[0]), q.Cols)
-		pgs = make([][]int32, 4)
+		pgs = make([][]int32, 8)
 		copy(pgs, gsums[t:])
-		for i := rows - t; i < 4; i++ {
+		for i := rem; i < 8; i++ {
 			pgs[i] = make([]int32, groups)
 		}
 	}
 	run := func(lo, hi int) {
 		var r int
-		for ; r+4 <= rows; r += 4 {
-			q4matmulCols4(out, xus[r:r+4], sxs[r:r+4], gsums[r:r+4], r, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
+		for ; r+8 <= rows; r += 8 {
+			q4matmulCols8(out, xus[r:r+8], sxs[r:r+8], gsums[r:r+8], r, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
 		}
-		if r < rows {
-			q4matmulCols4(scratch, pxus[:4], psxs[:4], pgs, 0, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
-			for i := 0; i < rows-r; i++ {
+		switch {
+		case rem == 0:
+		case rem == 4:
+			q4matmulCols4(out, xus[r:r+4], sxs[r:r+4], gsums[r:r+4], r, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
+		default:
+			if rem < 4 {
+				q4matmulCols4(scratch, pxus[:4], psxs[:4], pgs[:4], 0, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
+			} else {
+				q4matmulCols8(scratch, pxus, psxs, pgs, 0, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
+			}
+			for i := 0; i < rem; i++ {
 				copy(out.Data[(r+i)*q.Cols+lo:(r+i)*q.Cols+hi], scratch.Data[i*q.Cols+lo:i*q.Cols+hi])
 			}
 		}

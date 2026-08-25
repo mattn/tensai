@@ -303,3 +303,26 @@ func TestQuantizeActsAgree(t *testing.T) {
 		}
 	}
 }
+
+// BenchmarkQ4PrefillMinForm is the batched matmul over the asymmetric
+// Group-32 form GGUF's Q4_K repacks into — the shape a Q4_K_M prefill
+// actually runs.
+func BenchmarkQ4PrefillMinForm(b *testing.B) {
+	rng := rand.New(rand.NewSource(52))
+	q := NewQ4Matrix(1536, 8960, 32, true)
+	for i := range q.Q {
+		q.Q[i] = uint8(rng.Intn(256))
+	}
+	for i := range q.ScaleMin {
+		q.ScaleMin[i] = PackScaleMin(0.01, 0.2)
+	}
+	x := RandomMatrix(64, 1536, rng)
+	out := NewMatrix(64, 8960)
+	b.SetBytes(int64(64 * 1536 * 8960))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := q.MatMul(x, out); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
