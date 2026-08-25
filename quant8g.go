@@ -2,7 +2,6 @@ package tensai
 
 import (
 	"fmt"
-	"sync"
 )
 
 // q8Group is the number of input rows sharing one scale in a Q8GMatrix —
@@ -65,17 +64,9 @@ func (q *Q8GMatrix) MatVec(x, out []Float) error {
 		q8gMatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, grp, q.Cols, 0, q.Cols)
 		return nil
 	}
-	chunk := ((q.Cols+workers-1)/workers + 7) &^ 7
-	var wg sync.WaitGroup
-	for lo := 0; lo < q.Cols; lo += chunk {
-		hi := min(lo+chunk, q.Cols)
-		wg.Add(1)
-		go func(lo, hi int) {
-			defer wg.Done()
-			q8gMatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, grp, q.Cols, lo, hi)
-		}(lo, hi)
-	}
-	wg.Wait()
+	parallelChunks(q.Cols, workers, 8, func(lo, hi int) {
+		q8gMatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, grp, q.Cols, lo, hi)
+	})
 	return nil
 }
 
@@ -107,17 +98,9 @@ func (q *Q8GMatrix) MatMul(x, out *Matrix) error {
 		run(0, q.Cols)
 		return nil
 	}
-	chunk := ((q.Cols+workers-1)/workers + 7) &^ 7
-	var wg sync.WaitGroup
-	for lo := 0; lo < q.Cols; lo += chunk {
-		hi := min(lo+chunk, q.Cols)
-		wg.Add(1)
-		go func(lo, hi int) {
-			defer wg.Done()
-			run(lo, hi)
-		}(lo, hi)
-	}
-	wg.Wait()
+	parallelChunks(q.Cols, workers, 8, func(lo, hi int) {
+		run(lo, hi)
+	})
 	return nil
 }
 

@@ -21,6 +21,25 @@ func matvecWorkerCount(cols, rows int) int {
 	return workers
 }
 
+// parallelChunks splits [0, n) into align-rounded chunks across the
+// workers, the calling goroutine taking the first chunk itself: a
+// matvec fan-out spawns workers-1 goroutines and the caller streams
+// instead of idling on the join.
+func parallelChunks(n, workers, align int, body func(lo, hi int)) {
+	chunk := ((n+workers-1)/workers + align - 1) &^ (align - 1)
+	var wg sync.WaitGroup
+	for lo := chunk; lo < n; lo += chunk {
+		hi := min(lo+chunk, n)
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			body(lo, hi)
+		}(lo, hi)
+	}
+	body(0, min(chunk, n))
+	wg.Wait()
+}
+
 // QMatrix is a weight matrix quantized to int8 with one scale per output
 // column: W[i][j] ~= Float(q_ij) * Scale[j]. Rows are stored in
 // interleaved quads — Q[(i/4)*4*Cols + 4*j + i%4] holds rows i..i+3 of
@@ -184,17 +203,9 @@ func (q *QMatrix) MatVec(x, out []Float) error {
 		return nil
 	}
 	// Chunks stay multiples of 8 so only the last one has a scalar tail.
-	chunk := ((q.Cols+workers-1)/workers + 7) &^ 7
-	var wg sync.WaitGroup
-	for lo := 0; lo < q.Cols; lo += chunk {
-		hi := min(lo+chunk, q.Cols)
-		wg.Add(1)
-		go func(lo, hi int) {
-			defer wg.Done()
-			qmatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
-		}(lo, hi)
-	}
-	wg.Wait()
+	parallelChunks(q.Cols, workers, 8, func(lo, hi int) {
+		qmatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
+	})
 	return nil
 }
 
@@ -228,17 +239,9 @@ func (q *QMatrix) MatMul(x, out *Matrix) error {
 		run(0, q.Cols)
 		return nil
 	}
-	chunk := ((q.Cols+workers-1)/workers + 7) &^ 7
-	var wg sync.WaitGroup
-	for lo := 0; lo < q.Cols; lo += chunk {
-		hi := min(lo+chunk, q.Cols)
-		wg.Add(1)
-		go func(lo, hi int) {
-			defer wg.Done()
-			run(lo, hi)
-		}(lo, hi)
-	}
-	wg.Wait()
+	parallelChunks(q.Cols, workers, 8, func(lo, hi int) {
+		run(lo, hi)
+	})
 	return nil
 }
 
