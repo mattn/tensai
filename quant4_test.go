@@ -43,7 +43,7 @@ func TestQuantize4MatVec(t *testing.T) {
 					acc += nib * xs
 					gs += xs
 				}
-				want[j] += float64(acc-8*gs) * float64(q.Scale[g*c.cols+j])
+				want[j] += float64(acc-8*gs) * float64(q.Scale[q.TableIndex(g, j)])
 			}
 			want[j] *= float64(sx)
 		}
@@ -108,7 +108,7 @@ func TestQuantize4Group32(t *testing.T) {
 					}
 				}
 				s := maxAbs / 7
-				q.Scale[g*c.cols+j] = s
+				q.Scale[q.TableIndex(g, j)] = s
 				for i := rlo; i < rhi; i++ {
 					n := 0
 					if s != 0 {
@@ -153,7 +153,7 @@ func TestQuantize4Group32(t *testing.T) {
 					acc += nib * xs
 					gs += xs
 				}
-				want += float64(acc-8*gs) * float64(q.Scale[g*c.cols+j])
+				want += float64(acc-8*gs) * float64(q.Scale[q.TableIndex(g, j)])
 			}
 			want *= float64(sx)
 			if diff := math.Abs(float64(out[j]) - want); diff > 1e-3*(1+math.Abs(want)) {
@@ -208,8 +208,8 @@ func TestQuantize4MinForm(t *testing.T) {
 				// value = s*q + lo = s*q - min; the pack rounds the pair
 				// to bfloat16, so quantize against what the kernel will
 				// actually unpack.
-				q.ScaleMin[g*c.cols+j] = PackScaleMin((hi-lo)/15, -lo)
-				s, mn := UnpackScaleMin(q.ScaleMin[g*c.cols+j])
+				q.ScaleMin[q.TableIndex(g, j)] = PackScaleMin((hi-lo)/15, -lo)
+				s, mn := UnpackScaleMin(q.ScaleMin[q.TableIndex(g, j)])
 				lo = -mn
 				for i := rlo; i < rhi; i++ {
 					n := 0
@@ -245,7 +245,7 @@ func TestQuantize4MinForm(t *testing.T) {
 					acc += qv * xs
 					gs += xs
 				}
-				sc, mn := UnpackScaleMin(q.ScaleMin[g*c.cols+j])
+				sc, mn := UnpackScaleMin(q.ScaleMin[q.TableIndex(g, j)])
 				want += float64(acc)*float64(sc) - float64(gs)*float64(mn)
 			}
 			want *= float64(sx)

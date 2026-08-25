@@ -169,7 +169,7 @@ func repackQ4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func
 		}
 		for b := 0; b < nb; b++ {
 			blk := raw[(r*nb+b)*18:]
-			dst.Scale[b*dst.Cols+j] = gguf.Float16(binary.LittleEndian.Uint16(blk))
+			dst.Scale[dst.TableIndex(b, j)] = gguf.Float16(binary.LittleEndian.Uint16(blk))
 			for l := 0; l < 16; l++ {
 				q := blk[2+l]
 				iLo := b*32 + l
@@ -243,7 +243,7 @@ func repackQ4K(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fun
 			for is := 0; is < 8; is++ {
 				sc, mn := kScaleMin(is, scales)
 				g := b*8 + is
-				dst.ScaleMin[g*dst.Cols+j] = tensai.PackScaleMin(d*float32(sc), dmin*float32(mn))
+				dst.ScaleMin[dst.TableIndex(g, j)] = tensai.PackScaleMin(d*float32(sc), dmin*float32(mn))
 			}
 			for c := 0; c < 4; c++ {
 				for l := 0; l < 32; l++ {
@@ -350,7 +350,7 @@ func repackQ6K4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fu
 				// will unpack, so the rounding lands on the nibble choice
 				// rather than stacking onto the reconstruction.
 				packed := tensai.PackScaleMin((vmax-vmin)/15, -vmin)
-				dst.ScaleMin[g*dst.Cols+j] = packed
+				dst.ScaleMin[dst.TableIndex(g, j)] = packed
 				scale, mn := tensai.UnpackScaleMin(packed)
 				if scale == 0 {
 					continue
@@ -552,7 +552,7 @@ func repackQ5K4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fu
 				}
 				span := int(qhi) - int(qlo)
 				g := b*8 + is
-				dst.ScaleMin[g*dst.Cols+j] = tensai.PackScaleMin(
+				dst.ScaleMin[dst.TableIndex(g, j)] = tensai.PackScaleMin(
 					s*float32(sgn)*float32(span)/15, m-s*float32(qref))
 				if span == 0 {
 					continue

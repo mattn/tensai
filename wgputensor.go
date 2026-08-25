@@ -2194,7 +2194,9 @@ func (g *GPU) UploadQ4(q *Q4Matrix) (*GPUQ4Matrix, error) {
 	groups := (q.Rows + 63) / 64 // q4Group
 	scales := make([]float32, groups*words*4)
 	for gi := 0; gi < groups; gi++ {
-		copy(scales[gi*words*4:], q.Scale[gi*q.Cols:(gi+1)*q.Cols])
+		for j := 0; j < q.Cols; j++ {
+			scales[gi*words*4+j] = q.Scale[q.TableIndex(gi, j)]
+		}
 	}
 
 	g.mu.Lock()

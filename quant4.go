@@ -65,6 +65,14 @@ func (q *Q4Matrix) Index(i, j int) int {
 	return (j/q4Tile)*quads*2*q4Tile + (i/4)*2*q4Tile + (j%q4Tile)*2 + (i%4)/2
 }
 
+// TableIndex returns the position in Scale or ScaleMin of group g,
+// column j. Tables are tile-major like the nibbles — tile, then group,
+// then the 32 columns — so a kernel worker's table walk is sequential.
+func (q *Q4Matrix) TableIndex(g, j int) int {
+	groups := (q.Rows + q.group() - 1) / q.group()
+	return ((j/q4Tile)*groups+g)*q4Tile + j%q4Tile
+}
+
 // NewQ4Matrix allocates the layout for rows x cols with `group` input
 // rows per scale (0 for the default 64); minForm picks the packed
 // asymmetric scale/min table over the symmetric Scale. The caller fills
@@ -83,9 +91,9 @@ func NewQ4Matrix(rows, cols, group int, minForm bool) *Q4Matrix {
 		Group: group,
 	}
 	if minForm {
-		q.ScaleMin = make([]uint32, groups*cols)
+		q.ScaleMin = make([]uint32, tiles*groups*q4Tile)
 	} else {
-		q.Scale = make([]Float, groups*cols)
+		q.Scale = make([]Float, tiles*groups*q4Tile)
 	}
 	return q
 }
@@ -125,7 +133,7 @@ func quantize4Columns(m *Matrix, q *Q4Matrix, groups, colLo, colHi int) {
 				}
 			}
 			s := maxAbs / 7
-			q.Scale[g*m.Cols+j] = s
+			q.Scale[q.TableIndex(g, j)] = s
 			inv := Float(0)
 			if s != 0 {
 				inv = 1 / s
@@ -249,6 +257,7 @@ func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int
 		clear(out.Data[(r0+r)*cols+lo : (r0+r)*cols+hi])
 	}
 	quads := len(xus[0]) / 4
+	groups := len(gsums[0])
 	var acc [4][]int32
 	for r := range acc {
 		acc[r] = make([]int32, hi-lo)
@@ -276,22 +285,20 @@ func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int
 			}
 		}
 		if sm != nil {
-			smrow := sm[g*cols:]
 			for r := 0; r < 4; r++ {
 				o := out.Data[(r0+r)*cols:]
 				gs := Float(gsums[r][g])
 				for j := lo; j < hi; j++ {
-					s, m := UnpackScaleMin(smrow[j])
+					s, m := UnpackScaleMin(sm[((j/q4Tile)*groups+g)*q4Tile+j%q4Tile])
 					o[j] += Float(acc[r][j-lo])*s - gs*m
 				}
 			}
 		} else {
-			srow := scale[g*cols:]
 			for r := 0; r < 4; r++ {
 				o := out.Data[(r0+r)*cols:]
 				corr := 8 * gsums[r][g]
 				for j := lo; j < hi; j++ {
-					o[j] += Float(acc[r][j-lo]-corr) * srow[j]
+					o[j] += Float(acc[r][j-lo]-corr) * scale[((j/q4Tile)*groups+g)*q4Tile+j%q4Tile]
 				}
 			}
 		}
@@ -311,6 +318,7 @@ func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int
 func q4matvecColsGeneric(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, scale []Float, sm []uint32, group, cols, lo, hi int) {
 	clear(out[lo:hi])
 	quads := len(xu) / 4
+	groups := len(gsum)
 	acc := make([]int32, hi-lo)
 	for g := 0; g < len(gsum); g++ {
 		ib := g * group / 4
@@ -330,17 +338,15 @@ func q4matvecColsGeneric(out []Float, xu []uint8, sx Float, gsum []int32, qw []u
 			}
 		}
 		if sm != nil {
-			smrow := sm[g*cols:]
 			gs := Float(gsum[g])
 			for j := lo; j < hi; j++ {
-				s, m := UnpackScaleMin(smrow[j])
+				s, m := UnpackScaleMin(sm[((j/q4Tile)*groups+g)*q4Tile+j%q4Tile])
 				out[j] += Float(acc[j-lo])*s - gs*m
 			}
 		} else {
-			srow := scale[g*cols:]
 			corr := 8 * gsum[g]
 			for j := lo; j < hi; j++ {
-				out[j] += Float(acc[j-lo]-corr) * srow[j]
+				out[j] += Float(acc[j-lo]-corr) * scale[((j/q4Tile)*groups+g)*q4Tile+j%q4Tile]
 			}
 		}
 	}
