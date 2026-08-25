@@ -25,12 +25,12 @@ func q4xQuad(xu []uint8, i4 int) uint32 {
 	return x0 | x1<<8 | x2<<16 | x3<<24
 }
 
-func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, scale []Float, sm []uint32, group, cols, lo, hi int) {
+func q4matvecCols(out []Float, xu []uint8, xq []uint32, sx Float, gsum []int32, qw []uint8, scale []Float, sm []uint32, group, cols, lo, hi int) {
 	if !hasAVX2 {
 		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, sm, group, cols, lo, hi)
 		return
 	}
-	quads := len(xu) / 4
+	quads := len(xq)
 	vecEnd := lo + ((hi - lo) &^ 31)
 	if vecEnd > lo {
 		mLo := archsimd.BroadcastUint16x16(0x000F)
@@ -47,7 +47,7 @@ func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, s
 				for jt := lo; jt < vecEnd; jt += 32 {
 					var a0, a1, a2, a3 archsimd.Int32x8
 					for i4 := ib; i4 < ie; i4++ {
-						xp := archsimd.BroadcastUint32x8(q4xQuad(xu, i4)).AsInt8x32()
+						xp := archsimd.BroadcastUint32x8(xq[i4]).AsInt8x32()
 						row := qw[i4*2*cols+2*jt:]
 						v := loadU8x16(row).ExtendToUint16()
 						a0 = a0.Add(v.And(mLo).Or(v.ShiftAllLeft(4).And(mHi)).AsUint8x32().DotProductPairsSaturated(xp).DotProductPairs(ones))
@@ -81,7 +81,7 @@ func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, s
 				for jt := lo; jt < vecEnd; jt += 32 {
 					var a0, a1, a2, a3 archsimd.Int32x8
 					for i4 := ib; i4 < ie; i4++ {
-						xp := archsimd.BroadcastUint32x8(q4xQuad(xu, i4)).AsInt8x32()
+						xp := archsimd.BroadcastUint32x8(xq[i4]).AsInt8x32()
 						row := qw[i4*2*cols+2*jt:]
 						v := loadU8x16(row).ExtendToUint16()
 						a0 = a0.Add(v.And(mLo).Or(v.ShiftAllLeft(4).And(mHi)).AsUint8x32().DotProductPairsSaturated(xp).DotProductPairs(ones))

@@ -124,6 +124,21 @@ func quantize4Columns(m *Matrix, q *Q4Matrix, groups, colLo, colHi int) {
 	}
 }
 
+// packQuads re-centers the 7-bit activations to signed bytes and packs
+// each quad into the u32 the kernels broadcast, so the scalar assembly
+// runs once per call instead of once per column tile.
+func packQuads(xu []uint8) []uint32 {
+	xq := make([]uint32, len(xu)/4)
+	for i := range xq {
+		x0 := uint32(uint8(int8(int(xu[4*i]) - 64)))
+		x1 := uint32(uint8(int8(int(xu[4*i+1]) - 64)))
+		x2 := uint32(uint8(int8(int(xu[4*i+2]) - 64)))
+		x3 := uint32(uint8(int8(int(xu[4*i+3]) - 64)))
+		xq[i] = x0 | x1<<8 | x2<<16 | x3<<24
+	}
+	return xq
+}
+
 // MatVec computes out = x @ Q for a single activation row: len(x) must be
 // Rows and len(out) Cols. The activation row quantizes once per call, with
 // its per-group sums carrying the nibble offset correction.
@@ -133,6 +148,7 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 			len(x), len(out), q.Rows, q.Cols)
 	}
 	xu, sx := quantizeActs(x) // quad-padded, matching the weight layout
+	xq := packQuads(xu)
 	grp := q.group()
 	gsum := make([]int32, (q.Rows+grp-1)/grp)
 	for i, u := range xu {
@@ -140,7 +156,7 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 	}
 	workers := matvecWorkerCount(q.Cols, q.Rows)
 	if workers == 1 {
-		q4matvecCols(out, xu, sx, gsum, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, 0, q.Cols)
+		q4matvecCols(out, xu, xq, sx, gsum, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, 0, q.Cols)
 		return nil
 	}
 	chunk := ((q.Cols+workers-1)/workers + 7) &^ 7
@@ -150,7 +166,7 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 		wg.Add(1)
 		go func(lo, hi int) {
 			defer wg.Done()
-			q4matvecCols(out, xu, sx, gsum, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
+			q4matvecCols(out, xu, xq, sx, gsum, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
 		}(lo, hi)
 	}
 	wg.Wait()
@@ -185,7 +201,7 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 			q4matmulCols4(out, xus[r:r+4], sxs[r:r+4], gsums[r:r+4], r, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
 		}
 		for ; r < rows; r++ {
-			q4matvecCols(out.Data[r*q.Cols:(r+1)*q.Cols], xus[r], sxs[r], gsums[r], q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
+			q4matvecCols(out.Data[r*q.Cols:(r+1)*q.Cols], xus[r], packQuads(xus[r]), sxs[r], gsums[r], q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
 		}
 	}
 	workers := matvecWorkerCount(q.Cols, q.Rows)
