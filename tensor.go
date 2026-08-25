@@ -305,3 +305,15 @@ func Axpy(a Float, x, y []Float) {
 	}
 	axpy(a, x, y)
 }
+
+// SiluMul computes gate[i] = silu(gate[i]) * up[i] in place — the SwiGLU
+// activation between a transformer block's fused gate/up projection and
+// its down projection. The AVX2 build evaluates the sigmoid with the
+// same polynomial exp the training kernels use, so results can differ
+// from the portable build by a few float32 ulps.
+func SiluMul(gate, up []Float) {
+	if len(gate) != len(up) {
+		panic("tensai: SiluMul length mismatch")
+	}
+	siluMul(gate, up)
+}

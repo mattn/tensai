@@ -363,10 +363,7 @@ func rmsnorm(x, w []float32, eps float64) []float32 {
 // Gemma's tanh-approximated gelu when geglu is set.
 func activate(gate, up []float32, geglu bool) {
 	if !geglu {
-		for i := range gate {
-			g := float64(gate[i])
-			gate[i] = float32(g/(1+math.Exp(-g))) * up[i]
-		}
+		tensai.SiluMul(gate, up)
 		return
 	}
 	const c = 0.7978845608028654 // sqrt(2/pi)

@@ -12,6 +12,7 @@ func leakyBwd(dst, grad, src []Float, alpha Float) {
 	leakyBwdGeneric(dst, grad, src, alpha)
 }
 func sigmoidFwd(dst, src []Float)            { sigmoidFwdGeneric(dst, src) }
+func siluMul(gate, up []Float)               { siluMulGeneric(gate, up) }
 func sigmoidBwd(dst, grad, y []Float)        { sigmoidBwdGeneric(dst, grad, y) }
 func tanhFwd(dst, src []Float)               { tanhFwdGeneric(dst, src) }
 func tanhBwd(dst, grad, y []Float)           { tanhBwdGeneric(dst, grad, y) }

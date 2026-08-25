@@ -116,6 +116,20 @@ func sigmoidFwd(dst, src []Float) {
 	})
 }
 
+// siluMul computes gate = gate * sigmoid(gate) * up — the SwiGLU gate,
+// a transformer decode's only transcendental hot spot.
+func siluMul(gate, up []Float) {
+	if !hasAVX2 {
+		siluMulGeneric(gate, up)
+		return
+	}
+	one := archsimd.BroadcastFloat32x8(1)
+	zero := archsimd.BroadcastFloat32x8(0)
+	mapSlices2(gate, gate, up, func(g, u archsimd.Float32x8) archsimd.Float32x8 {
+		return g.Div(one.Add(vexpf(zero.Sub(g)))).Mul(u)
+	})
+}
+
 func sigmoidBwd(dst, grad, y []Float) {
 	if !hasAVX2 {
 		sigmoidBwdGeneric(dst, grad, y)
