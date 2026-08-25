@@ -2182,7 +2182,7 @@ func (g *GPU) UploadQ4(q *Q4Matrix) (*GPUQ4Matrix, error) {
 		if i >= q.Rows {
 			return 8 // zero pad row
 		}
-		return uint32(q.Q[(i/4)*2*q.Cols+2*j+(i%4)/2]>>(4*(i%2))) & 0x0F
+		return uint32(q.Q[q.Index(i, j)]>>(4*(i%2))) & 0x0F
 	}
 	packed := make([]uint32, pairs*words)
 	for i2 := 0; i2 < pairs; i2++ {

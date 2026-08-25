@@ -174,8 +174,8 @@ func repackQ4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func
 				q := blk[2+l]
 				iLo := b*32 + l
 				iHi := b*32 + l + 16
-				dst.Q[(iLo/4)*2*dst.Cols+2*j+(iLo%4)/2] |= (q & 0x0F) << (4 * (iLo % 2))
-				dst.Q[(iHi/4)*2*dst.Cols+2*j+(iHi%4)/2] |= (q >> 4) << (4 * (iHi % 2))
+				dst.Q[dst.Index(iLo, j)] |= (q & 0x0F) << (4 * (iLo % 2))
+				dst.Q[dst.Index(iHi, j)] |= (q >> 4) << (4 * (iHi % 2))
 			}
 		}
 	}
@@ -250,8 +250,8 @@ func repackQ4K(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fun
 					q := qs[32*c+l]
 					iLo := b*256 + 64*c + l
 					iHi := iLo + 32
-					dst.Q[(iLo/4)*2*dst.Cols+2*j+(iLo%4)/2] |= (q & 0x0F) << (4 * (iLo % 2))
-					dst.Q[(iHi/4)*2*dst.Cols+2*j+(iHi%4)/2] |= (q >> 4) << (4 * (iHi % 2))
+					dst.Q[dst.Index(iLo, j)] |= (q & 0x0F) << (4 * (iLo % 2))
+					dst.Q[dst.Index(iHi, j)] |= (q >> 4) << (4 * (iHi % 2))
 				}
 			}
 		}
@@ -364,7 +364,7 @@ func repackQ6K4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fu
 						n = 15
 					}
 					gi := b*256 + p*32 + k
-					dst.Q[(gi/4)*2*dst.Cols+2*j+(gi%4)/2] |= uint8(n) << (4 * (gi % 2))
+					dst.Q[dst.Index(gi, j)] |= uint8(n) << (4 * (gi % 2))
 				}
 			}
 		}
@@ -560,7 +560,7 @@ func repackQ5K4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fu
 				for k, w := range grp {
 					nib := (sgn*(int(w)-int(qref))*30 + span) / (2 * span)
 					gi := b*256 + is*32 + k
-					dst.Q[(gi/4)*2*dst.Cols+2*j+(gi%4)/2] |= uint8(nib) << (4 * (gi % 2))
+					dst.Q[dst.Index(gi, j)] |= uint8(nib) << (4 * (gi % 2))
 				}
 			}
 		}
@@ -763,15 +763,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			}
 			return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
 		}
-		quads := (in + 3) / 4
-		groups := (in + 31) / 32
-		dst := &tensai.Q4Matrix{
-			Rows:     in,
-			Cols:     total,
-			Q:        make([]uint8, quads*2*total+32),
-			ScaleMin: make([]uint32, groups*total),
-			Group:    32,
-		}
+		dst := tensai.NewQ4Matrix(in, total, 32, true)
 		colOff := 0
 		for i, name := range names {
 			_, raw, err := g.RawTensor(name)
@@ -825,15 +817,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			}
 			return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
 		}
-		quads := (in + 3) / 4
-		groups := (in + 31) / 32
-		dst := &tensai.Q4Matrix{
-			Rows:     in,
-			Cols:     total,
-			Q:        make([]uint8, quads*2*total+32),
-			ScaleMin: make([]uint32, groups*total),
-			Group:    32,
-		}
+		dst := tensai.NewQ4Matrix(in, total, 32, true)
 		colOff := 0
 		for i, name := range names {
 			_, raw, err := g.RawTensor(name)
@@ -872,15 +856,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			}
 			return &qmat{cols: dst.Cols, f: dst.MatVec, mm: dst.MatMul}
 		}
-		quads := (in + 3) / 4
-		groups := (in + 31) / 32
-		dst := &tensai.Q4Matrix{
-			Rows:     in,
-			Cols:     total,
-			Q:        make([]uint8, quads*2*total+32),
-			ScaleMin: make([]uint32, groups*total),
-			Group:    32,
-		}
+		dst := tensai.NewQ4Matrix(in, total, 32, true)
 		colOff := 0
 		for i, name := range names {
 			_, raw, err := g.RawTensor(name)
@@ -905,15 +881,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 		for _, o := range outs {
 			total += o
 		}
-		quads := (in + 3) / 4
-		groups := (in + 31) / 32
-		dst := &tensai.Q4Matrix{
-			Rows:  in,
-			Cols:  total,
-			Q:     make([]uint8, quads*2*total+32),
-			Scale: make([]float32, groups*total),
-			Group: 32,
-		}
+		dst := tensai.NewQ4Matrix(in, total, 32, false)
 		colOff := 0
 		for i, name := range names {
 			_, raw, err := g.RawTensor(name)

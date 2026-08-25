@@ -38,7 +38,7 @@ func TestQuantize4MatVec(t *testing.T) {
 				rlo, rhi := g*q4Group, min((g+1)*q4Group, c.rows)
 				var acc, gs int64
 				for i := rlo; i < rhi; i++ {
-					nib := int64(q.Q[(i/4)*2*c.cols+2*j+(i%4)/2]>>(4*(i%2))) & 0x0F
+					nib := int64(q.Q[q.Index(i, j)]>>(4*(i%2))) & 0x0F
 					xs := int64(xu[i]) - 64
 					acc += nib * xs
 					gs += xs
@@ -92,15 +92,8 @@ func TestQuantize4Group32(t *testing.T) {
 		m := RandomMatrix(c.rows, c.cols, rng)
 		// Build a Group-32 matrix by quantizing per 32-row group, the way
 		// a GGUF Q4_0 repack does.
-		quads := (c.rows + 3) / 4
 		groups := (c.rows + 31) / 32
-		q := &Q4Matrix{
-			Rows:  c.rows,
-			Cols:  c.cols,
-			Q:     make([]uint8, quads*2*c.cols+32),
-			Scale: make([]Float, groups*c.cols),
-			Group: 32,
-		}
+		q := NewQ4Matrix(c.rows, c.cols, 32, false)
 		for j := 0; j < c.cols; j++ {
 			for g := 0; g < groups; g++ {
 				rlo, rhi := g*32, min((g+1)*32, c.rows)
@@ -132,11 +125,11 @@ func TestQuantize4Group32(t *testing.T) {
 							n = 7
 						}
 					}
-					q.Q[(i/4)*2*c.cols+2*j+(i%4)/2] |= uint8(n+8) << (4 * (i % 2))
+					q.Q[q.Index(i, j)] |= uint8(n+8) << (4 * (i % 2))
 				}
 			}
-			for i := c.rows; i < 4*quads; i++ {
-				q.Q[(i/4)*2*c.cols+2*j+(i%4)/2] |= 8 << (4 * (i % 2))
+			for i := c.rows; i < 4*((c.rows+3)/4); i++ {
+				q.Q[q.Index(i, j)] |= 8 << (4 * (i % 2))
 			}
 		}
 
@@ -155,7 +148,7 @@ func TestQuantize4Group32(t *testing.T) {
 				rlo, rhi := g*32, min((g+1)*32, c.rows)
 				var acc, gs int64
 				for i := rlo; i < rhi; i++ {
-					nib := int64(q.Q[(i/4)*2*c.cols+2*j+(i%4)/2]>>(4*(i%2))) & 0x0F
+					nib := int64(q.Q[q.Index(i, j)]>>(4*(i%2))) & 0x0F
 					xs := int64(xu[i]) - 64
 					acc += nib * xs
 					gs += xs
@@ -197,15 +190,8 @@ func TestQuantize4MinForm(t *testing.T) {
 		m := RandomMatrix(c.rows, c.cols, rng)
 		// Asymmetric group quantization: value = scale*q - min, q in 0..15
 		// — the form GGUF's Q4_K sub-blocks carry.
-		quads := (c.rows + 3) / 4
 		groups := (c.rows + 31) / 32
-		q := &Q4Matrix{
-			Rows:     c.rows,
-			Cols:     c.cols,
-			Q:        make([]uint8, quads*2*c.cols+32),
-			ScaleMin: make([]uint32, groups*c.cols),
-			Group:    32,
-		}
+		q := NewQ4Matrix(c.rows, c.cols, 32, true)
 		for j := 0; j < c.cols; j++ {
 			for g := 0; g < groups; g++ {
 				rlo, rhi := g*32, min((g+1)*32, c.rows)
@@ -233,7 +219,7 @@ func TestQuantize4MinForm(t *testing.T) {
 							n = 15
 						}
 					}
-					q.Q[(i/4)*2*c.cols+2*j+(i%4)/2] |= uint8(n) << (4 * (i % 2))
+					q.Q[q.Index(i, j)] |= uint8(n) << (4 * (i % 2))
 				}
 			}
 			// Pad rows encode q=0; their min contribution must vanish, so
@@ -254,7 +240,7 @@ func TestQuantize4MinForm(t *testing.T) {
 				rlo, rhi := g*32, min((g+1)*32, c.rows)
 				var acc, gs int64
 				for i := rlo; i < rhi; i++ {
-					qv := int64(q.Q[(i/4)*2*c.cols+2*j+(i%4)/2]>>(4*(i%2))) & 0x0F
+					qv := int64(q.Q[q.Index(i, j)]>>(4*(i%2))) & 0x0F
 					xs := int64(xu[i]) - 64
 					acc += qv * xs
 					gs += xs
