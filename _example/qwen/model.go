@@ -43,11 +43,17 @@ type config struct {
 	// architecture — DeepSeek's R1 distills are qwen2/llama blocks that
 	// speak DeepSeek's turn markers. Set by the GGUF loader, never JSON.
 	ChatStyle string `json:"-"`
-	// MoE dimensions (qwen2moe/qwen3moe), from GGUF metadata.
+	// MoE dimensions (qwen2moe/qwen3moe/gpt-oss), from GGUF metadata.
 	NExpert     int `json:"-"`
 	NExpertUsed int `json:"-"`
 	MoeFF       int `json:"-"`
 	SharedFF    int `json:"-"`
+	// YaRN rope scaling (gpt-oss), from GGUF metadata; Factor 0 means
+	// plain rope.
+	YarnFactor   float64 `json:"-"`
+	YarnOrigCtx  int     `json:"-"`
+	YarnBetaFast float64 `json:"-"`
+	YarnBetaSlow float64 `json:"-"`
 }
 
 // qmat abstracts the int8 and int4 twins behind one matvec call, plus the
@@ -97,18 +103,25 @@ type qblock struct {
 	// place of the dense gate/up/down; qwen2moe adds an always-on shared
 	// expert scaled by a sigmoid gate.
 	router     *tensai.Matrix // [hidden, nExpert], float — tiny
+	routerBias []float32
 	experts    []expertFFN
 	topK       int
-	normTopK   bool // qwen3moe renormalizes the top-k weights
+	normTopK   bool      // qwen3moe renormalizes the top-k weights
+	softmaxK   bool      // gpt-oss: softmax over the top-k logits, not all
+	oaiGLU     bool      // gpt-oss: clamped swiglu with the (up+1) linear term
+	sinks      []float32 // gpt-oss: per-head extra softmax logit
+	bo         []float32 // attention output bias (gpt-oss)
 	sharedGU   *qmat
 	sharedDown *qmat
 	sharedGate []float32   // [hidden]; sigmoid(dot) scales the shared expert
 	kc, vc     [][]float32 // KV cache, kvHeads*headDim per position
 }
 
-// expertFFN is one expert's SwiGLU: fused gate|up and down projections.
+// expertFFN is one expert's SwiGLU: fused gate|up and down projections,
+// with gpt-oss carrying per-expert biases.
 type expertFFN struct {
-	qGU, qDown *qmat
+	qGU, qDown       *qmat
+	guBias, downBias []float32
 }
 
 type qwen struct {
@@ -385,6 +398,17 @@ func rmsnorm(x, w []float32, eps float64) []float32 {
 
 // activate applies the gated activation in place: silu(gate)*up, or
 // Gemma's tanh-approximated gelu when geglu is set.
+// swigluOAI is gpt-oss's clamped SwiGLU: gate = min(gate, 7),
+// up in [-7, 7], out = gate*sigmoid(1.702*gate) * (up + 1).
+func swigluOAI(gate, up []float32) {
+	const alpha, limit = 1.702, 7.0
+	for i, g := range gate {
+		gd := math.Min(float64(g), limit)
+		u := math.Min(math.Max(float64(up[i]), -limit), limit)
+		gate[i] = float32(gd / (1 + math.Exp(-alpha*gd)) * (u + 1))
+	}
+}
+
 func activate(gate, up []float32, geglu bool) {
 	if !geglu {
 		tensai.SiluMul(gate, up)
@@ -402,60 +426,95 @@ func activate(gate, up []float32, geglu bool) {
 // output scaled by its routing weight, and qwen2moe's shared expert
 // adds its sigmoid-gated output on top.
 func (m *qwen) moeFFN(b *qblock, a []float32) []float32 {
-	logits := mv(a, b.router, nil, nil)
-	// Softmax over all experts, per the HF reference; top-k picks from
-	// the probabilities.
-	maxL := logits[0]
-	for _, v := range logits[1:] {
-		maxL = max(maxL, v)
-	}
-	var sum float64
-	for i, v := range logits {
-		e := math.Exp(float64(v - maxL))
-		logits[i] = float32(e)
-		sum += e
-	}
-	inv := float32(1 / sum)
-	for i := range logits {
-		logits[i] *= inv
-	}
+	logits := mv(a, b.router, nil, b.routerBias)
 	type pick struct {
 		e int
 		w float32
 	}
 	picks := make([]pick, 0, b.topK)
-	for e, w := range logits {
-		if len(picks) < b.topK {
-			picks = append(picks, pick{e, w})
-			continue
-		}
-		lo := 0
-		for i := 1; i < len(picks); i++ {
-			if picks[i].w < picks[lo].w {
-				lo = i
+	if b.softmaxK {
+		// gpt-oss: pick the top-k logits, softmax over just those.
+		for e, w := range logits {
+			if len(picks) < b.topK {
+				picks = append(picks, pick{e, w})
+				continue
+			}
+			lo := 0
+			for i := 1; i < len(picks); i++ {
+				if picks[i].w < picks[lo].w {
+					lo = i
+				}
+			}
+			if w > picks[lo].w {
+				picks[lo] = pick{e, w}
 			}
 		}
-		if w > picks[lo].w {
-			picks[lo] = pick{e, w}
+		maxL := picks[0].w
+		for _, p := range picks[1:] {
+			maxL = max(maxL, p.w)
 		}
-	}
-	if b.normTopK {
-		var ws float32
-		for _, p := range picks {
-			ws += p.w
+		var sum float64
+		for i := range picks {
+			picks[i].w = float32(math.Exp(float64(picks[i].w - maxL)))
+			sum += float64(picks[i].w)
 		}
 		for i := range picks {
-			picks[i].w /= ws
+			picks[i].w = float32(float64(picks[i].w) / sum)
+		}
+	} else {
+		// Qwen MoE: softmax over all experts, then pick from the
+		// probabilities.
+		maxL := logits[0]
+		for _, v := range logits[1:] {
+			maxL = max(maxL, v)
+		}
+		var sum float64
+		for i, v := range logits {
+			e := math.Exp(float64(v - maxL))
+			logits[i] = float32(e)
+			sum += e
+		}
+		inv := float32(1 / sum)
+		for i := range logits {
+			logits[i] *= inv
+		}
+		for e, w := range logits {
+			if len(picks) < b.topK {
+				picks = append(picks, pick{e, w})
+				continue
+			}
+			lo := 0
+			for i := 1; i < len(picks); i++ {
+				if picks[i].w < picks[lo].w {
+					lo = i
+				}
+			}
+			if w > picks[lo].w {
+				picks[lo] = pick{e, w}
+			}
+		}
+		if b.normTopK {
+			var ws float32
+			for _, p := range picks {
+				ws += p.w
+			}
+			for i := range picks {
+				picks[i].w /= ws
+			}
 		}
 	}
 	out := make([]float32, m.cfg.HiddenSize)
 	moeFF := m.cfg.MoeFF
 	for _, p := range picks {
 		ex := &b.experts[p.e]
-		gu := mv(a, nil, ex.qGU, nil)
+		gu := mv(a, nil, ex.qGU, ex.guBias)
 		gate, up := gu[:moeFF], gu[moeFF:]
-		tensai.SiluMul(gate, up)
-		d := mv(gate, nil, ex.qDown, nil)
+		if b.oaiGLU {
+			swigluOAI(gate, up)
+		} else {
+			tensai.SiluMul(gate, up)
+		}
+		d := mv(gate, nil, ex.qDown, ex.downBias)
 		tensai.Axpy(p.w, d, out)
 	}
 	if b.sharedGU != nil {
@@ -543,10 +602,18 @@ func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, sco
 			maxs = s
 		}
 	}
+	if b.sinks != nil && float64(b.sinks[h]) > maxs {
+		maxs = float64(b.sinks[h])
+	}
 	var sum float64
 	for t := start; t < steps; t++ {
 		scores[t] = math.Exp(scores[t] - maxs)
 		sum += scores[t]
+	}
+	if b.sinks != nil {
+		// The sink is an extra softmax slot with no value: it only
+		// absorbs probability mass.
+		sum += math.Exp(float64(b.sinks[h]) - maxs)
 	}
 	out := attn[qOff : qOff+m.headSz]
 	for t := start; t < steps; t++ {
@@ -571,12 +638,35 @@ func (m *qwen) rope(h []float32, pos int, theta float64) {
 		theta = m.cfg.RopeTheta
 	}
 	half := m.headSz / 2
+	yarn := m.cfg.YarnFactor > 1
+	var low, high, mscale float64
+	if yarn {
+		// ggml's YaRN: dimensions below `low` keep their train-time
+		// frequencies (extrapolation), above `high` divide by the factor
+		// (interpolation), with a linear ramp between; the magnitudes
+		// scale by 1 + 0.1*ln(factor).
+		corr := func(rot float64) float64 {
+			return float64(m.headSz) * math.Log(float64(m.cfg.YarnOrigCtx)/(rot*2*math.Pi)) / (2 * math.Log(theta))
+		}
+		low = math.Max(0, math.Floor(corr(m.cfg.YarnBetaFast)))
+		high = math.Min(float64(m.headSz-1), math.Ceil(corr(m.cfg.YarnBetaSlow)))
+		mscale = 1 + 0.1*math.Log(m.cfg.YarnFactor)
+	}
 	for i := 0; i < half; i++ {
 		freq := math.Pow(theta, -2*float64(i)/float64(m.headSz))
-		s, c := math.Sincos(float64(pos) * freq)
+		angle := float64(pos) * freq
+		scale := 1.0
+		if yarn {
+			ramp := (float64(i) - low) / math.Max(0.001, high-low)
+			ramp = 1 - math.Min(1, math.Max(0, ramp))
+			angle = angle/m.cfg.YarnFactor*(1-ramp) + angle*ramp
+			scale = mscale
+		}
+		sv, cv := math.Sincos(angle)
+		sv, cv = sv*scale, cv*scale
 		a, b := float64(h[i]), float64(h[i+half])
-		h[i] = float32(a*c - b*s)
-		h[i+half] = float32(b*c + a*s)
+		h[i] = float32(a*cv - b*sv)
+		h[i+half] = float32(b*cv + a*sv)
 	}
 }
 
@@ -690,7 +780,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		}
 		wg.Wait()
 
-		proj := mmb(attn, b.wo, b.qo, nil)
+		proj := mmb(attn, b.wo, b.qo, b.bo)
 		if b.postAttn != nil {
 			for t := 0; t < n; t++ {
 				copy(proj.Data[t*hs:(t+1)*hs], rmsnorm(proj.Data[t*hs:(t+1)*hs], b.postAttn, cfg.RMSEps))
@@ -801,7 +891,7 @@ func (m *qwen) step(token, pos int) []float32 {
 				m.attendHead(b, q, attn, h, group, steps, scores)
 			}
 		}
-		proj := mv(attn, b.wo, b.qo, nil)
+		proj := mv(attn, b.wo, b.qo, b.bo)
 		if b.postAttn != nil {
 			proj = rmsnorm(proj, b.postAttn, cfg.RMSEps)
 		}
