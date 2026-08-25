@@ -59,6 +59,14 @@ type QMatrix struct {
 	ColSum64   []int32
 }
 
+// Index returns the position in Q of row i, column j: 32-column tiles
+// store their row quads back to back (128 bytes apiece), so a kernel
+// worker streams sequential memory.
+func (q *QMatrix) Index(i, j int) int {
+	quads := (q.Rows + 3) / 4
+	return (j/q4Tile)*quads*4*q4Tile + (i/4)*4*q4Tile + (j%q4Tile)*4 + i%4
+}
+
 // QuantizeMatrix quantizes column-wise, symmetric around zero with
 // round-to-nearest. Columns are independent, so large matrices split
 // across CPUs — quantize-at-load of a whole checkpoint is bound by this.
@@ -67,7 +75,7 @@ func QuantizeMatrix(m *Matrix) *QMatrix {
 	q := &QMatrix{
 		Rows:     m.Rows,
 		Cols:     m.Cols,
-		Q:        make([]int8, quads*4*m.Cols+32),
+		Q:        make([]int8, ((m.Cols+q4Tile-1)/q4Tile)*quads*4*q4Tile+32),
 		Scale:    make([]Float, m.Cols),
 		ColSum64: make([]int32, m.Cols+8), // padded for 8-wide loads
 	}
@@ -128,7 +136,7 @@ func quantizeColumns(m *Matrix, q *QMatrix, colLo, colHi int) {
 				v -= 0.5
 			}
 			w := int8(v)
-			q.Q[(i/4)*4*m.Cols+4*j+i%4] = w
+			q.Q[q.Index(i, j)] = w
 			sum += int32(w)
 		}
 		q.ColSum64[j] = 64 * sum
@@ -203,7 +211,7 @@ func (q *QMatrix) MatVec(x, out []Float) error {
 		return nil
 	}
 	// Chunks stay multiples of 8 so only the last one has a scalar tail.
-	parallelChunks(q.Cols, workers, 8, func(lo, hi int) {
+	parallelChunks(q.Cols, workers, q4Tile, func(lo, hi int) {
 		qmatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
 	})
 	return nil
@@ -239,7 +247,7 @@ func (q *QMatrix) MatMul(x, out *Matrix) error {
 		run(0, q.Cols)
 		return nil
 	}
-	parallelChunks(q.Cols, workers, 8, func(lo, hi int) {
+	parallelChunks(q.Cols, workers, q4Tile, func(lo, hi int) {
 		run(lo, hi)
 	})
 	return nil
@@ -254,14 +262,15 @@ func qmatmulRows8Generic(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []i
 	}
 	quads := len(xus[0]) / 4
 	for i4 := 0; i4 < quads; i4++ {
-		row := qw[i4*4*cols:]
+		row := qw[i4*4*q4Tile:]
 		for r := 0; r < 8; r++ {
 			x0, x1 := int32(xus[r][4*i4]), int32(xus[r][4*i4+1])
 			x2, x3 := int32(xus[r][4*i4+2]), int32(xus[r][4*i4+3])
 			a := acc[r]
 			for j := lo; j < hi; j++ {
-				a[j-lo] += x0*int32(row[4*j]) + x1*int32(row[4*j+1]) +
-					x2*int32(row[4*j+2]) + x3*int32(row[4*j+3])
+				o := (j/q4Tile)*quads*4*q4Tile + (j%q4Tile)*4
+				a[j-lo] += x0*int32(row[o]) + x1*int32(row[o+1]) +
+					x2*int32(row[o+2]) + x3*int32(row[o+3])
 			}
 		}
 	}
@@ -279,13 +288,15 @@ func qmatmulRows8Generic(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []i
 // quant_generic.go) dispatches to the AVX2 kernel when available.
 func qmatvecColsGeneric(out []Float, xu []uint8, sx Float, qw []int8, scale []Float, colSum64 []int32, cols, lo, hi int) {
 	acc := make([]int32, hi-lo)
-	for i4 := 0; i4 < len(xu)/4; i4++ {
+	quads := len(xu) / 4
+	for i4 := 0; i4 < quads; i4++ {
 		x0, x1 := int32(xu[4*i4]), int32(xu[4*i4+1])
 		x2, x3 := int32(xu[4*i4+2]), int32(xu[4*i4+3])
-		row := qw[i4*4*cols:]
+		row := qw[i4*4*q4Tile:]
 		for j := lo; j < hi; j++ {
-			acc[j-lo] += x0*int32(row[4*j]) + x1*int32(row[4*j+1]) +
-				x2*int32(row[4*j+2]) + x3*int32(row[4*j+3])
+			o := (j/q4Tile)*quads*4*q4Tile + (j%q4Tile)*4
+			acc[j-lo] += x0*int32(row[o]) + x1*int32(row[o+1]) +
+				x2*int32(row[o+2]) + x3*int32(row[o+3])
 		}
 	}
 	for j := lo; j < hi; j++ {

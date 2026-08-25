@@ -32,10 +32,11 @@ func qmatvecCols(out []Float, xu []uint8, sx Float, qw []int8, scale []Float, co
 	ones := archsimd.BroadcastInt16x16(1)
 	vecEnd := lo + ((hi - lo) &^ 31)
 	for jt := lo; jt < vecEnd; jt += 32 {
+		tile := qw[(jt/q4Tile)*quads*4*q4Tile:]
 		var a0, a1, a2, a3 archsimd.Int32x8
 		for i4 := 0; i4 < quads; i4++ {
 			xp := archsimd.BroadcastUint32x8(qxQuad(xu, i4)).AsUint8x32()
-			row := qw[i4*4*cols+4*jt:]
+			row := tile[i4*4*q4Tile:]
 			a0 = a0.Add(xp.DotProductPairsSaturated(loadI8x32(row)).DotProductPairs(ones))
 			a1 = a1.Add(xp.DotProductPairsSaturated(loadI8x32(row[32:])).DotProductPairs(ones))
 			a2 = a2.Add(xp.DotProductPairsSaturated(loadI8x32(row[64:])).DotProductPairs(ones))
@@ -77,9 +78,10 @@ func qmatmulRows8(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []int8, sc
 	ones := archsimd.BroadcastInt16x16(1)
 	vecEnd := lo + ((hi - lo) &^ 7)
 	for jt := lo; jt < vecEnd; jt += 8 {
+		tile := qw[(jt/q4Tile)*quads*4*q4Tile+(jt%q4Tile)*4:]
 		var a0, a1, a2, a3, a4, a5, a6, a7 archsimd.Int32x8
 		for i4 := 0; i4 < quads; i4++ {
-			w := loadI8x32(qw[i4*4*cols+4*jt:])
+			w := loadI8x32(tile[i4*4*q4Tile:])
 			xf := xq[i4*8 : i4*8+8]
 			a0 = a0.Add(archsimd.BroadcastUint32x8(xf[0]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))
 			a1 = a1.Add(archsimd.BroadcastUint32x8(xf[1]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))

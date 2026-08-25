@@ -84,14 +84,21 @@ func sliceQ(q *tensai.QMatrix, lo, hi int) *tensai.QMatrix {
 	out := &tensai.QMatrix{
 		Rows:     q.Rows,
 		Cols:     cols,
-		Q:        make([]int8, quads*4*cols+32),
+		Q:        make([]int8, ((cols+31)/32)*quads*4*32+32),
 		Scale:    make([]float32, cols),
 		ColSum64: make([]int32, cols+8),
 	}
 	copy(out.Scale, q.Scale[lo:hi])
 	copy(out.ColSum64, q.ColSum64[lo:hi])
-	for i4 := 0; i4 < quads; i4++ {
-		copy(out.Q[i4*4*cols:i4*4*cols+4*cols], q.Q[i4*4*q.Cols+4*lo:i4*4*q.Cols+4*hi])
+	if lo%32 == 0 && cols%32 == 0 {
+		block := quads * 4 * 32
+		copy(out.Q[:(cols/32)*block], q.Q[(lo/32)*block:(hi/32)*block])
+	} else {
+		for j := 0; j < cols; j++ {
+			for i := 0; i < 4*quads; i++ {
+				out.Q[out.Index(i, j)] = q.Q[q.Index(i, lo+j)]
+			}
+		}
 	}
 	return out
 }
