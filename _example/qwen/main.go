@@ -237,7 +237,23 @@ type tmpl struct {
 	stops               []string
 }
 
+// qwenSystem is the -system default; models outside the Qwen family get
+// a neutral prompt instead, since Qwen's branding derails some of them
+// (Phi-3 in particular treats it as a writing exercise).
+const qwenSystem = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+
 func templateFor(modelType string, think bool) tmpl {
+	if modelType == "phi3" {
+		// Phi-3's template has no system role either; its official
+		// guidance folds the system prompt into the first user turn.
+		return tmpl{
+			bos:      "<s>",
+			userOpen: "<|user|>\n", userClose: "<|end|>\n",
+			asstOpen: "<|assistant|>\n", asstClose: "<|end|>\n",
+			foldSystem: true,
+			stops:      []string{"<|end|>", "<|endoftext|>"},
+		}
+	}
 	if modelType == "gemma3" {
 		return tmpl{
 			bos:      "<bos>",
@@ -265,7 +281,7 @@ func main() {
 	dataDir := flag.String("data", "_example/qwen/data", "directory for the downloaded model files")
 	repo := flag.String("repo", defaultRepo, "Hugging Face repo to download missing model files from")
 	prompt := flag.String("prompt", "What is the capital of France?", "user message (or raw prompt with -raw)")
-	system := flag.String("system", "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.", "system message for the chat template")
+	system := flag.String("system", qwenSystem, "system message for the chat template (Qwen's branding swaps for a neutral one on other models)")
 	raw := flag.Bool("raw", false, "skip the chat template, complete the prompt as-is")
 	n := flag.Int("n", 256, "max tokens to generate")
 	temp := flag.Float64("temp", 0, "sampling temperature; 0 = greedy")
@@ -361,6 +377,9 @@ func main() {
 			draftM.cfg.Layers, draftM.cfg.HiddenSize, time.Since(start).Round(time.Millisecond))
 	}
 
+	if *system == qwenSystem && model.cfg.ModelType != "qwen2" && model.cfg.ModelType != "qwen3" {
+		*system = "You are a helpful assistant."
+	}
 	tm := templateFor(model.cfg.ModelType, *think)
 	stopID := func(i int) int {
 		if i < len(tm.stops) {
