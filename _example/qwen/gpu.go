@@ -23,8 +23,12 @@ type gpuMat interface {
 
 type gpuLayer struct {
 	ln1, ln2                          *tensai.GPUTensor
-	qNorm, kNorm                      *tensai.GPUTensor // Qwen3 QK-norm; nil otherwise
+	qNorm, kNorm                      *tensai.GPUTensor // Qwen3/Gemma QK-norm; nil otherwise
+	postAttn, postFFN                 *tensai.GPUTensor // Gemma sandwich norms; nil otherwise
 	noPE                              bool
+	window                            int
+	ropeTheta                         float64
+	geglu                             bool
 	bq, bk, bv                        *tensai.GPUTensor
 	qq, qk, qv, qo, qGate, qUp, qDown gpuMat
 	kc, vc                            *tensai.GPUTensor // [nCtx, kvDim]
@@ -130,8 +134,12 @@ func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 		}
 		l := &gq.layers[i]
 		l.noPE = b.noPE
+		l.window = b.window
+		l.ropeTheta = b.ropeTheta
+		l.geglu = b.geglu
 		l.ln1, l.ln2 = vec(b.ln1), vec(b.ln2)
 		l.qNorm, l.kNorm = vec(b.qNorm), vec(b.kNorm)
+		l.postAttn, l.postFFN = vec(b.postAttn), vec(b.postFFN)
 		l.bq = vec(vecRange(b.bQKV, 0, hs))
 		l.bk = vec(vecRange(b.bQKV, hs, hs+kvDim))
 		l.bv = vec(vecRange(b.bQKV, hs+kvDim, hs+2*kvDim))
@@ -200,10 +208,14 @@ func (gq *gpuQwen) prefill(tokens []int, startPos int) []float32 {
 			k = nk
 		}
 		if !l.noPE {
-			if err := q.RoPE(m.headSz, startPos, cfg.RopeTheta); err != nil {
+			theta := l.ropeTheta
+			if theta == 0 {
+				theta = cfg.RopeTheta
+			}
+			if err := q.RoPE(m.headSz, startPos, theta); err != nil {
 				panic(err)
 			}
-			if err := k.RoPE(m.headSz, startPos, cfg.RopeTheta); err != nil {
+			if err := k.RoPE(m.headSz, startPos, theta); err != nil {
 				panic(err)
 			}
 		}
@@ -215,10 +227,15 @@ func (gq *gpuQwen) prefill(tokens []int, startPos int) []float32 {
 		}
 		k.Free()
 		v.Free()
-		attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, cfg.KVHeads, startPos+n))
+		attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, cfg.KVHeads, startPos+n, l.window))
 		q.Free()
 		proj := must(l.qo.MatMul(attn))
 		attn.Free()
+		if l.postAttn != nil {
+			np := must(proj.RMSNorm(l.postAttn, cfg.RMSEps))
+			proj.Free()
+			proj = np
+		}
 		if err := x.Add(proj); err != nil {
 			panic(err)
 		}
@@ -228,12 +245,21 @@ func (gq *gpuQwen) prefill(tokens []int, startPos int) []float32 {
 		gate := must(l.qGate.MatMul(a))
 		up := must(l.qUp.MatMul(a))
 		a.Free()
-		if err := gate.SiluMul(up); err != nil {
+		if l.geglu {
+			if err := gate.GeluMul(up); err != nil {
+				panic(err)
+			}
+		} else if err := gate.SiluMul(up); err != nil {
 			panic(err)
 		}
 		up.Free()
 		down := must(l.qDown.MatMul(gate))
 		gate.Free()
+		if l.postFFN != nil {
+			nd := must(down.RMSNorm(l.postFFN, cfg.RMSEps))
+			down.Free()
+			down = nd
+		}
 		if err := x.Add(down); err != nil {
 			panic(err)
 		}
@@ -289,10 +315,14 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 			k = nk
 		}
 		if !l.noPE {
-			if err := q.RoPE(m.headSz, pos, cfg.RopeTheta); err != nil {
+			theta := l.ropeTheta
+			if theta == 0 {
+				theta = cfg.RopeTheta
+			}
+			if err := q.RoPE(m.headSz, pos, theta); err != nil {
 				panic(err)
 			}
-			if err := k.RoPE(m.headSz, pos, cfg.RopeTheta); err != nil {
+			if err := k.RoPE(m.headSz, pos, theta); err != nil {
 				panic(err)
 			}
 		}
@@ -307,10 +337,15 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 		if pos+1 > gq.gpuLen {
 			gq.gpuLen = pos + 1
 		}
-		attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, cfg.KVHeads, pos+1))
+		attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, cfg.KVHeads, pos+1, l.window))
 		q.Free()
 		proj := must(l.qo.MatMul(attn))
 		attn.Free()
+		if l.postAttn != nil {
+			np := must(proj.RMSNorm(l.postAttn, cfg.RMSEps))
+			proj.Free()
+			proj = np
+		}
 		if err := x.Add(proj); err != nil {
 			panic(err)
 		}
@@ -320,12 +355,21 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 		gate := must(l.qGate.MatMul(a))
 		up := must(l.qUp.MatMul(a))
 		a.Free()
-		if err := gate.SiluMul(up); err != nil {
+		if l.geglu {
+			if err := gate.GeluMul(up); err != nil {
+				panic(err)
+			}
+		} else if err := gate.SiluMul(up); err != nil {
 			panic(err)
 		}
 		up.Free()
 		down := must(l.qDown.MatMul(gate))
 		gate.Free()
+		if l.postFFN != nil {
+			nd := must(down.RMSNorm(l.postFFN, cfg.RMSEps))
+			down.Free()
+			down = nd
+		}
 		if err := x.Add(down); err != nil {
 			panic(err)
 		}

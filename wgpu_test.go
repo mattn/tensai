@@ -750,6 +750,82 @@ func TestGPUQ8MatMul(t *testing.T) {
 // against a large resident weight — for the int8 kernel next to the f32
 // matmul it replaces. 2048x8192 keeps the f32 twin (64MB) under modest
 // device storage limits (dzn stops at 128MB).
+func TestGPUWindowedAttention(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(73))
+
+	const heads, kvHeads, dh = 2, 1, 8
+	const d, kvDim = heads * dh, kvHeads * dh
+	const seqKV, window = 9, 3
+	k := randTensor(rng, seqKV, kvDim)
+	v := randTensor(rng, seqKV, kvDim)
+	gk, err := g.Upload(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gk.Free()
+	gv, err := g.Upload(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gv.Free()
+	for _, seq := range []int{1, 4} {
+		q := randTensor(rng, seq, d)
+		gq, err := g.Upload(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := gq.GroupedCausalAttention(gk, gv, heads, kvHeads, seqKV, window)
+		if err != nil {
+			t.Fatalf("seq %d: %v", seq, err)
+		}
+		out, err := got.Download()
+		if err != nil {
+			t.Fatal(err)
+		}
+		scale := 1 / math.Sqrt(dh)
+		for qi := 0; qi < seq; qi++ {
+			limit := qi + seqKV - seq + 1
+			start := 0
+			if limit > window {
+				start = limit - window
+			}
+			for h := 0; h < heads; h++ {
+				kvOff := (h / heads * kvHeads) * dh
+				_ = kvOff
+				scores := make([]float64, limit)
+				maxs := math.Inf(-1)
+				for j := start; j < limit; j++ {
+					var s float64
+					for c := 0; c < dh; c++ {
+						s += float64(q.Data[qi*d+h*dh+c]) * float64(k.Data[j*kvDim+c])
+					}
+					scores[j] = s * scale
+					maxs = math.Max(maxs, scores[j])
+				}
+				var sum float64
+				for j := start; j < limit; j++ {
+					scores[j] = math.Exp(scores[j] - maxs)
+					sum += scores[j]
+				}
+				for c := 0; c < dh; c++ {
+					var want float64
+					for j := start; j < limit; j++ {
+						want += scores[j] / sum * float64(v.Data[j*kvDim+c])
+					}
+					gotv := float64(out.Data[qi*d+h*dh+c])
+					if diff := math.Abs(gotv - want); diff > 1e-4 {
+						t.Fatalf("seq %d query %d head %d chan %d: got %v want %v", seq, qi, h, c, gotv, want)
+					}
+				}
+			}
+		}
+		got.Free()
+		gq.Free()
+	}
+}
+
 func BenchmarkGPUQ8MatVec(b *testing.B) {
 	g, err := OpenGPU()
 	if err != nil {
@@ -978,7 +1054,7 @@ func TestGPUGroupedCausalAttention(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, err := gq.GroupedCausalAttention(gk, gv, heads, kvHeads, seqKV)
+		got, err := gq.GroupedCausalAttention(gk, gv, heads, kvHeads, seqKV, 0)
 		if err != nil {
 			t.Fatalf("seq %d: %v", seq, err)
 		}
@@ -1029,10 +1105,10 @@ func TestGPUGroupedCausalAttention(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer gq.Free()
-	if _, err := gq.GroupedCausalAttention(gk, gv, 3, 2, seqKV); err == nil {
+	if _, err := gq.GroupedCausalAttention(gk, gv, 3, 2, seqKV, 0); err == nil {
 		t.Fatal("expected error: kv heads do not divide heads")
 	}
-	if _, err := gq.GroupedCausalAttention(gk, gv, heads, kvHeads, capacity+1); err == nil {
+	if _, err := gq.GroupedCausalAttention(gk, gv, heads, kvHeads, capacity+1, 0); err == nil {
 		t.Fatal("expected error: seqKV beyond cache")
 	}
 }

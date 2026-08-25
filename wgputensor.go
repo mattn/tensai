@@ -355,7 +355,7 @@ fn softmax_last(@builtin(workgroup_id) wid: vec3<u32>,
 // (grouped-query attention).
 struct AttnParams {
     seqQ: u32, seqKV: u32, dh: u32, d: u32,
-    rows: u32, off: u32, dkv: u32, pad1: u32,
+    rows: u32, off: u32, dkv: u32, window: u32,
 }
 @group(0) @binding(10) var<uniform> ap: AttnParams;
 @group(0) @binding(11) var<storage, read> aq: array<f32>;
@@ -364,7 +364,7 @@ struct AttnParams {
 @group(0) @binding(14) var<storage, read_write> aout: array<f32>;
 
 const AT = 64u;
-var<workgroup> qrow: array<f32, 128>;
+var<workgroup> qrow: array<f32, 256>;
 var<workgroup> ap_sc: array<f32, 64>;
 var<workgroup> ap_red: array<f32, 64>;
 
@@ -387,17 +387,24 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
     }
     workgroupBarrier();
     let limit = qi + ap.off + 1u;
+    // Sliding-window layers (Gemma) see only the last window positions.
+    var start = 0u;
+    if (ap.window > 0u && limit > ap.window) {
+        start = limit - ap.window;
+    }
     let scale = inverseSqrt(f32(ap.dh));
     var m = -3.40282e38;
     var l = 0.0;
     var acc0 = 0.0;
     var acc1 = 0.0;
+    var acc2 = 0.0;
+    var acc3 = 0.0;
     let tiles = (limit + AT - 1u) / AT;
-    for (var tt = 0u; tt < tiles; tt = tt + 1u) {
+    for (var tt = start / AT; tt < tiles; tt = tt + 1u) {
         // Lane t scores kv position tt*64+t.
         let j = tt * AT + t;
         var s = -3.40282e38;
-        if (j < limit) {
+        if (j >= start && j < limit) {
             var dot = 0.0;
             for (var c = 0u; c < ap.dh; c = c + 1u) {
                 dot = dot + qrow[c] * ak[offKV + j * ap.dkv + c];
@@ -413,7 +420,7 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
         let mNew = max(m, ap_red[0]);
         workgroupBarrier();
         var p = 0.0;
-        if (j < limit) {
+        if (j >= start && j < limit) {
             p = exp(s - mNew);
         }
         ap_sc[t] = p;
@@ -428,17 +435,25 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
         let rescale = exp(m - mNew);
         l = l * rescale + tileSum;
         m = mNew;
-        // Lane t now accumulates output channels t and t+64.
+        // Lane t now accumulates output channels t, t+64, t+128, t+192.
         acc0 = acc0 * rescale;
         acc1 = acc1 * rescale;
+        acc2 = acc2 * rescale;
+        acc3 = acc3 * rescale;
         let jEnd = min(limit, tt * AT + AT);
-        for (var jj = tt * AT; jj < jEnd; jj = jj + 1u) {
+        for (var jj = max(start, tt * AT); jj < jEnd; jj = jj + 1u) {
             let pj = ap_sc[jj - tt * AT];
             if (t < ap.dh) {
                 acc0 = acc0 + pj * av[offKV + jj * ap.dkv + t];
             }
             if (64u + t < ap.dh) {
                 acc1 = acc1 + pj * av[offKV + jj * ap.dkv + 64u + t];
+            }
+            if (128u + t < ap.dh) {
+                acc2 = acc2 + pj * av[offKV + jj * ap.dkv + 128u + t];
+            }
+            if (192u + t < ap.dh) {
+                acc3 = acc3 + pj * av[offKV + jj * ap.dkv + 192u + t];
             }
         }
         workgroupBarrier();
@@ -448,6 +463,12 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (64u + t < ap.dh) {
         aout[offO + qi * ap.d + 64u + t] = acc1 / l;
+    }
+    if (128u + t < ap.dh) {
+        aout[offO + qi * ap.d + 128u + t] = acc2 / l;
+    }
+    if (192u + t < ap.dh) {
+        aout[offO + qi * ap.d + 192u + t] = acc3 / l;
     }
 }
 
@@ -599,6 +620,19 @@ fn silu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
     }
 }
 
+// gelu_mul_ip: dst = gelu_tanh(dst) * src — Gemma's gate.
+@compute @workgroup_size(256, 1, 1)
+fn gelu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>,
+               @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx < ep.count) {
+        let g = edst[idx];
+        let inner = 0.7978845608028654 * (g + 0.044715 * g * g * g);
+        edst[idx] = 0.5 * g * (1.0 + tanh(inner)) * esrc[idx % ep.srcCount];
+    }
+}
+
 // q4matmul multiplies f32 activation rows by an int4 weight matrix packed
 // four row-pair bytes per u32 (a byte holds one column's even row in the
 // low nibble and odd row in the high one, offset-binary). The -8 offset
@@ -680,10 +714,11 @@ type gpuPipelines struct {
 	matmul, matmulT, matmulS, matmulTS             uintptr
 	scale, softmax, attn, qmatmul                  uintptr
 	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
+	geluMulIP                                      uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
 	layScale, laySoftmax, layAttn, layQmatmul      uintptr
 	layRmsnorm, layRope, layAddIP, laySiluMulIP    uintptr
-	layQ4matmul                                    uintptr
+	layQ4matmul, layGeluMulIP                      uintptr
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -706,6 +741,7 @@ func (g *GPU) initPipelines() error {
 		{&g.pipes.addIP, &g.pipes.layAddIP, "add_ip"},
 		{&g.pipes.siluMulIP, &g.pipes.laySiluMulIP, "silu_mul_ip"},
 		{&g.pipes.q4matmul, &g.pipes.layQ4matmul, "q4matmul"},
+		{&g.pipes.geluMulIP, &g.pipes.layGeluMulIP, "gelu_mul_ip"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -724,6 +760,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.layMatmulTS, g.pipes.layScale, g.pipes.laySoftmax, g.pipes.layAttn,
 		g.pipes.layQmatmul, g.pipes.layRmsnorm, g.pipes.layRope,
 		g.pipes.layAddIP, g.pipes.laySiluMulIP, g.pipes.layQ4matmul,
+		g.pipes.layGeluMulIP,
 	} {
 		if h != 0 {
 			fnLayoutRelease(h)
@@ -734,6 +771,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.matmulTS, g.pipes.scale, g.pipes.softmax, g.pipes.attn,
 		g.pipes.qmatmul, g.pipes.rmsnorm, g.pipes.rope,
 		g.pipes.addIP, g.pipes.siluMulIP, g.pipes.q4matmul,
+		g.pipes.geluMulIP,
 	} {
 		if h != 0 {
 			fnPipelineRelease(h)
@@ -1981,6 +2019,12 @@ func (t *GPUTensor) SiluMul(o *GPUTensor) error {
 	return t.eltwiseIP(t.g.pipes.siluMulIP, t.g.pipes.laySiluMulIP, o)
 }
 
+// GeluMul computes t = gelu_tanh(t) * o elementwise in place — Gemma's
+// gate.
+func (t *GPUTensor) GeluMul(o *GPUTensor) error {
+	return t.eltwiseIP(t.g.pipes.geluMulIP, t.g.pipes.layGeluMulIP, o)
+}
+
 // CopyRowsInto copies t's whole buffer into dst starting at element offset
 // off — appending freshly projected k/v rows to a preallocated cache
 // without leaving the device.
@@ -2024,9 +2068,10 @@ func (t *GPUTensor) CopyRowsInto(dst *GPUTensor, off int) error {
 // attention) and hold more positions than are valid: q is (seq, heads*dh),
 // k and v hold at least seqKV rows of kvHeads*dh (extra cache capacity
 // beyond seqKV is ignored), and query i attends to positions
-// 0..i+(seqKV-seq). Head h reads kv head h/(heads/kvHeads). One fused
-// dispatch, dh at most 128.
-func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqKV int) (*GPUTensor, error) {
+// 0..i+(seqKV-seq), floored to the last `window` positions when window is
+// positive (Gemma's sliding attention). Head h reads kv head
+// h/(heads/kvHeads). One fused dispatch, dh at most 128.
+func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqKV, window int) (*GPUTensor, error) {
 	if q.freed || k.freed || v.freed {
 		return nil, errors.New("tensai: gpu tensor already freed")
 	}
@@ -2042,8 +2087,8 @@ func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqK
 		return nil, fmt.Errorf("tensai: %d query heads / %d kv heads do not divide dimension %d", heads, kvHeads, d)
 	}
 	dh := d / heads
-	if dh > 128 {
-		return nil, fmt.Errorf("tensai: grouped attention head dimension %d exceeds 128", dh)
+	if dh > 256 {
+		return nil, fmt.Errorf("tensai: grouped attention head dimension %d exceeds 256", dh)
 	}
 	seq := q.Size() / d
 	kvDim := kvHeads * dh
@@ -2063,7 +2108,7 @@ func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqK
 	rows := heads * seq
 	params := [8]uint32{
 		uint32(seq), uint32(seqKV), uint32(dh), uint32(d),
-		uint32(rows), uint32(seqKV - seq), uint32(kvDim), 0,
+		uint32(rows), uint32(seqKV - seq), uint32(kvDim), uint32(window),
 	}
 
 	g := q.g

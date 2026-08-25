@@ -395,10 +395,6 @@ func main() {
 			fmt.Fprintln(os.Stderr, "-gpu requires -q8 or -q4")
 			os.Exit(1)
 		}
-		if model.cfg.ModelType == "gemma3" {
-			fmt.Fprintln(os.Stderr, "-gpu does not support gemma3 yet (sliding-window attention)")
-			os.Exit(1)
-		}
 		g, err := tensai.OpenGPU(tensai.GPUHighPerformance)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
