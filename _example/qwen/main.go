@@ -254,6 +254,18 @@ func templateFor(modelType string, think bool) tmpl {
 			stops: []string{"<|return|>"},
 		}
 	}
+	if modelType == "mistral" {
+		// Mistral instruct: user turns bracketed by [INST], no system
+		// role (it folds into the first user turn), </s> closing each
+		// assistant reply.
+		return tmpl{
+			bos:      "<s>",
+			userOpen: "[INST] ", userClose: " [/INST]",
+			asstClose:  "</s>",
+			foldSystem: true,
+			stops:      []string{"</s>"},
+		}
+	}
 	if modelType == "deepseek" {
 		// DeepSeek R1 distills: the system prompt (rarely used — DeepSeek
 		// recommends none) sits bare after BOS, user turns have no closing

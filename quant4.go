@@ -329,12 +329,16 @@ func q4matvecColsGeneric(out []Float, xu []uint8, sx Float, gsum []int32, qw []u
 			x1 := int32(xu[4*i4+1]) - 64
 			x2 := int32(xu[4*i4+2]) - 64
 			x3 := int32(xu[4*i4+3]) - 64
-			row := qw[i4*2*q4Tile:]
-			for j := lo; j < hi; j++ {
-				o := (j/q4Tile)*quads*2*q4Tile + (j%q4Tile)*2
-				b0, b1 := row[o], row[o+1]
-				acc[j-lo] += int32(b0&0x0F)*x0 + int32(b0>>4)*x1 +
-					int32(b1&0x0F)*x2 + int32(b1>>4)*x3
+			for tile := lo / q4Tile; tile <= (hi-1)/q4Tile; tile++ {
+				j0 := max(lo, tile*q4Tile)
+				j1 := min(hi, j0+(q4Tile-j0%q4Tile))
+				row := qw[tile*quads*2*q4Tile+i4*2*q4Tile+(j0%q4Tile)*2:]
+				for j := j0; j < j1; j++ {
+					b0, b1 := row[0], row[1]
+					acc[j-lo] += int32(b0&0x0F)*x0 + int32(b0>>4)*x1 +
+						int32(b1&0x0F)*x2 + int32(b1>>4)*x3
+					row = row[2:]
+				}
 			}
 		}
 		if sm != nil {
