@@ -25,7 +25,7 @@
 - **safetensors** - `encoding/safetensors` reads the checkpoint format most published model weights ship in — lazily, one tensor at a time, with F16/BF16/F64 converted to float32 — and writes F32 checkpoints; interoperability is verified against the reference implementation in both directions. Also dependency-free
 - **GGUF** - `encoding/gguf` reads llama.cpp's model container — typed metadata plus lazily-loaded tensors, with F16/BF16, the block-quantized Q8_0/Q4_0/Q4_1/Q5_0/Q5_1, the K-quants Q2_K through Q6_K, and IQ4_NL dequantized to float32 — verified block-exact against real llama.cpp conversions. Dependency-free as well
 - **ONNX export** - `encoding/onnx` marshals Sequential models into ONNX (opset 13, FP32) with a hand-written protobuf encoder; onnxruntime reproduces `Predict` to ~1e-7 relative error. ONNX convolutions are NCHW, which is tensai's own row layout, so nothing is reordered
-- **Tokenizers** - the `tokenizer` package loads Hugging Face `tokenizer.json` files and implements the byte-level BPE family (GPT-2, Llama 3, Qwen, ...), including the split patterns Go's regexp cannot express, as hand-written scanners; encodings and decodings match the reference `tokenizers` library exactly on both split families
+- **Tokenizers** - the `tokenizer` package loads Hugging Face `tokenizer.json` files and implements the byte-level BPE family (GPT-2, Llama 3, Qwen, ...), including the split patterns Go's regexp cannot express, as hand-written scanners, plus SentencePiece (Gemma, the Llama-2 era) built from GGUF vocabularies via `NewSPM`; encodings match the reference `tokenizers` library on the BPE families and `llama-tokenize` exactly on SentencePiece
 
 ## Layout
 

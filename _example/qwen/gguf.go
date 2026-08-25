@@ -26,8 +26,12 @@ import (
 // ggufTokenizer rebuilds a tokenizer.json from the metadata llama.cpp
 // embeds and hands it to the tokenizer package's parser.
 func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
-	if model, _ := g.String("tokenizer.ggml.model"); model != "gpt2" {
-		return nil, fmt.Errorf("unsupported tokenizer model %q (byte-level BPE only)", model)
+	switch model, _ := g.String("tokenizer.ggml.model"); model {
+	case "gpt2":
+	case "llama": // SentencePiece: Gemma and the Llama-2 family
+		return ggufSPMTokenizer(g)
+	default:
+		return nil, fmt.Errorf("unsupported tokenizer model %q", model)
 	}
 	toksAny, ok := g.KV("tokenizer.ggml.tokens")
 	if !ok {
@@ -174,6 +178,36 @@ func repackQ4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func
 			}
 		}
 	}
+}
+
+// ggufSPMTokenizer builds a SentencePiece tokenizer from the embedded
+// vocabulary, scores, and token types.
+func ggufSPMTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
+	toksAny, ok := g.KV("tokenizer.ggml.tokens")
+	if !ok {
+		return nil, fmt.Errorf("gguf has no embedded tokenizer")
+	}
+	scoresAny, ok := g.KV("tokenizer.ggml.scores")
+	if !ok {
+		return nil, fmt.Errorf("gguf spm tokenizer has no scores")
+	}
+	typesAny, _ := g.KV("tokenizer.ggml.token_type")
+	ta := toksAny.([]any)
+	sa := scoresAny.([]any)
+	ya := typesAny.([]any)
+	tokens := make([]string, len(ta))
+	scores := make([]float32, len(ta))
+	types := make([]int32, len(ta))
+	for i := range ta {
+		tokens[i], _ = ta[i].(string)
+		scores[i], _ = sa[i].(float32)
+		types[i], _ = ya[i].(int32)
+	}
+	pre := false
+	if v, ok := g.KV("tokenizer.ggml.add_space_prefix"); ok {
+		pre, _ = v.(bool)
+	}
+	return tokenizer.NewSPM(tokens, scores, types, pre)
 }
 
 // unpermuteMap returns the llama rope unpermutation as a row index map,

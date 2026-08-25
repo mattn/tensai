@@ -26,15 +26,20 @@ type special struct {
 
 // Tokenizer encodes text to token ids and back.
 type Tokenizer struct {
-	vocab    map[string]int
-	inverse  map[int]string
-	specials []special // sorted longest-first
-	byID     map[int]string
-	ranks    map[[2]string]int
-	cfg      splitConfig
-	byteEnc  [256]rune
-	byteDec  map[rune]byte
-	cache    map[string][]int
+	vocab       map[string]int
+	inverse     map[int]string
+	specials    []special // sorted longest-first
+	byID        map[int]string
+	ranks       map[[2]string]int
+	cfg         splitConfig
+	spm         bool
+	scores      []float32
+	byteID      [256]int
+	unkID       int
+	spacePrefix bool
+	byteEnc     [256]rune
+	byteDec     map[rune]byte
+	cache       map[string][]int
 }
 
 // splitConfig selects between the two pre-tokenization scanners.
@@ -139,9 +144,7 @@ func Parse(raw []byte) (*Tokenizer, error) {
 		t.specials = append(t.specials, special{content: at.Content, id: at.ID})
 		t.byID[at.ID] = at.Content
 	}
-	sort.Slice(t.specials, func(i, j int) bool {
-		return len(t.specials[i].content) > len(t.specials[j].content)
-	})
+	sortSpecials(t)
 
 	// bytes_to_unicode: printable bytes map to themselves, the rest to
 	// 256 and up, so every byte has a visible stand-in character.
@@ -284,6 +287,9 @@ func (t *Tokenizer) Encode(s string) []int {
 }
 
 func (t *Tokenizer) encodeText(s string) []int {
+	if t.spm {
+		return t.spmEncode(s)
+	}
 	var ids []int
 	for _, word := range t.split(s) {
 		var sb strings.Builder
@@ -297,6 +303,9 @@ func (t *Tokenizer) encodeText(s string) []int {
 
 // Decode turns token ids back into text.
 func (t *Tokenizer) Decode(ids []int) string {
+	if t.spm {
+		return t.spmDecode(ids)
+	}
 	var bs []byte
 	for _, id := range ids {
 		if sp, ok := t.byID[id]; ok {
@@ -487,4 +496,12 @@ func matchContraction(rs []rune, ci bool) int {
 
 func isPunct(r rune) bool {
 	return !unicode.IsSpace(r) && !unicode.IsLetter(r) && !unicode.IsNumber(r)
+}
+
+// sortSpecials orders special tokens longest-first so overlapping matches
+// resolve to the longest.
+func sortSpecials(t *Tokenizer) {
+	sort.Slice(t.specials, func(i, j int) bool {
+		return len(t.specials[i].content) > len(t.specials[j].content)
+	})
 }
