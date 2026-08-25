@@ -99,9 +99,12 @@ func (t *GPUTensor) SiluMul(o *GPUTensor) error { return errNoWGPU }
 func (t *GPUTensor) CopyRowsInto(dst *GPUTensor, off int) error { return errNoWGPU }
 
 // GroupedCausalAttention always fails in builds without the wgpu tag.
-func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqKV int) (*GPUTensor, error) {
+func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqKV, window int) (*GPUTensor, error) {
 	return nil, errNoWGPU
 }
+
+// GeluMul always fails in builds without the wgpu tag.
+func (t *GPUTensor) GeluMul(o *GPUTensor) error { return errNoWGPU }
 
 // GPUQMatrix is a GPU-resident int8 weight matrix. This build has it
 // disabled; build with -tags wgpu or -tags wgpu24 to enable it.
