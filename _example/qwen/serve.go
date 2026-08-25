@@ -41,22 +41,36 @@ func (m *qwen) reset() {
 	}
 }
 
-// chatML renders the messages through the same template the CLI uses,
-// ending with an open assistant turn (asst carries the model-specific
-// opening, including Qwen3's empty think block).
-func chatML(msgs []chatMessage, defaultSystem, asst string) string {
+// render walks the messages through the model's template, ending with an
+// open assistant turn. Models without a system role (Gemma) get the
+// system text folded into the first user message.
+func render(tm tmpl, msgs []chatMessage, defaultSystem string) string {
 	var b strings.Builder
-	if len(msgs) == 0 || msgs[0].Role != "system" {
-		b.WriteString("<|im_start|>system\n" + defaultSystem + "<|im_end|>\n")
+	b.WriteString(tm.bos)
+	system := defaultSystem
+	rest := msgs
+	if len(msgs) > 0 && msgs[0].Role == "system" {
+		system = msgs[0].Content
+		rest = msgs[1:]
 	}
-	for _, m := range msgs {
-		role := m.Role
-		if role != "system" && role != "user" && role != "assistant" {
-			role = "user"
+	if !tm.foldSystem {
+		b.WriteString(tm.sysOpen + system + tm.sysClose)
+	}
+	first := true
+	for _, m := range rest {
+		switch m.Role {
+		case "assistant":
+			b.WriteString(tm.asstOpen + m.Content + tm.asstClose)
+		default:
+			text := m.Content
+			if tm.foldSystem && first {
+				text = system + "\n\n" + text
+			}
+			first = false
+			b.WriteString(tm.userOpen + text + tm.userClose)
 		}
-		b.WriteString("<|im_start|>" + role + "\n" + m.Content + "<|im_end|>\n")
 	}
-	b.WriteString(asst)
+	b.WriteString(tm.asstOpen)
 	return b.String()
 }
 
@@ -70,7 +84,7 @@ type server struct {
 	topP    float64
 	imEnd   int
 	eot     int
-	asst    string // assistant-turn opening (Qwen3: may close thinking)
+	tm      tmpl
 	prefill func([]int, int) []float32
 	step    func(int, int) []float32
 	reset   func()
@@ -142,7 +156,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	rng := rand.New(rand.NewSource(seed))
 
-	ids := s.tok.Encode(chatML(req.Messages, s.system, s.asst))
+	ids := s.tok.Encode(render(s.tm, req.Messages, s.system))
 	if len(ids) >= s.nCtx-1 {
 		httpError(w, http.StatusBadRequest, fmt.Sprintf("prompt of %d tokens exceeds the %d-token context", len(ids), s.nCtx))
 		return

@@ -27,6 +27,7 @@ type config struct {
 	HiddenSize   int     `json:"hidden_size"`
 	HeadDim      int     `json:"head_dim"`
 	NoRopeLayers []int   `json:"no_rope_layers"` // smollm3: 1 = RoPE, 0 = NoPE
+	SlidingWin   int     `json:"sliding_window"` // gemma3: local-attention span
 	Intermediate int     `json:"intermediate_size"`
 	Layers       int     `json:"num_hidden_layers"`
 	Heads        int     `json:"num_attention_heads"`
@@ -71,8 +72,13 @@ func quantizeMat(m *tensai.Matrix, bits int) *qmat {
 // is per column, so the fused results are bit-identical to separate calls.
 type qblock struct {
 	ln1, ln2     []float32
-	qNorm, kNorm []float32      // Qwen3 per-head QK-norm; nil otherwise
+	qNorm, kNorm []float32 // Qwen3/Gemma per-head QK-norm; nil otherwise
+	postAttn     []float32 // Gemma sandwich norms; nil otherwise
+	postFFN      []float32
 	noPE         bool           // smollm3: every fourth layer skips RoPE
+	window       int            // gemma3: sliding-attention span; 0 = full
+	ropeTheta    float64        // per-layer rope base; 0 = the config default
+	geglu        bool           // gemma3: gelu-tanh gate instead of silu
 	wQKV, wo     *tensai.Matrix // [in, out] after transposing HF's [out, in]
 	bQKV         []float32
 	wGU, wDown   *tensai.Matrix
@@ -353,6 +359,23 @@ func rmsnorm(x, w []float32, eps float64) []float32 {
 	return out
 }
 
+// activate applies the gated activation in place: silu(gate)*up, or
+// Gemma's tanh-approximated gelu when geglu is set.
+func activate(gate, up []float32, geglu bool) {
+	if !geglu {
+		for i := range gate {
+			g := float64(gate[i])
+			gate[i] = float32(g/(1+math.Exp(-g))) * up[i]
+		}
+		return
+	}
+	const c = 0.7978845608028654 // sqrt(2/pi)
+	for i := range gate {
+		g := float64(gate[i])
+		gate[i] = float32(0.5*g*(1+math.Tanh(c*(g+0.044715*g*g*g)))) * up[i]
+	}
+}
+
 // mv computes x @ W (+ bias), on the quantized twin when it exists.
 func mv(x []float32, w *tensai.Matrix, q *qmat, bias []float32) []float32 {
 	var out []float32
@@ -409,12 +432,17 @@ func mmb(x, w *tensai.Matrix, q *qmat, bias []float32) *tensai.Matrix {
 // accumulation into attn's slot for the head. Heads touch disjoint
 // output ranges, so callers fan heads out across goroutines freely.
 func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, scores []float64) {
+	// Sliding-window layers (Gemma) see only the last window positions.
+	start := 0
+	if b.window > 0 && steps > b.window {
+		start = steps - b.window
+	}
 	qOff := h * m.headSz
 	kvOff := (h / group) * m.headSz
 	scale := 1 / math.Sqrt(float64(m.headSz))
 	qh := q[qOff : qOff+m.headSz]
 	maxs := math.Inf(-1)
-	for t := 0; t < steps; t++ {
+	for t := start; t < steps; t++ {
 		s := float64(tensai.DotVec(qh, b.kc[t][kvOff:kvOff+m.headSz])) * scale
 		scores[t] = s
 		if s > maxs {
@@ -422,12 +450,12 @@ func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, sco
 		}
 	}
 	var sum float64
-	for t := 0; t < steps; t++ {
+	for t := start; t < steps; t++ {
 		scores[t] = math.Exp(scores[t] - maxs)
 		sum += scores[t]
 	}
 	out := attn[qOff : qOff+m.headSz]
-	for t := 0; t < steps; t++ {
+	for t := start; t < steps; t++ {
 		tensai.Axpy(float32(scores[t]/sum), b.vc[t][kvOff:kvOff+m.headSz], out)
 	}
 }
@@ -444,10 +472,13 @@ func (m *qwen) qkNorm(v, w []float32) {
 }
 
 // rope rotates one head in place, half-split style: pair (i, i+dh/2).
-func (m *qwen) rope(h []float32, pos int) {
+func (m *qwen) rope(h []float32, pos int, theta float64) {
+	if theta == 0 {
+		theta = m.cfg.RopeTheta
+	}
 	half := m.headSz / 2
 	for i := 0; i < half; i++ {
-		freq := math.Pow(m.cfg.RopeTheta, -2*float64(i)/float64(m.headSz))
+		freq := math.Pow(theta, -2*float64(i)/float64(m.headSz))
 		s, c := math.Sincos(float64(pos) * freq)
 		a, b := float64(h[i]), float64(h[i+half])
 		h[i] = float32(a*c - b*s)
@@ -528,10 +559,10 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			m.qkNorm(kr, b.kNorm)
 			if !b.noPE {
 				for h := 0; h < cfg.Heads; h++ {
-					m.rope(qr[h*m.headSz:(h+1)*m.headSz], pos)
+					m.rope(qr[h*m.headSz:(h+1)*m.headSz], pos, b.ropeTheta)
 				}
 				for h := 0; h < cfg.KVHeads; h++ {
-					m.rope(kr[h*m.headSz:(h+1)*m.headSz], pos)
+					m.rope(kr[h*m.headSz:(h+1)*m.headSz], pos, b.ropeTheta)
 				}
 			}
 			// Copies detach the cache rows from the wide fused buffer.
@@ -566,6 +597,11 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		wg.Wait()
 
 		proj := mmb(attn, b.wo, b.qo, nil)
+		if b.postAttn != nil {
+			for t := 0; t < n; t++ {
+				copy(proj.Data[t*hs:(t+1)*hs], rmsnorm(proj.Data[t*hs:(t+1)*hs], b.postAttn, cfg.RMSEps))
+			}
+		}
 		for i := range x.Data {
 			x.Data[i] += proj.Data[i]
 		}
@@ -576,12 +612,15 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		gate := tensai.NewMatrix(n, inter)
 		for t := 0; t < n; t++ {
 			row := gu.Data[t*2*inter:]
-			for i := 0; i < inter; i++ {
-				g := float64(row[i])
-				gate.Data[t*inter+i] = float32(g/(1+math.Exp(-g))) * row[inter+i]
-			}
+			copy(gate.Data[t*inter:(t+1)*inter], row[:inter])
+			activate(gate.Data[t*inter:(t+1)*inter], row[inter:2*inter], b.geglu)
 		}
 		down := mmb(gate, b.wDown, b.qDown, nil)
+		if b.postFFN != nil {
+			for t := 0; t < n; t++ {
+				copy(down.Data[t*hs:(t+1)*hs], rmsnorm(down.Data[t*hs:(t+1)*hs], b.postFFN, cfg.RMSEps))
+			}
+		}
 		for i := range x.Data {
 			x.Data[i] += down.Data[i]
 		}
@@ -611,10 +650,10 @@ func (m *qwen) step(token, pos int) []float32 {
 		m.qkNorm(k, b.kNorm)
 		if !b.noPE {
 			for h := 0; h < cfg.Heads; h++ {
-				m.rope(q[h*m.headSz:(h+1)*m.headSz], pos)
+				m.rope(q[h*m.headSz:(h+1)*m.headSz], pos, b.ropeTheta)
 			}
 			for h := 0; h < cfg.KVHeads; h++ {
-				m.rope(k[h*m.headSz:(h+1)*m.headSz], pos)
+				m.rope(k[h*m.headSz:(h+1)*m.headSz], pos, b.ropeTheta)
 			}
 		}
 		// Copy k and v out of the fused row so the cache does not retain
@@ -646,6 +685,9 @@ func (m *qwen) step(token, pos int) []float32 {
 			}
 		}
 		proj := mv(attn, b.wo, b.qo, nil)
+		if b.postAttn != nil {
+			proj = rmsnorm(proj, b.postAttn, cfg.RMSEps)
+		}
 		for i := range x {
 			x[i] += proj[i]
 		}
@@ -653,11 +695,11 @@ func (m *qwen) step(token, pos int) []float32 {
 		a = rmsnorm(x, b.ln2, cfg.RMSEps)
 		gu := mv(a, b.wGU, b.qGU, nil)
 		gate, up := gu[:cfg.Intermediate], gu[cfg.Intermediate:]
-		for i := range gate {
-			g := float64(gate[i])
-			gate[i] = float32(g/(1+math.Exp(-g))) * up[i] // silu(gate) * up
-		}
+		activate(gate, up, b.geglu)
 		down := mv(gate, b.wDown, b.qDown, nil)
+		if b.postFFN != nil {
+			down = rmsnorm(down, b.postFFN, cfg.RMSEps)
+		}
 		for i := range x {
 			x[i] += down[i]
 		}

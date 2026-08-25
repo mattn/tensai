@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 
@@ -240,9 +241,9 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 
 	arch, _ := g.String("general.architecture")
 	switch arch {
-	case "llama", "qwen2", "qwen3", "smollm3":
+	case "llama", "qwen2", "qwen3", "smollm3", "gemma3":
 	default:
-		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2, qwen3, llama, and smollm3)", arch)
+		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2, qwen3, llama, smollm3, and gemma3)", arch)
 	}
 	meta := func(key string) int64 {
 		n, _ := g.Int(arch + "." + key)
@@ -258,6 +259,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 	cfg.MaxPos = int(meta("context_length"))
 	cfg.Vocab = int(meta("vocab_size"))
 	cfg.HeadDim = int(meta("attention.key_length"))
+	cfg.SlidingWin = int(meta("attention.sliding_window"))
 	cfg.RMSEps, _ = g.Float(arch + ".attention.layer_norm_rms_epsilon")
 	cfg.RopeTheta, _ = g.Float(arch + ".rope.freq_base")
 	if cfg.RopeTheta == 0 {
@@ -405,6 +407,13 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 	}
 	m := &qwen{cfg: cfg, headSz: headSz}
 	m.embed = tensor("token_embd.weight")
+	if arch == "gemma3" {
+		// Gemma scales embeddings by sqrt(hidden) before the first block.
+		s := float32(math.Sqrt(float64(cfg.HiddenSize)))
+		for i := range m.embed.Data {
+			m.embed.Data[i] *= s
+		}
+	}
 	m.normW = tensor("output_norm.weight").Data
 	m.blocks = make([]qblock, cfg.Layers)
 	// Layers load concurrently, same as the safetensors path: dequantize,
@@ -466,11 +475,24 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			// SmolLM3 skips RoPE on every fourth layer; the GGUF carries no
 			// flag for it, matching llama.cpp's hardcoded rule.
 			b.noPE = arch == "smollm3" && i%4 == 3
+			if arch == "gemma3" {
+				// Five of every six layers attend over a sliding window
+				// with the local rope base; the sixth is global. Sandwich
+				// norms and the gelu-tanh gate round out the block. (The
+				// converter already folds Gemma's +1 into norm weights.)
+				b.geglu = true
+				if (i+1)%6 != 0 {
+					b.window = cfg.SlidingWin
+					b.ropeTheta = 10000
+				}
+			}
 			p := fmt.Sprintf("blk.%d.", i)
 			b.ln1 = tensor(p + "attn_norm.weight").Data
 			b.ln2 = tensor(p + "ffn_norm.weight").Data
 			b.qNorm = vecOpt(p + "attn_q_norm.weight")
 			b.kNorm = vecOpt(p + "attn_k_norm.weight")
+			b.postAttn = vecOpt(p + "post_attention_norm.weight")
+			b.postFFN = vecOpt(p + "post_ffw_norm.weight")
 			layerNames := []string{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight", p + "attn_output.weight", p + "ffn_gate.weight", p + "ffn_up.weight", p + "ffn_down.weight"}
 			if allQ8(layerNames...) {
 				b.qQKV = linDirect(

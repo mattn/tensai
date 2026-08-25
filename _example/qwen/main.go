@@ -225,6 +225,42 @@ func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 	return cands[0].id
 }
 
+// tmpl is the chat template family a model speaks: ChatML for the Qwen
+// and SmolLM lines, Gemma's turn markers for gemma3 (which has no system
+// role — the system prompt folds into the first user turn).
+type tmpl struct {
+	bos                 string
+	sysOpen, sysClose   string
+	userOpen, userClose string
+	asstOpen, asstClose string
+	foldSystem          bool
+	stops               []string
+}
+
+func templateFor(modelType string, think bool) tmpl {
+	if modelType == "gemma3" {
+		return tmpl{
+			bos:      "<bos>",
+			userOpen: "<start_of_turn>user\n", userClose: "<end_of_turn>\n",
+			asstOpen: "<start_of_turn>model\n", asstClose: "<end_of_turn>\n",
+			foldSystem: true,
+			stops:      []string{"<end_of_turn>"},
+		}
+	}
+	t := tmpl{
+		sysOpen: "<|im_start|>system\n", sysClose: "<|im_end|>\n",
+		userOpen: "<|im_start|>user\n", userClose: "<|im_end|>\n",
+		asstOpen: "<|im_start|>assistant\n", asstClose: "<|im_end|>\n",
+		stops: []string{"<|im_end|>", "<|endoftext|>"},
+	}
+	// Qwen3 and SmolLM3 disable their thinking mode by opening the
+	// assistant turn with an empty think block; -think leaves it open.
+	if (modelType == "qwen3" || modelType == "smollm3") && !think {
+		t.asstOpen += "<think>\n\n</think>\n\n"
+	}
+	return t
+}
+
 func main() {
 	dataDir := flag.String("data", "_example/qwen/data", "directory for the downloaded model files")
 	repo := flag.String("repo", defaultRepo, "Hugging Face repo to download missing model files from")
@@ -324,8 +360,16 @@ func main() {
 			draftM.cfg.Layers, draftM.cfg.HiddenSize, time.Since(start).Round(time.Millisecond))
 	}
 
-	imEnd, _ := tok.ID("<|im_end|>")
-	eot, _ := tok.ID("<|endoftext|>")
+	tm := templateFor(model.cfg.ModelType, *think)
+	stopID := func(i int) int {
+		if i < len(tm.stops) {
+			if id, ok := tok.ID(tm.stops[i]); ok {
+				return id
+			}
+		}
+		return -1
+	}
+	imEnd, eot := stopID(0), stopID(1)
 	rng := rand.New(rand.NewSource(*seed))
 
 	if *cpuprofile != "" {
@@ -349,6 +393,10 @@ func main() {
 	if *gpu {
 		if bits == 0 {
 			fmt.Fprintln(os.Stderr, "-gpu requires -q8 or -q4")
+			os.Exit(1)
+		}
+		if model.cfg.ModelType == "gemma3" {
+			fmt.Fprintln(os.Stderr, "-gpu does not support gemma3 yet (sliding-window attention)")
 			os.Exit(1)
 		}
 		g, err := tensai.OpenGPU(tensai.GPUHighPerformance)
@@ -383,14 +431,6 @@ func main() {
 	// feed pushes tokens through the model, extending the KV cache;
 	// generate then samples until an end token, which is also fed so the
 	// cache stays aligned with the template for the next turn.
-	// Qwen3's template disables its thinking mode by opening the assistant
-	// turn with an empty think block; -think leaves the block open so the
-	// model reasons first. Other models just open the turn.
-	asst := "<|im_start|>assistant\n"
-	if (model.cfg.ModelType == "qwen3" || model.cfg.ModelType == "smollm3") && !*think {
-		asst += "<think>\n\n</think>\n\n"
-	}
-
 	stepFn := model.step
 	prefillFn := model.prefill
 	reset := func() {
@@ -409,7 +449,7 @@ func main() {
 		s := &server{
 			model: model, tok: tok, system: *system, nCtx: nCtx,
 			temp: *temp, topP: *topP, imEnd: imEnd, eot: eot,
-			asst: asst, prefill: prefillFn, step: stepFn, reset: reset,
+			tm: tm, prefill: prefillFn, step: stepFn, reset: reset,
 		}
 		if err := s.listen(*serveAddr); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -512,15 +552,27 @@ func main() {
 	}
 
 	if *chat {
-		feed(tok.Encode("<|im_start|>system\n" + *system + "<|im_end|>\n"))
+		pre := tm.bos
+		if !tm.foldSystem {
+			pre += tm.sysOpen + *system + tm.sysClose
+		}
+		if pre != "" {
+			feed(tok.Encode(pre))
+		}
 		fmt.Fprintln(os.Stderr, "chat mode: type a message, empty line or Ctrl-D to quit")
 		sc := bufio.NewScanner(os.Stdin)
+		first := true
 		for {
 			fmt.Print("> ")
 			if !sc.Scan() || strings.TrimSpace(sc.Text()) == "" {
 				break
 			}
-			feed(tok.Encode("<|im_start|>user\n" + sc.Text() + "<|im_end|>\n" + asst))
+			text := sc.Text()
+			if tm.foldSystem && first {
+				text = *system + "\n\n" + text
+			}
+			first = false
+			feed(tok.Encode(tm.userOpen + text + tm.userClose + tm.asstOpen))
 			generate(*n)
 			feed(tok.Encode("\n"))
 			if steps >= nCtx-64 {
@@ -533,8 +585,12 @@ func main() {
 
 	text := *prompt
 	if !*raw {
-		text = "<|im_start|>system\n" + *system + "<|im_end|>\n" +
-			"<|im_start|>user\n" + *prompt + "<|im_end|>\n" + asst
+		if tm.foldSystem {
+			text = tm.bos + tm.userOpen + *system + "\n\n" + *prompt + tm.userClose + tm.asstOpen
+		} else {
+			text = tm.bos + tm.sysOpen + *system + tm.sysClose +
+				tm.userOpen + *prompt + tm.userClose + tm.asstOpen
+		}
 	}
 	ids := tok.Encode(text)
 	fmt.Fprintf(os.Stderr, "prompt: %d tokens\n", len(ids))
