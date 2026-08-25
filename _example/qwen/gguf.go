@@ -204,7 +204,9 @@ func ggufSPMTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 		scores[i], _ = sa[i].(float32)
 		types[i], _ = ya[i].(int32)
 	}
-	pre := false
+	// llama.cpp defaults SentencePiece space-prefixing on when the key is
+	// absent (Phi-3, the Llama-2 family); Gemma writes an explicit false.
+	pre := true
 	if v, ok := g.KV("tokenizer.ggml.add_space_prefix"); ok {
 		pre, _ = v.(bool)
 	}
@@ -399,9 +401,9 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 
 	arch, _ := g.String("general.architecture")
 	switch arch {
-	case "llama", "qwen2", "qwen3", "smollm3", "gemma3":
+	case "llama", "qwen2", "qwen3", "smollm3", "gemma3", "phi3":
 	default:
-		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2, qwen3, llama, smollm3, and gemma3)", arch)
+		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2, qwen3, llama, smollm3, gemma3, and phi3)", arch)
 	}
 	meta := func(key string) int64 {
 		n, _ := g.Int(arch + "." + key)
@@ -425,6 +427,22 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 	}
 	if cfg.HiddenSize == 0 || cfg.Layers == 0 || cfg.Heads == 0 || cfg.KVHeads == 0 {
 		return nil, nil, fmt.Errorf("gguf is missing %s.* dimensions", arch)
+	}
+	if cfg.Vocab == 0 {
+		// Phi-3 files omit vocab_size; the load gate's lm-head estimate
+		// reads it off the embedding instead.
+		if _, shape, ok := g.Info("token_embd.weight"); ok {
+			cfg.Vocab = shape[0]
+		}
+	}
+	if rd := int(meta("rope.dimension_count")); rd != 0 {
+		hs := cfg.HiddenSize / cfg.Heads
+		if cfg.HeadDim != 0 {
+			hs = cfg.HeadDim
+		}
+		if rd != hs {
+			return nil, nil, fmt.Errorf("partial rotary (%d of %d dims) is not supported", rd, hs)
+		}
 	}
 
 	tok, err := ggufTokenizer(g)
@@ -796,11 +814,23 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 				}
 				return quant(hcat(parts))
 			}
-			b.wQKV, b.qQKV = linAuto(
-				[]string{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"},
-				[]int{qPerm, kPerm, 0})
+			if _, _, ok := g.Info(p + "attn_qkv.weight"); ok {
+				// Phi-3 ships q/k/v pre-fused in that order — the layout
+				// the runtime wants, no permutation (NEOX rope).
+				b.wQKV, b.qQKV = linAuto([]string{p + "attn_qkv.weight"}, []int{0})
+			} else {
+				b.wQKV, b.qQKV = linAuto(
+					[]string{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"},
+					[]int{qPerm, kPerm, 0})
+			}
 			b.wo, b.qo = linAuto([]string{p + "attn_output.weight"}, []int{0})
-			b.wGU, b.qGU = linAuto([]string{p + "ffn_gate.weight", p + "ffn_up.weight"}, []int{0, 0})
+			if _, _, ok := g.Info(p + "ffn_gate.weight"); ok {
+				b.wGU, b.qGU = linAuto([]string{p + "ffn_gate.weight", p + "ffn_up.weight"}, []int{0, 0})
+			} else {
+				// Phi-3 fuses gate and up into one ffn_up, gate rows first —
+				// transposed, exactly the [gate | up] column split downstream.
+				b.wGU, b.qGU = linAuto([]string{p + "ffn_up.weight"}, []int{0})
+			}
 			b.wDown, b.qDown = linAuto([]string{p + "ffn_down.weight"}, []int{0})
 			b.bQKV = catVec(
 				unpermuteVec(vecOpt(p+"attn_q.bias"), qPerm),
