@@ -11,20 +11,20 @@ import "simd/archsimd"
 // and 64x column-sum correction at each 32-row group boundary, Q4Matrix
 // style.
 
-func q8gMatvecCols(out []Float, xu []uint8, sx Float, qw []int8, scale []Float, colSum64 []int32, cols, lo, hi int) {
+func q8gMatvecCols(out []Float, xu []uint8, sx Float, qw []int8, scale []Float, colSum64 []int32, group, cols, lo, hi int) {
 	if !hasAVX2 {
-		q8gMatvecColsGeneric(out, xu, sx, qw, scale, colSum64, cols, lo, hi)
+		q8gMatvecColsGeneric(out, xu, sx, qw, scale, colSum64, group, cols, lo, hi)
 		return
 	}
 	quads := len(xu) / 4
-	groups := (len(xu) + q8Group - 1) / q8Group
+	groups := (len(xu) + group - 1) / group
 	ones := archsimd.BroadcastInt16x16(1)
 	vecEnd := lo + ((hi - lo) &^ 31)
 	if vecEnd > lo {
 		clear(out[lo:vecEnd])
 		for g := 0; g < groups; g++ {
-			ib := g * q8Group / 4
-			ie := min(ib+q8Group/4, quads)
+			ib := g * group / 4
+			ie := min(ib+group/4, quads)
 			srow := scale[g*cols:]
 			csrow := colSum64[g*cols:]
 			for jt := lo; jt < vecEnd; jt += 32 {
@@ -51,19 +51,19 @@ func q8gMatvecCols(out []Float, xu []uint8, sx Float, qw []int8, scale []Float, 
 	}
 	archsimd.ClearAVXUpperBits()
 	if vecEnd < hi {
-		q8gMatvecColsGeneric(out, xu, sx, qw, scale, colSum64, cols, vecEnd, hi)
+		q8gMatvecColsGeneric(out, xu, sx, qw, scale, colSum64, group, cols, vecEnd, hi)
 	}
 }
 
 // q8gMatmulRows8 is the eight-row batched form: per eight-column tile each
 // 32-byte weight load feeds eight broadcast activation quads.
-func q8gMatmulRows8(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []int8, scale []Float, colSum64 []int32, cols, lo, hi int) {
+func q8gMatmulRows8(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []int8, scale []Float, colSum64 []int32, group, cols, lo, hi int) {
 	if !hasAVX2 {
-		q8gMatmulRows8Generic(out, xus, sxs, r0, qw, scale, colSum64, cols, lo, hi)
+		q8gMatmulRows8Generic(out, xus, sxs, r0, qw, scale, colSum64, group, cols, lo, hi)
 		return
 	}
 	quads := len(xus[0]) / 4
-	groups := (len(xus[0]) + q8Group - 1) / q8Group
+	groups := (len(xus[0]) + group - 1) / group
 	xq := make([]uint32, 8*quads)
 	for r := 0; r < 8; r++ {
 		for i4 := 0; i4 < quads; i4++ {
@@ -77,8 +77,8 @@ func q8gMatmulRows8(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []int8, 
 			clear(out.Data[(r0+r)*cols+lo : (r0+r)*cols+vecEnd])
 		}
 		for g := 0; g < groups; g++ {
-			ib := g * q8Group / 4
-			ie := min(ib+q8Group/4, quads)
+			ib := g * group / 4
+			ie := min(ib+group/4, quads)
 			srow := scale[g*cols:]
 			csrow := colSum64[g*cols:]
 			for jt := lo; jt < vecEnd; jt += 8 {
@@ -114,6 +114,6 @@ func q8gMatmulRows8(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []int8, 
 	}
 	archsimd.ClearAVXUpperBits()
 	if vecEnd < hi {
-		q8gMatmulRows8Generic(out, xus, sxs, r0, qw, scale, colSum64, cols, vecEnd, hi)
+		q8gMatmulRows8Generic(out, xus, sxs, r0, qw, scale, colSum64, group, cols, vecEnd, hi)
 	}
 }

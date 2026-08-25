@@ -21,20 +21,34 @@ type Q8GMatrix struct {
 	Q          []int8 // interleaved row quads, padded for 32-byte loads
 	Scale      []Float
 	ColSum64   []int32 // per (group, column): 64 * sum of the group's weights
+	Group      int     // input rows per scale; 0 means the default q8Group (32)
 }
 
-// NewQ8GMatrix allocates the layout for rows x cols; the caller fills Q
-// (quad layout), Scale, and ColSum64 — see the loaders in _example/qwen.
-func NewQ8GMatrix(rows, cols int) *Q8GMatrix {
+// NewQ8GMatrix allocates the layout for rows x cols with `group` input
+// rows per scale (0 for the default 32); the caller fills Q (quad
+// layout), Scale, and ColSum64 — see the loaders in _example/qwen.
+func NewQ8GMatrix(rows, cols, group int) *Q8GMatrix {
+	if group == 0 {
+		group = q8Group
+	}
 	quads := (rows + 3) / 4
-	groups := (rows + q8Group - 1) / q8Group
+	groups := (rows + group - 1) / group
 	return &Q8GMatrix{
 		Rows:     rows,
 		Cols:     cols,
 		Q:        make([]int8, quads*4*cols+32),
 		Scale:    make([]Float, groups*cols),
 		ColSum64: make([]int32, groups*cols),
+		Group:    group,
 	}
+}
+
+// group returns the effective scale-group length.
+func (q *Q8GMatrix) group() int {
+	if q.Group != 0 {
+		return q.Group
+	}
+	return q8Group
 }
 
 // MatVec computes out = x @ Q for a single activation row: len(x) must be
@@ -45,9 +59,10 @@ func (q *Q8GMatrix) MatVec(x, out []Float) error {
 			len(x), len(out), q.Rows, q.Cols)
 	}
 	xu, sx := quantizeActs(x)
+	grp := q.group()
 	workers := matvecWorkerCount(q.Cols, q.Rows)
 	if workers == 1 {
-		q8gMatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, q.Cols, 0, q.Cols)
+		q8gMatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, grp, q.Cols, 0, q.Cols)
 		return nil
 	}
 	chunk := ((q.Cols+workers-1)/workers + 7) &^ 7
@@ -57,7 +72,7 @@ func (q *Q8GMatrix) MatVec(x, out []Float) error {
 		wg.Add(1)
 		go func(lo, hi int) {
 			defer wg.Done()
-			q8gMatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
+			q8gMatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, grp, q.Cols, lo, hi)
 		}(lo, hi)
 	}
 	wg.Wait()
@@ -72,6 +87,7 @@ func (q *Q8GMatrix) MatMul(x, out *Matrix) error {
 			x.Rows, x.Cols, out.Rows, out.Cols, q.Rows, q.Cols)
 	}
 	rows := x.Rows
+	grp := q.group()
 	xus := make([][]uint8, rows)
 	sxs := make([]Float, rows)
 	for r := 0; r < rows; r++ {
@@ -80,10 +96,10 @@ func (q *Q8GMatrix) MatMul(x, out *Matrix) error {
 	run := func(lo, hi int) {
 		var r int
 		for ; r+8 <= rows; r += 8 {
-			q8gMatmulRows8(out, xus[r:r+8], sxs[r:r+8], r, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
+			q8gMatmulRows8(out, xus[r:r+8], sxs[r:r+8], r, q.Q, q.Scale, q.ColSum64, grp, q.Cols, lo, hi)
 		}
 		for ; r < rows; r++ {
-			q8gMatvecCols(out.Data[r*q.Cols:(r+1)*q.Cols], xus[r], sxs[r], q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
+			q8gMatvecCols(out.Data[r*q.Cols:(r+1)*q.Cols], xus[r], sxs[r], q.Q, q.Scale, q.ColSum64, grp, q.Cols, lo, hi)
 		}
 	}
 	workers := matvecWorkerCount(q.Cols, q.Rows)
@@ -107,14 +123,14 @@ func (q *Q8GMatrix) MatMul(x, out *Matrix) error {
 
 // q8gMatvecColsGeneric accumulates out[lo:hi] in pure Go over the same
 // 7-bit activations as the AVX2 kernel, so both builds agree exactly.
-func q8gMatvecColsGeneric(out []Float, xu []uint8, sx Float, qw []int8, scale []Float, colSum64 []int32, cols, lo, hi int) {
+func q8gMatvecColsGeneric(out []Float, xu []uint8, sx Float, qw []int8, scale []Float, colSum64 []int32, group, cols, lo, hi int) {
 	clear(out[lo:hi])
 	quads := len(xu) / 4
-	groups := (len(xu) + q8Group - 1) / q8Group
+	groups := (len(xu) + group - 1) / group
 	acc := make([]int32, hi-lo)
 	for g := 0; g < groups; g++ {
-		ib := g * q8Group / 4
-		ie := min(ib+q8Group/4, quads)
+		ib := g * group / 4
+		ie := min(ib+group/4, quads)
 		clear(acc)
 		for i4 := ib; i4 < ie; i4++ {
 			x0, x1 := int32(xu[4*i4]), int32(xu[4*i4+1])
@@ -137,19 +153,19 @@ func q8gMatvecColsGeneric(out []Float, xu []uint8, sx Float, qw []int8, scale []
 }
 
 // q8gMatmulRows8Generic is the eight-row batched body.
-func q8gMatmulRows8Generic(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []int8, scale []Float, colSum64 []int32, cols, lo, hi int) {
+func q8gMatmulRows8Generic(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []int8, scale []Float, colSum64 []int32, group, cols, lo, hi int) {
 	for r := 0; r < 8; r++ {
 		clear(out.Data[(r0+r)*cols+lo : (r0+r)*cols+hi])
 	}
 	quads := len(xus[0]) / 4
-	groups := (len(xus[0]) + q8Group - 1) / q8Group
+	groups := (len(xus[0]) + group - 1) / group
 	var acc [8][]int32
 	for r := range acc {
 		acc[r] = make([]int32, hi-lo)
 	}
 	for g := 0; g < groups; g++ {
-		ib := g * q8Group / 4
-		ie := min(ib+q8Group/4, quads)
+		ib := g * group / 4
+		ie := min(ib+group/4, quads)
 		for r := range acc {
 			clear(acc[r])
 		}

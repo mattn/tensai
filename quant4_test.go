@@ -188,6 +188,110 @@ func TestQuantize4Group32(t *testing.T) {
 	}
 }
 
+func TestQuantize4MinForm(t *testing.T) {
+	rng := rand.New(rand.NewSource(44))
+	for _, c := range []struct{ rows, cols int }{
+		{256, 96},
+		{100, 33}, // partial final group
+	} {
+		m := RandomMatrix(c.rows, c.cols, rng)
+		// Asymmetric group quantization: value = scale*q - min, q in 0..15
+		// — the form GGUF's Q4_K sub-blocks carry.
+		quads := (c.rows + 3) / 4
+		groups := (c.rows + 31) / 32
+		q := &Q4Matrix{
+			Rows:  c.rows,
+			Cols:  c.cols,
+			Q:     make([]uint8, quads*2*c.cols+32),
+			Scale: make([]Float, groups*c.cols),
+			Min:   make([]Float, groups*c.cols),
+			Group: 32,
+		}
+		for j := 0; j < c.cols; j++ {
+			for g := 0; g < groups; g++ {
+				rlo, rhi := g*32, min((g+1)*32, c.rows)
+				lo, hi := m.Data[rlo*c.cols+j], m.Data[rlo*c.cols+j]
+				for i := rlo; i < rhi; i++ {
+					v := m.Data[i*c.cols+j]
+					if v < lo {
+						lo = v
+					}
+					if v > hi {
+						hi = v
+					}
+				}
+				s := (hi - lo) / 15
+				q.Scale[g*c.cols+j] = s
+				q.Min[g*c.cols+j] = -lo // value = s*q + lo = s*q - min
+				for i := rlo; i < rhi; i++ {
+					n := 0
+					if s != 0 {
+						n = int((m.Data[i*c.cols+j]-lo)/s + 0.5)
+						if n > 15 {
+							n = 15
+						}
+					}
+					q.Q[(i/4)*2*c.cols+2*j+(i%4)/2] |= uint8(n) << (4 * (i % 2))
+				}
+			}
+			// Pad rows encode q=0; their min contribution must vanish, so
+			// the pad rows rely on activation pads being exactly 64 (xs=0).
+		}
+		x := make([]Float, c.rows)
+		for i := range x {
+			x[i] = Float(rng.NormFloat64())
+		}
+		out := make([]Float, c.cols)
+		if err := q.MatVec(x, out); err != nil {
+			t.Fatalf("%v: %v", c, err)
+		}
+		xu, sx := quantizeActs(x)
+		for j := 0; j < c.cols; j++ {
+			var want float64
+			for g := 0; g < groups; g++ {
+				rlo, rhi := g*32, min((g+1)*32, c.rows)
+				var acc, gs int64
+				for i := rlo; i < rhi; i++ {
+					qv := int64(q.Q[(i/4)*2*c.cols+2*j+(i%4)/2]>>(4*(i%2))) & 0x0F
+					xs := int64(xu[i]) - 64
+					acc += qv * xs
+					gs += xs
+				}
+				want += float64(acc)*float64(q.Scale[g*c.cols+j]) - float64(gs)*float64(q.Min[g*c.cols+j])
+			}
+			want *= float64(sx)
+			if diff := math.Abs(float64(out[j]) - want); diff > 1e-3*(1+math.Abs(want)) {
+				t.Fatalf("%v col %d: got %v want %v", c, j, out[j], want)
+			}
+			// And the whole thing stays close to the float product.
+			var full float64
+			for i := 0; i < c.rows; i++ {
+				full += float64(x[i]) * float64(m.Data[i*c.cols+j])
+			}
+			if diff := math.Abs(want - full); diff > 2 {
+				t.Fatalf("%v col %d: quantization error %v too large", c, j, diff)
+			}
+		}
+
+		xb := RandomMatrix(6, c.rows, rng)
+		ob := NewMatrix(6, c.cols)
+		if err := q.MatMul(xb, ob); err != nil {
+			t.Fatal(err)
+		}
+		row := make([]Float, c.cols)
+		for r := 0; r < 6; r++ {
+			if err := q.MatVec(xb.Data[r*c.rows:(r+1)*c.rows], row); err != nil {
+				t.Fatal(err)
+			}
+			for j := range row {
+				if ob.Data[r*c.cols+j] != row[j] {
+					t.Fatalf("%v row %d col %d differs", c, r, j)
+				}
+			}
+		}
+	}
+}
+
 func BenchmarkMatVecQ4Big(b *testing.B) {
 	rng := rand.New(rand.NewSource(33))
 	q, err := QuantizeMatrix4(RandomMatrix(4096, 16384, rng))
