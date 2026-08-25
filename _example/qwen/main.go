@@ -333,6 +333,7 @@ func main() {
 	draftDir := flag.String("draft", "", "data directory of a smaller draft model: speculative decoding (greedy only)")
 	specK := flag.Int("spec", 3, "draft tokens proposed per speculative step (3 fills one 4-row verification block)")
 	requant := flag.Bool("requant", false, "requantize gguf weights through float32 instead of repacking their stored blocks (slower load, but coarser scale tables decode faster)")
+	nocache := flag.Bool("nocache", false, "neither write nor reuse the repack cache file the first -gguf load leaves next to the model")
 	flag.Parse()
 	hfBase = "https://huggingface.co/" + *repo + "/resolve/main/"
 
@@ -349,7 +350,7 @@ func main() {
 	var err error
 	start := time.Now()
 	if *ggufPath != "" {
-		model, tok, err = loadGGUF(*ggufPath, bits, !*gpu && !*requant)
+		model, tok, err = loadGGUF(*ggufPath, bits, !*gpu && !*requant, !*nocache)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
