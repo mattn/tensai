@@ -39,6 +39,10 @@ type config struct {
 	TieEmbedding bool    `json:"tie_word_embeddings"`
 	EOS          int     `json:"eos_token_id"`
 	ModelType    string  `json:"model_type"`
+	// ChatStyle overrides the template family when it differs from the
+	// architecture — DeepSeek's R1 distills are qwen2/llama blocks that
+	// speak DeepSeek's turn markers. Set by the GGUF loader, never JSON.
+	ChatStyle string `json:"-"`
 }
 
 // qmat abstracts the int8 and int4 twins behind one matvec call, plus the

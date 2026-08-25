@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"math"
 	"runtime"
+	"strings"
 	"sync"
 
 	tensai "github.com/mattn/tensai"
@@ -46,7 +47,7 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 	switch pre {
 	case "smollm":
 		preJSON = `{"type":"Sequence","pretokenizers":[{"type":"Digits","individual_digits":true},{"type":"ByteLevel","use_regex":true}]}`
-	case "qwen2", "llama-bpe", "llama3", "smaug-bpe":
+	case "qwen2", "llama-bpe", "llama3", "smaug-bpe", "deepseek-r1-qwen":
 		preJSON = `{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}}`
 	case "gpt-2", "olmo", "":
 		preJSON = `{"type":"ByteLevel","use_regex":true}`
@@ -619,6 +620,11 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 	}
 	if cfg.HiddenSize == 0 || cfg.Layers == 0 || cfg.Heads == 0 || cfg.KVHeads == 0 {
 		return nil, nil, fmt.Errorf("gguf is missing %s.* dimensions", arch)
+	}
+	// DeepSeek's R1 distills are stock qwen2/llama blocks speaking
+	// DeepSeek's turn markers; the embedded template gives them away.
+	if tpl, _ := g.String("tokenizer.chat_template"); strings.Contains(tpl, "<｜User｜>") {
+		cfg.ChatStyle = "deepseek"
 	}
 	if cfg.Vocab == 0 {
 		// Phi-3 files omit vocab_size; the load gate's lm-head estimate

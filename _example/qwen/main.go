@@ -243,6 +243,18 @@ type tmpl struct {
 const qwenSystem = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
 
 func templateFor(modelType string, think bool) tmpl {
+	if modelType == "deepseek" {
+		// DeepSeek R1 distills: the system prompt (rarely used — DeepSeek
+		// recommends none) sits bare after BOS, user turns have no closing
+		// marker, and the model opens its answer with a <think> block on
+		// its own.
+		return tmpl{
+			bos:      "<｜begin▁of▁sentence｜>",
+			userOpen: "<｜User｜>",
+			asstOpen: "<｜Assistant｜>", asstClose: "<｜end▁of▁sentence｜>",
+			stops: []string{"<｜end▁of▁sentence｜>"},
+		}
+	}
 	if modelType == "phi3" {
 		// Phi-3's template has no system role either; its official
 		// guidance folds the system prompt into the first user turn.
@@ -377,10 +389,20 @@ func main() {
 			draftM.cfg.Layers, draftM.cfg.HiddenSize, time.Since(start).Round(time.Millisecond))
 	}
 
-	if *system == qwenSystem && model.cfg.ModelType != "qwen2" && model.cfg.ModelType != "qwen3" {
-		*system = "You are a helpful assistant."
+	style := model.cfg.ChatStyle
+	if style == "" {
+		style = model.cfg.ModelType
 	}
-	tm := templateFor(model.cfg.ModelType, *think)
+	if *system == qwenSystem {
+		switch {
+		case style == "deepseek":
+			// DeepSeek recommends no system prompt for the R1 distills.
+			*system = ""
+		case style != "qwen2" && style != "qwen3":
+			*system = "You are a helpful assistant."
+		}
+	}
+	tm := templateFor(style, *think)
 	stopID := func(i int) int {
 		if i < len(tm.stops) {
 			if id, ok := tok.ID(tm.stops[i]); ok {
