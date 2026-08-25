@@ -549,26 +549,35 @@ func (m *qwen) moeFFN(b *qblock, a []float32) []float32 {
 
 // mv computes x @ W (+ bias), on the quantized twin when it exists.
 func mv(x []float32, w *tensai.Matrix, q *qmat, bias []float32) []float32 {
-	var out []float32
+	cols := 0
 	if q != nil {
-		out = make([]float32, q.cols)
+		cols = q.cols
+	} else {
+		cols = w.Cols
+	}
+	out := make([]float32, cols)
+	mvInto(out, x, w, q, bias)
+	return out
+}
+
+// mvInto computes x @ W (+ bias) into out, on the quantized twin when it exists.
+func mvInto(out, x []float32, w *tensai.Matrix, q *qmat, bias []float32) {
+	if q != nil {
 		if err := q.f(x, out); err != nil {
 			panic(err)
 		}
 	} else {
 		xm := &tensai.Matrix{Rows: 1, Cols: len(x), Data: x}
-		o, err := tensai.Dot(xm, w)
-		if err != nil {
+		om := &tensai.Matrix{Rows: 1, Cols: len(out), Data: out}
+		if err := tensai.DotInto(om, xm, w); err != nil {
 			panic(err)
 		}
-		out = o.Data
 	}
 	if bias != nil {
 		for i := range out {
 			out[i] += bias[i]
 		}
 	}
-	return out
 }
 
 // mmb is mv for a batch of rows: x @ W (+ bias per row), on the quantized
@@ -869,10 +878,16 @@ func (m *qwen) step(token, pos int) []float32 {
 
 	kvDim := cfg.KVHeads * m.headSz
 	qDim := cfg.Heads * m.headSz
+	qkvW := qDim + 2*kvDim
+	qkv := make([]float32, qkvW)
+	attn := make([]float32, qDim)
+	proj := make([]float32, hs)
+	gu := make([]float32, 2*cfg.Intermediate)
+	downBuf := make([]float32, hs)
 	for li := range m.blocks {
 		b := &m.blocks[li]
 		rmsnormInto(a, x, b.ln1, cfg.RMSEps)
-		qkv := mv(a, b.wQKV, b.qQKV, b.bQKV)
+		mvInto(qkv, a, b.wQKV, b.qQKV, b.bQKV)
 		q := qkv[:qDim]
 		k := qkv[qDim : qDim+kvDim]
 		v := qkv[qDim+kvDim:]
@@ -891,7 +906,7 @@ func (m *qwen) step(token, pos int) []float32 {
 		b.kc = append(b.kc, append(make([]float32, 0, kvDim), k...))
 		b.vc = append(b.vc, append(make([]float32, 0, kvDim), v...))
 
-		attn := make([]float32, qDim)
+		clear(attn)
 		steps := len(b.kc)
 		// Short contexts run the heads serially; past that the goroutine
 		// cost disappears into the O(steps*headSz) work per head.
@@ -914,7 +929,7 @@ func (m *qwen) step(token, pos int) []float32 {
 				m.attendHead(b, q, attn, h, group, steps, scores)
 			}
 		}
-		proj := mv(attn, b.wo, b.qo, b.bo)
+		mvInto(proj, attn, b.wo, b.qo, b.bo)
 		if b.postAttn != nil {
 			rmsnormInto(proj, proj, b.postAttn, cfg.RMSEps)
 		}
@@ -927,10 +942,11 @@ func (m *qwen) step(token, pos int) []float32 {
 		if len(b.experts) > 0 {
 			down = m.moeFFN(b, a)
 		} else {
-			gu := mv(a, b.wGU, b.qGU, nil)
+			mvInto(gu, a, b.wGU, b.qGU, nil)
 			gate, up := gu[:cfg.Intermediate], gu[cfg.Intermediate:]
 			activate(gate, up, b.geglu)
-			down = mv(gate, b.wDown, b.qDown, nil)
+			mvInto(downBuf, gate, b.wDown, b.qDown, nil)
+			down = downBuf
 		}
 		if b.postFFN != nil {
 			rmsnormInto(down, down, b.postFFN, cfg.RMSEps)
