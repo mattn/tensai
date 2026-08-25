@@ -35,9 +35,9 @@ func NewQ8GMatrix(rows, cols, group int) *Q8GMatrix {
 	return &Q8GMatrix{
 		Rows:     rows,
 		Cols:     cols,
-		Q:        make([]int8, quads*4*cols+32),
-		Scale:    make([]Float, groups*cols),
-		ColSum64: make([]int32, groups*cols),
+		Q:        make([]int8, ((cols+q4Tile-1)/q4Tile)*quads*4*q4Tile+32),
+		Scale:    make([]Float, ((cols+q4Tile-1)/q4Tile)*groups*q4Tile),
+		ColSum64: make([]int32, ((cols+q4Tile-1)/q4Tile)*groups*q4Tile),
 		Group:    group,
 	}
 }
@@ -48,6 +48,21 @@ func (q *Q8GMatrix) group() int {
 		return q.Group
 	}
 	return q8Group
+}
+
+// Index returns the position in Q of row i, column j: 32-column tiles
+// store their row quads back to back (128 bytes apiece), so a kernel
+// worker streams sequential memory.
+func (q *Q8GMatrix) Index(i, j int) int {
+	quads := (q.Rows + 3) / 4
+	return (j/q4Tile)*quads*4*q4Tile + (i/4)*4*q4Tile + (j%q4Tile)*4 + i%4
+}
+
+// TableIndex returns the position in Scale and ColSum64 of group g,
+// column j; tables are tile-major like the weights.
+func (q *Q8GMatrix) TableIndex(g, j int) int {
+	groups := (q.Rows + q.group() - 1) / q.group()
+	return ((j/q4Tile)*groups+g)*q4Tile + j%q4Tile
 }
 
 // MatVec computes out = x @ Q for a single activation row: len(x) must be
@@ -64,7 +79,7 @@ func (q *Q8GMatrix) MatVec(x, out []Float) error {
 		q8gMatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, grp, q.Cols, 0, q.Cols)
 		return nil
 	}
-	parallelChunks(q.Cols, workers, 8, func(lo, hi int) {
+	parallelChunks(q.Cols, workers, q4Tile, func(lo, hi int) {
 		q8gMatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, grp, q.Cols, lo, hi)
 	})
 	return nil
@@ -98,7 +113,7 @@ func (q *Q8GMatrix) MatMul(x, out *Matrix) error {
 		run(0, q.Cols)
 		return nil
 	}
-	parallelChunks(q.Cols, workers, 8, func(lo, hi int) {
+	parallelChunks(q.Cols, workers, q4Tile, func(lo, hi int) {
 		run(lo, hi)
 	})
 	return nil
@@ -118,16 +133,16 @@ func q8gMatvecColsGeneric(out []Float, xu []uint8, sx Float, qw []int8, scale []
 		for i4 := ib; i4 < ie; i4++ {
 			x0, x1 := int32(xu[4*i4]), int32(xu[4*i4+1])
 			x2, x3 := int32(xu[4*i4+2]), int32(xu[4*i4+3])
-			row := qw[i4*4*cols:]
+			row := qw[i4*4*q4Tile:]
 			for j := lo; j < hi; j++ {
-				acc[j-lo] += x0*int32(row[4*j]) + x1*int32(row[4*j+1]) +
-					x2*int32(row[4*j+2]) + x3*int32(row[4*j+3])
+				o := (j/q4Tile)*quads*4*q4Tile + (j%q4Tile)*4
+				acc[j-lo] += x0*int32(row[o]) + x1*int32(row[o+1]) +
+					x2*int32(row[o+2]) + x3*int32(row[o+3])
 			}
 		}
-		srow := scale[g*cols:]
-		csrow := colSum64[g*cols:]
 		for j := lo; j < hi; j++ {
-			out[j] += Float(acc[j-lo]-csrow[j]) * srow[j]
+			t := ((j/q4Tile)*groups + g) * q4Tile
+			out[j] += Float(acc[j-lo]-colSum64[t+j%q4Tile]) * scale[t+j%q4Tile]
 		}
 	}
 	for j := lo; j < hi; j++ {
@@ -153,23 +168,23 @@ func q8gMatmulRows8Generic(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw [
 			clear(acc[r])
 		}
 		for i4 := ib; i4 < ie; i4++ {
-			row := qw[i4*4*cols:]
+			row := qw[i4*4*q4Tile:]
 			for r := 0; r < 8; r++ {
 				x0, x1 := int32(xus[r][4*i4]), int32(xus[r][4*i4+1])
 				x2, x3 := int32(xus[r][4*i4+2]), int32(xus[r][4*i4+3])
 				a := acc[r]
 				for j := lo; j < hi; j++ {
-					a[j-lo] += x0*int32(row[4*j]) + x1*int32(row[4*j+1]) +
-						x2*int32(row[4*j+2]) + x3*int32(row[4*j+3])
+					o := (j/q4Tile)*quads*4*q4Tile + (j%q4Tile)*4
+					a[j-lo] += x0*int32(row[o]) + x1*int32(row[o+1]) +
+						x2*int32(row[o+2]) + x3*int32(row[o+3])
 				}
 			}
 		}
-		srow := scale[g*cols:]
-		csrow := colSum64[g*cols:]
 		for r := 0; r < 8; r++ {
 			o := out.Data[(r0+r)*cols:]
 			for j := lo; j < hi; j++ {
-				o[j] += Float(acc[r][j-lo]-csrow[j]) * srow[j]
+				t := ((j/q4Tile)*groups + g) * q4Tile
+				o[j] += Float(acc[r][j-lo]-colSum64[t+j%q4Tile]) * scale[t+j%q4Tile]
 			}
 		}
 	}

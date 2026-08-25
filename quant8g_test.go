@@ -29,7 +29,7 @@ func buildQ8G(m *Matrix, group int) *Q8GMatrix {
 				}
 			}
 			s := maxAbs / 127
-			q.Scale[g*m.Cols+j] = s
+			q.Scale[q.TableIndex(g, j)] = s
 			var sum int32
 			for i := rlo; i < rhi; i++ {
 				n := 0
@@ -42,10 +42,10 @@ func buildQ8G(m *Matrix, group int) *Q8GMatrix {
 					}
 					n = int(v)
 				}
-				q.Q[(i/4)*4*m.Cols+4*j+i%4] = int8(n)
+				q.Q[q.Index(i, j)] = int8(n)
 				sum += int32(n)
 			}
-			q.ColSum64[g*m.Cols+j] = 64 * sum
+			q.ColSum64[q.TableIndex(g, j)] = 64 * sum
 		}
 	}
 	return q
@@ -85,10 +85,10 @@ func TestQ8GMatVecAndMatMul(t *testing.T) {
 				rlo, rhi := g*group, min((g+1)*group, c.rows)
 				var acc int64
 				for i := rlo; i < rhi; i++ {
-					w := int64(q.Q[(i/4)*4*c.cols+4*j+i%4])
+					w := int64(q.Q[q.Index(i, j)])
 					acc += w * (int64(xu[i]) - 64)
 				}
-				want += float64(acc) * float64(q.Scale[g*c.cols+j])
+				want += float64(acc) * float64(q.Scale[q.TableIndex(g, j)])
 			}
 			want *= float64(sx)
 			if diff := math.Abs(float64(out[j]) - want); diff > 1e-3*(1+math.Abs(want)) {
