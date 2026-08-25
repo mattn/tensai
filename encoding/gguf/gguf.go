@@ -216,6 +216,31 @@ func (f *File) Close() error {
 	return err
 }
 
+// Release hints that a tensor's bytes will not be read again: when the
+// file is memory-mapped, the kernel may drop those page-cache pages
+// right away instead of letting them crowd out the caller's own
+// memory during a large load. Harmless otherwise.
+func (f *File) Release(name string) {
+	t, ok := f.tensors[name]
+	if !ok || f.data == nil {
+		return
+	}
+	spec, ok := blockSpec[t.typ]
+	if !ok {
+		return
+	}
+	n := int64(1)
+	for _, d := range t.shape {
+		n *= int64(d)
+	}
+	nbytes := n / spec.values * spec.bytes
+	lo := f.dataBase + t.offset
+	if lo < 0 || lo+nbytes > int64(len(f.data)) {
+		return
+	}
+	mmapfile.Release(f.data[lo : lo+nbytes])
+}
+
 // Names returns the tensor names in sorted order.
 func (f *File) Names() []string { return append([]string(nil), f.names...) }
 

@@ -21,6 +21,24 @@ func matvecWorkerCount(cols, rows int) int {
 	return workers
 }
 
+// padRows8 pads a tail of quantized activation rows (fewer than eight)
+// to a full block: zero rows are harmless in the integer kernels, and a
+// scratch matrix receives the block so callers copy back only the real
+// rows. The Q4 path uses the first four entries.
+func padRows8(xus [][]uint8, sxs []Float, rowLen, cols int) ([][]uint8, []Float, *Matrix) {
+	pxus := make([][]uint8, 8)
+	psxs := make([]Float, 8)
+	zero := make([]uint8, rowLen)
+	for i := 0; i < 8; i++ {
+		if i < len(xus) {
+			pxus[i], psxs[i] = xus[i], sxs[i]
+		} else {
+			pxus[i] = zero
+		}
+	}
+	return pxus, psxs, NewMatrix(8, cols)
+}
+
 // parallelChunks splits [0, n) into align-rounded chunks across the
 // workers, the calling goroutine taking the first chunk itself: a
 // matvec fan-out spawns workers-1 goroutines and the caller streams
@@ -233,13 +251,27 @@ func (q *QMatrix) MatMul(x, out *Matrix) error {
 	for r := 0; r < rows; r++ {
 		xus[r], sxs[r] = quantizeActs(x.Data[r*x.Cols : (r+1)*x.Cols])
 	}
+	// The row tail (rows%8 leftovers) pads to one full block: zero
+	// rows are harmless in the integer kernels, the scratch matrix is
+	// shared by every column chunk (they write disjoint ranges), and
+	// only the real rows copy back — so the tail streams the weights
+	// once instead of once per row.
+	var pxus [][]uint8
+	var psxs []Float
+	var scratch *Matrix
+	if rows%8 != 0 {
+		pxus, psxs, scratch = padRows8(xus[rows-rows%8:], sxs[rows-rows%8:], len(xus[0]), q.Cols)
+	}
 	run := func(lo, hi int) {
 		var r int
 		for ; r+8 <= rows; r += 8 {
 			qmatmulRows8(out, xus[r:r+8], sxs[r:r+8], r, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
 		}
-		for ; r < rows; r++ {
-			qmatvecCols(out.Data[r*q.Cols:(r+1)*q.Cols], xus[r], sxs[r], q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
+		if r < rows {
+			qmatmulRows8(scratch, pxus, psxs, 0, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
+			for i := 0; i < rows-r; i++ {
+				copy(out.Data[(r+i)*q.Cols+lo:(r+i)*q.Cols+hi], scratch.Data[i*q.Cols+lo:i*q.Cols+hi])
+			}
 		}
 	}
 	workers := matvecWorkerCount(q.Cols, q.Rows)
