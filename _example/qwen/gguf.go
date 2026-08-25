@@ -634,6 +634,29 @@ func repackQ5K4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fu
 	}
 }
 
+// repackMXFP4 copies an MXFP4 tensor's blocks — [out, in] with one E8M0
+// exponent and 32 FP4 codes apiece — into columns of a transposed
+// MXFP4Matrix: the codes move verbatim, so the repack is exact.
+func repackMXFP4(dst *tensai.MXFP4Matrix, raw []byte, out, in, colOff int) {
+	nb := in / 32
+	for r := 0; r < out; r++ {
+		j := colOff + r
+		for b := 0; b < nb; b++ {
+			blk := raw[(r*nb+b)*17:]
+			dst.Scale[dst.TableIndex(b, j)] = tensai.MXFP4Scale(blk[0])
+			var sum int32
+			for i := 0; i < 16; i++ {
+				q := blk[1+i]
+				iLo, iHi := b*32+i, b*32+i+16
+				dst.Q[dst.Index(iLo, j)] |= (q & 0x0F) << (4 * (iLo % 2))
+				dst.Q[dst.Index(iHi, j)] |= (q >> 4) << (4 * (iHi % 2))
+				sum += int32(tensai.MXFP4Value(q&0x0F)) + int32(tensai.MXFP4Value(q>>4))
+			}
+			dst.ColSum64[dst.TableIndex(b, j)] = 64 * sum
+		}
+	}
+}
+
 // unpermuteMap returns the llama rope unpermutation as a row index map,
 // or nil when heads is zero.
 func unpermuteMap(rows, heads int) func(int) int {
@@ -664,7 +687,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 
 	arch, _ := g.String("general.architecture")
 	switch arch {
-	case "llama", "qwen2", "qwen3", "smollm3", "gemma3", "phi3", "qwen2moe", "qwen3moe":
+	case "llama", "qwen2", "qwen3", "smollm3", "gemma3", "phi3", "qwen2moe", "qwen3moe", "gpt-oss":
 	default:
 		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2(+moe), qwen3(+moe), llama, smollm3, gemma3, and phi3)", arch)
 	}
@@ -691,7 +714,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 	if cfg.HiddenSize == 0 || cfg.Layers == 0 || cfg.Heads == 0 || cfg.KVHeads == 0 {
 		return nil, nil, fmt.Errorf("gguf is missing %s.* dimensions", arch)
 	}
-	if arch == "qwen2moe" || arch == "qwen3moe" {
+	if arch == "qwen2moe" || arch == "qwen3moe" || arch == "gpt-oss" {
 		cfg.NExpert = int(meta("expert_count"))
 		cfg.NExpertUsed = int(meta("expert_used_count"))
 		// Older conversions omit the expert dims; the tensors carry them.
@@ -707,6 +730,13 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 		if bits == 0 || !direct {
 			return nil, nil, fmt.Errorf("%s needs -q8 or -q4 without -requant or -gpu (experts repack directly from the stored blocks)", arch)
 		}
+	}
+
+	if typ, _ := g.String(arch + ".rope.scaling.type"); typ == "yarn" {
+		cfg.YarnFactor, _ = g.Float(arch + ".rope.scaling.factor")
+		cfg.YarnOrigCtx = int(meta("rope.scaling.original_context_length"))
+		cfg.YarnBetaFast, _ = g.Float(arch + ".rope.scaling.yarn_beta_fast")
+		cfg.YarnBetaSlow, _ = g.Float(arch + ".rope.scaling.yarn_beta_slow")
 	}
 
 	// DeepSeek's R1 distills are stock qwen2/llama blocks speaking
@@ -1053,6 +1083,8 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 				return in / 32 * 18
 			case "Q5_0":
 				return in / 32 * 22
+			case "MXFP4":
+				return in / 32 * 17
 			case "Q4_K":
 				return in / 256 * 144
 			case "Q5_K":
@@ -1083,8 +1115,12 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 		}
 		var q4 *tensai.Q4Matrix
 		var q8 *tensai.Q8GMatrix
+		var mx *tensai.MXFP4Matrix
 		var pack func(raw []byte, out, colOff int)
 		switch {
+		case typ0 == "MXFP4":
+			mx = tensai.NewMXFP4Matrix(in, total)
+			pack = func(raw []byte, out, colOff int) { repackMXFP4(mx, raw, out, in, colOff) }
 		case typ0 == "Q8_0":
 			q8 = tensai.NewQ8GMatrix(in, total, 0)
 			pack = func(raw []byte, out, colOff int) { repackQ8(q8, raw, out, in, colOff, nil) }
@@ -1124,6 +1160,9 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			}
 			pack(raw[e*rb*outs[i]:], outs[i], colOff)
 			colOff += outs[i]
+		}
+		if mx != nil {
+			return &qmat{cols: mx.Cols, f: mx.MatVec, mm: mx.MatMul}
 		}
 		if q8 != nil {
 			return &qmat{cols: q8.Cols, f: q8.MatVec, mm: q8.MatMul}
@@ -1216,11 +1255,24 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			}
 			p := fmt.Sprintf("blk.%d.", i)
 			b.ln1 = tensor(p + "attn_norm.weight").Data
-			b.ln2 = tensor(p + "ffn_norm.weight").Data
+			if arch == "gpt-oss" {
+				// gpt-oss names its pre-FFN norm the HF way; there is no
+				// sandwich norm, so postAttn stays nil. Even layers slide
+				// a 128-token window with the attention sinks absorbing
+				// the mass that would have gone beyond it.
+				b.ln2 = tensor(p + "post_attention_norm.weight").Data
+				b.sinks = vecOpt(p + "attn_sinks.weight")
+				b.bo = vecOpt(p + "attn_output.bias")
+				if i%2 == 0 {
+					b.window = cfg.SlidingWin
+				}
+			} else {
+				b.ln2 = tensor(p + "ffn_norm.weight").Data
+				b.postAttn = vecOpt(p + "post_attention_norm.weight")
+				b.postFFN = vecOpt(p + "post_ffw_norm.weight")
+			}
 			b.qNorm = vecOpt(p + "attn_q_norm.weight")
 			b.kNorm = vecOpt(p + "attn_k_norm.weight")
-			b.postAttn = vecOpt(p + "post_attention_norm.weight")
-			b.postFFN = vecOpt(p + "post_ffw_norm.weight")
 			if _, _, ok := g.Info(p + "attn_qkv.weight"); ok {
 				// Phi-3 ships q/k/v pre-fused in that order — the layout
 				// the runtime wants, no permutation (NEOX rope).
@@ -1235,11 +1287,28 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 			case cfg.NExpert > 0:
 				b.topK = cfg.NExpertUsed
 				b.normTopK = arch == "qwen3moe"
+				b.softmaxK = arch == "gpt-oss"
+				b.oaiGLU = arch == "gpt-oss"
 				b.router = trans(p+"ffn_gate_inp.weight", 0)
+				b.routerBias = vecOpt(p + "ffn_gate_inp.bias")
+				var gateB, upB, downB []float32
+				if arch == "gpt-oss" {
+					gateB = tensor(p + "ffn_gate_exps.bias").Data
+					upB = tensor(p + "ffn_up_exps.bias").Data
+					downB = tensor(p + "ffn_down_exps.bias").Data
+				}
 				b.experts = make([]expertFFN, cfg.NExpert)
 				for e := range b.experts {
 					b.experts[e].qGU = moeExpert([]string{p + "ffn_gate_exps.weight", p + "ffn_up_exps.weight"}, e)
 					b.experts[e].qDown = moeExpert([]string{p + "ffn_down_exps.weight"}, e)
+					if gateB != nil {
+						ff := cfg.MoeFF
+						gu := make([]float32, 2*ff)
+						copy(gu[:ff], gateB[e*ff:(e+1)*ff])
+						copy(gu[ff:], upB[e*ff:(e+1)*ff])
+						b.experts[e].guBias = gu
+						b.experts[e].downBias = downB[e*cfg.HiddenSize : (e+1)*cfg.HiddenSize]
+					}
 				}
 				if arch == "qwen2moe" {
 					_, b.sharedGU = linAuto([]string{p + "ffn_gate_shexp.weight", p + "ffn_up_shexp.weight"}, []int{0, 0})

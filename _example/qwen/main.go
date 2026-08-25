@@ -243,6 +243,17 @@ type tmpl struct {
 const qwenSystem = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
 
 func templateFor(modelType string, think bool) tmpl {
+	if modelType == "gpt-oss" {
+		// The harmony format: role blocks between <|start|> and <|end|>,
+		// the assistant answering in channels (analysis for reasoning,
+		// final for the reply) and finishing with <|return|>.
+		return tmpl{
+			sysOpen: "<|start|>system<|message|>", sysClose: "<|end|>",
+			userOpen: "<|start|>user<|message|>", userClose: "<|end|>",
+			asstOpen: "<|start|>assistant", asstClose: "<|return|>",
+			stops: []string{"<|return|>"},
+		}
+	}
 	if modelType == "deepseek" {
 		// DeepSeek R1 distills: the system prompt (rarely used — DeepSeek
 		// recommends none) sits bare after BOS, user turns have no closing
@@ -395,6 +406,10 @@ func main() {
 	}
 	if *system == qwenSystem {
 		switch {
+		case style == "gpt-oss":
+			// The harmony system block: identity, reasoning effort, and
+			// the channel contract the model was trained on.
+			*system = "You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\n\nReasoning: low\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message."
 		case style == "deepseek":
 			// DeepSeek recommends no system prompt for the R1 distills.
 			*system = ""
