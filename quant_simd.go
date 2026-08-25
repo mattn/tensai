@@ -64,29 +64,36 @@ func qmatmulRows8(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []int8, sc
 		return
 	}
 	quads := len(xus[0]) / 4
-	// The packed activation quads per row, hoisted out of the tile loop.
-	var xq [8][]uint32
+	// The packed activation quads, interleaved per quad row so the inner
+	// loop walks one contiguous stream. Accumulators are eight named
+	// variables: an array of SIMD values would live on the stack and turn
+	// every multiply-add into a load-op-store round trip.
+	xq := make([]uint32, 8*quads)
 	for r := 0; r < 8; r++ {
-		xq[r] = make([]uint32, quads)
 		for i4 := 0; i4 < quads; i4++ {
-			xq[r][i4] = qxQuad(xus[r], i4)
+			xq[i4*8+r] = qxQuad(xus[r], i4)
 		}
 	}
 	ones := archsimd.BroadcastInt16x16(1)
 	vecEnd := lo + ((hi - lo) &^ 7)
 	for jt := lo; jt < vecEnd; jt += 8 {
-		var a [8]archsimd.Int32x8
+		var a0, a1, a2, a3, a4, a5, a6, a7 archsimd.Int32x8
 		for i4 := 0; i4 < quads; i4++ {
 			w := loadI8x32(qw[i4*4*cols+4*jt:])
-			for r := 0; r < 8; r++ {
-				xp := archsimd.BroadcastUint32x8(xq[r][i4]).AsUint8x32()
-				a[r] = a[r].Add(xp.DotProductPairsSaturated(w).DotProductPairs(ones))
-			}
+			xf := xq[i4*8 : i4*8+8]
+			a0 = a0.Add(archsimd.BroadcastUint32x8(xf[0]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))
+			a1 = a1.Add(archsimd.BroadcastUint32x8(xf[1]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))
+			a2 = a2.Add(archsimd.BroadcastUint32x8(xf[2]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))
+			a3 = a3.Add(archsimd.BroadcastUint32x8(xf[3]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))
+			a4 = a4.Add(archsimd.BroadcastUint32x8(xf[4]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))
+			a5 = a5.Add(archsimd.BroadcastUint32x8(xf[5]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))
+			a6 = a6.Add(archsimd.BroadcastUint32x8(xf[6]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))
+			a7 = a7.Add(archsimd.BroadcastUint32x8(xf[7]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))
 		}
 		cs := loadI32x8(colSum64[jt:])
 		sc := loadF32x8(scale[jt:])
-		for r := 0; r < 8; r++ {
-			f := a[r].Sub(cs).ConvertToFloat32().Mul(sc).Mul(archsimd.BroadcastFloat32x8(sxs[r]))
+		for r, a := range [8]archsimd.Int32x8{a0, a1, a2, a3, a4, a5, a6, a7} {
+			f := a.Sub(cs).ConvertToFloat32().Mul(sc).Mul(archsimd.BroadcastFloat32x8(sxs[r]))
 			storeF32x8(f, out.Data[(r0+r)*cols+jt:])
 		}
 	}
