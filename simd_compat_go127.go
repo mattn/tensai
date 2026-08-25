@@ -31,6 +31,10 @@ func storeI32x8(v archsimd.Int32x8, s []int32) {
 	v.Store(s)
 }
 
+func loadU32x8(s []uint32) archsimd.Uint32x8 {
+	return archsimd.LoadUint32x8(s)
+}
+
 func loadU8x16(s []uint8) archsimd.Uint8x16 {
 	return archsimd.LoadUint8x16(s)
 }

@@ -2171,7 +2171,7 @@ func (g *GPU) UploadQ4(q *Q4Matrix) (*GPUQ4Matrix, error) {
 	if q.Group != 0 && q.Group != 64 {
 		return nil, fmt.Errorf("tensai: gpu int4 kernel folds 64-row groups, not %d", q.Group)
 	}
-	if q.Min != nil {
+	if q.ScaleMin != nil {
 		return nil, fmt.Errorf("tensai: gpu int4 kernel is symmetric; min-form matrices are cpu-only")
 	}
 	pairs := (q.Rows + 1) / 2

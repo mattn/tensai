@@ -223,8 +223,8 @@ func kScaleMin(is int, q []byte) (sc, mn uint8) {
 // repackQ4K copies a Q4_K tensor's super-blocks — [out, in] with eight
 // 32-value sub-groups per 256, each carrying a 6-bit scale and min
 // against two f16 super-factors — into columns of a transposed Group-32
-// min-form Q4Matrix. Nibbles copy raw; only the per-group scale and min
-// tables touch floats.
+// min-form Q4Matrix. Nibbles copy raw; the per-group scale and min pairs
+// round to packed bfloat16, the only lossy step (~0.2% on the tables).
 func repackQ4K(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
 	nb := in / 256
 	for r := 0; r < out; r++ {
@@ -241,8 +241,7 @@ func repackQ4K(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fun
 			for is := 0; is < 8; is++ {
 				sc, mn := kScaleMin(is, scales)
 				g := b*8 + is
-				dst.Scale[g*dst.Cols+j] = d * float32(sc)
-				dst.Min[g*dst.Cols+j] = dmin * float32(mn)
+				dst.ScaleMin[g*dst.Cols+j] = tensai.PackScaleMin(d*float32(sc), dmin*float32(mn))
 			}
 			for c := 0; c < 4; c++ {
 				for l := 0; l < 32; l++ {
@@ -345,17 +344,25 @@ func repackQ6K4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fu
 					vmin, vmax = min(vmin, w), max(vmax, w)
 				}
 				g := b*8 + p
-				scale := (vmax - vmin) / 15
-				dst.Scale[g*dst.Cols+j] = scale
-				dst.Min[g*dst.Cols+j] = -vmin
+				// Quantize against the bfloat16-rounded pair the kernel
+				// will unpack, so the rounding lands on the nibble choice
+				// rather than stacking onto the reconstruction.
+				packed := tensai.PackScaleMin((vmax-vmin)/15, -vmin)
+				dst.ScaleMin[g*dst.Cols+j] = packed
+				scale, mn := tensai.UnpackScaleMin(packed)
 				if scale == 0 {
 					continue
 				}
 				inv := 1 / scale
 				for k, w := range v {
-					nib := uint8((w-vmin)*inv + 0.5)
+					n := (w+mn)*inv + 0.5
+					if n < 0 {
+						n = 0
+					} else if n > 15 {
+						n = 15
+					}
 					gi := b*256 + p*32 + k
-					dst.Q[(gi/4)*2*dst.Cols+2*j+(gi%4)/2] |= nib << (4 * (gi % 2))
+					dst.Q[(gi/4)*2*dst.Cols+2*j+(gi%4)/2] |= uint8(n) << (4 * (gi % 2))
 				}
 			}
 		}
@@ -544,12 +551,11 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 		quads := (in + 3) / 4
 		groups := (in + 31) / 32
 		dst := &tensai.Q4Matrix{
-			Rows:  in,
-			Cols:  total,
-			Q:     make([]uint8, quads*2*total+32),
-			Scale: make([]float32, groups*total),
-			Min:   make([]float32, groups*total),
-			Group: 32,
+			Rows:     in,
+			Cols:     total,
+			Q:        make([]uint8, quads*2*total+32),
+			ScaleMin: make([]uint32, groups*total),
+			Group:    32,
 		}
 		colOff := 0
 		for i, name := range names {
@@ -578,12 +584,11 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 		quads := (in + 3) / 4
 		groups := (in + 31) / 32
 		dst := &tensai.Q4Matrix{
-			Rows:  in,
-			Cols:  total,
-			Q:     make([]uint8, quads*2*total+32),
-			Scale: make([]float32, groups*total),
-			Min:   make([]float32, groups*total),
-			Group: 32,
+			Rows:     in,
+			Cols:     total,
+			Q:        make([]uint8, quads*2*total+32),
+			ScaleMin: make([]uint32, groups*total),
+			Group:    32,
 		}
 		colOff := 0
 		for i, name := range names {

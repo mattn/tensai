@@ -25,9 +25,9 @@ func q4xQuad(xu []uint8, i4 int) uint32 {
 	return x0 | x1<<8 | x2<<16 | x3<<24
 }
 
-func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, scale, mins []Float, group, cols, lo, hi int) {
+func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, scale []Float, sm []uint32, group, cols, lo, hi int) {
 	if !hasAVX2 {
-		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, mins, group, cols, lo, hi)
+		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, sm, group, cols, lo, hi)
 		return
 	}
 	quads := len(xu) / 4
@@ -35,14 +35,23 @@ func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, s
 	if vecEnd > lo {
 		mLo := archsimd.BroadcastUint16x16(0x000F)
 		mHi := archsimd.BroadcastUint16x16(0x0F00)
+		mMin := archsimd.BroadcastUint32x8(0xFFFF0000)
 		ones := archsimd.BroadcastInt16x16(1)
 		clear(out[lo:vecEnd])
 		for g := 0; g < len(gsum); g++ {
 			ib := g * group / 4
 			ie := min(ib+group/4, quads)
-			corr := archsimd.BroadcastInt32x8(8 * gsum[g])
-			gsf := archsimd.BroadcastFloat32x8(-Float(gsum[g]))
-			srow := scale[g*cols:]
+			var corr archsimd.Int32x8
+			var gsf archsimd.Float32x8
+			var srow []Float
+			var smrow []uint32
+			if sm != nil {
+				gsf = archsimd.BroadcastFloat32x8(-Float(gsum[g]))
+				smrow = sm[g*cols:]
+			} else {
+				corr = archsimd.BroadcastInt32x8(8 * gsum[g])
+				srow = scale[g*cols:]
+			}
 			for jt := lo; jt < vecEnd; jt += 32 {
 				var a0, a1, a2, a3 archsimd.Int32x8
 				for i4 := ib; i4 < ie; i4++ {
@@ -57,12 +66,12 @@ func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, s
 					v = loadU8x16(row[48:]).ExtendToUint16()
 					a3 = a3.Add(v.And(mLo).Or(v.ShiftAllLeft(4).And(mHi)).AsUint8x32().DotProductPairsSaturated(xp).DotProductPairs(ones))
 				}
-				if mins != nil {
-					mrow := mins[g*cols:]
+				if sm != nil {
 					for k, a := range [4]archsimd.Int32x8{a0, a1, a2, a3} {
 						j := jt + 8*k
-						o := gsf.MulAdd(loadF32x8(mrow[j:]), loadF32x8(out[j:]))
-						storeF32x8(a.ConvertToFloat32().MulAdd(loadF32x8(srow[j:]), o), out[j:])
+						u := loadU32x8(smrow[j:])
+						o := gsf.MulAdd(u.And(mMin).AsFloat32x8(), loadF32x8(out[j:]))
+						storeF32x8(a.ConvertToFloat32().MulAdd(u.ShiftAllLeft(16).AsFloat32x8(), o), out[j:])
 					}
 				} else {
 					for k, a := range [4]archsimd.Int32x8{a0, a1, a2, a3} {
@@ -80,16 +89,16 @@ func q4matvecCols(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, s
 	}
 	archsimd.ClearAVXUpperBits()
 	if vecEnd < hi {
-		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, mins, group, cols, vecEnd, hi)
+		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, sm, group, cols, vecEnd, hi)
 	}
 }
 
 // q4matmulCols4 is the four-row batched form: per eight-column tile each
 // sixteen-byte nibble load unpacks once and feeds four broadcast
 // activation quads, amortizing the nibble traffic fourfold.
-func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 int, qw []uint8, scale, mins []Float, group, cols, lo, hi int) {
+func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 int, qw []uint8, scale []Float, sm []uint32, group, cols, lo, hi int) {
 	if !hasAVX2 {
-		q4matmulCols4Generic(out, xus, sxs, gsums, r0, qw, scale, mins, group, cols, lo, hi)
+		q4matmulCols4Generic(out, xus, sxs, gsums, r0, qw, scale, sm, group, cols, lo, hi)
 		return
 	}
 	quads := len(xus[0]) / 4
@@ -103,6 +112,7 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 	if vecEnd > lo {
 		mLo := archsimd.BroadcastUint16x16(0x000F)
 		mHi := archsimd.BroadcastUint16x16(0x0F00)
+		mMin := archsimd.BroadcastUint32x8(0xFFFF0000)
 		ones := archsimd.BroadcastInt16x16(1)
 		for r := 0; r < 4; r++ {
 			clear(out.Data[(r0+r)*cols+lo : (r0+r)*cols+vecEnd])
@@ -110,7 +120,13 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 		for g := 0; g < len(gsums[0]); g++ {
 			ib := g * group / 4
 			ie := min(ib+group/4, quads)
-			srow := scale[g*cols:]
+			var srow []Float
+			var smrow []uint32
+			if sm != nil {
+				smrow = sm[g*cols:]
+			} else {
+				srow = scale[g*cols:]
+			}
 			for jt := lo; jt < vecEnd; jt += 8 {
 				var a0, a1, a2, a3 archsimd.Int32x8
 				for i4 := ib; i4 < ie; i4++ {
@@ -122,9 +138,10 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 					a2 = a2.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[2]).AsInt8x32()).DotProductPairs(ones))
 					a3 = a3.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[3]).AsInt8x32()).DotProductPairs(ones))
 				}
-				sc := loadF32x8(srow[jt:])
-				if mins != nil {
-					mn := loadF32x8(mins[g*cols+jt:])
+				if sm != nil {
+					u := loadU32x8(smrow[jt:])
+					sc := u.ShiftAllLeft(16).AsFloat32x8()
+					mn := u.And(mMin).AsFloat32x8()
 					for r, a := range [4]archsimd.Int32x8{a0, a1, a2, a3} {
 						gsf := archsimd.BroadcastFloat32x8(-Float(gsums[r][g]))
 						o := out.Data[(r0+r)*cols:]
@@ -132,6 +149,7 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 						storeF32x8(a.ConvertToFloat32().MulAdd(sc, f), o[jt:])
 					}
 				} else {
+					sc := loadF32x8(srow[jt:])
 					for r, a := range [4]archsimd.Int32x8{a0, a1, a2, a3} {
 						corr := archsimd.BroadcastInt32x8(8 * gsums[r][g])
 						o := out.Data[(r0+r)*cols:]
@@ -151,6 +169,6 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 	}
 	archsimd.ClearAVXUpperBits()
 	if vecEnd < hi {
-		q4matmulCols4Generic(out, xus, sxs, gsums, r0, qw, scale, mins, group, cols, vecEnd, hi)
+		q4matmulCols4Generic(out, xus, sxs, gsums, r0, qw, scale, sm, group, cols, vecEnd, hi)
 	}
 }

@@ -200,12 +200,11 @@ func TestQuantize4MinForm(t *testing.T) {
 		quads := (c.rows + 3) / 4
 		groups := (c.rows + 31) / 32
 		q := &Q4Matrix{
-			Rows:  c.rows,
-			Cols:  c.cols,
-			Q:     make([]uint8, quads*2*c.cols+32),
-			Scale: make([]Float, groups*c.cols),
-			Min:   make([]Float, groups*c.cols),
-			Group: 32,
+			Rows:     c.rows,
+			Cols:     c.cols,
+			Q:        make([]uint8, quads*2*c.cols+32),
+			ScaleMin: make([]uint32, groups*c.cols),
+			Group:    32,
 		}
 		for j := 0; j < c.cols; j++ {
 			for g := 0; g < groups; g++ {
@@ -220,9 +219,12 @@ func TestQuantize4MinForm(t *testing.T) {
 						hi = v
 					}
 				}
-				s := (hi - lo) / 15
-				q.Scale[g*c.cols+j] = s
-				q.Min[g*c.cols+j] = -lo // value = s*q + lo = s*q - min
+				// value = s*q + lo = s*q - min; the pack rounds the pair
+				// to bfloat16, so quantize against what the kernel will
+				// actually unpack.
+				q.ScaleMin[g*c.cols+j] = PackScaleMin((hi-lo)/15, -lo)
+				s, mn := UnpackScaleMin(q.ScaleMin[g*c.cols+j])
+				lo = -mn
 				for i := rlo; i < rhi; i++ {
 					n := 0
 					if s != 0 {
@@ -257,7 +259,8 @@ func TestQuantize4MinForm(t *testing.T) {
 					acc += qv * xs
 					gs += xs
 				}
-				want += float64(acc)*float64(q.Scale[g*c.cols+j]) - float64(gs)*float64(q.Min[g*c.cols+j])
+				sc, mn := UnpackScaleMin(q.ScaleMin[g*c.cols+j])
+				want += float64(acc)*float64(sc) - float64(gs)*float64(mn)
 			}
 			want *= float64(sx)
 			if diff := math.Abs(float64(out[j]) - want); diff > 1e-3*(1+math.Abs(want)) {
