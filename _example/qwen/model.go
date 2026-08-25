@@ -443,18 +443,21 @@ func activate(gate, up []float32, geglu bool) {
 // router's softmax picks topK experts, each contributes its SwiGLU
 // output scaled by its routing weight, and qwen2moe's shared expert
 // adds its sigmoid-gated output on top.
-func (m *qwen) moeFFN(b *qblock, a []float32) []float32 {
-	logits := mv(a, b.router, nil, b.routerBias)
-	type pick struct {
-		e int
-		w float32
-	}
-	picks := make([]pick, 0, b.topK)
+// moePick is one routed expert and its mixing weight.
+type moePick struct {
+	e int
+	w float32
+}
+
+// route turns one row's router logits into its top-k experts and
+// weights; logits are consumed as scratch.
+func (b *qblock) route(logits []float32) []moePick {
+	picks := make([]moePick, 0, b.topK)
 	if b.softmaxK {
 		// gpt-oss: pick the top-k logits, softmax over just those.
 		for e, w := range logits {
 			if len(picks) < b.topK {
-				picks = append(picks, pick{e, w})
+				picks = append(picks, moePick{e, w})
 				continue
 			}
 			lo := 0
@@ -464,7 +467,7 @@ func (m *qwen) moeFFN(b *qblock, a []float32) []float32 {
 				}
 			}
 			if w > picks[lo].w {
-				picks[lo] = pick{e, w}
+				picks[lo] = moePick{e, w}
 			}
 		}
 		maxL := picks[0].w
@@ -498,7 +501,7 @@ func (m *qwen) moeFFN(b *qblock, a []float32) []float32 {
 		}
 		for e, w := range logits {
 			if len(picks) < b.topK {
-				picks = append(picks, pick{e, w})
+				picks = append(picks, moePick{e, w})
 				continue
 			}
 			lo := 0
@@ -508,7 +511,7 @@ func (m *qwen) moeFFN(b *qblock, a []float32) []float32 {
 				}
 			}
 			if w > picks[lo].w {
-				picks[lo] = pick{e, w}
+				picks[lo] = moePick{e, w}
 			}
 		}
 		if b.normTopK {
@@ -521,6 +524,11 @@ func (m *qwen) moeFFN(b *qblock, a []float32) []float32 {
 			}
 		}
 	}
+	return picks
+}
+
+func (m *qwen) moeFFN(b *qblock, a []float32) []float32 {
+	picks := b.route(mv(a, b.router, nil, b.routerBias))
 	out := make([]float32, m.cfg.HiddenSize)
 	moeFF := m.cfg.MoeFF
 	for _, p := range picks {
@@ -825,7 +833,11 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		var down *tensai.Matrix
 		if len(b.experts) > 0 {
 			// Each row routes to its own experts, so the batch runs
-			// row-wise, rows spread across CPUs.
+			// row-wise, rows spread across CPUs. (An expert-grouped GEMM
+			// was tried and lost: the four-row kernel's multiply work
+			// scales with rows x weights either way, the per-expert
+			// weights sit in L3 across rows, and the orchestration cost
+			// is real — a deeper batch kernel is the actual lever.)
 			down = tensai.NewMatrix(n, hs)
 			var wg sync.WaitGroup
 			rowCh := make(chan int, n)

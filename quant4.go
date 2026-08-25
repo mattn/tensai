@@ -228,13 +228,31 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 			gsums[r][min(i/grp, groups-1)] += int32(u) - 64
 		}
 	}
+	// See padRows8: the row tail pads to one full block over a shared
+	// scratch matrix so the weights stream once.
+	var pxus [][]uint8
+	var psxs []Float
+	var pgs [][]int32
+	var scratch *Matrix
+	if rows%4 != 0 {
+		t := rows - rows%4
+		pxus, psxs, scratch = padRows8(xus[t:], sxs[t:], len(xus[0]), q.Cols)
+		pgs = make([][]int32, 4)
+		copy(pgs, gsums[t:])
+		for i := rows - t; i < 4; i++ {
+			pgs[i] = make([]int32, groups)
+		}
+	}
 	run := func(lo, hi int) {
 		var r int
 		for ; r+4 <= rows; r += 4 {
 			q4matmulCols4(out, xus[r:r+4], sxs[r:r+4], gsums[r:r+4], r, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
 		}
-		for ; r < rows; r++ {
-			q4matvecCols(out.Data[r*q.Cols:(r+1)*q.Cols], xus[r], packQuads(xus[r]), sxs[r], gsums[r], q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
+		if r < rows {
+			q4matmulCols4(scratch, pxus[:4], psxs[:4], pgs, 0, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
+			for i := 0; i < rows-r; i++ {
+				copy(out.Data[(r+i)*q.Cols+lo:(r+i)*q.Cols+hi], scratch.Data[i*q.Cols+lo:i*q.Cols+hi])
+			}
 		}
 	}
 	workers := matvecWorkerCount(q.Cols, q.Rows)

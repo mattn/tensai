@@ -96,13 +96,27 @@ func (q *MXFP4Matrix) MatMul(x, out *Matrix) error {
 	for r := 0; r < rows; r++ {
 		xus[r], sxs[r] = quantizeActs(x.Data[r*x.Cols : (r+1)*x.Cols])
 	}
+	// The row tail (rows%8 leftovers) pads to one full block: zero
+	// rows are harmless in the integer kernels, the scratch matrix is
+	// shared by every column chunk (they write disjoint ranges), and
+	// only the real rows copy back — so the tail streams the weights
+	// once instead of once per row.
+	var pxus [][]uint8
+	var psxs []Float
+	var scratch *Matrix
+	if rows%8 != 0 {
+		pxus, psxs, scratch = padRows8(xus[rows-rows%8:], sxs[rows-rows%8:], len(xus[0]), q.Cols)
+	}
 	run := func(lo, hi int) {
 		var r int
 		for ; r+8 <= rows; r += 8 {
 			mxfp4MatmulRows8(out, xus[r:r+8], sxs[r:r+8], r, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
 		}
-		for ; r < rows; r++ {
-			mxfp4MatvecCols(out.Data[r*q.Cols:(r+1)*q.Cols], xus[r], sxs[r], q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
+		if r < rows {
+			mxfp4MatmulRows8(scratch, pxus, psxs, 0, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
+			for i := 0; i < rows-r; i++ {
+				copy(out.Data[(r+i)*q.Cols+lo:(r+i)*q.Cols+hi], scratch.Data[i*q.Cols+lo:i*q.Cols+hi])
+			}
 		}
 	}
 	workers := matvecWorkerCount(q.Cols, q.Rows)

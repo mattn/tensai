@@ -1203,6 +1203,7 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer g.Release("output.weight")
 		if _, _, ok := g.Info("output.weight"); ok {
 			if q := linDirectAuto([]string{"output.weight"}, []int{0}); q != nil {
 				m.qLmT = q
@@ -1332,6 +1333,14 @@ func loadGGUF(path string, bits int, direct bool) (*qwen, *tokenizer.Tokenizer, 
 				unpermuteVec(vecOpt(p+"attn_q.bias"), qPerm),
 				unpermuteVec(vecOpt(p+"attn_k.bias"), kPerm),
 				vecOpt(p+"attn_v.bias"))
+			// The layer's file pages will not be read again: let them go
+			// now so a big load's repacked weights are not the pages the
+			// kernel chooses to evict.
+			for _, name := range g.Names() {
+				if strings.HasPrefix(name, p) {
+					g.Release(name)
+				}
+			}
 		}(i)
 	}
 	wg.Wait()
