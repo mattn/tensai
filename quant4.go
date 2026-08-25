@@ -13,14 +13,17 @@ const q4Group = 64
 
 // Q4Matrix is a weight matrix quantized to 4 bits with one scale per
 // (64-row group, output column). Rows are stored in interleaved quads of
-// two bytes per column: byte (i/4)*2*Cols + 2*j + (i%4)/2 holds rows
-// i..i+3 of column j as four nibbles (each byte low nibble first),
-// offset-binary (0..15 encodes -8..7), zero rows padding the final quad.
-// The 256-bit kernel's nibble unpack turns those two bytes into four
-// consecutive u8 lanes — exactly QMatrix's quad layout — so the same
-// two-instruction multiply-add chain takes a column four rows deep, with
-// activations re-centered to signed bytes and the nibble offset folded
-// out through per-group activation sums.
+// two bytes per column, tiled 32 columns at a time: tile j/32 packs its
+// row quads back to back (64 bytes apiece, see Index), so a kernel
+// worker sweeping a tile range streams strictly sequential memory
+// instead of striding across the full row width. Each byte holds two
+// rows' nibbles (low nibble first), offset-binary (0..15 encodes -8..7),
+// zero rows padding the final quad. The 256-bit kernel's nibble unpack
+// turns those two bytes into four consecutive u8 lanes — exactly
+// QMatrix's quad layout — so the same two-instruction multiply-add chain
+// takes a column four rows deep, with activations re-centered to signed
+// bytes and the nibble offset folded out through per-group activation
+// sums.
 type Q4Matrix struct {
 	Rows, Cols int
 	Q          []uint8 // row quads x 2*Cols, padded for 32-byte loads
@@ -53,6 +56,41 @@ func bf16(f Float) uint16 {
 	return uint16((b + 0x7fff + (b >> 16 & 1)) >> 16)
 }
 
+// q4Tile is the column-tile width of the nibble layout.
+const q4Tile = 32
+
+// Index returns the position in Q of the byte carrying column j of rows
+// i and i+1 (the low and the high nibble; shift by 4*(i%2)).
+func (q *Q4Matrix) Index(i, j int) int {
+	quads := (q.Rows + 3) / 4
+	return (j/q4Tile)*quads*2*q4Tile + (i/4)*2*q4Tile + (j%q4Tile)*2 + (i%4)/2
+}
+
+// NewQ4Matrix allocates the layout for rows x cols with `group` input
+// rows per scale (0 for the default 64); minForm picks the packed
+// asymmetric scale/min table over the symmetric Scale. The caller fills
+// Q via Index and the table it asked for.
+func NewQ4Matrix(rows, cols, group int, minForm bool) *Q4Matrix {
+	if group == 0 {
+		group = q4Group
+	}
+	quads := (rows + 3) / 4
+	groups := (rows + group - 1) / group
+	tiles := (cols + q4Tile - 1) / q4Tile
+	q := &Q4Matrix{
+		Rows:  rows,
+		Cols:  cols,
+		Q:     make([]uint8, tiles*quads*2*q4Tile+32),
+		Group: group,
+	}
+	if minForm {
+		q.ScaleMin = make([]uint32, groups*cols)
+	} else {
+		q.Scale = make([]Float, groups*cols)
+	}
+	return q
+}
+
 // group returns the effective scale-group length.
 func (q *Q4Matrix) group() int {
 	if q.Group != 0 {
@@ -64,14 +102,8 @@ func (q *Q4Matrix) group() int {
 // QuantizeMatrix4 quantizes group-wise, symmetric with round-to-nearest.
 // Columns split across CPUs for large matrices, like QuantizeMatrix.
 func QuantizeMatrix4(m *Matrix) (*Q4Matrix, error) {
-	quads := (m.Rows + 3) / 4
 	groups := (m.Rows + q4Group - 1) / q4Group
-	q := &Q4Matrix{
-		Rows:  m.Rows,
-		Cols:  m.Cols,
-		Q:     make([]uint8, quads*2*m.Cols+32),
-		Scale: make([]Float, groups*m.Cols),
-	}
+	q := NewQ4Matrix(m.Rows, m.Cols, 0, false)
 	parallelCols(m.Rows, m.Cols, func(lo, hi int) {
 		quantize4Columns(m, q, groups, lo, hi)
 	})
@@ -115,11 +147,11 @@ func quantize4Columns(m *Matrix, q *Q4Matrix, groups, colLo, colHi int) {
 						n = 7
 					}
 				}
-				q.Q[(i/4)*2*m.Cols+2*j+(i%4)/2] |= uint8(n+8) << (4 * (i % 2))
+				q.Q[q.Index(i, j)] |= uint8(n+8) << (4 * (i % 2))
 			}
 		}
 		for i := m.Rows; i < 4*((m.Rows+3)/4); i++ {
-			q.Q[(i/4)*2*m.Cols+2*j+(i%4)/2] |= 8 << (4 * (i % 2)) // zero pad rows
+			q.Q[q.Index(i, j)] |= 8 << (4 * (i % 2)) // zero pad rows
 		}
 	}
 }
@@ -159,7 +191,9 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 		q4matvecCols(out, xu, xq, sx, gsum, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, 0, q.Cols)
 		return nil
 	}
-	chunk := ((q.Cols+workers-1)/workers + 7) &^ 7
+	// Tile-aligned chunks keep every worker's vector span inside whole
+	// layout tiles, and its memory walk sequential.
+	chunk := ((q.Cols+workers-1)/workers + q4Tile - 1) &^ (q4Tile - 1)
 	var wg sync.WaitGroup
 	for lo := 0; lo < q.Cols; lo += chunk {
 		hi := min(lo+chunk, q.Cols)
@@ -209,7 +243,9 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 		run(0, q.Cols)
 		return nil
 	}
-	chunk := ((q.Cols+workers-1)/workers + 7) &^ 7
+	// Tile-aligned, so the row-tail matvec's vector span starts on a
+	// layout tile like the batch kernel's 8-column steps do.
+	chunk := ((q.Cols+workers-1)/workers + q4Tile - 1) &^ (q4Tile - 1)
 	var wg sync.WaitGroup
 	for lo := 0; lo < q.Cols; lo += chunk {
 		hi := min(lo+chunk, q.Cols)
@@ -241,7 +277,7 @@ func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int
 			clear(acc[r])
 		}
 		for i4 := ib; i4 < ie; i4++ {
-			row := qw[i4*2*cols:]
+			row := qw[i4*2*q4Tile:]
 			for r := 0; r < 4; r++ {
 				x0 := int32(xus[r][4*i4]) - 64
 				x1 := int32(xus[r][4*i4+1]) - 64
@@ -249,7 +285,8 @@ func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int
 				x3 := int32(xus[r][4*i4+3]) - 64
 				a := acc[r]
 				for j := lo; j < hi; j++ {
-					b0, b1 := row[2*j], row[2*j+1]
+					o := (j/q4Tile)*quads*2*q4Tile + (j%q4Tile)*2
+					b0, b1 := row[o], row[o+1]
 					a[j-lo] += int32(b0&0x0F)*x0 + int32(b0>>4)*x1 +
 						int32(b1&0x0F)*x2 + int32(b1>>4)*x3
 				}
@@ -301,9 +338,10 @@ func q4matvecColsGeneric(out []Float, xu []uint8, sx Float, gsum []int32, qw []u
 			x1 := int32(xu[4*i4+1]) - 64
 			x2 := int32(xu[4*i4+2]) - 64
 			x3 := int32(xu[4*i4+3]) - 64
-			row := qw[i4*2*cols:]
+			row := qw[i4*2*q4Tile:]
 			for j := lo; j < hi; j++ {
-				b0, b1 := row[2*j], row[2*j+1]
+				o := (j/q4Tile)*quads*2*q4Tile + (j%q4Tile)*2
+				b0, b1 := row[o], row[o+1]
 				acc[j-lo] += int32(b0&0x0F)*x0 + int32(b0>>4)*x1 +
 					int32(b1&0x0F)*x2 + int32(b1>>4)*x3
 			}
