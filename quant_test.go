@@ -273,3 +273,33 @@ func BenchmarkQ8PrefillRowwise(b *testing.B) {
 		}
 	}
 }
+
+func TestQuantizeActsAgree(t *testing.T) {
+	rng := rand.New(rand.NewSource(77))
+	for _, n := range []int{5, 16, 31, 1536, 4099} {
+		x := make([]Float, n)
+		for i := range x {
+			x[i] = Float(rng.NormFloat64())
+		}
+		// Force representable ties and extremes into the mix.
+		x[0] = 0
+		if n > 8 {
+			x[7] = -x[1]
+			x[8] = 63.5 * x[2]
+		}
+		want := make([]uint8, (n+3)&^3)
+		for i := n; i < len(want); i++ {
+			want[i] = 64
+		}
+		wantSx := quantizeActsScalar(x, want)
+		got, gotSx := quantizeActs(x)
+		if gotSx != wantSx {
+			t.Fatalf("n=%d: sx %v vs scalar %v", n, gotSx, wantSx)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("n=%d idx %d: %d vs scalar %d (x=%v)", n, i, got[i], want[i], x[min(i, n-1)])
+			}
+		}
+	}
+}

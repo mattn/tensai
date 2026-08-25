@@ -14,7 +14,7 @@ func matvecWorkerCount(cols, rows int) int {
 	if cols*rows < 1<<20 {
 		return 1
 	}
-	workers := runtime.NumCPU()
+	workers := runtime.GOMAXPROCS(0)
 	if workers > cols {
 		workers = cols
 	}
@@ -119,8 +119,21 @@ func quantizeColumns(m *Matrix, q *QMatrix, colLo, colHi int) {
 // quantizeActs maps an activation row to 7-bit offset-binary: round(x/sx)
 // clamped to [-63,63], stored +64 so every value sits in [1,127]. The
 // range keeps u8 x s8 pair sums inside int16. Pad bytes (which the weight
-// layout pairs with zero weight rows) fill the final quad.
+// layout pairs with zero weight rows) fill the final quad. The AVX2 build
+// runs a vectorized twin with the same rounding (see quantacts_simd.go).
 func quantizeActs(x []Float) (xu []uint8, sx Float) {
+	padded := (len(x) + 3) &^ 3
+	xu = make([]uint8, padded)
+	for i := len(x); i < padded; i++ {
+		xu[i] = 64 // pairs with a zero weight row: contributes 64*0
+	}
+	sx = quantizeActsInto(x, xu)
+	return xu, sx
+}
+
+// quantizeActsScalar is the portable body; the round is half away from
+// zero, truncation after a signed 0.5 nudge.
+func quantizeActsScalar(x []Float, xu []uint8) Float {
 	var maxAbs Float
 	for _, v := range x {
 		if v < 0 {
@@ -130,17 +143,12 @@ func quantizeActs(x []Float) (xu []uint8, sx Float) {
 			maxAbs = v
 		}
 	}
-	padded := (len(x) + 3) &^ 3
-	xu = make([]uint8, padded)
-	for i := len(x); i < padded; i++ {
-		xu[i] = 64 // pairs with a zero weight row: contributes 64*0
-	}
-	sx = maxAbs / 63
+	sx := maxAbs / 63
 	if sx == 0 {
-		for i := range xu {
+		for i := range x {
 			xu[i] = 64
 		}
-		return xu, 0
+		return 0
 	}
 	inv := 1 / sx
 	for i, v := range x {
@@ -158,7 +166,7 @@ func quantizeActs(x []Float) (xu []uint8, sx Float) {
 		}
 		xu[i] = uint8(n + 64)
 	}
-	return xu, sx
+	return sx
 }
 
 // MatVec computes out = x @ Q for a single activation row: len(x) must be
