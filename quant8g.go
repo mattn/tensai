@@ -133,11 +133,16 @@ func q8gMatvecColsGeneric(out []Float, xu []uint8, sx Float, qw []int8, scale []
 		for i4 := ib; i4 < ie; i4++ {
 			x0, x1 := int32(xu[4*i4]), int32(xu[4*i4+1])
 			x2, x3 := int32(xu[4*i4+2]), int32(xu[4*i4+3])
-			row := qw[i4*4*q4Tile:]
-			for j := lo; j < hi; j++ {
-				o := (j/q4Tile)*quads*4*q4Tile + (j%q4Tile)*4
-				acc[j-lo] += x0*int32(row[o]) + x1*int32(row[o+1]) +
-					x2*int32(row[o+2]) + x3*int32(row[o+3])
+			for tile := lo / q4Tile; tile <= (hi-1)/q4Tile; tile++ {
+				j0 := max(lo, tile*q4Tile)
+				j1 := min(hi, j0+(q4Tile-j0%q4Tile))
+				row := qw[tile*quads*4*q4Tile+i4*4*q4Tile+(j0%q4Tile)*4:]
+				for j := j0; j < j1; j++ {
+					a := j - lo
+					acc[a] += x0*int32(row[0]) + x1*int32(row[1]) +
+						x2*int32(row[2]) + x3*int32(row[3])
+					row = row[4:]
+				}
 			}
 		}
 		for j := lo; j < hi; j++ {
