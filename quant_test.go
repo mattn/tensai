@@ -31,7 +31,7 @@ func TestQuantizeMatVec(t *testing.T) {
 		want := make([]float64, c.cols)
 		for i := 0; i < c.rows; i++ {
 			for j := 0; j < c.cols; j++ {
-				w := q.Q[(i/4)*4*c.cols+4*j+i%4]
+				w := q.Q[q.Index(i, j)]
 				want[j] += float64(int(xu[i])-64) * float64(w)
 			}
 		}

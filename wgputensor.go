@@ -1710,9 +1710,8 @@ func (g *GPU) UploadQ8(q *QMatrix) (*GPUQMatrix, error) {
 	words := (q.Cols + 3) / 4
 	packed := make([]uint32, q.Rows*words)
 	for i := 0; i < q.Rows; i++ {
-		base := (i / 4) * 4 * q.Cols
 		for j := 0; j < q.Cols; j++ {
-			b := uint32(uint8(q.Q[base+4*j+i%4]))
+			b := uint32(uint8(q.Q[q.Index(i, j)]))
 			packed[i*words+j/4] |= b << (8 * (j % 4))
 		}
 	}
