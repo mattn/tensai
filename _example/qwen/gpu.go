@@ -288,7 +288,9 @@ func (gq *gpuQwen) prefill(tokens []int, startPos int) []float32 {
 	// Only the final position's hidden state comes back; the download
 	// flushes the batch.
 	last := must(x.DownloadRange((n-1)*hs, hs))
-	return mv(rmsnorm(last.Data, m.normW, cfg.RMSEps), m.lmT, m.qLmT, nil)
+	a := make([]float32, hs)
+	rmsnormInto(a, last.Data, m.normW, cfg.RMSEps)
+	return mv(a, m.lmT, m.qLmT, nil)
 }
 
 // step feeds one token at position pos through the GPU-resident blocks and
@@ -395,5 +397,7 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 		down.Free()
 	}
 	xt := must(x.Download())
-	return mv(rmsnorm(xt.Data, m.normW, cfg.RMSEps), m.lmT, m.qLmT, nil)
+	a := make([]float32, hs)
+	rmsnormInto(a, xt.Data, m.normW, cfg.RMSEps)
+	return mv(a, m.lmT, m.qLmT, nil)
 }

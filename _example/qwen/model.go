@@ -383,17 +383,15 @@ func catVec(vs ...[]float32) []float32 {
 	return out
 }
 
-func rmsnorm(x, w []float32, eps float64) []float32 {
+func rmsnormInto(out, x, w []float32, eps float64) {
 	var ss float64
 	for _, v := range x {
 		ss += float64(v) * float64(v)
 	}
 	inv := 1 / math.Sqrt(ss/float64(len(x))+eps)
-	out := make([]float32, len(x))
 	for i, v := range x {
 		out[i] = float32(float64(v)*inv) * w[i]
 	}
-	return out
 }
 
 // activate applies the gated activation in place: silu(gate)*up, or
@@ -628,7 +626,7 @@ func (m *qwen) qkNorm(v, w []float32) {
 		return
 	}
 	for o := 0; o < len(v); o += m.headSz {
-		copy(v[o:o+m.headSz], rmsnorm(v[o:o+m.headSz], w, m.cfg.RMSEps))
+		rmsnormInto(v[o:o+m.headSz], v[o:o+m.headSz], w, m.cfg.RMSEps)
 	}
 }
 
@@ -681,7 +679,9 @@ func (m *qwen) prefill(tokens []int, startPos int) []float32 {
 	x := m.forwardBatch(tokens, startPos)
 	hs := m.cfg.HiddenSize
 	last := x.Data[(len(tokens)-1)*hs : len(tokens)*hs]
-	return mv(rmsnorm(last, m.normW, m.cfg.RMSEps), m.lmT, m.qLmT, nil)
+	a := make([]float32, hs)
+	rmsnormInto(a, last, m.normW, m.cfg.RMSEps)
+	return mv(a, m.lmT, m.qLmT, nil)
 }
 
 // prefillLogits is prefill with the lm_head applied to every position:
@@ -692,7 +692,7 @@ func (m *qwen) prefillLogits(tokens []int, startPos int) *tensai.Matrix {
 	hs := m.cfg.HiddenSize
 	a := tensai.NewMatrix(x.Rows, hs)
 	for t := 0; t < x.Rows; t++ {
-		copy(a.Data[t*hs:(t+1)*hs], rmsnorm(x.Data[t*hs:(t+1)*hs], m.normW, m.cfg.RMSEps))
+		rmsnormInto(a.Data[t*hs:(t+1)*hs], x.Data[t*hs:(t+1)*hs], m.normW, m.cfg.RMSEps)
 	}
 	return mmb(a, m.lmT, m.qLmT, nil)
 }
@@ -725,7 +725,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 	a := tensai.NewMatrix(n, hs)
 	norm := func(w []float32) {
 		for t := 0; t < n; t++ {
-			copy(a.Data[t*hs:(t+1)*hs], rmsnorm(x.Data[t*hs:(t+1)*hs], w, cfg.RMSEps))
+			rmsnormInto(a.Data[t*hs:(t+1)*hs], x.Data[t*hs:(t+1)*hs], w, cfg.RMSEps)
 		}
 	}
 	qDim := cfg.Heads * m.headSz
@@ -783,7 +783,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		proj := mmb(attn, b.wo, b.qo, b.bo)
 		if b.postAttn != nil {
 			for t := 0; t < n; t++ {
-				copy(proj.Data[t*hs:(t+1)*hs], rmsnorm(proj.Data[t*hs:(t+1)*hs], b.postAttn, cfg.RMSEps))
+				rmsnormInto(proj.Data[t*hs:(t+1)*hs], proj.Data[t*hs:(t+1)*hs], b.postAttn, cfg.RMSEps)
 			}
 		}
 		for i := range x.Data {
@@ -825,7 +825,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		}
 		if b.postFFN != nil {
 			for t := 0; t < n; t++ {
-				copy(down.Data[t*hs:(t+1)*hs], rmsnorm(down.Data[t*hs:(t+1)*hs], b.postFFN, cfg.RMSEps))
+				rmsnormInto(down.Data[t*hs:(t+1)*hs], down.Data[t*hs:(t+1)*hs], b.postFFN, cfg.RMSEps)
 			}
 		}
 		for i := range x.Data {
@@ -843,12 +843,13 @@ func (m *qwen) step(token, pos int) []float32 {
 
 	x := make([]float32, hs)
 	copy(x, m.embed.Data[token*hs:(token+1)*hs])
+	a := make([]float32, hs)
 
 	kvDim := cfg.KVHeads * m.headSz
 	qDim := cfg.Heads * m.headSz
 	for li := range m.blocks {
 		b := &m.blocks[li]
-		a := rmsnorm(x, b.ln1, cfg.RMSEps)
+		rmsnormInto(a, x, b.ln1, cfg.RMSEps)
 		qkv := mv(a, b.wQKV, b.qQKV, b.bQKV)
 		q := qkv[:qDim]
 		k := qkv[qDim : qDim+kvDim]
@@ -893,13 +894,13 @@ func (m *qwen) step(token, pos int) []float32 {
 		}
 		proj := mv(attn, b.wo, b.qo, b.bo)
 		if b.postAttn != nil {
-			proj = rmsnorm(proj, b.postAttn, cfg.RMSEps)
+			rmsnormInto(proj, proj, b.postAttn, cfg.RMSEps)
 		}
 		for i := range x {
 			x[i] += proj[i]
 		}
 
-		a = rmsnorm(x, b.ln2, cfg.RMSEps)
+		rmsnormInto(a, x, b.ln2, cfg.RMSEps)
 		var down []float32
 		if len(b.experts) > 0 {
 			down = m.moeFFN(b, a)
@@ -910,12 +911,13 @@ func (m *qwen) step(token, pos int) []float32 {
 			down = mv(gate, b.wDown, b.qDown, nil)
 		}
 		if b.postFFN != nil {
-			down = rmsnorm(down, b.postFFN, cfg.RMSEps)
+			rmsnormInto(down, down, b.postFFN, cfg.RMSEps)
 		}
 		for i := range x {
 			x[i] += down[i]
 		}
 	}
 
-	return mv(rmsnorm(x, m.normW, cfg.RMSEps), m.lmT, m.qLmT, nil)
+	rmsnormInto(a, x, m.normW, cfg.RMSEps)
+	return mv(a, m.lmT, m.qLmT, nil)
 }
