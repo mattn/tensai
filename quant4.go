@@ -2,6 +2,7 @@ package tensai
 
 import (
 	"fmt"
+	"math"
 	"sync"
 )
 
@@ -24,12 +25,32 @@ type Q4Matrix struct {
 	Rows, Cols int
 	Q          []uint8 // row quads x 2*Cols, padded for 32-byte loads
 	Scale      []Float
-	// Min, when non-nil, switches the per-(group, column) dequantization
-	// from the symmetric offset-binary form scale*(nibble-8) to the
-	// asymmetric scale*nibble - min — the form GGUF's Q4_K sub-blocks
-	// carry. Nil keeps the symmetric form.
-	Min   []Float
-	Group int // input rows per scale; 0 means the default q4Group (64)
+	// ScaleMin, when non-nil, switches the per-(group, column)
+	// dequantization from the symmetric offset-binary form
+	// scale*(nibble-8) to the asymmetric scale*nibble - min — the form
+	// GGUF's Q4_K sub-blocks carry — with Scale unused. Each entry packs
+	// the pair as bfloat16 (PackScaleMin), halving what the kernels
+	// stream per group next to two float32 tables. Nil keeps the
+	// symmetric form.
+	ScaleMin []uint32
+	Group    int // input rows per scale; 0 means the default q4Group (64)
+}
+
+// PackScaleMin rounds a min-form group's scale and min to bfloat16 and
+// packs them into one ScaleMin entry (scale low, min high).
+func PackScaleMin(scale, min Float) uint32 {
+	return uint32(bf16(scale)) | uint32(bf16(min))<<16
+}
+
+// UnpackScaleMin is the inverse of PackScaleMin.
+func UnpackScaleMin(u uint32) (scale, min Float) {
+	return math.Float32frombits(u << 16), math.Float32frombits(u & 0xffff0000)
+}
+
+// bf16 rounds a float32 to nearest-even bfloat16, returning the top bits.
+func bf16(f Float) uint16 {
+	b := math.Float32bits(f)
+	return uint16((b + 0x7fff + (b >> 16 & 1)) >> 16)
 }
 
 // group returns the effective scale-group length.
@@ -119,7 +140,7 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 	}
 	workers := matvecWorkerCount(q.Cols, q.Rows)
 	if workers == 1 {
-		q4matvecCols(out, xu, sx, gsum, q.Q, q.Scale, q.Min, grp, q.Cols, 0, q.Cols)
+		q4matvecCols(out, xu, sx, gsum, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, 0, q.Cols)
 		return nil
 	}
 	chunk := ((q.Cols+workers-1)/workers + 7) &^ 7
@@ -129,7 +150,7 @@ func (q *Q4Matrix) MatVec(x, out []Float) error {
 		wg.Add(1)
 		go func(lo, hi int) {
 			defer wg.Done()
-			q4matvecCols(out, xu, sx, gsum, q.Q, q.Scale, q.Min, grp, q.Cols, lo, hi)
+			q4matvecCols(out, xu, sx, gsum, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
 		}(lo, hi)
 	}
 	wg.Wait()
@@ -161,10 +182,10 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 	run := func(lo, hi int) {
 		var r int
 		for ; r+4 <= rows; r += 4 {
-			q4matmulCols4(out, xus[r:r+4], sxs[r:r+4], gsums[r:r+4], r, q.Q, q.Scale, q.Min, grp, q.Cols, lo, hi)
+			q4matmulCols4(out, xus[r:r+4], sxs[r:r+4], gsums[r:r+4], r, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
 		}
 		for ; r < rows; r++ {
-			q4matvecCols(out.Data[r*q.Cols:(r+1)*q.Cols], xus[r], sxs[r], gsums[r], q.Q, q.Scale, q.Min, grp, q.Cols, lo, hi)
+			q4matvecCols(out.Data[r*q.Cols:(r+1)*q.Cols], xus[r], sxs[r], gsums[r], q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
 		}
 	}
 	workers := matvecWorkerCount(q.Cols, q.Rows)
@@ -188,7 +209,7 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 
 // q4matmulCols4Generic is the four-row batched body: each nibble byte read
 // once feeds four output rows.
-func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 int, qw []uint8, scale, mins []Float, group, cols, lo, hi int) {
+func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 int, qw []uint8, scale []Float, sm []uint32, group, cols, lo, hi int) {
 	for r := 0; r < 4; r++ {
 		clear(out.Data[(r0+r)*cols+lo : (r0+r)*cols+hi])
 	}
@@ -218,16 +239,20 @@ func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int
 				}
 			}
 		}
-		srow := scale[g*cols:]
-		for r := 0; r < 4; r++ {
-			o := out.Data[(r0+r)*cols:]
-			if mins != nil {
-				mrow := mins[g*cols:]
+		if sm != nil {
+			smrow := sm[g*cols:]
+			for r := 0; r < 4; r++ {
+				o := out.Data[(r0+r)*cols:]
 				gs := Float(gsums[r][g])
 				for j := lo; j < hi; j++ {
-					o[j] += Float(acc[r][j-lo])*srow[j] - gs*mrow[j]
+					s, m := UnpackScaleMin(smrow[j])
+					o[j] += Float(acc[r][j-lo])*s - gs*m
 				}
-			} else {
+			}
+		} else {
+			srow := scale[g*cols:]
+			for r := 0; r < 4; r++ {
+				o := out.Data[(r0+r)*cols:]
 				corr := 8 * gsums[r][g]
 				for j := lo; j < hi; j++ {
 					o[j] += Float(acc[r][j-lo]-corr) * srow[j]
@@ -247,7 +272,7 @@ func q4matmulCols4Generic(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int
 // 7-bit activations as the AVX2 kernel, so both builds agree exactly.
 // q4matvecCols (see quant4_simd.go and quant4_generic.go) dispatches to
 // the AVX2 kernel when available.
-func q4matvecColsGeneric(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, scale, mins []Float, group, cols, lo, hi int) {
+func q4matvecColsGeneric(out []Float, xu []uint8, sx Float, gsum []int32, qw []uint8, scale []Float, sm []uint32, group, cols, lo, hi int) {
 	clear(out[lo:hi])
 	quads := len(xu) / 4
 	acc := make([]int32, hi-lo)
@@ -267,14 +292,15 @@ func q4matvecColsGeneric(out []Float, xu []uint8, sx Float, gsum []int32, qw []u
 					int32(b1&0x0F)*x2 + int32(b1>>4)*x3
 			}
 		}
-		srow := scale[g*cols:]
-		if mins != nil {
-			mrow := mins[g*cols:]
+		if sm != nil {
+			smrow := sm[g*cols:]
 			gs := Float(gsum[g])
 			for j := lo; j < hi; j++ {
-				out[j] += Float(acc[j-lo])*srow[j] - gs*mrow[j]
+				s, m := UnpackScaleMin(smrow[j])
+				out[j] += Float(acc[j-lo])*s - gs*m
 			}
 		} else {
+			srow := scale[g*cols:]
 			corr := 8 * gsum[g]
 			for j := lo; j < hi; j++ {
 				out[j] += Float(acc[j-lo]-corr) * srow[j]
