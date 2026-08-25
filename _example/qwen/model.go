@@ -93,6 +93,7 @@ type qblock struct {
 	noPE         bool           // smollm3: every fourth layer skips RoPE
 	window       int            // gemma3: sliding-attention span; 0 = full
 	ropeTheta    float64        // per-layer rope base; 0 = the config default
+	ropeFreq     []float64      // precomputed theta^(-2*i/head_dim)
 	geglu        bool           // gemma3: gelu-tanh gate instead of silu
 	wQKV, wo     *tensai.Matrix // [in, out] after transposing HF's [out, in]
 	bQKV         []float32
@@ -297,7 +298,26 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 		}(i)
 	}
 	wg.Wait()
+	m.initRopeFreqs()
 	return m, nil
+}
+
+func (m *qwen) initRopeFreqs() {
+	half := m.headSz / 2
+	for i := range m.blocks {
+		b := &m.blocks[i]
+		if b.noPE || half == 0 {
+			continue
+		}
+		theta := b.ropeTheta
+		if theta == 0 {
+			theta = m.cfg.RopeTheta
+		}
+		b.ropeFreq = make([]float64, half)
+		for j := range b.ropeFreq {
+			b.ropeFreq[j] = math.Pow(theta, -2*float64(j)/float64(m.headSz))
+		}
+	}
 }
 
 // memGate bounds the float32 staging bytes alive at once during a
@@ -631,10 +651,12 @@ func (m *qwen) qkNorm(v, w []float32) {
 }
 
 // rope rotates one head in place, half-split style: pair (i, i+dh/2).
-func (m *qwen) rope(h []float32, pos int, theta float64) {
+func (m *qwen) rope(h []float32, pos int, b *qblock) {
+	theta := b.ropeTheta
 	if theta == 0 {
 		theta = m.cfg.RopeTheta
 	}
+	freqs := b.ropeFreq
 	half := m.headSz / 2
 	yarn := m.cfg.YarnFactor > 1
 	var low, high, mscale float64
@@ -651,7 +673,7 @@ func (m *qwen) rope(h []float32, pos int, theta float64) {
 		mscale = 1 + 0.1*math.Log(m.cfg.YarnFactor)
 	}
 	for i := 0; i < half; i++ {
-		freq := math.Pow(theta, -2*float64(i)/float64(m.headSz))
+		freq := freqs[i]
 		angle := float64(pos) * freq
 		scale := 1.0
 		if yarn {
@@ -743,10 +765,10 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			m.qkNorm(kr, b.kNorm)
 			if !b.noPE {
 				for h := 0; h < cfg.Heads; h++ {
-					m.rope(qr[h*m.headSz:(h+1)*m.headSz], pos, b.ropeTheta)
+					m.rope(qr[h*m.headSz:(h+1)*m.headSz], pos, b)
 				}
 				for h := 0; h < cfg.KVHeads; h++ {
-					m.rope(kr[h*m.headSz:(h+1)*m.headSz], pos, b.ropeTheta)
+					m.rope(kr[h*m.headSz:(h+1)*m.headSz], pos, b)
 				}
 			}
 			// Copies detach the cache rows from the wide fused buffer.
@@ -858,10 +880,10 @@ func (m *qwen) step(token, pos int) []float32 {
 		m.qkNorm(k, b.kNorm)
 		if !b.noPE {
 			for h := 0; h < cfg.Heads; h++ {
-				m.rope(q[h*m.headSz:(h+1)*m.headSz], pos, b.ropeTheta)
+				m.rope(q[h*m.headSz:(h+1)*m.headSz], pos, b)
 			}
 			for h := 0; h < cfg.KVHeads; h++ {
-				m.rope(k[h*m.headSz:(h+1)*m.headSz], pos, b.ropeTheta)
+				m.rope(k[h*m.headSz:(h+1)*m.headSz], pos, b)
 			}
 		}
 		// Copy k and v out of the fused row so the cache does not retain
