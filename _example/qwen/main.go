@@ -26,6 +26,7 @@ import (
 	"runtime/pprof"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	tensai "github.com/mattn/tensai"
@@ -33,6 +34,18 @@ import (
 )
 
 const defaultRepo = "Qwen/Qwen2.5-0.5B-Instruct"
+
+type sampleCandidate struct {
+	id int
+	p  float64
+}
+
+type sampleScratch struct {
+	ps    []float64
+	cands []sampleCandidate
+}
+
+var sampleScratchPool sync.Pool
 
 // hfBase is derived from the -repo flag before any download starts.
 var hfBase = "https://huggingface.co/" + defaultRepo + "/resolve/main/"
@@ -138,13 +151,25 @@ func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 		}
 		return best
 	}
+	scratch, _ := sampleScratchPool.Get().(*sampleScratch)
+	if scratch == nil {
+		scratch = &sampleScratch{}
+	}
+	if cap(scratch.ps) < len(logits) {
+		scratch.ps = make([]float64, len(logits))
+	}
+	ps := scratch.ps[:len(logits)]
+	cands := scratch.cands[:0]
+	defer func() {
+		scratch.cands = cands[:0]
+		sampleScratchPool.Put(scratch)
+	}()
 	maxl := logits[0]
 	for _, v := range logits {
 		if v > maxl {
 			maxl = v
 		}
 	}
-	ps := make([]float64, len(logits))
 	var sum float64
 	for i, v := range logits {
 		p := math.Exp(float64(v-maxl) / temp)
@@ -194,14 +219,9 @@ func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 			break
 		}
 	}
-	type cand struct {
-		id int
-		p  float64
-	}
-	var cands []cand
 	for i, p := range ps {
 		if p > 0 && bucket(p) <= cut {
-			cands = append(cands, cand{i, p})
+			cands = append(cands, sampleCandidate{i, p})
 		}
 	}
 	sort.Slice(cands, func(a, b int) bool { return cands[a].p > cands[b].p })
