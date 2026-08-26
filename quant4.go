@@ -274,7 +274,7 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 			}
 		}
 	}
-	workers := matvecWorkerCount(q.Cols, q.Rows)
+	workers := matvecWorkerCount(q.Cols, q.Rows*rows)
 	if workers == 1 {
 		run(0, q.Cols)
 		return nil
