@@ -368,6 +368,171 @@ var<workgroup> qrow: array<f32, 256>;
 var<workgroup> ap_sc: array<f32, 64>;
 var<workgroup> ap_red: array<f32, 64>;
 
+// attn_causal_g is attn_causal for one query row against one KV head,
+// producing every query head of the group that shares it: the K and V
+// rows stream once per group instead of once per head. Loops over the
+// group run a fixed eight iterations masked by the real group (grp =
+// d/dkv) so per-head state keeps static indices, and each head repeats
+// attn_causal's arithmetic in its exact order, so outputs match it bit
+// for bit.
+var<workgroup> qrow_g: array<f32, 2048>;
+var<workgroup> ap_sc_g: array<f32, 512>;
+var<workgroup> ap_red_g: array<f32, 512>;
+
+@compute @workgroup_size(64, 1, 1)
+fn attn_causal_g(@builtin(workgroup_id) wid: vec3<u32>,
+                 @builtin(num_workgroups) nwg: vec3<u32>,
+                 @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.y * nwg.x + wid.x;
+    if (row >= ap.rows) {
+        return;
+    }
+    let grp = ap.d / ap.dkv;
+    let bh = row / ap.seqQ;
+    let qi = row % ap.seqQ;
+    let offQ = offs[bh].x;
+    let offKV = offs[bh].y;
+    let offO = offs[bh].z;
+    let t = lid.x;
+    for (var c = t; c < grp * ap.dh; c = c + 64u) {
+        qrow_g[c] = aq[offQ + qi * ap.d + c];
+    }
+    workgroupBarrier();
+    let limit = qi + ap.off + 1u;
+    // Sliding-window layers (Gemma) see only the last window positions.
+    var start = 0u;
+    if (ap.window > 0u && limit > ap.window) {
+        start = limit - ap.window;
+    }
+    let scale = inverseSqrt(f32(ap.dh));
+    var m: array<f32, 8>;
+    var l: array<f32, 8>;
+    var acc: array<vec4<f32>, 8>;
+    for (var h = 0u; h < 8u; h = h + 1u) {
+        m[h] = -3.40282e38;
+    }
+    let tiles = (limit + AT - 1u) / AT;
+    for (var tt = start / AT; tt < tiles; tt = tt + 1u) {
+        // Lane t scores kv position tt*64+t for every head at once.
+        let j = tt * AT + t;
+        let valid = j >= start && j < limit;
+        var dot: array<f32, 8>;
+        for (var h = 0u; h < 8u; h = h + 1u) {
+            dot[h] = 0.0;
+        }
+        if (valid) {
+            for (var c = 0u; c < ap.dh; c = c + 1u) {
+                let kv = ak[offKV + j * ap.dkv + c];
+                for (var h = 0u; h < 8u; h = h + 1u) {
+                    if (h < grp) {
+                        dot[h] = dot[h] + qrow_g[h * ap.dh + c] * kv;
+                    }
+                }
+            }
+        }
+        for (var h = 0u; h < 8u; h = h + 1u) {
+            if (h < grp) {
+                var s = -3.40282e38;
+                if (valid) {
+                    s = dot[h] * scale;
+                }
+                dot[h] = s;
+                ap_red_g[h * 64u + t] = s;
+            }
+        }
+        workgroupBarrier();
+        for (var r = 32u; r > 0u; r = r >> 1u) {
+            if (t < r) {
+                for (var h = 0u; h < 8u; h = h + 1u) {
+                    if (h < grp) {
+                        ap_red_g[h * 64u + t] = max(ap_red_g[h * 64u + t], ap_red_g[h * 64u + t + r]);
+                    }
+                }
+            }
+            workgroupBarrier();
+        }
+        var mNew: array<f32, 8>;
+        var p: array<f32, 8>;
+        for (var h = 0u; h < 8u; h = h + 1u) {
+            p[h] = 0.0;
+            if (h < grp) {
+                mNew[h] = max(m[h], ap_red_g[h * 64u]);
+                if (valid) {
+                    p[h] = exp(dot[h] - mNew[h]);
+                }
+            }
+        }
+        workgroupBarrier();
+        for (var h = 0u; h < 8u; h = h + 1u) {
+            if (h < grp) {
+                ap_sc_g[h * 64u + t] = p[h];
+                ap_red_g[h * 64u + t] = p[h];
+            }
+        }
+        workgroupBarrier();
+        for (var r = 32u; r > 0u; r = r >> 1u) {
+            if (t < r) {
+                for (var h = 0u; h < 8u; h = h + 1u) {
+                    if (h < grp) {
+                        ap_red_g[h * 64u + t] = ap_red_g[h * 64u + t] + ap_red_g[h * 64u + t + r];
+                    }
+                }
+            }
+            workgroupBarrier();
+        }
+        for (var h = 0u; h < 8u; h = h + 1u) {
+            if (h < grp) {
+                // exp underflows to zero on the first tile, where m is -inf-like.
+                let rescale = exp(m[h] - mNew[h]);
+                l[h] = l[h] * rescale + ap_red_g[h * 64u];
+                m[h] = mNew[h];
+                acc[h] = acc[h] * rescale;
+            }
+        }
+        // Lane t accumulates output channels t, t+64, t+128, t+192; the
+        // V row loads once and feeds every head.
+        let jEnd = min(limit, tt * AT + AT);
+        for (var jj = max(start, tt * AT); jj < jEnd; jj = jj + 1u) {
+            var vv = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            if (t < ap.dh) {
+                vv.x = av[offKV + jj * ap.dkv + t];
+            }
+            if (64u + t < ap.dh) {
+                vv.y = av[offKV + jj * ap.dkv + 64u + t];
+            }
+            if (128u + t < ap.dh) {
+                vv.z = av[offKV + jj * ap.dkv + 128u + t];
+            }
+            if (192u + t < ap.dh) {
+                vv.w = av[offKV + jj * ap.dkv + 192u + t];
+            }
+            for (var h = 0u; h < 8u; h = h + 1u) {
+                if (h < grp) {
+                    acc[h] = acc[h] + ap_sc_g[h * 64u + jj - tt * AT] * vv;
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+    for (var h = 0u; h < 8u; h = h + 1u) {
+        if (h < grp) {
+            let o = offO + qi * ap.d + h * ap.dh;
+            if (t < ap.dh) {
+                aout[o + t] = acc[h].x / l[h];
+            }
+            if (64u + t < ap.dh) {
+                aout[o + 64u + t] = acc[h].y / l[h];
+            }
+            if (128u + t < ap.dh) {
+                aout[o + 128u + t] = acc[h].z / l[h];
+            }
+            if (192u + t < ap.dh) {
+                aout[o + 192u + t] = acc[h].w / l[h];
+            }
+        }
+    }
+}
+
 @compute @workgroup_size(64, 1, 1)
 fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
                @builtin(num_workgroups) nwg: vec3<u32>,
@@ -762,11 +927,12 @@ type gpuPipelines struct {
 	matmul, matmulT, matmulS, matmulTS             uintptr
 	scale, softmax, attn, qmatmul                  uintptr
 	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
-	geluMulIP, qmatmulB                            uintptr
+	geluMulIP, qmatmulB, attnG                     uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
 	layScale, laySoftmax, layAttn, layQmatmul      uintptr
 	layRmsnorm, layRope, layAddIP, laySiluMulIP    uintptr
 	layQ4matmul, layGeluMulIP, layQmatmulB         uintptr
+	layAttnG                                       uintptr
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -791,6 +957,7 @@ func (g *GPU) initPipelines() error {
 		{&g.pipes.q4matmul, &g.pipes.layQ4matmul, "q4matmul"},
 		{&g.pipes.geluMulIP, &g.pipes.layGeluMulIP, "gelu_mul_ip"},
 		{&g.pipes.qmatmulB, &g.pipes.layQmatmulB, "qmatmul_b"},
+		{&g.pipes.attnG, &g.pipes.layAttnG, "attn_causal_g"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -809,7 +976,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.layMatmulTS, g.pipes.layScale, g.pipes.laySoftmax, g.pipes.layAttn,
 		g.pipes.layQmatmul, g.pipes.layRmsnorm, g.pipes.layRope,
 		g.pipes.layAddIP, g.pipes.laySiluMulIP, g.pipes.layQ4matmul,
-		g.pipes.layGeluMulIP, g.pipes.layQmatmulB,
+		g.pipes.layGeluMulIP, g.pipes.layQmatmulB, g.pipes.layAttnG,
 	} {
 		if h != 0 {
 			fnLayoutRelease(h)
@@ -820,7 +987,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.matmulTS, g.pipes.scale, g.pipes.softmax, g.pipes.attn,
 		g.pipes.qmatmul, g.pipes.rmsnorm, g.pipes.rope,
 		g.pipes.addIP, g.pipes.siluMulIP, g.pipes.q4matmul,
-		g.pipes.geluMulIP, g.pipes.qmatmulB,
+		g.pipes.geluMulIP, g.pipes.qmatmulB, g.pipes.attnG,
 	} {
 		if h != 0 {
 			fnPipelineRelease(h)
@@ -2221,14 +2388,28 @@ func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqK
 	if k.Size() < seqKV*kvDim || v.Size() < seqKV*kvDim {
 		return nil, fmt.Errorf("tensai: kv cache of %d/%d elements is smaller than %d x %d", k.Size(), v.Size(), seqKV, kvDim)
 	}
+	// Groups of up to eight query heads sharing a KV head run in one
+	// workgroup (attn_causal_g), streaming each K and V row once per
+	// group; other shapes keep the per-head kernel.
 	group := heads / kvHeads
-	offs := make([]uint32, 4*heads)
-	for h := 0; h < heads; h++ {
-		offs[4*h] = uint32(h * dh)
-		offs[4*h+1] = uint32((h / group) * dh)
-		offs[4*h+2] = uint32(h * dh)
+	grouped := group > 1 && group <= 8 && dh <= 256
+	nwg := heads
+	if grouped {
+		nwg = kvHeads
 	}
-	rows := heads * seq
+	offs := make([]uint32, 4*nwg)
+	for h := 0; h < nwg; h++ {
+		if grouped {
+			offs[4*h] = uint32(h * group * dh)
+			offs[4*h+1] = uint32(h * dh)
+			offs[4*h+2] = uint32(h * group * dh)
+		} else {
+			offs[4*h] = uint32(h * dh)
+			offs[4*h+1] = uint32((h / group) * dh)
+			offs[4*h+2] = uint32(h * dh)
+		}
+	}
+	rows := nwg * seq
 	params := [8]uint32{
 		uint32(seq), uint32(seqKV), uint32(dh), uint32(d),
 		uint32(rows), uint32(seqKV - seq), uint32(kvDim), uint32(window),
@@ -2261,11 +2442,15 @@ func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqK
 		{binding: 13, buffer: v.buf, size: uint64(v.Size()) * 4},
 		{binding: 14, buffer: bufOut, size: outBytes},
 	}
-	bindGroup := g.cachedBindGroup(g.pipes.layAttn, entries[:])
+	pipe, lay := g.pipes.attn, g.pipes.layAttn
+	if grouped {
+		pipe, lay = g.pipes.attnG, g.pipes.layAttnG
+	}
+	bindGroup := g.cachedBindGroup(lay, entries[:])
 	runtime.KeepAlive(&entries)
 
 	x, y := split2D(rows)
-	if err := g.dispatch(g.pipes.attn, bindGroup, x, y, 1); err != nil {
+	if err := g.dispatch(pipe, bindGroup, x, y, 1); err != nil {
 		g.dropBuffer(bufOut)
 		return nil, err
 	}
