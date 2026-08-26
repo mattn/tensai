@@ -836,18 +836,31 @@ func (g *GPU) dispatch(pipe, bindGroup uintptr, x, y, z uint32) error {
 	if encoder == 0 {
 		encoder = fnDeviceCreateCmdEncoder(g.device, nil)
 	}
-	pass := fnEncoderBeginComputePass(encoder, nil)
+	// Inside a batch every dispatch shares one open compute pass: the
+	// spec orders dispatches within a pass (each is its own
+	// synchronization scope), and per-pass setup is where drivers like
+	// dozen burn milliseconds. Buffer copies end the pass (endBatchPass);
+	// the next dispatch reopens it.
+	var pass uintptr
+	if g.batchEnc != 0 {
+		if g.batchPass == 0 {
+			g.batchPass = fnEncoderBeginComputePass(encoder, nil)
+		}
+		pass = g.batchPass
+	} else {
+		pass = fnEncoderBeginComputePass(encoder, nil)
+	}
 	fnPassSetPipeline(pass, pipe)
 	fnPassSetBindGroup(pass, 0, bindGroup, 0, nil)
 	fnPassDispatch(pass, x, y, z)
-	fnPassEnd(pass)
-	fnPassRelease(pass)
 	if g.batchEnc != 0 {
 		if uncapturedCB != "" {
 			return fmt.Errorf("tensai: gpu dispatch failed: %s", uncapturedCB)
 		}
 		return nil
 	}
+	fnPassEnd(pass)
+	fnPassRelease(pass)
 	cmd := fnEncoderFinish(encoder, nil)
 	fnCmdEncoderRelease(encoder)
 	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
@@ -891,12 +904,23 @@ func (g *GPU) Flush() error {
 	return g.flushLocked()
 }
 
+// endBatchPass closes the batch's open compute pass, if any, so the
+// encoder can record buffer copies or finish. The caller holds wgpuMu.
+func (g *GPU) endBatchPass() {
+	if g.batchPass != 0 {
+		fnPassEnd(g.batchPass)
+		fnPassRelease(g.batchPass)
+		g.batchPass = 0
+	}
+}
+
 // flushLocked submits and closes an open batch encoder; the caller holds
 // g.mu and wgpuMu.
 func (g *GPU) flushLocked() error {
 	if g.batchEnc == 0 {
 		return nil
 	}
+	g.endBatchPass()
 	encoder := g.batchEnc
 	g.batchEnc = 0
 	cmd := fnEncoderFinish(encoder, nil)
@@ -919,7 +943,14 @@ func (g *GPU) flushLocked() error {
 // still-unsubmitted encoder, so a buffer must not be handed out again
 // until the batch that references it is flushed.
 type gpuBufferPool struct {
-	free    map[[2]uint64][]uintptr
+	free map[[2]uint64][]uintptr
+	// batch holds tensor buffers freed while a batch is open. The encoded
+	// passes execute in order with implicit barriers between them, so a
+	// later dispatch may write such a buffer — but only a dispatch: queue
+	// writes jump ahead of the unsubmitted encoder, so takeBuffer (which
+	// feeds the queue-write sites) never draws from here; takeOutBuffer
+	// (dispatch outputs) does. Flush folds batch into free.
+	batch   map[[2]uint64][]uintptr
 	pending []pooledBuf
 	bytes   uint64
 }
@@ -953,6 +984,15 @@ func (g *GPU) putBuffer(usage, size uint64, buf uintptr) {
 		return
 	}
 	if g.batchEnc != 0 {
+		if usage == gpuTensorUsage {
+			if g.pool.batch == nil {
+				g.pool.batch = make(map[[2]uint64][]uintptr)
+			}
+			key := [2]uint64{usage, size}
+			g.pool.batch[key] = append(g.pool.batch[key], buf)
+			g.pool.bytes += size
+			return
+		}
 		g.pool.pending = append(g.pool.pending, pooledBuf{usage, size, buf})
 		return
 	}
@@ -964,9 +1004,32 @@ func (g *GPU) putBuffer(usage, size uint64, buf uintptr) {
 	g.pool.bytes += size
 }
 
+// takeOutBuffer returns a tensor buffer a dispatch will write: unlike
+// takeBuffer it may reuse one freed earlier in the still-open batch,
+// which keeps a long prefill from allocating a fresh buffer (and, past
+// the pool cap, wiping the bind-group cache) for every intermediate.
+// The caller holds g.mu and wgpuMu.
+func (g *GPU) takeOutBuffer(size uint64) uintptr {
+	key := [2]uint64{gpuTensorUsage, size}
+	if l := g.pool.batch[key]; len(l) > 0 {
+		buf := l[len(l)-1]
+		g.pool.batch[key] = l[:len(l)-1]
+		g.pool.bytes -= size
+		return buf
+	}
+	return g.takeBuffer(gpuTensorUsage, size)
+}
+
 // drainPending moves batch-held buffers into the free lists once their
 // batch has been submitted. The caller holds wgpuMu.
 func (g *GPU) drainPending() {
+	if len(g.pool.batch) > 0 && g.pool.free == nil {
+		g.pool.free = make(map[[2]uint64][]uintptr)
+	}
+	for key, l := range g.pool.batch {
+		g.pool.free[key] = append(g.pool.free[key], l...)
+		delete(g.pool.batch, key)
+	}
 	for _, p := range g.pool.pending {
 		if g.pool.bytes+p.size > gpuPoolMaxBytes {
 			g.dropBuffer(p.buf)
@@ -986,6 +1049,11 @@ func (g *GPU) drainPending() {
 // wgpuMu.
 func (g *GPU) releasePool() {
 	for _, l := range g.pool.free {
+		for _, buf := range l {
+			fnBufferRelease(buf)
+		}
+	}
+	for _, l := range g.pool.batch {
 		for _, buf := range l {
 			fnBufferRelease(buf)
 		}
@@ -1372,7 +1440,7 @@ func (g *GPU) stridedMatMul(a, b *GPUTensor, outShape []int, transB bool, m, k, 
 	}
 	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
 	bufOffs := g.takeBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
-	bufOut := g.takeBuffer(gpuTensorUsage, outBytes)
+	bufOut := g.takeOutBuffer(outBytes)
 	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
 	defer g.putBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4, bufOffs)
 
@@ -1489,7 +1557,7 @@ func (t *GPUTensor) softmax(qmod, off int) (*GPUTensor, error) {
 	bytes := uint64(t.Size()) * 4
 	params := [4]uint32{uint32(rows), uint32(cols), uint32(qmod), uint32(off)}
 	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
-	bufOut := g.takeBuffer(gpuTensorUsage, bytes)
+	bufOut := g.takeOutBuffer(bytes)
 	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
 
@@ -1686,7 +1754,7 @@ func (q *GPUTensor) fusedCausalMHA(k, v *GPUTensor, heads, batch, seq, seqKV, d,
 	}
 	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
 	bufOffs := g.takeBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
-	bufOut := g.takeBuffer(gpuTensorUsage, outBytes)
+	bufOut := g.takeOutBuffer(outBytes)
 	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
 	defer g.putBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4, bufOffs)
 
@@ -1849,7 +1917,7 @@ func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 	}
 	params := [4]uint32{uint32(q.rows), uint32(q.cols), uint32(q.words), uint32(m)}
 	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
-	bufOut := g.takeBuffer(gpuTensorUsage, outBytes)
+	bufOut := g.takeOutBuffer(outBytes)
 	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
 
@@ -1906,7 +1974,7 @@ func (t *GPUTensor) RMSNorm(w *GPUTensor, eps float64) (*GPUTensor, error) {
 
 	params := [4]uint32{uint32(rows), uint32(n), math.Float32bits(float32(eps)), 0}
 	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
-	bufOut := g.takeBuffer(gpuTensorUsage, uint64(t.Size())*4)
+	bufOut := g.takeOutBuffer(uint64(t.Size()) * 4)
 	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
 
@@ -1952,7 +2020,7 @@ func (t *GPUTensor) RMSNormEach(w *GPUTensor, eps float64) (*GPUTensor, error) {
 
 	params := [4]uint32{uint32(rows), uint32(n), math.Float32bits(float32(eps)), 0}
 	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
-	bufOut := g.takeBuffer(gpuTensorUsage, uint64(t.Size())*4)
+	bufOut := g.takeOutBuffer(uint64(t.Size()) * 4)
 	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
 
@@ -2102,6 +2170,7 @@ func (t *GPUTensor) CopyRowsInto(dst *GPUTensor, off int) error {
 	}
 	uncapturedCB = ""
 	if g.batchEnc != 0 {
+		g.endBatchPass()
 		fnEncoderCopyBuffer(g.batchEnc, t.buf, 0, dst.buf, uint64(off)*4, uint64(t.Size())*4)
 		return nil
 	}
@@ -2178,7 +2247,7 @@ func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqK
 	outBytes := uint64(q.Size()) * 4
 	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
 	bufOffs := g.takeBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
-	bufOut := g.takeBuffer(gpuTensorUsage, outBytes)
+	bufOut := g.takeOutBuffer(outBytes)
 	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
 	defer g.putBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4, bufOffs)
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
@@ -2335,7 +2404,7 @@ func (q *GPUQ4Matrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 		uint32(groups), 0, 0, 0,
 	}
 	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
-	bufOut := g.takeBuffer(gpuTensorUsage, outBytes)
+	bufOut := g.takeOutBuffer(outBytes)
 	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
 
