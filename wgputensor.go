@@ -752,10 +752,10 @@ fn qmatmul_b(@builtin(workgroup_id) wid: vec3<u32>,
 // cross-lane reduction is needed. Accumulation is k-sequential per
 // output, so results sit within fp32 rounding of the split kernels
 // rather than matching them bit for bit.
-const QTR = 32u; // output rows per workgroup
-const QTK = 64u; // K slice depth
-var<workgroup> qta: array<f32, 2048>;       // QTR x QTK activations
-var<workgroup> qtw: array<vec4<f32>, 1024>; // QTK x 16 dequantized words
+const QTR = 64u; // output rows per workgroup
+const QTK = 32u; // K slice depth
+var<workgroup> qta: array<f32, 2048>;      // QTR x QTK activations
+var<workgroup> qtw: array<vec4<f32>, 512>; // QTK x 16 dequantized words
 
 @compute @workgroup_size(256, 1, 1)
 fn qmatmul_t(@builtin(workgroup_id) wid: vec3<u32>,
@@ -766,6 +766,8 @@ fn qmatmul_t(@builtin(workgroup_id) wid: vec3<u32>,
     let r0 = wid.y * QTR;
     var acc0 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     var acc1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc3 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     let ktiles = (qp.rows + QTK - 1u) / QTK;
     for (var kt = 0u; kt < ktiles; kt = kt + 1u) {
         let kbase = kt * QTK;
@@ -780,9 +782,9 @@ fn qmatmul_t(@builtin(workgroup_id) wid: vec3<u32>,
             }
             qta[idx] = a;
         }
-        // Stage the weight tile, each lane expanding four packed words.
-        for (var s = 0u; s < 4u; s = s + 1u) {
-            let idx = lid.x * 4u + s;
+        // Stage the weight tile, each lane expanding two packed words.
+        for (var s = 0u; s < 2u; s = s + 1u) {
+            let idx = lid.x * 2u + s;
             let kk = idx / QWG;
             let ww = wid.x * QWG + idx % QWG;
             var wv = vec4<f32>(0.0, 0.0, 0.0, 0.0);
@@ -798,24 +800,33 @@ fn qmatmul_t(@builtin(workgroup_id) wid: vec3<u32>,
         }
         workgroupBarrier();
         let kmax = min(QTK, qp.rows - kbase);
+        let ra = rsub * 4u;
         for (var i = 0u; i < kmax; i = i + 1u) {
             let wv = qtw[i * QWG + wsub];
-            acc0 = acc0 + qta[(rsub * 2u) * QTK + i] * wv;
-            acc1 = acc1 + qta[(rsub * 2u + 1u) * QTK + i] * wv;
+            acc0 = acc0 + qta[ra * QTK + i] * wv;
+            acc1 = acc1 + qta[(ra + 1u) * QTK + i] * wv;
+            acc2 = acc2 + qta[(ra + 2u) * QTK + i] * wv;
+            acc3 = acc3 + qta[(ra + 3u) * QTK + i] * wv;
         }
         workgroupBarrier();
     }
     if (w < qp.words) {
         let j = w * 4u;
-        let rA = r0 + rsub * 2u;
-        let rB = rA + 1u;
+        let rA = r0 + rsub * 4u;
         for (var l = 0u; l < 4u; l = l + 1u) {
             if (j + l < qp.cols) {
+                let sc = qsc[j + l];
                 if (rA < qp.m) {
-                    qov[rA * qp.cols + j + l] = acc0[l] * qsc[j + l];
+                    qov[rA * qp.cols + j + l] = acc0[l] * sc;
                 }
-                if (rB < qp.m) {
-                    qov[rB * qp.cols + j + l] = acc1[l] * qsc[j + l];
+                if (rA + 1u < qp.m) {
+                    qov[(rA + 1u) * qp.cols + j + l] = acc1[l] * sc;
+                }
+                if (rA + 2u < qp.m) {
+                    qov[(rA + 2u) * qp.cols + j + l] = acc2[l] * sc;
+                }
+                if (rA + 3u < qp.m) {
+                    qov[(rA + 3u) * qp.cols + j + l] = acc3[l] * sc;
                 }
             }
         }
@@ -2181,7 +2192,7 @@ func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 	// kernel; a single row keeps the matvec shape.
 	pipe, lay, gy := g.pipes.qmatmul, g.pipes.layQmatmul, uint32(m)
 	if m >= 32 {
-		pipe, lay, gy = g.pipes.qmatmulT, g.pipes.layQmatmulT, uint32((m+31)/32)
+		pipe, lay, gy = g.pipes.qmatmulT, g.pipes.layQmatmulT, uint32((m+63)/64)
 	} else if m > 1 {
 		pipe, lay, gy = g.pipes.qmatmulB, g.pipes.layQmatmulB, uint32((m+7)/8)
 	}
