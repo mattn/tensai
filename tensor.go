@@ -71,11 +71,7 @@ func (m *Matrix) Row(r int) []Float {
 // T returns the transpose of the matrix.
 func (m *Matrix) T() *Matrix {
 	out := NewMatrix(m.Cols, m.Rows)
-	for r := 0; r < m.Rows; r++ {
-		for c := 0; c < m.Cols; c++ {
-			out.Data[c*m.Rows+r] = m.Data[r*m.Cols+c]
-		}
-	}
+	transposeData(out.Data, m.Data, m.Rows, m.Cols)
 	return out
 }
 
@@ -192,12 +188,27 @@ func TInto(dst, src *Matrix) error {
 		return fmt.Errorf("tensai: transpose shape mismatch: dst %dx%d, src %dx%d",
 			dst.Rows, dst.Cols, src.Rows, src.Cols)
 	}
-	for r := 0; r < src.Rows; r++ {
-		for c := 0; c < src.Cols; c++ {
-			dst.Data[c*src.Rows+r] = src.Data[r*src.Cols+c]
+	transposeData(dst.Data, src.Data, src.Rows, src.Cols)
+	return nil
+}
+
+// transposeData uses cache-sized tiles so both the source reads and the
+// destination writes stay local. This also gives the SIMD compiler compact
+// 8-element runs to optimize instead of one full-matrix strided stream.
+func transposeData(dst, src []Float, rows, cols int) {
+	const tile = 32
+	for r0 := 0; r0 < rows; r0 += tile {
+		r1 := min(r0+tile, rows)
+		for c0 := 0; c0 < cols; c0 += tile {
+			c1 := min(c0+tile, cols)
+			for r := r0; r < r1; r++ {
+				s := src[r*cols+c0 : r*cols+c1]
+				for i, v := range s {
+					dst[(c0+i)*rows+r] = v
+				}
+			}
 		}
 	}
-	return nil
 }
 
 // dotRowsGeneric computes rows lo..hi of out = a * b in pure Go. Loop order

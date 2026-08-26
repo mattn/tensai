@@ -224,3 +224,57 @@ func TestDotVecsAxpys(t *testing.T) {
 		}
 	}
 }
+
+func TestSoftmaxBwdAdd(t *testing.T) {
+	rng := rand.New(rand.NewSource(81))
+	for _, n := range []int{1, 7, 8, 15, 16, 127, 128, 130, 4096} {
+		dst := make([]Float, n)
+		grad := make([]Float, n)
+		y := make([]Float, n)
+		var sum Float
+		for i := range dst {
+			dst[i] = Float(rng.NormFloat64())
+			grad[i] = Float(rng.NormFloat64())
+			y[i] = Float(rng.Float64())
+			sum += y[i]
+		}
+		for i := range y {
+			y[i] /= sum
+		}
+		want := append([]Float(nil), dst...)
+		softmaxBwdAddGeneric(want, grad, y)
+		softmaxBwdAdd(dst, grad, y)
+		for i := range dst {
+			if diff := math.Abs(float64(dst[i] - want[i])); diff > 2e-5*(1+math.Abs(float64(want[i]))) {
+				t.Fatalf("n=%d idx=%d: got %g want %g", n, i, dst[i], want[i])
+			}
+		}
+	}
+}
+
+func BenchmarkSoftmaxBackward4096(b *testing.B) {
+	dst := make([]Float, 4096)
+	grad := make([]Float, 4096)
+	y := make([]Float, 4096)
+	for i := range y {
+		grad[i] = Float(i%17) / 17
+		y[i] = (Float(i%31) / 31) / 2048
+	}
+	b.SetBytes(int64(len(y) * 4 * 3))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		softmaxBwdAdd(dst, grad, y)
+	}
+}
+
+func BenchmarkTranspose1024(b *testing.B) {
+	src := NewMatrix(1024, 1024)
+	dst := NewMatrix(1024, 1024)
+	b.SetBytes(int64(len(src.Data) * 4))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := TInto(dst, src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

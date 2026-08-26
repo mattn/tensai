@@ -459,8 +459,8 @@ Where the AVX2 kernels apply today, and where they still could:
 - [x] Adam / AdamW parameter update
 - [x] Slice add & scale primitives (bias add, `Embedding` gradient scatter-add)
 - [x] Transpose-free gradient matmul (`DotTAInto`) — `Dense`/`Conv2D` weight gradients no longer materialize `input^T` / `im2col^T`
-- [ ] Remaining transposes (`T`/`TInto`, now only weight matrices and autograd) — needs 8x8 block-and-shuffle
-- [ ] Softmax backward row dot products (layer and autograd)
+- [x] Remaining transposes (`T`/`TInto`, now only weight matrices and autograd) — cache-blocked 32x32 tiles
+- [x] Softmax backward row dot products (autograd) — fused AVX2 dot and Jacobian-vector accumulation
 - [ ] MSE / BinaryCrossEntropy losses (BCE needs a vectorized `log`)
 - [ ] Autograd element-wise backward passes (gradients accumulate with `+=`, so they need dedicated fused kernels)
 - [ ] BatchNorm statistics (column-strided access needs a restructure)
