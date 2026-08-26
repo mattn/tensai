@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strings"
@@ -175,10 +176,51 @@ func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 			maxl = v
 		}
 	}
+	// Bucket the probability mass by exponent (p in (0, 1], so Ilogb is
+	// 0, -1, -2, ...); the crossing search below finds the bucket where
+	// the running mass reaches the nucleus target.
+	const nb = 1100
+	bucket := func(p float64) int {
+		b := -math.Ilogb(p)
+		if b < 0 {
+			b = 0
+		} else if b >= nb {
+			b = nb - 1
+		}
+		return b
+	}
+	// Exp over the vocabulary dominates sampling, so it fans out across
+	// CPUs — each element (and its bucket) is independent — while the
+	// mass accumulation stays a serial in-order pass, keeping the result
+	// bit-identical to the fused serial loop.
+	needBuckets := topP < 1
+	expRange := func(lo, hi int) {
+		for i := lo; i < hi; i++ {
+			p := math.Exp(float64(logits[i]-maxl) / temp)
+			ps[i] = p
+			if needBuckets && p > 0 {
+				buckets[i] = uint16(bucket(p))
+			}
+		}
+	}
+	if workers := min(runtime.NumCPU(), len(logits)/4096); workers > 1 {
+		var wg sync.WaitGroup
+		chunk := (len(logits) + workers - 1) / workers
+		for lo := chunk; lo < len(logits); lo += chunk {
+			hi := min(lo+chunk, len(logits))
+			wg.Add(1)
+			go func(lo, hi int) {
+				defer wg.Done()
+				expRange(lo, hi)
+			}(lo, hi)
+		}
+		expRange(0, chunk)
+		wg.Wait()
+	} else {
+		expRange(0, len(logits))
+	}
 	var sum float64
-	for i, v := range logits {
-		p := math.Exp(float64(v-maxl) / temp)
-		ps[i] = p
+	for _, p := range ps {
 		sum += p
 	}
 
@@ -194,26 +236,13 @@ func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 		return len(ps) - 1
 	}
 
-	// Bucket the probability mass by exponent (p in (0, 1], so Ilogb is
-	// 0, -1, -2, ...) and find the bucket where the running mass crosses
-	// the nucleus target: every nucleus member has p in a bucket at or
-	// above the crossing.
-	const nb = 1100
+	// Sum the mass per precomputed bucket and find the bucket where the
+	// running mass crosses the nucleus target: every nucleus member has
+	// p in a bucket at or above the crossing.
 	var bsum [nb]float64
-	bucket := func(p float64) int {
-		b := -math.Ilogb(p)
-		if b < 0 {
-			b = 0
-		} else if b >= nb {
-			b = nb - 1
-		}
-		return b
-	}
 	for i, p := range ps {
 		if p > 0 {
-			b := bucket(p)
-			buckets[i] = uint16(b)
-			bsum[b] += p
+			bsum[buckets[i]] += p
 		}
 	}
 	target := topP * sum
