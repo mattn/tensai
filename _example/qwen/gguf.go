@@ -1223,6 +1223,18 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 	// A valid repack cache stands in for the whole tensor load: the
 	// weights map straight from the cache file as clean pages.
 	useCache := cache && bits != 0
+	// Requantization's per-column scales decode materially faster than
+	// the direct Q8_0 group scales. Once a user has paid its one-time
+	// conversion cost, prefer that valid cache on ordinary -q8 runs too.
+	// A missing, stale, or corrupt fast cache silently leaves the normal
+	// direct-repack path unchanged.
+	if useCache && direct && bits == 8 {
+		fastPath := cachePath(path, bits, false)
+		if m, err := loadWeightCache(fastPath, path, bits, false, cfg, headSz); err == nil {
+			fmt.Fprintf(os.Stderr, "using faster requantized cache: %s\n", fastPath)
+			return m, tok, nil
+		}
+	}
 	cpath := cachePath(path, bits, direct)
 	if useCache {
 		if m, err := loadWeightCache(cpath, path, bits, direct, cfg, headSz); err == nil {
