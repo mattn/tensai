@@ -77,6 +77,8 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string) string {
 type server struct {
 	mu      sync.Mutex // one request drives the model at a time
 	model   *qwen
+	draft   *qwen
+	specK   int
 	tok     tokenizerIface
 	system  string
 	nCtx    int
@@ -165,6 +167,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reset()
+	if s.draft != nil {
+		s.draft.reset()
+	}
 
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
@@ -229,31 +234,53 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	logits := s.prefill(ids, 0)
+	if s.draft != nil {
+		s.draft.prefill(ids, 0)
+	}
 	steps := len(ids)
 	var out []int
 	finish := "length"
 	ctx := r.Context()
-	for len(out) < limit && steps < s.nCtx-1 {
-		// A disconnected client stops the generation instead of holding
-		// the model for tokens nobody will read.
-		select {
-		case <-ctx.Done():
-			finish = "abort"
-			steps = s.nCtx // fall out below
-			continue
-		default:
+	if s.draft != nil {
+		emit := func(next int) bool {
+			select {
+			case <-ctx.Done():
+				return false
+			default:
+			}
+			out = append(out, next)
+			if flush != nil {
+				push(s.tok.Decode([]int{next}), false)
+			}
+			return true
 		}
-		next := sample(logits, temp, topP, rng)
-		if next == s.imEnd || next == s.eot {
-			finish = "stop"
-			break
+		_, _, finish, _ = generateSpeculative(s.model, s.draft, logits, steps, limit,
+			s.nCtx, s.specK, temp, topP, func(id int) bool {
+				return id == s.imEnd || id == s.eot
+			}, rng, emit)
+	} else {
+		for len(out) < limit && steps < s.nCtx-1 {
+			// A disconnected client stops the generation instead of holding
+			// the model for tokens nobody will read.
+			select {
+			case <-ctx.Done():
+				finish = "abort"
+				steps = s.nCtx // fall out below
+				continue
+			default:
+			}
+			next := sample(logits, temp, topP, rng)
+			if next == s.imEnd || next == s.eot {
+				finish = "stop"
+				break
+			}
+			out = append(out, next)
+			if flush != nil {
+				push(s.tok.Decode([]int{next}), false)
+			}
+			logits = s.step(next, steps)
+			steps++
 		}
-		out = append(out, next)
-		if flush != nil {
-			push(s.tok.Decode([]int{next}), false)
-		}
-		logits = s.step(next, steps)
-		steps++
 	}
 	if finish == "abort" {
 		return
