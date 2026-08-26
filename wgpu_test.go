@@ -686,8 +686,10 @@ func TestGPUQ8MatMul(t *testing.T) {
 	rng := rand.New(rand.NewSource(61))
 	for _, c := range []struct{ m, rows, cols int }{
 		{1, 256, 512},
-		{3, 64, 33}, // cols not a multiple of 4: guarded tail
-		{5, 33, 7},  // odd rows: interleave pad must not leak
+		{3, 64, 33},   // cols not a multiple of 4: guarded tail
+		{5, 33, 7},    // odd rows: interleave pad must not leak
+		{70, 130, 33}, // tiled path: row, K-slice, and col tails at once
+		{32, 64, 64},  // tiled path: exact tile boundaries
 	} {
 		w := RandomMatrix(c.rows, c.cols, rng)
 		q := QuantizeMatrix(w)

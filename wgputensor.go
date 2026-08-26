@@ -743,6 +743,85 @@ fn qmatmul_b(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+
+// qmatmul_t is the tiled GEMM form for large batches: a workgroup
+// produces a 64-column x 32-row output tile, staging both operands in
+// shared memory per 64-deep K slice — activations cooperatively, the
+// packed weights dequantized once into a vec4 tile — so each weight
+// byte streams from memory rows/32 times instead of rows/8 and no
+// cross-lane reduction is needed. Accumulation is k-sequential per
+// output, so results sit within fp32 rounding of the split kernels
+// rather than matching them bit for bit.
+const QTR = 32u; // output rows per workgroup
+const QTK = 64u; // K slice depth
+var<workgroup> qta: array<f32, 2048>;       // QTR x QTK activations
+var<workgroup> qtw: array<vec4<f32>, 1024>; // QTK x 16 dequantized words
+
+@compute @workgroup_size(256, 1, 1)
+fn qmatmul_t(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(local_invocation_id) lid: vec3<u32>) {
+    let wsub = lid.x % QWG;
+    let rsub = lid.x / QWG;
+    let w = wid.x * QWG + wsub;
+    let r0 = wid.y * QTR;
+    var acc0 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let ktiles = (qp.rows + QTK - 1u) / QTK;
+    for (var kt = 0u; kt < ktiles; kt = kt + 1u) {
+        let kbase = kt * QTK;
+        // Stage the activation tile, each lane eight consecutive k.
+        for (var s = 0u; s < 8u; s = s + 1u) {
+            let idx = lid.x * 8u + s;
+            let rr = idx / QTK;
+            let kk = idx % QTK;
+            var a = 0.0;
+            if (r0 + rr < qp.m && kbase + kk < qp.rows) {
+                a = qxv[(r0 + rr) * qp.rows + kbase + kk];
+            }
+            qta[idx] = a;
+        }
+        // Stage the weight tile, each lane expanding four packed words.
+        for (var s = 0u; s < 4u; s = s + 1u) {
+            let idx = lid.x * 4u + s;
+            let kk = idx / QWG;
+            let ww = wid.x * QWG + idx % QWG;
+            var wv = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            if (kbase + kk < qp.rows && ww < qp.words) {
+                let pw = qwt[(kbase + kk) * qp.words + ww];
+                wv = vec4<f32>(
+                    f32(i32(pw << 24u) >> 24u),
+                    f32(i32(pw << 16u) >> 24u),
+                    f32(i32(pw << 8u) >> 24u),
+                    f32(i32(pw) >> 24u));
+            }
+            qtw[idx] = wv;
+        }
+        workgroupBarrier();
+        let kmax = min(QTK, qp.rows - kbase);
+        for (var i = 0u; i < kmax; i = i + 1u) {
+            let wv = qtw[i * QWG + wsub];
+            acc0 = acc0 + qta[(rsub * 2u) * QTK + i] * wv;
+            acc1 = acc1 + qta[(rsub * 2u + 1u) * QTK + i] * wv;
+        }
+        workgroupBarrier();
+    }
+    if (w < qp.words) {
+        let j = w * 4u;
+        let rA = r0 + rsub * 2u;
+        let rB = rA + 1u;
+        for (var l = 0u; l < 4u; l = l + 1u) {
+            if (j + l < qp.cols) {
+                if (rA < qp.m) {
+                    qov[rA * qp.cols + j + l] = acc0[l] * qsc[j + l];
+                }
+                if (rB < qp.m) {
+                    qov[rB * qp.cols + j + l] = acc1[l] * qsc[j + l];
+                }
+            }
+        }
+    }
+}
+
 // rmsnorm_row: one workgroup per row computes out = x * w / rms(x).
 struct NormParams { rows: u32, n: u32, eps: f32, pad: u32 }
 @group(0) @binding(20) var<uniform> np: NormParams;
@@ -927,12 +1006,12 @@ type gpuPipelines struct {
 	matmul, matmulT, matmulS, matmulTS             uintptr
 	scale, softmax, attn, qmatmul                  uintptr
 	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
-	geluMulIP, qmatmulB, attnG                     uintptr
+	geluMulIP, qmatmulB, attnG, qmatmulT           uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
 	layScale, laySoftmax, layAttn, layQmatmul      uintptr
 	layRmsnorm, layRope, layAddIP, laySiluMulIP    uintptr
 	layQ4matmul, layGeluMulIP, layQmatmulB         uintptr
-	layAttnG                                       uintptr
+	layAttnG, layQmatmulT                          uintptr
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -958,6 +1037,7 @@ func (g *GPU) initPipelines() error {
 		{&g.pipes.geluMulIP, &g.pipes.layGeluMulIP, "gelu_mul_ip"},
 		{&g.pipes.qmatmulB, &g.pipes.layQmatmulB, "qmatmul_b"},
 		{&g.pipes.attnG, &g.pipes.layAttnG, "attn_causal_g"},
+		{&g.pipes.qmatmulT, &g.pipes.layQmatmulT, "qmatmul_t"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -977,6 +1057,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.layQmatmul, g.pipes.layRmsnorm, g.pipes.layRope,
 		g.pipes.layAddIP, g.pipes.laySiluMulIP, g.pipes.layQ4matmul,
 		g.pipes.layGeluMulIP, g.pipes.layQmatmulB, g.pipes.layAttnG,
+		g.pipes.layQmatmulT,
 	} {
 		if h != 0 {
 			fnLayoutRelease(h)
@@ -988,6 +1069,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.qmatmul, g.pipes.rmsnorm, g.pipes.rope,
 		g.pipes.addIP, g.pipes.siluMulIP, g.pipes.q4matmul,
 		g.pipes.geluMulIP, g.pipes.qmatmulB, g.pipes.attnG,
+		g.pipes.qmatmulT,
 	} {
 		if h != 0 {
 			fnPipelineRelease(h)
@@ -2095,10 +2177,12 @@ func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 		{binding: 18, buffer: x.buf, size: uint64(x.Size()) * 4},
 		{binding: 19, buffer: bufOut, size: outBytes},
 	}
-	// A batch takes the row-blocked kernel, whose weight stream amortizes
-	// across QROWS activation rows; a single row keeps the matvec shape.
+	// A large batch takes the tiled GEMM, a small one the row-blocked
+	// kernel; a single row keeps the matvec shape.
 	pipe, lay, gy := g.pipes.qmatmul, g.pipes.layQmatmul, uint32(m)
-	if m > 1 {
+	if m >= 32 {
+		pipe, lay, gy = g.pipes.qmatmulT, g.pipes.layQmatmulT, uint32((m+31)/32)
+	} else if m > 1 {
 		pipe, lay, gy = g.pipes.qmatmulB, g.pipes.layQmatmulB, uint32((m+7)/8)
 	}
 	bindGroup := g.cachedBindGroup(lay, entries[:])
