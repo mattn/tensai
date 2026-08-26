@@ -647,12 +647,13 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
 // folds the row splits before the guarded store. The split keeps a decode
 // matvec — parallelism = output columns only — wide enough to fill the
 // device.
-struct QMParams { rows: u32, cols: u32, words: u32, m: u32 }
+struct QMParams { rows: u32, cols: u32, words: u32, m: u32, flags: u32, pad0: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(15) var<uniform> qp: QMParams;
 @group(0) @binding(16) var<storage, read> qwt: array<u32>;
 @group(0) @binding(17) var<storage, read> qsc: array<f32>;
 @group(0) @binding(18) var<storage, read> qxv: array<f32>;
 @group(0) @binding(19) var<storage, read_write> qov: array<f32>;
+@group(0) @binding(34) var<storage, read> qbias: array<f32>;
 
 const QWG = 16u;    // packed words per workgroup
 const QSPLIT = 16u; // row splits sharing one word
@@ -689,7 +690,14 @@ fn qmatmul(@builtin(workgroup_id) wid: vec3<u32>,
         let j = w * 4u;
         for (var l = 0u; l < 4u; l = l + 1u) {
             if (j + l < qp.cols) {
-                qov[r * qp.cols + j + l] = sum[l] * qsc[j + l];
+                var o = sum[l] * qsc[j + l];
+                if ((qp.flags & 1u) != 0u) {
+                    o = o + qbias[j + l];
+                }
+                if ((qp.flags & 2u) != 0u) {
+                    o = o + qov[r * qp.cols + j + l];
+                }
+                qov[r * qp.cols + j + l] = o;
             }
         }
     }
@@ -735,7 +743,14 @@ fn qmatmul_b(@builtin(workgroup_id) wid: vec3<u32>,
             let jc = w * 4u;
             for (var l = 0u; l < 4u; l = l + 1u) {
                 if (jc + l < qp.cols) {
-                    qov[(r0 + j) * qp.cols + jc + l] = sum[l] * qsc[jc + l];
+                    var o = sum[l] * qsc[jc + l];
+                    if ((qp.flags & 1u) != 0u) {
+                        o = o + qbias[jc + l];
+                    }
+                    if ((qp.flags & 2u) != 0u) {
+                        o = o + qov[(r0 + j) * qp.cols + jc + l];
+                    }
+                    qov[(r0 + j) * qp.cols + jc + l] = o;
                 }
             }
         }
@@ -816,17 +831,20 @@ fn qmatmul_t(@builtin(workgroup_id) wid: vec3<u32>,
         for (var l = 0u; l < 4u; l = l + 1u) {
             if (j + l < qp.cols) {
                 let sc = qsc[j + l];
-                if (rA < qp.m) {
-                    qov[rA * qp.cols + j + l] = acc0[l] * sc;
+                var bv = 0.0;
+                if ((qp.flags & 1u) != 0u) {
+                    bv = qbias[j + l];
                 }
-                if (rA + 1u < qp.m) {
-                    qov[(rA + 1u) * qp.cols + j + l] = acc1[l] * sc;
-                }
-                if (rA + 2u < qp.m) {
-                    qov[(rA + 2u) * qp.cols + j + l] = acc2[l] * sc;
-                }
-                if (rA + 3u < qp.m) {
-                    qov[(rA + 3u) * qp.cols + j + l] = acc3[l] * sc;
+                let vv = vec4<f32>(acc0[l], acc1[l], acc2[l], acc3[l]) * sc + vec4<f32>(bv, bv, bv, bv);
+                for (var r = 0u; r < 4u; r = r + 1u) {
+                    if (rA + r < qp.m) {
+                        let idx = (rA + r) * qp.cols + j + l;
+                        var o = vv[r];
+                        if ((qp.flags & 2u) != 0u) {
+                            o = o + qov[idx];
+                        }
+                        qov[idx] = o;
+                    }
                 }
             }
         }
@@ -943,12 +961,13 @@ fn gelu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
 // running partial folds with its (group, column) scale at the boundary.
 // Same shape as qmatmul: 16 words x 16 row-splits per 256-lane workgroup
 // with a shared-memory reduction.
-struct Q4MParams { rows: u32, cols: u32, words: u32, m: u32, groups: u32, pad0: u32, pad1: u32, pad2: u32 }
+struct Q4MParams { rows: u32, cols: u32, words: u32, m: u32, groups: u32, flags: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(29) var<uniform> q4p: Q4MParams;
 @group(0) @binding(30) var<storage, read> q4w: array<u32>;
 @group(0) @binding(31) var<storage, read> q4sc: array<f32>;
 @group(0) @binding(32) var<storage, read> q4x: array<f32>;
 @group(0) @binding(33) var<storage, read_write> q4out: array<f32>;
+@group(0) @binding(35) var<storage, read> q4bias: array<f32>;
 
 var<workgroup> q4red: array<vec4<f32>, 256>;
 
@@ -1003,7 +1022,14 @@ fn q4matmul(@builtin(workgroup_id) wid: vec3<u32>,
         let j = w * 4u;
         for (var l = 0u; l < 4u; l = l + 1u) {
             if (j + l < q4p.cols) {
-                q4out[r * q4p.cols + j + l] = sum[l];
+                var o = sum[l];
+                if ((q4p.flags & 1u) != 0u) {
+                    o = o + q4bias[j + l];
+                }
+                if ((q4p.flags & 2u) != 0u) {
+                    o = o + q4out[r * q4p.cols + j + l];
+                }
+                q4out[r * q4p.cols + j + l] = o;
             }
         }
     }
@@ -1018,7 +1044,7 @@ fn q4matmul(@builtin(workgroup_id) wid: vec3<u32>,
 // staged weight slice to K-packed form in shared memory, four int8
 // multiply-adds per dot4I8Packed.
 const intDotWGSL = `
-struct QIParams { rows: u32, kw4: u32, cols: u32, words: u32, m: u32, pad0: u32, pad1: u32, pad2: u32 }
+struct QIParams { rows: u32, kw4: u32, cols: u32, words: u32, m: u32, flags: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(0) var<uniform> qip: QIParams;
 @group(0) @binding(1) var<storage, read> qix: array<f32>;
 @group(0) @binding(2) var<storage, read_write> qia: array<u32>;
@@ -1026,6 +1052,7 @@ struct QIParams { rows: u32, kw4: u32, cols: u32, words: u32, m: u32, pad0: u32,
 @group(0) @binding(4) var<storage, read> qiw: array<u32>;
 @group(0) @binding(5) var<storage, read> qisc: array<f32>;
 @group(0) @binding(6) var<storage, read_write> qio: array<f32>;
+@group(0) @binding(7) var<storage, read> qibias: array<f32>;
 
 var<workgroup> qired: array<f32, 256>;
 
@@ -1157,7 +1184,14 @@ fn qmatmul_i(@builtin(workgroup_id) wid: vec3<u32>,
             let sa = qis[rr + r];
             for (var c = 0u; c < 4u; c = c + 1u) {
                 if (cc + c < qip.cols) {
-                    qio[(rr + r) * qip.cols + cc + c] = av[c] * sa * qisc[cc + c];
+                    var o = av[c] * sa * qisc[cc + c];
+                    if ((qip.flags & 1u) != 0u) {
+                        o = o + qibias[cc + c];
+                    }
+                    if ((qip.flags & 2u) != 0u) {
+                        o = o + qio[(rr + r) * qip.cols + cc + c];
+                    }
+                    qio[(rr + r) * qip.cols + cc + c] = o;
                 }
             }
         }
@@ -1513,7 +1547,7 @@ func (g *GPU) releasePool() {
 type bgKey struct {
 	layout uintptr
 	n      int
-	e      [6]struct {
+	e      [8]struct {
 		binding uint32
 		buf     uintptr
 		size    uint64
@@ -2327,7 +2361,15 @@ func (q *GPUQMatrix) Free() {
 // dequantized in registers, so only a quarter of the f32 weight bytes
 // cross the memory bus.
 func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
-	if q.freed || x.freed {
+	return q.MatMulOpts(x, nil, nil)
+}
+
+// MatMulOpts is MatMul with a fused epilogue: a per-column bias added
+// when bias is non-nil, and the product accumulated into dst — which is
+// then the returned tensor — when dst is non-nil. One dispatch instead
+// of a matmul plus one or two element-wise passes.
+func (q *GPUQMatrix) MatMulOpts(x, bias, dst *GPUTensor) (*GPUTensor, error) {
+	if q.freed || x.freed || (bias != nil && bias.freed) || (dst != nil && dst.freed) {
 		return nil, errors.New("tensai: gpu tensor already freed")
 	}
 	if q.g != x.g {
@@ -2341,9 +2383,15 @@ func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 	if m > 65535 {
 		return nil, fmt.Errorf("tensai: gpu qmatmul batch of %d rows exceeds 65535", m)
 	}
+	if bias != nil && bias.Size() != q.cols {
+		return nil, fmt.Errorf("tensai: gpu qmatmul bias length %d != %d columns", bias.Size(), q.cols)
+	}
+	if dst != nil && dst.Size() != m*q.cols {
+		return nil, fmt.Errorf("tensai: gpu qmatmul dst of %d elements, want %d", dst.Size(), m*q.cols)
+	}
 	outShape := append(append([]int(nil), x.shape[:n-1]...), q.cols)
 	if m >= 32 && q.g.hasIntDot {
-		return q.matmulIntDot(x, m, outShape)
+		return q.matmulIntDot(x, bias, dst, m, outShape)
 	}
 
 	g := q.g
@@ -2360,18 +2408,31 @@ func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 	if err := g.checkSize(outBytes); err != nil {
 		return nil, err
 	}
-	params := [4]uint32{uint32(q.rows), uint32(q.cols), uint32(q.words), uint32(m)}
-	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
-	bufOut := g.takeOutBuffer(outBytes)
-	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
-	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+	var flags uint32
+	biasBuf, biasSize := q.scales, uint64(q.words*4)*4 // dummy; flags gate the read
+	if bias != nil {
+		flags |= 1
+		biasBuf, biasSize = bias.buf, uint64(bias.Size())*4
+	}
+	bufOut := uintptr(0)
+	if dst != nil {
+		flags |= 2
+		bufOut = dst.buf
+	} else {
+		bufOut = g.takeOutBuffer(outBytes)
+	}
+	params := [8]uint32{uint32(q.rows), uint32(q.cols), uint32(q.words), uint32(m), flags}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
 
-	entries := [5]wgpuBindGroupEntry{
-		{binding: 15, buffer: bufParams, size: 16},
+	entries := [6]wgpuBindGroupEntry{
+		{binding: 15, buffer: bufParams, size: 32},
 		{binding: 16, buffer: q.buf, size: uint64(q.rows*q.words) * 4},
 		{binding: 17, buffer: q.scales, size: uint64(q.words*4) * 4},
 		{binding: 18, buffer: x.buf, size: uint64(x.Size()) * 4},
 		{binding: 19, buffer: bufOut, size: outBytes},
+		{binding: 34, buffer: biasBuf, size: biasSize},
 	}
 	// A large batch takes the tiled GEMM, a small one the row-blocked
 	// kernel; a single row keeps the matvec shape.
@@ -2387,8 +2448,13 @@ func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 	err := g.dispatch(pipe, bindGroup,
 		uint32((q.words+15)/16), gy, 1)
 	if err != nil {
-		g.dropBuffer(bufOut)
+		if dst == nil {
+			g.dropBuffer(bufOut)
+		}
 		return nil, err
+	}
+	if dst != nil {
+		return dst, nil
 	}
 	return &GPUTensor{g: g, buf: bufOut, shape: outShape}, nil
 }
@@ -2399,7 +2465,7 @@ func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 // int8 scale per row — the same shape of rounding the CPU decode path
 // applies — so outputs differ from the f32 kernels within quantization
 // tolerance.
-func (q *GPUQMatrix) matmulIntDot(x *GPUTensor, m int, outShape []int) (*GPUTensor, error) {
+func (q *GPUQMatrix) matmulIntDot(x, bias, dst *GPUTensor, m int, outShape []int) (*GPUTensor, error) {
 	g := q.g
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -2415,12 +2481,25 @@ func (q *GPUQMatrix) matmulIntDot(x *GPUTensor, m int, outShape []int) (*GPUTens
 	if err := g.checkSize(outBytes); err != nil {
 		return nil, err
 	}
-	params := [8]uint32{uint32(q.rows), uint32(kw4), uint32(q.cols), uint32(q.words), uint32(m)}
+	var flags uint32
+	biasBuf, biasSize := q.scales, uint64(q.words*4)*4 // dummy; flags gate the read
+	if bias != nil {
+		flags |= 1
+		biasBuf, biasSize = bias.buf, uint64(bias.Size())*4
+	}
+	params := [8]uint32{uint32(q.rows), uint32(kw4), uint32(q.cols), uint32(q.words), uint32(m), flags}
 	paBytes := uint64(m*kw4) * 4
 	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
 	bufPA := g.takeOutBuffer(paBytes)
 	bufAS := g.takeOutBuffer(uint64(m) * 4)
-	bufOut := g.takeOutBuffer(outBytes)
+	bufOut := uintptr(0)
+	if dst != nil {
+		flags |= 2
+		params[5] = flags
+		bufOut = dst.buf
+	} else {
+		bufOut = g.takeOutBuffer(outBytes)
+	}
 	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
 	defer g.putBuffer(gpuTensorUsage, paBytes, bufPA)
 	defer g.putBuffer(gpuTensorUsage, uint64(m)*4, bufAS)
@@ -2435,22 +2514,30 @@ func (q *GPUQMatrix) matmulIntDot(x *GPUTensor, m int, outShape []int) (*GPUTens
 	bgA := g.cachedBindGroup(g.pipes.layQacts, qe[:])
 	runtime.KeepAlive(&qe)
 	if err := g.dispatch(g.pipes.qacts, bgA, uint32(m), 1, 1); err != nil {
-		g.dropBuffer(bufOut)
+		if dst == nil {
+			g.dropBuffer(bufOut)
+		}
 		return nil, err
 	}
-	me := [6]wgpuBindGroupEntry{
+	me := [7]wgpuBindGroupEntry{
 		{binding: 0, buffer: bufParams, size: 32},
 		{binding: 2, buffer: bufPA, size: paBytes},
 		{binding: 3, buffer: bufAS, size: uint64(m) * 4},
 		{binding: 4, buffer: q.buf, size: uint64(q.rows*q.words) * 4},
 		{binding: 5, buffer: q.scales, size: uint64(q.words*4) * 4},
 		{binding: 6, buffer: bufOut, size: outBytes},
+		{binding: 7, buffer: biasBuf, size: biasSize},
 	}
 	bgM := g.cachedBindGroup(g.pipes.layQmatmulI, me[:])
 	runtime.KeepAlive(&me)
 	if err := g.dispatch(g.pipes.qmatmulI, bgM, uint32((q.cols+63)/64), uint32((m+63)/64), 1); err != nil {
-		g.dropBuffer(bufOut)
+		if dst == nil {
+			g.dropBuffer(bufOut)
+		}
 		return nil, err
+	}
+	if dst != nil {
+		return dst, nil
 	}
 	return &GPUTensor{g: g, buf: bufOut, shape: outShape}, nil
 }
@@ -2895,7 +2982,14 @@ func (q *GPUQ4Matrix) Free() {
 // MatMul computes x @ Q on the GPU: x's last axis must equal the weight
 // rows, and every leading axis is a batch of activation rows.
 func (q *GPUQ4Matrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
-	if q.freed || x.freed {
+	return q.MatMulOpts(x, nil, nil)
+}
+
+// MatMulOpts is MatMul with a fused epilogue: a per-column bias added
+// when bias is non-nil, and the product accumulated into dst — which is
+// then the returned tensor — when dst is non-nil.
+func (q *GPUQ4Matrix) MatMulOpts(x, bias, dst *GPUTensor) (*GPUTensor, error) {
+	if q.freed || x.freed || (bias != nil && bias.freed) || (dst != nil && dst.freed) {
 		return nil, errors.New("tensai: gpu tensor already freed")
 	}
 	if q.g != x.g {
@@ -2908,6 +3002,12 @@ func (q *GPUQ4Matrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 	m := x.Size() / q.rows
 	if m > 65535 {
 		return nil, fmt.Errorf("tensai: gpu q4matmul batch of %d rows exceeds 65535", m)
+	}
+	if bias != nil && bias.Size() != q.cols {
+		return nil, fmt.Errorf("tensai: gpu q4matmul bias length %d != %d columns", bias.Size(), q.cols)
+	}
+	if dst != nil && dst.Size() != m*q.cols {
+		return nil, fmt.Errorf("tensai: gpu q4matmul dst of %d elements, want %d", dst.Size(), m*q.cols)
 	}
 	outShape := append(append([]int(nil), x.shape[:n-1]...), q.cols)
 
@@ -2926,22 +3026,35 @@ func (q *GPUQ4Matrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 		return nil, err
 	}
 	groups := (q.rows + 63) / 64
+	var flags uint32
+	biasBuf, biasSize := q.scales, uint64(groups*q.words*4)*4 // dummy; flags gate the read
+	if bias != nil {
+		flags |= 1
+		biasBuf, biasSize = bias.buf, uint64(bias.Size())*4
+	}
+	bufOut := uintptr(0)
+	if dst != nil {
+		flags |= 2
+		bufOut = dst.buf
+	} else {
+		bufOut = g.takeOutBuffer(outBytes)
+	}
 	params := [8]uint32{
 		uint32(q.rows), uint32(q.cols), uint32(q.words), uint32(m),
-		uint32(groups), 0, 0, 0,
+		uint32(groups), flags, 0, 0,
 	}
 	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
-	bufOut := g.takeOutBuffer(outBytes)
 	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
 
 	pairs := (q.rows + 1) / 2
-	entries := [5]wgpuBindGroupEntry{
+	entries := [6]wgpuBindGroupEntry{
 		{binding: 29, buffer: bufParams, size: 32},
 		{binding: 30, buffer: q.buf, size: uint64(pairs*q.words) * 4},
 		{binding: 31, buffer: q.scales, size: uint64(groups*q.words*4) * 4},
 		{binding: 32, buffer: x.buf, size: uint64(x.Size()) * 4},
 		{binding: 33, buffer: bufOut, size: outBytes},
+		{binding: 35, buffer: biasBuf, size: biasSize},
 	}
 	bindGroup := g.cachedBindGroup(g.pipes.layQ4matmul, entries[:])
 	runtime.KeepAlive(&entries)
@@ -2949,8 +3062,13 @@ func (q *GPUQ4Matrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 	err := g.dispatch(g.pipes.q4matmul, bindGroup,
 		uint32((q.words+15)/16), uint32(m), 1)
 	if err != nil {
-		g.dropBuffer(bufOut)
+		if dst == nil {
+			g.dropBuffer(bufOut)
+		}
 		return nil, err
+	}
+	if dst != nil {
+		return dst, nil
 	}
 	return &GPUTensor{g: g, buf: bufOut, shape: outShape}, nil
 }
