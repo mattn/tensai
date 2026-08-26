@@ -116,6 +116,9 @@ func (g *GPU) UploadQ8(q *QMatrix) (*GPUQMatrix, error) { return nil, errNoWGPU 
 // MatMul always fails in builds without the wgpu tag.
 func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) { return nil, errNoWGPU }
 
+// MatMulOpts always fails in builds without the wgpu tag.
+func (q *GPUQMatrix) MatMulOpts(x, bias, dst *GPUTensor) (*GPUTensor, error) { return nil, errNoWGPU }
+
 // Shape returns zeros in builds without the wgpu tag.
 func (q *GPUQMatrix) Shape() (int, int) { return 0, 0 }
 
@@ -138,8 +141,17 @@ type GPUQ4Matrix struct{}
 // UploadQ4 always fails in builds without the wgpu tag.
 func (g *GPU) UploadQ4(q *Q4Matrix) (*GPUQ4Matrix, error) { return nil, errNoWGPU }
 
+// HasF16 reports false in builds without the wgpu tag.
+func (g *GPU) HasF16() bool { return false }
+
+// NewF16Tensor always fails in builds without the wgpu tag.
+func (g *GPU) NewF16Tensor(shape ...int) (*GPUTensor, error) { return nil, errNoWGPU }
+
 // MatMul always fails in builds without the wgpu tag.
 func (q *GPUQ4Matrix) MatMul(x *GPUTensor) (*GPUTensor, error) { return nil, errNoWGPU }
+
+// MatMulOpts always fails in builds without the wgpu tag.
+func (q *GPUQ4Matrix) MatMulOpts(x, bias, dst *GPUTensor) (*GPUTensor, error) { return nil, errNoWGPU }
 
 // Shape returns zeros in builds without the wgpu tag.
 func (q *GPUQ4Matrix) Shape() (int, int) { return 0, 0 }

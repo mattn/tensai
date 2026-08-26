@@ -44,7 +44,9 @@ type GPU struct {
 	queue      uintptr
 	module     uintptr
 	module2    uintptr // optional integer-dot module; 0 if unsupported
+	module3    uintptr // optional f16 module; 0 if unsupported
 	hasIntDot  bool
+	hasF16     bool
 	pipes      gpuPipelines
 	readback   gpuReadbackBuffer
 	pool       gpuBufferPool
@@ -268,6 +270,7 @@ type wgpuAdapterInfo struct {
 var (
 	fnCreateInstance          func(*wgpuInstanceDescriptor) uintptr
 	fnAdapterGetInfo          func(uintptr, *wgpuAdapterInfo) uint32
+	fnAdapterHasFeature       func(uintptr, uint32) uint32
 	fnAdapterGetLimits        func(uintptr, *wgpuLimits) uint32
 	fnDeviceGetQueue          func(uintptr) uintptr
 	fnDeviceCreateShaderMod   func(uintptr, *wgpuShaderModuleDescriptor) uintptr
@@ -380,6 +383,7 @@ func loadWGPU() error {
 		}{
 			{&fnCreateInstance, "wgpuCreateInstance"},
 			{&fnAdapterGetInfo, "wgpuAdapterGetInfo"},
+			{&fnAdapterHasFeature, "wgpuAdapterHasFeature"},
 			{&fnAdapterGetLimits, "wgpuAdapterGetLimits"},
 			{&fnDeviceGetQueue, "wgpuDeviceGetQueue"},
 			{&fnDeviceCreateShaderMod, "wgpuDeviceCreateShaderModule"},
@@ -523,11 +527,29 @@ func OpenGPU(power ...GPUPower) (*GPU, error) {
 		dDesc.requiredLimits = uintptr(unsafe.Pointer(&lim))
 		g.maxStorage = min(lim.maxStorageBufferBindingSize, lim.maxBufferSize)
 	}
+	// Shader-f16 halves the resident KV cache; ask for it when the
+	// adapter advertises it, and drop it if the device still refuses.
+	const featShaderF16 = 0x0B // WGPUFeatureName_ShaderF16
+	feats := []uint32{featShaderF16}
+	if fnAdapterHasFeature(g.adapter, featShaderF16) == 1 {
+		dDesc.requiredFeatureCount = 1
+		dDesc.requiredFeatures = uintptr(unsafe.Pointer(&feats[0]))
+		g.hasF16 = true
+	}
 	requestDevice(g.adapter, &dDesc, wgpuCallbackInfo{
 		mode: wgpuCallbackModeAllowSpontaneous, callback: deviceCB,
 	})
+	if cbDevice == 0 && g.hasF16 {
+		g.hasF16 = false
+		dDesc.requiredFeatureCount = 0
+		dDesc.requiredFeatures = 0
+		requestDevice(g.adapter, &dDesc, wgpuCallbackInfo{
+			mode: wgpuCallbackModeAllowSpontaneous, callback: deviceCB,
+		})
+	}
 	runtime.KeepAlive(&dDesc)
 	runtime.KeepAlive(&lim)
+	runtime.KeepAlive(feats)
 	if cbDevice == 0 {
 		g.Close()
 		return nil, fmt.Errorf("tensai: wgpu device request failed: %s", cbFailMsg)
@@ -619,6 +641,7 @@ func (g *GPU) Close() {
 		fn func(uintptr)
 		h  uintptr
 	}{
+		{fnShaderModRelease, g.module3},
 		{fnShaderModRelease, g.module2},
 		{fnShaderModRelease, g.module},
 		{fnQueueRelease, g.queue},
