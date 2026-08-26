@@ -196,6 +196,31 @@ func scaleSlice(dst []Float, s Float) {
 	})
 }
 
+func softmaxBwdAdd(dst, grad, y []Float) {
+	if !hasAVX2 || len(y) < 16 {
+		softmaxBwdAddGeneric(dst, grad, y)
+		return
+	}
+	n := len(y) &^ 7
+	var acc archsimd.Float32x8
+	for i := 0; i < n; i += 8 {
+		acc = loadF32x8(grad[i:]).MulAdd(loadF32x8(y[i:]), acc)
+	}
+	dot := hsum(acc)
+	for i := n; i < len(y); i++ {
+		dot += grad[i] * y[i]
+	}
+	dv := archsimd.BroadcastFloat32x8(dot)
+	for i := 0; i < n; i += 8 {
+		gv := loadF32x8(grad[i:]).Sub(dv)
+		storeF32x8(loadF32x8(y[i:]).MulAdd(gv, loadF32x8(dst[i:])), dst[i:])
+	}
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < len(y); i++ {
+		dst[i] += y[i] * (grad[i] - dot)
+	}
+}
+
 func adamStepSlice(w, g, m, v []Float, beta1, beta2, rc1, rc2, lr, eps, wd Float) {
 	if !hasAVX2 {
 		adamStepGeneric(w, g, m, v, beta1, beta2, rc1, rc2, lr, eps, wd)

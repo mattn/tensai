@@ -98,6 +98,18 @@ func scaleSliceGeneric(dst []Float, s Float) {
 	}
 }
 
+// softmaxBwdAddGeneric accumulates the Jacobian-vector product
+// dst += y * (grad-dot(grad,y)) for one softmax row.
+func softmaxBwdAddGeneric(dst, grad, y []Float) {
+	var dot Float
+	for i, v := range y {
+		dot += grad[i] * v
+	}
+	for i, v := range y {
+		dst[i] += v * (grad[i] - dot)
+	}
+}
+
 // adamStepGeneric applies one Adam/AdamW update over a parameter slice.
 // rc1/rc2 are the reciprocal bias corrections 1/(1-beta^t).
 func adamStepGeneric(w, g, m, v []Float, beta1, beta2, rc1, rc2, lr, eps, wd Float) {

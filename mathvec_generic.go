@@ -19,6 +19,7 @@ func tanhBwd(dst, grad, y []Float)           { tanhBwdGeneric(dst, grad, y) }
 func expShift(dst, src []Float, shift Float) { expShiftGeneric(dst, src, shift) }
 func addSlice(dst, src []Float)              { addSliceGeneric(dst, src) }
 func scaleSlice(dst []Float, s Float)        { scaleSliceGeneric(dst, s) }
+func softmaxBwdAdd(dst, grad, y []Float)     { softmaxBwdAddGeneric(dst, grad, y) }
 func adamStepSlice(w, g, m, v []Float, beta1, beta2, rc1, rc2, lr, eps, wd Float) {
 	adamStepGeneric(w, g, m, v, beta1, beta2, rc1, rc2, lr, eps, wd)
 }

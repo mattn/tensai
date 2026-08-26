@@ -298,13 +298,7 @@ func (n *Node) Softmax() *Node {
 		for r := 0; r < v.Rows; r++ {
 			y := v.Data[r*cols : (r+1)*cols]
 			gv := out.Grad.Data[r*cols : (r+1)*cols]
-			var dot Float
-			for i := range y {
-				dot += gv[i] * y[i]
-			}
-			for i := range y {
-				g.Data[r*cols+i] += y[i] * (gv[i] - dot)
-			}
+			softmaxBwdAdd(g.Data[r*cols:(r+1)*cols], gv, y)
 		}
 	})
 }
