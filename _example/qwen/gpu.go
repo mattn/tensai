@@ -18,6 +18,7 @@ import (
 // satisfy.
 type gpuMat interface {
 	MatMul(*tensai.GPUTensor) (*tensai.GPUTensor, error)
+	MatMulOpts(x, bias, dst *tensai.GPUTensor) (*tensai.GPUTensor, error)
 	Free()
 }
 
@@ -236,21 +237,10 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 	for i := range gq.layers {
 		l := &gq.layers[i]
 		a := must(x.RMSNorm(l.ln1, cfg.RMSEps))
-		q := must(l.qq.MatMul(a))
-		k := must(l.qk.MatMul(a))
-		v := must(l.qv.MatMul(a))
+		q := must(l.qq.MatMulOpts(a, l.bq, nil))
+		k := must(l.qk.MatMulOpts(a, l.bk, nil))
+		v := must(l.qv.MatMulOpts(a, l.bv, nil))
 		a.Free()
-		if l.bq != nil {
-			if err := q.Add(l.bq); err != nil {
-				panic(err)
-			}
-			if err := k.Add(l.bk); err != nil {
-				panic(err)
-			}
-			if err := v.Add(l.bv); err != nil {
-				panic(err)
-			}
-		}
 		if l.qNorm != nil {
 			nq := must(q.RMSNormEach(l.qNorm, cfg.RMSEps))
 			q.Free()
@@ -281,17 +271,22 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 		v.Free()
 		attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, cfg.KVHeads, startPos+n, l.window))
 		q.Free()
-		proj := must(l.qo.MatMul(attn))
-		attn.Free()
-		if l.postAttn != nil {
+		// The residual add rides the projection's epilogue unless a
+		// sandwich norm (Gemma) has to run in between.
+		if l.postAttn == nil {
+			must(l.qo.MatMulOpts(attn, nil, x))
+			attn.Free()
+		} else {
+			proj := must(l.qo.MatMul(attn))
+			attn.Free()
 			np := must(proj.RMSNorm(l.postAttn, cfg.RMSEps))
 			proj.Free()
 			proj = np
+			if err := x.Add(proj); err != nil {
+				panic(err)
+			}
+			proj.Free()
 		}
-		if err := x.Add(proj); err != nil {
-			panic(err)
-		}
-		proj.Free()
 
 		a = must(x.RMSNorm(l.ln2, cfg.RMSEps))
 		gate := must(l.qGate.MatMul(a))
@@ -305,17 +300,20 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 			panic(err)
 		}
 		up.Free()
-		down := must(l.qDown.MatMul(gate))
-		gate.Free()
-		if l.postFFN != nil {
+		if l.postFFN == nil {
+			must(l.qDown.MatMulOpts(gate, nil, x))
+			gate.Free()
+		} else {
+			down := must(l.qDown.MatMul(gate))
+			gate.Free()
 			nd := must(down.RMSNorm(l.postFFN, cfg.RMSEps))
 			down.Free()
 			down = nd
+			if err := x.Add(down); err != nil {
+				panic(err)
+			}
+			down.Free()
 		}
-		if err := x.Add(down); err != nil {
-			panic(err)
-		}
-		down.Free()
 	}
 	gq.gpuLen = startPos + n
 	// Only the final position's hidden state comes back; the download
@@ -345,21 +343,10 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 	for i := range gq.layers {
 		l := &gq.layers[i]
 		a := must(x.RMSNorm(l.ln1, cfg.RMSEps))
-		q := must(l.qq.MatMul(a))
-		k := must(l.qk.MatMul(a))
-		v := must(l.qv.MatMul(a))
+		q := must(l.qq.MatMulOpts(a, l.bq, nil))
+		k := must(l.qk.MatMulOpts(a, l.bk, nil))
+		v := must(l.qv.MatMulOpts(a, l.bv, nil))
 		a.Free()
-		if l.bq != nil {
-			if err := q.Add(l.bq); err != nil {
-				panic(err)
-			}
-			if err := k.Add(l.bk); err != nil {
-				panic(err)
-			}
-			if err := v.Add(l.bv); err != nil {
-				panic(err)
-			}
-		}
 		if l.qNorm != nil {
 			nq := must(q.RMSNormEach(l.qNorm, cfg.RMSEps))
 			q.Free()
@@ -393,17 +380,22 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 		}
 		attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, cfg.KVHeads, pos+1, l.window))
 		q.Free()
-		proj := must(l.qo.MatMul(attn))
-		attn.Free()
-		if l.postAttn != nil {
+		// The residual add rides the projection's epilogue unless a
+		// sandwich norm (Gemma) has to run in between.
+		if l.postAttn == nil {
+			must(l.qo.MatMulOpts(attn, nil, x))
+			attn.Free()
+		} else {
+			proj := must(l.qo.MatMul(attn))
+			attn.Free()
 			np := must(proj.RMSNorm(l.postAttn, cfg.RMSEps))
 			proj.Free()
 			proj = np
+			if err := x.Add(proj); err != nil {
+				panic(err)
+			}
+			proj.Free()
 		}
-		if err := x.Add(proj); err != nil {
-			panic(err)
-		}
-		proj.Free()
 
 		a = must(x.RMSNorm(l.ln2, cfg.RMSEps))
 		gate := must(l.qGate.MatMul(a))
@@ -417,17 +409,20 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 			panic(err)
 		}
 		up.Free()
-		down := must(l.qDown.MatMul(gate))
-		gate.Free()
-		if l.postFFN != nil {
+		if l.postFFN == nil {
+			must(l.qDown.MatMulOpts(gate, nil, x))
+			gate.Free()
+		} else {
+			down := must(l.qDown.MatMul(gate))
+			gate.Free()
 			nd := must(down.RMSNorm(l.postFFN, cfg.RMSEps))
 			down.Free()
 			down = nd
+			if err := x.Add(down); err != nil {
+				panic(err)
+			}
+			down.Free()
 		}
-		if err := x.Add(down); err != nil {
-			panic(err)
-		}
-		down.Free()
 	}
 	xt := must(x.Download())
 	a := make([]float32, hs)
