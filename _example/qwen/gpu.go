@@ -191,10 +191,12 @@ func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 // next-token logits after the last position. With this, -gpu never
 // touches the CPU KV cache at all.
 func (gq *gpuQwen) prefill(tokens []int, startPos int) []float32 {
-	// The widest intermediate is a gate/up projection row, so batches
-	// whose activations would exceed the device's storage-buffer limit
-	// split into chunks; the KV cache carries across them.
-	chunk := len(tokens)
+	// Batches split into chunks, the KV cache carrying across them: the
+	// widest intermediate (a gate/up projection row) must fit the
+	// device's storage-buffer limit, and a chunk caps at 512 tokens so
+	// no single submission runs long enough for the OS's GPU watchdog
+	// (Windows TDR behind dozen) to declare the device lost.
+	chunk := 512
 	if lim := gq.g.StorageLimit(); lim > 0 {
 		w := gq.m.cfg.Intermediate
 		if gq.m.cfg.MoeFF > w {
