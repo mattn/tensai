@@ -1,4 +1,4 @@
-package main
+package llm
 
 // Repack caching: the first -gguf load repacks the stored blocks into
 // tensai's tile layouts and then writes every weight the model holds

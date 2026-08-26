@@ -1,4 +1,4 @@
-package main
+package llm
 
 // GPU decode: every transformer block runs on the device — int8 weights
 // resident via GPUQMatrix, the KV cache resident in two preallocated

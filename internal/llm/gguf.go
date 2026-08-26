@@ -1,4 +1,4 @@
-package main
+package llm
 
 // GGUF loading: one downloaded .gguf file carries the config (typed
 // metadata), the tokenizer (embedded vocab, merges, and pre-tokenizer

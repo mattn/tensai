@@ -1,4 +1,4 @@
-package main
+package llm
 
 // Qwen2-, Qwen3-, and Llama-family inference: pre-norm transformer
 // blocks with RMSNorm, rotary position embeddings, grouped-query
