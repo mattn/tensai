@@ -850,6 +850,10 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		b := &m.blocks[li]
 		norm(b.ln1)
 		qkv := mmb(a, b.wQKV, b.qQKV, b.bQKV)
+		// Two batch-wide backings detach the cache rows from the wide
+		// fused buffer instead of 2n little allocations per layer.
+		kb := make([]float32, n*kvDim)
+		vb := make([]float32, n*kvDim)
 		for t := 0; t < n; t++ {
 			pos := startPos + t
 			row := qkv.Data[t*qkvW : (t+1)*qkvW]
@@ -865,9 +869,12 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 					m.rope(kr[h*m.headSz:(h+1)*m.headSz], pos, b)
 				}
 			}
-			// Copies detach the cache rows from the wide fused buffer.
-			b.kc = append(b.kc, append(make([]float32, 0, kvDim), kr...))
-			b.vc = append(b.vc, append(make([]float32, 0, kvDim), row[qDim+kvDim:]...))
+			kt := kb[t*kvDim : (t+1)*kvDim : (t+1)*kvDim]
+			vt := vb[t*kvDim : (t+1)*kvDim : (t+1)*kvDim]
+			copy(kt, kr)
+			copy(vt, row[qDim+kvDim:])
+			b.kc = append(b.kc, kt)
+			b.vc = append(b.vc, vt)
 		}
 
 		// Causal attention: row t sees cache positions [0, startPos+t].

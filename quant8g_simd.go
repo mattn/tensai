@@ -70,19 +70,13 @@ func q8gMatvecCols(out []Float, xu []uint8, sx Float, qw []int8, scale []Float, 
 // q8gMatmulRows8 is the eight-row batched form: per eight-column step
 // each 32-byte weight load feeds eight broadcast activation quads, with
 // steps outermost so both streams advance sequentially.
-func q8gMatmulRows8(out *Matrix, xus [][]uint8, sxs []Float, r0 int, qw []int8, scale []Float, colSum64 []int32, group, cols, lo, hi int) {
+func q8gMatmulRows8(out *Matrix, xus [][]uint8, xq []uint32, sxs []Float, r0 int, qw []int8, scale []Float, colSum64 []int32, group, cols, lo, hi int) {
 	if !hasAVX2 {
 		q8gMatmulRows8Generic(out, xus, sxs, r0, qw, scale, colSum64, group, cols, lo, hi)
 		return
 	}
 	quads := len(xus[0]) / 4
 	groups := (len(xus[0]) + group - 1) / group
-	xq := make([]uint32, 8*quads)
-	for r := 0; r < 8; r++ {
-		for i4 := 0; i4 < quads; i4++ {
-			xq[i4*8+r] = qxQuad(xus[r], i4)
-		}
-	}
 	ones := archsimd.BroadcastInt16x16(1)
 	vecEnd := lo + ((hi - lo) &^ 7)
 	if vecEnd > lo {

@@ -39,6 +39,23 @@ func padRows8(xus [][]uint8, sxs []Float, rowLen, cols int) ([][]uint8, []Float,
 	return pxus, psxs, NewMatrix(8, cols)
 }
 
+// packQuadsRows8 packs eight quantized activation rows into the
+// quad-major interleaved stream the batched kernels broadcast from:
+// entry i4*8+r holds row r's quad i4, so the inner loop walks one
+// contiguous group of eight per weight load. Packing here runs once
+// per row block instead of once per column chunk.
+func packQuadsRows8(xus [][]uint8) []uint32 {
+	quads := len(xus[0]) / 4
+	xq := make([]uint32, 8*quads)
+	for r, xu := range xus {
+		for i4 := 0; i4 < quads; i4++ {
+			xq[i4*8+r] = uint32(xu[4*i4]) | uint32(xu[4*i4+1])<<8 |
+				uint32(xu[4*i4+2])<<16 | uint32(xu[4*i4+3])<<24
+		}
+	}
+	return xq
+}
+
 // parallelChunks splits [0, n) into align-rounded chunks across the
 // workers, the calling goroutine taking the first chunk itself: a
 // matvec fan-out spawns workers-1 goroutines and the caller streams
@@ -256,19 +273,25 @@ func (q *QMatrix) MatMul(x, out *Matrix) error {
 	// shared by every column chunk (they write disjoint ranges), and
 	// only the real rows copy back — so the tail streams the weights
 	// once instead of once per row.
+	xqb := make([][]uint32, rows/8)
+	for b := range xqb {
+		xqb[b] = packQuadsRows8(xus[b*8 : b*8+8])
+	}
 	var pxus [][]uint8
+	var pxq []uint32
 	var psxs []Float
 	var scratch *Matrix
 	if rows%8 != 0 {
 		pxus, psxs, scratch = padRows8(xus[rows-rows%8:], sxs[rows-rows%8:], len(xus[0]), q.Cols)
+		pxq = packQuadsRows8(pxus)
 	}
 	run := func(lo, hi int) {
 		var r int
 		for ; r+8 <= rows; r += 8 {
-			qmatmulRows8(out, xus[r:r+8], sxs[r:r+8], r, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
+			qmatmulRows8(out, xus[r:r+8], xqb[r/8], sxs[r:r+8], r, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
 		}
 		if r < rows {
-			qmatmulRows8(scratch, pxus, psxs, 0, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
+			qmatmulRows8(scratch, pxus, pxq, psxs, 0, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
 			for i := 0; i < rows-r; i++ {
 				copy(out.Data[(r+i)*q.Cols+lo:(r+i)*q.Cols+hi], scratch.Data[i*q.Cols+lo:i*q.Cols+hi])
 			}

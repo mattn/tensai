@@ -104,19 +104,25 @@ func (q *Q8GMatrix) MatMul(x, out *Matrix) error {
 	// shared by every column chunk (they write disjoint ranges), and
 	// only the real rows copy back — so the tail streams the weights
 	// once instead of once per row.
+	xqb := make([][]uint32, rows/8)
+	for b := range xqb {
+		xqb[b] = packQuadsRows8(xus[b*8 : b*8+8])
+	}
 	var pxus [][]uint8
+	var pxq []uint32
 	var psxs []Float
 	var scratch *Matrix
 	if rows%8 != 0 {
 		pxus, psxs, scratch = padRows8(xus[rows-rows%8:], sxs[rows-rows%8:], len(xus[0]), q.Cols)
+		pxq = packQuadsRows8(pxus)
 	}
 	run := func(lo, hi int) {
 		var r int
 		for ; r+8 <= rows; r += 8 {
-			q8gMatmulRows8(out, xus[r:r+8], sxs[r:r+8], r, q.Q, q.Scale, q.ColSum64, grp, q.Cols, lo, hi)
+			q8gMatmulRows8(out, xus[r:r+8], xqb[r/8], sxs[r:r+8], r, q.Q, q.Scale, q.ColSum64, grp, q.Cols, lo, hi)
 		}
 		if r < rows {
-			q8gMatmulRows8(scratch, pxus, psxs, 0, q.Q, q.Scale, q.ColSum64, grp, q.Cols, lo, hi)
+			q8gMatmulRows8(scratch, pxus, pxq, psxs, 0, q.Q, q.Scale, q.ColSum64, grp, q.Cols, lo, hi)
 			for i := 0; i < rows-r; i++ {
 				copy(out.Data[(r+i)*q.Cols+lo:(r+i)*q.Cols+hi], scratch.Data[i*q.Cols+lo:i*q.Cols+hi])
 			}
