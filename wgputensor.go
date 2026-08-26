@@ -1010,7 +1010,6 @@ fn q4matmul(@builtin(workgroup_id) wid: vec3<u32>,
 }
 `
 
-
 // intDotWGSL is the integer-dot GEMM module, compiled separately from
 // matmulWGSL so a naga without dot4I8Packed only disables this path.
 // qacts_pack quantizes activation rows to symmetric int8 (one scale per
