@@ -43,6 +43,8 @@ type GPU struct {
 	device     uintptr
 	queue      uintptr
 	module     uintptr
+	module2    uintptr // optional integer-dot module; 0 if unsupported
+	hasIntDot  bool
 	pipes      gpuPipelines
 	readback   gpuReadbackBuffer
 	pool       gpuBufferPool
@@ -555,6 +557,35 @@ func OpenGPU(power ...GPUPower) (*GPU, error) {
 	return g, nil
 }
 
+// makeModuleFrom compiles an extra WGSL module, returning 0 on failure
+// (the caller checks uncapturedCB for the reason).
+func (g *GPU) makeModuleFrom(src string) uintptr {
+	code, codeBuf := sv(src)
+	wgsl := wgpuShaderSourceWGSL{
+		chain: wgpuChainedStruct{sType: wgpuSTypeShaderSourceWGSL},
+		code:  code,
+	}
+	smDesc := wgpuShaderModuleDescriptor{nextInChain: &wgsl}
+	m := fnDeviceCreateShaderMod(g.device, &smDesc)
+	runtime.KeepAlive(&wgsl)
+	runtime.KeepAlive(&smDesc)
+	runtime.KeepAlive(codeBuf)
+	return m
+}
+
+// makePipelineIn builds a compute pipeline for one entry point of an
+// explicit module.
+func (g *GPU) makePipelineIn(module uintptr, entry string) uintptr {
+	e, eBuf := sv(entry)
+	pDesc := wgpuComputePipelineDescriptor{
+		compute: wgpuComputeState{module: module, entryPoint: e},
+	}
+	p := fnDeviceCreatePipeline(g.device, &pDesc)
+	runtime.KeepAlive(&pDesc)
+	runtime.KeepAlive(eBuf)
+	return p
+}
+
 // makePipeline builds a compute pipeline for one entry point of g.module.
 func (g *GPU) makePipeline(entry string) uintptr {
 	e, eBuf := sv(entry)
@@ -588,6 +619,7 @@ func (g *GPU) Close() {
 		fn func(uintptr)
 		h  uintptr
 	}{
+		{fnShaderModRelease, g.module2},
 		{fnShaderModRelease, g.module},
 		{fnQueueRelease, g.queue},
 		{fnDeviceRelease, g.device},
