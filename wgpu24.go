@@ -48,6 +48,7 @@ type GPU struct {
 	pool       gpuBufferPool
 	bgCache    map[bgKey]uintptr
 	batchEnc   uintptr // open command encoder while batching, see BeginBatch
+	batchPass  uintptr // open compute pass inside the batch encoder
 	name       string
 	maxStorage uint64 // usable bytes per storage buffer, 0 = unknown
 	closed     bool
