@@ -530,6 +530,54 @@ fn qmatmul(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// qmatmul_b is qmatmul's batched twin for prefill: a workgroup still
+// covers 16 packed words split 16 ways, but accumulates QROWS activation
+// rows per weight word, so the weight stream a matvec pays once per row
+// amortizes QROWS-fold. Each row keeps qmatmul's stride-16 accumulation
+// and reduction order, so its output matches the matvec bit for bit; the
+// shared reduction reuses qred once per row.
+const QROWS = 8u;
+
+@compute @workgroup_size(256, 1, 1)
+fn qmatmul_b(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(local_invocation_id) lid: vec3<u32>) {
+    let w = wid.x * QWG + lid.x % QWG;
+    let rsub = lid.x / QWG;
+    let r0 = wid.y * QROWS;
+    let jm = min(QROWS, qp.m - r0);
+    var acc: array<vec4<f32>, 8>;
+    if (w < qp.words) {
+        for (var i = rsub; i < qp.rows; i = i + QSPLIT) {
+            let pw = qwt[i * qp.words + w];
+            let wv = vec4<f32>(
+                f32(i32(pw << 24u) >> 24u),
+                f32(i32(pw << 16u) >> 24u),
+                f32(i32(pw << 8u) >> 24u),
+                f32(i32(pw) >> 24u));
+            for (var j = 0u; j < jm; j = j + 1u) {
+                acc[j] = acc[j] + qxv[(r0 + j) * qp.rows + i] * wv;
+            }
+        }
+    }
+    for (var j = 0u; j < QROWS; j = j + 1u) {
+        qred[lid.x] = acc[j];
+        workgroupBarrier();
+        if (lid.x < QWG && w < qp.words && j < jm) {
+            var sum = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            for (var v = 0u; v < QSPLIT; v = v + 1u) {
+                sum = sum + qred[v * QWG + lid.x];
+            }
+            let jc = w * 4u;
+            for (var l = 0u; l < 4u; l = l + 1u) {
+                if (jc + l < qp.cols) {
+                    qov[(r0 + j) * qp.cols + jc + l] = sum[l] * qsc[jc + l];
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+}
+
 // rmsnorm_row: one workgroup per row computes out = x * w / rms(x).
 struct NormParams { rows: u32, n: u32, eps: f32, pad: u32 }
 @group(0) @binding(20) var<uniform> np: NormParams;
@@ -714,11 +762,11 @@ type gpuPipelines struct {
 	matmul, matmulT, matmulS, matmulTS             uintptr
 	scale, softmax, attn, qmatmul                  uintptr
 	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
-	geluMulIP                                      uintptr
+	geluMulIP, qmatmulB                            uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
 	layScale, laySoftmax, layAttn, layQmatmul      uintptr
 	layRmsnorm, layRope, layAddIP, laySiluMulIP    uintptr
-	layQ4matmul, layGeluMulIP                      uintptr
+	layQ4matmul, layGeluMulIP, layQmatmulB         uintptr
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -742,6 +790,7 @@ func (g *GPU) initPipelines() error {
 		{&g.pipes.siluMulIP, &g.pipes.laySiluMulIP, "silu_mul_ip"},
 		{&g.pipes.q4matmul, &g.pipes.layQ4matmul, "q4matmul"},
 		{&g.pipes.geluMulIP, &g.pipes.layGeluMulIP, "gelu_mul_ip"},
+		{&g.pipes.qmatmulB, &g.pipes.layQmatmulB, "qmatmul_b"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -760,7 +809,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.layMatmulTS, g.pipes.layScale, g.pipes.laySoftmax, g.pipes.layAttn,
 		g.pipes.layQmatmul, g.pipes.layRmsnorm, g.pipes.layRope,
 		g.pipes.layAddIP, g.pipes.laySiluMulIP, g.pipes.layQ4matmul,
-		g.pipes.layGeluMulIP,
+		g.pipes.layGeluMulIP, g.pipes.layQmatmulB,
 	} {
 		if h != 0 {
 			fnLayoutRelease(h)
@@ -771,7 +820,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.matmulTS, g.pipes.scale, g.pipes.softmax, g.pipes.attn,
 		g.pipes.qmatmul, g.pipes.rmsnorm, g.pipes.rope,
 		g.pipes.addIP, g.pipes.siluMulIP, g.pipes.q4matmul,
-		g.pipes.geluMulIP,
+		g.pipes.geluMulIP, g.pipes.qmatmulB,
 	} {
 		if h != 0 {
 			fnPipelineRelease(h)
@@ -1811,11 +1860,17 @@ func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 		{binding: 18, buffer: x.buf, size: uint64(x.Size()) * 4},
 		{binding: 19, buffer: bufOut, size: outBytes},
 	}
-	bindGroup := g.cachedBindGroup(g.pipes.layQmatmul, entries[:])
+	// A batch takes the row-blocked kernel, whose weight stream amortizes
+	// across QROWS activation rows; a single row keeps the matvec shape.
+	pipe, lay, gy := g.pipes.qmatmul, g.pipes.layQmatmul, uint32(m)
+	if m > 1 {
+		pipe, lay, gy = g.pipes.qmatmulB, g.pipes.layQmatmulB, uint32((m+7)/8)
+	}
+	bindGroup := g.cachedBindGroup(lay, entries[:])
 	runtime.KeepAlive(&entries)
 
-	err := g.dispatch(g.pipes.qmatmul, bindGroup,
-		uint32((q.words+15)/16), uint32(m), 1)
+	err := g.dispatch(pipe, bindGroup,
+		uint32((q.words+15)/16), gy, 1)
 	if err != nil {
 		g.dropBuffer(bufOut)
 		return nil, err
