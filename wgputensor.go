@@ -1010,6 +1010,166 @@ fn q4matmul(@builtin(workgroup_id) wid: vec3<u32>,
 }
 `
 
+
+// intDotWGSL is the integer-dot GEMM module, compiled separately from
+// matmulWGSL so a naga without dot4I8Packed only disables this path.
+// qacts_pack quantizes activation rows to symmetric int8 (one scale per
+// row, four values per u32); qmatmul_i then multiplies packed
+// activations against the resident col-packed weights, transposing each
+// staged weight slice to K-packed form in shared memory, four int8
+// multiply-adds per dot4I8Packed.
+const intDotWGSL = `
+struct QIParams { rows: u32, kw4: u32, cols: u32, words: u32, m: u32, pad0: u32, pad1: u32, pad2: u32 }
+@group(0) @binding(0) var<uniform> qip: QIParams;
+@group(0) @binding(1) var<storage, read> qix: array<f32>;
+@group(0) @binding(2) var<storage, read_write> qia: array<u32>;
+@group(0) @binding(3) var<storage, read_write> qis: array<f32>;
+@group(0) @binding(4) var<storage, read> qiw: array<u32>;
+@group(0) @binding(5) var<storage, read> qisc: array<f32>;
+@group(0) @binding(6) var<storage, read_write> qio: array<f32>;
+
+var<workgroup> qired: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn qacts_pack(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let r = wid.x;
+    let t = lid.x;
+    var mx = 0.0;
+    for (var i = t; i < qip.rows; i = i + 256u) {
+        mx = max(mx, abs(qix[r * qip.rows + i]));
+    }
+    qired[t] = mx;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (t < s) {
+            qired[t] = max(qired[t], qired[t + s]);
+        }
+        workgroupBarrier();
+    }
+    let scale = max(qired[0], 1e-20) / 127.0;
+    if (t == 0u) {
+        qis[r] = scale;
+    }
+    let inv = 1.0 / scale;
+    for (var kw = t; kw < qip.kw4; kw = kw + 256u) {
+        var word = 0u;
+        for (var b = 0u; b < 4u; b = b + 1u) {
+            let i = kw * 4u + b;
+            var q = 0;
+            if (i < qip.rows) {
+                q = i32(round(clamp(qix[r * qip.rows + i] * inv, -127.0, 127.0)));
+            }
+            word = word | ((u32(q) & 0xFFu) << (8u * b));
+        }
+        qia[r * qip.kw4 + kw] = word;
+    }
+}
+
+const QIR = 64u; // output rows per workgroup
+const QIC = 64u; // output columns per workgroup
+var<workgroup> qita: array<u32, 512>; // 64 rows x 8 kwords
+var<workgroup> qitw: array<u32, 512>; // 64 cols x 8 kwords, K-packed
+
+@compute @workgroup_size(256, 1, 1)
+fn qmatmul_i(@builtin(workgroup_id) wid: vec3<u32>,
+             @builtin(local_invocation_id) lid: vec3<u32>) {
+    let csub = lid.x % 16u;
+    let rsub = lid.x / 16u;
+    let c0 = wid.x * QIC;
+    let r0 = wid.y * QIR;
+    var a00 = 0; var a01 = 0; var a02 = 0; var a03 = 0;
+    var a10 = 0; var a11 = 0; var a12 = 0; var a13 = 0;
+    var a20 = 0; var a21 = 0; var a22 = 0; var a23 = 0;
+    var a30 = 0; var a31 = 0; var a32 = 0; var a33 = 0;
+    let kwTiles = (qip.kw4 + 7u) / 8u;
+    for (var kt = 0u; kt < kwTiles; kt = kt + 1u) {
+        let kwb = kt * 8u;
+        for (var s = 0u; s < 2u; s = s + 1u) {
+            let idx = lid.x * 2u + s;
+            let rr = idx / 8u;
+            let kw = idx % 8u;
+            var wa = 0u;
+            if (r0 + rr < qip.m && kwb + kw < qip.kw4) {
+                wa = qia[(r0 + rr) * qip.kw4 + kwb + kw];
+            }
+            qita[idx] = wa;
+        }
+        // Transpose the col-packed weight slice to K-packed: byte lane
+        // col%4 of four consecutive K rows becomes one dot4 operand.
+        for (var s = 0u; s < 2u; s = s + 1u) {
+            let idx = lid.x * 2u + s;
+            let cc = idx / 8u;
+            let kw = idx % 8u;
+            let col = c0 + cc;
+            let word = col / 4u;
+            let sh = (col % 4u) * 8u;
+            let k = (kwb + kw) * 4u;
+            var wpk = 0u;
+            if (word < qip.words) {
+                for (var b = 0u; b < 4u; b = b + 1u) {
+                    if (k + b < qip.rows) {
+                        wpk = wpk | (((qiw[(k + b) * qip.words + word] >> sh) & 0xFFu) << (8u * b));
+                    }
+                }
+            }
+            qitw[idx] = wpk;
+        }
+        workgroupBarrier();
+        let ra = rsub * 32u;
+        let ca = csub * 32u;
+        for (var kw = 0u; kw < 8u; kw = kw + 1u) {
+            let v0 = qita[ra + kw];
+            let v1 = qita[ra + 8u + kw];
+            let v2 = qita[ra + 16u + kw];
+            let v3 = qita[ra + 24u + kw];
+            let w0 = qitw[ca + kw];
+            let w1 = qitw[ca + 8u + kw];
+            let w2 = qitw[ca + 16u + kw];
+            let w3 = qitw[ca + 24u + kw];
+            a00 = a00 + dot4I8Packed(v0, w0);
+            a01 = a01 + dot4I8Packed(v0, w1);
+            a02 = a02 + dot4I8Packed(v0, w2);
+            a03 = a03 + dot4I8Packed(v0, w3);
+            a10 = a10 + dot4I8Packed(v1, w0);
+            a11 = a11 + dot4I8Packed(v1, w1);
+            a12 = a12 + dot4I8Packed(v1, w2);
+            a13 = a13 + dot4I8Packed(v1, w3);
+            a20 = a20 + dot4I8Packed(v2, w0);
+            a21 = a21 + dot4I8Packed(v2, w1);
+            a22 = a22 + dot4I8Packed(v2, w2);
+            a23 = a23 + dot4I8Packed(v2, w3);
+            a30 = a30 + dot4I8Packed(v3, w0);
+            a31 = a31 + dot4I8Packed(v3, w1);
+            a32 = a32 + dot4I8Packed(v3, w2);
+            a33 = a33 + dot4I8Packed(v3, w3);
+        }
+        workgroupBarrier();
+    }
+    let rr = r0 + rsub * 4u;
+    let cc = c0 + csub * 4u;
+    for (var r = 0u; r < 4u; r = r + 1u) {
+        if (rr + r < qip.m) {
+            var av = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            if (r == 0u) { av = vec4<f32>(f32(a00), f32(a01), f32(a02), f32(a03)); }
+            if (r == 1u) { av = vec4<f32>(f32(a10), f32(a11), f32(a12), f32(a13)); }
+            if (r == 2u) { av = vec4<f32>(f32(a20), f32(a21), f32(a22), f32(a23)); }
+            if (r == 3u) { av = vec4<f32>(f32(a30), f32(a31), f32(a32), f32(a33)); }
+            let sa = qis[rr + r];
+            for (var c = 0u; c < 4u; c = c + 1u) {
+                if (cc + c < qip.cols) {
+                    qio[(rr + r) * qip.cols + cc + c] = av[c] * sa * qisc[cc + c];
+                }
+            }
+        }
+    }
+}
+`
+
+// IntDot reports whether the optional integer-dot GEMM module compiled
+// on this device; without it large batches use the f32 tiled kernel.
+func (g *GPU) IntDot() bool { return g.hasIntDot }
+
 // gpuPipelines holds one compute pipeline (and its auto bind-group layout)
 // per kernel entry point. It is embedded in each binding generation's GPU
 // struct.
@@ -1018,11 +1178,12 @@ type gpuPipelines struct {
 	scale, softmax, attn, qmatmul                  uintptr
 	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
 	geluMulIP, qmatmulB, attnG, qmatmulT           uintptr
+	qacts, qmatmulI                                uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
 	layScale, laySoftmax, layAttn, layQmatmul      uintptr
 	layRmsnorm, layRope, layAddIP, laySiluMulIP    uintptr
 	layQ4matmul, layGeluMulIP, layQmatmulB         uintptr
-	layAttnG, layQmatmulT                          uintptr
+	layAttnG, layQmatmulT, layQacts, layQmatmulI   uintptr
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -1056,6 +1217,28 @@ func (g *GPU) initPipelines() error {
 		}
 		*x.lay = fnPipelineGetLayout(*x.pipe, 0)
 	}
+	// The integer-dot module is optional — dot4I8Packed needs a newer
+	// naga — so a compile failure here just leaves the f32 tiled kernel.
+	g.module2 = g.makeModuleFrom(intDotWGSL)
+	if g.module2 != 0 && uncapturedCB == "" {
+		ok := true
+		for _, x := range []struct {
+			pipe, lay *uintptr
+			entry     string
+		}{
+			{&g.pipes.qacts, &g.pipes.layQacts, "qacts_pack"},
+			{&g.pipes.qmatmulI, &g.pipes.layQmatmulI, "qmatmul_i"},
+		} {
+			*x.pipe = g.makePipelineIn(g.module2, x.entry)
+			if *x.pipe == 0 || uncapturedCB != "" {
+				ok = false
+				break
+			}
+			*x.lay = fnPipelineGetLayout(*x.pipe, 0)
+		}
+		g.hasIntDot = ok
+	}
+	uncapturedCB = ""
 	return nil
 }
 
@@ -1068,7 +1251,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.layQmatmul, g.pipes.layRmsnorm, g.pipes.layRope,
 		g.pipes.layAddIP, g.pipes.laySiluMulIP, g.pipes.layQ4matmul,
 		g.pipes.layGeluMulIP, g.pipes.layQmatmulB, g.pipes.layAttnG,
-		g.pipes.layQmatmulT,
+		g.pipes.layQmatmulT, g.pipes.layQacts, g.pipes.layQmatmulI,
 	} {
 		if h != 0 {
 			fnLayoutRelease(h)
@@ -1080,7 +1263,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.qmatmul, g.pipes.rmsnorm, g.pipes.rope,
 		g.pipes.addIP, g.pipes.siluMulIP, g.pipes.q4matmul,
 		g.pipes.geluMulIP, g.pipes.qmatmulB, g.pipes.attnG,
-		g.pipes.qmatmulT,
+		g.pipes.qmatmulT, g.pipes.qacts, g.pipes.qmatmulI,
 	} {
 		if h != 0 {
 			fnPipelineRelease(h)
@@ -2160,6 +2343,9 @@ func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 		return nil, fmt.Errorf("tensai: gpu qmatmul batch of %d rows exceeds 65535", m)
 	}
 	outShape := append(append([]int(nil), x.shape[:n-1]...), q.cols)
+	if m >= 32 && q.g.hasIntDot {
+		return q.matmulIntDot(x, m, outShape)
+	}
 
 	g := q.g
 	g.mu.Lock()
@@ -2202,6 +2388,68 @@ func (q *GPUQMatrix) MatMul(x *GPUTensor) (*GPUTensor, error) {
 	err := g.dispatch(pipe, bindGroup,
 		uint32((q.words+15)/16), gy, 1)
 	if err != nil {
+		g.dropBuffer(bufOut)
+		return nil, err
+	}
+	return &GPUTensor{g: g, buf: bufOut, shape: outShape}, nil
+}
+
+// matmulIntDot is MatMul's integer path: qacts_pack quantizes the
+// activation rows to symmetric int8 once, then qmatmul_i runs the
+// GEMM on dot4I8Packed. Activations lose their f32 precision to one
+// int8 scale per row — the same shape of rounding the CPU decode path
+// applies — so outputs differ from the f32 kernels within quantization
+// tolerance.
+func (q *GPUQMatrix) matmulIntDot(x *GPUTensor, m int, outShape []int) (*GPUTensor, error) {
+	g := q.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	kw4 := (q.rows + 3) / 4
+	outBytes := uint64(m*q.cols) * 4
+	if err := g.checkSize(outBytes); err != nil {
+		return nil, err
+	}
+	params := [8]uint32{uint32(q.rows), uint32(kw4), uint32(q.cols), uint32(q.words), uint32(m)}
+	paBytes := uint64(m*kw4) * 4
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
+	bufPA := g.takeOutBuffer(paBytes)
+	bufAS := g.takeOutBuffer(uint64(m) * 4)
+	bufOut := g.takeOutBuffer(outBytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
+	defer g.putBuffer(gpuTensorUsage, paBytes, bufPA)
+	defer g.putBuffer(gpuTensorUsage, uint64(m)*4, bufAS)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
+
+	qe := [4]wgpuBindGroupEntry{
+		{binding: 0, buffer: bufParams, size: 32},
+		{binding: 1, buffer: x.buf, size: uint64(x.Size()) * 4},
+		{binding: 2, buffer: bufPA, size: paBytes},
+		{binding: 3, buffer: bufAS, size: uint64(m) * 4},
+	}
+	bgA := g.cachedBindGroup(g.pipes.layQacts, qe[:])
+	runtime.KeepAlive(&qe)
+	if err := g.dispatch(g.pipes.qacts, bgA, uint32(m), 1, 1); err != nil {
+		g.dropBuffer(bufOut)
+		return nil, err
+	}
+	me := [6]wgpuBindGroupEntry{
+		{binding: 0, buffer: bufParams, size: 32},
+		{binding: 2, buffer: bufPA, size: paBytes},
+		{binding: 3, buffer: bufAS, size: uint64(m) * 4},
+		{binding: 4, buffer: q.buf, size: uint64(q.rows*q.words) * 4},
+		{binding: 5, buffer: q.scales, size: uint64(q.words*4) * 4},
+		{binding: 6, buffer: bufOut, size: outBytes},
+	}
+	bgM := g.cachedBindGroup(g.pipes.layQmatmulI, me[:])
+	runtime.KeepAlive(&me)
+	if err := g.dispatch(g.pipes.qmatmulI, bgM, uint32((q.cols+63)/64), uint32((m+63)/64), 1); err != nil {
 		g.dropBuffer(bufOut)
 		return nil, err
 	}

@@ -713,7 +713,23 @@ func TestGPUQ8MatMul(t *testing.T) {
 
 		// Reference: the same dequantized weights on the CPU. The GPU
 		// multiplies f32 activations (no 7-bit activation step), so the
-		// comparison is float tolerance, not bit equality.
+		// comparison is float tolerance, not bit equality. The integer
+		// path additionally quantizes activations to int8 per row —
+		// mirror it so the reference tracks what the kernel computes.
+		if c.m >= 32 && g.IntDot() {
+			for r := 0; r < c.m; r++ {
+				row := x.Data[r*c.rows : (r+1)*c.rows]
+				mx := 0.0
+				for _, v := range row {
+					mx = math.Max(mx, math.Abs(float64(v)))
+				}
+				scale := math.Max(mx, 1e-20) / 127
+				for i, v := range row {
+					q := math.RoundToEven(math.Min(127, math.Max(-127, float64(v)/scale)))
+					row[i] = float32(q * scale)
+				}
+			}
+		}
 		for r := 0; r < c.m; r++ {
 			for j := 0; j < c.cols; j++ {
 				var want float64
