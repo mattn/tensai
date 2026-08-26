@@ -60,7 +60,6 @@ func fetch(dir, name string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	fmt.Fprintf(os.Stderr, "downloading %s...\n", name)
 	resp, err := http.Get(hfBase + name)
 	if err != nil {
 		return "", err
@@ -74,15 +73,41 @@ func fetch(dir, name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	if _, err := io.Copy(f, &progressReader{r: resp.Body, name: name, total: resp.ContentLength}); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return "", err
 	}
+	fmt.Fprintln(os.Stderr)
 	if err := f.Close(); err != nil {
 		return "", err
 	}
 	return path, os.Rename(tmp, path)
+}
+
+// progressReader reports download progress on stderr, at most twice a
+// second so slow terminals don't throttle the transfer.
+type progressReader struct {
+	r     io.Reader
+	name  string
+	total int64
+	done  int64
+	last  time.Time
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	p.done += int64(n)
+	if now := time.Now(); now.Sub(p.last) > 500*time.Millisecond || err != nil {
+		p.last = now
+		if p.total > 0 {
+			fmt.Fprintf(os.Stderr, "\rdownloading %s... %d%% (%d/%d MB)",
+				p.name, p.done*100/p.total, p.done>>20, p.total>>20)
+		} else {
+			fmt.Fprintf(os.Stderr, "\rdownloading %s... %d MB", p.name, p.done>>20)
+		}
+	}
+	return n, err
 }
 
 // fetchWeights returns the checkpoint path: a plain model.safetensors, or
