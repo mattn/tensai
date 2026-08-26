@@ -191,6 +191,28 @@ func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 // next-token logits after the last position. With this, -gpu never
 // touches the CPU KV cache at all.
 func (gq *gpuQwen) prefill(tokens []int, startPos int) []float32 {
+	// The widest intermediate is a gate/up projection row, so batches
+	// whose activations would exceed the device's storage-buffer limit
+	// split into chunks; the KV cache carries across them.
+	chunk := len(tokens)
+	if lim := gq.g.StorageLimit(); lim > 0 {
+		w := gq.m.cfg.Intermediate
+		if gq.m.cfg.MoeFF > w {
+			w = gq.m.cfg.MoeFF
+		}
+		if c := int(lim / uint64(4*w)); c > 0 && c < chunk {
+			chunk = c
+		}
+	}
+	for len(tokens) > chunk {
+		gq.prefillChunk(tokens[:chunk], startPos)
+		tokens = tokens[chunk:]
+		startPos += chunk
+	}
+	return gq.prefillChunk(tokens, startPos)
+}
+
+func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 	m := gq.m
 	cfg := m.cfg
 	hs := cfg.HiddenSize
