@@ -172,6 +172,15 @@ func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 		l.kc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
 		l.vc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
 	}
+	// Warm every kernel the decode and both prefill batch sizes touch:
+	// drivers like dozen compile a pipeline's GPU code at first dispatch,
+	// which otherwise lands in the first timed prefill. The dummy tokens
+	// rewind afterwards, and the real prefill overwrites their cache rows.
+	warm := make([]int, 33)
+	gq.prefill(warm, 0)
+	gq.prefill(warm[:4], 33)
+	gq.step(0, 37)
+	gq.gpuLen = 0
 	return gq, nil
 }
 
