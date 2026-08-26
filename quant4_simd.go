@@ -15,16 +15,6 @@ import "simd/archsimd"
 // sums sit far inside saturation. Group scales and the nibble-offset
 // correction (8 times the group's activation sum) fold in per group.
 
-// q4xQuad packs four re-centered activations into the u32 a broadcast
-// turns into the signed multiply operand.
-func q4xQuad(xu []uint8, i4 int) uint32 {
-	x0 := uint32(uint8(int8(int(xu[4*i4]) - 64)))
-	x1 := uint32(uint8(int8(int(xu[4*i4+1]) - 64)))
-	x2 := uint32(uint8(int8(int(xu[4*i4+2]) - 64)))
-	x3 := uint32(uint8(int8(int(xu[4*i4+3]) - 64)))
-	return x0 | x1<<8 | x2<<16 | x3<<24
-}
-
 func q4matvecCols(out []Float, xu []uint8, xq []uint32, sx Float, gsum []int32, qw []uint8, scale []Float, sm []uint32, group, cols, lo, hi int) {
 	if !hasAVX2 {
 		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, sm, group, cols, lo, hi)
@@ -128,19 +118,14 @@ func q4matvecCols(out []Float, xu []uint8, xq []uint32, sx Float, gsum []int32, 
 // sixteen-byte nibble load unpacks once and feeds four broadcast
 // activation quads, amortizing the nibble traffic fourfold; steps stay
 // outermost so both streams advance sequentially.
-func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 int, qw []uint8, scale []Float, sm []uint32, group, cols, lo, hi int) {
+func q4matmulCols4(out *Matrix, xus [][]uint8, xqs [][]uint32, sxs []Float, gsums [][]int32, r0 int, qw []uint8, scale []Float, sm []uint32, group, cols, lo, hi int) {
 	if !hasAVX2 {
 		q4matmulCols4Generic(out, xus, sxs, gsums, r0, qw, scale, sm, group, cols, lo, hi)
 		return
 	}
 	quads := len(xus[0]) / 4
 	groups := len(gsums[0])
-	xq := make([]uint32, 4*quads)
-	for r := 0; r < 4; r++ {
-		for i4 := 0; i4 < quads; i4++ {
-			xq[i4*4+r] = q4xQuad(xus[r], i4)
-		}
-	}
+	xq0, xq1, xq2, xq3 := xqs[0], xqs[1], xqs[2], xqs[3]
 	// Flat copies keep the folds free of nested-slice loads: one indexed
 	// read per row instead of a header chase and two bounds checks.
 	gsf := make([]Float, 4*groups)
@@ -179,11 +164,10 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 					for i4 := ib; i4 < ie; i4++ {
 						v := loadU8x16(tile[i4*2*q4Tile:]).ExtendToUint16()
 						pair := v.And(mLo).Or(v.ShiftAllLeft(4).And(mHi)).AsUint8x32()
-						xf := xq[i4*4 : i4*4+4]
-						a0 = a0.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[0]).AsInt8x32()).DotProductPairs(ones))
-						a1 = a1.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[1]).AsInt8x32()).DotProductPairs(ones))
-						a2 = a2.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[2]).AsInt8x32()).DotProductPairs(ones))
-						a3 = a3.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[3]).AsInt8x32()).DotProductPairs(ones))
+						a0 = a0.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq0[i4]).AsInt8x32()).DotProductPairs(ones))
+						a1 = a1.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq1[i4]).AsInt8x32()).DotProductPairs(ones))
+						a2 = a2.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq2[i4]).AsInt8x32()).DotProductPairs(ones))
+						a3 = a3.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq3[i4]).AsInt8x32()).DotProductPairs(ones))
 					}
 					u := loadU32x8(tab[g*q4Tile:])
 					sc := u.ShiftAllLeft(16).AsFloat32x8()
@@ -207,11 +191,10 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 					for i4 := ib; i4 < ie; i4++ {
 						v := loadU8x16(tile[i4*2*q4Tile:]).ExtendToUint16()
 						pair := v.And(mLo).Or(v.ShiftAllLeft(4).And(mHi)).AsUint8x32()
-						xf := xq[i4*4 : i4*4+4]
-						a0 = a0.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[0]).AsInt8x32()).DotProductPairs(ones))
-						a1 = a1.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[1]).AsInt8x32()).DotProductPairs(ones))
-						a2 = a2.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[2]).AsInt8x32()).DotProductPairs(ones))
-						a3 = a3.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[3]).AsInt8x32()).DotProductPairs(ones))
+						a0 = a0.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq0[i4]).AsInt8x32()).DotProductPairs(ones))
+						a1 = a1.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq1[i4]).AsInt8x32()).DotProductPairs(ones))
+						a2 = a2.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq2[i4]).AsInt8x32()).DotProductPairs(ones))
+						a3 = a3.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq3[i4]).AsInt8x32()).DotProductPairs(ones))
 					}
 					sc := loadF32x8(tab[g*q4Tile:])
 					gr := gsc[4*g : 4*g+4 : 4*g+4]
@@ -247,7 +230,7 @@ func q4matmulCols4(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 // still fit the sixteen-register file — named variables only, flat
 // tables, hoisted row slices (the spill traps notes on the four-row
 // kernel apply verbatim).
-func q4matmulCols8(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 int, qw []uint8, scale []Float, sm []uint32, group, cols, lo, hi int) {
+func q4matmulCols8(out *Matrix, xus [][]uint8, xqs [][]uint32, sxs []Float, gsums [][]int32, r0 int, qw []uint8, scale []Float, sm []uint32, group, cols, lo, hi int) {
 	if !hasAVX2 {
 		q4matmulCols4Generic(out, xus[:4], sxs[:4], gsums[:4], r0, qw, scale, sm, group, cols, lo, hi)
 		q4matmulCols4Generic(out, xus[4:8], sxs[4:8], gsums[4:8], r0+4, qw, scale, sm, group, cols, lo, hi)
@@ -255,12 +238,8 @@ func q4matmulCols8(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 	}
 	quads := len(xus[0]) / 4
 	groups := len(gsums[0])
-	xq := make([]uint32, 8*quads)
-	for r := 0; r < 8; r++ {
-		for i4 := 0; i4 < quads; i4++ {
-			xq[i4*8+r] = q4xQuad(xus[r], i4)
-		}
-	}
+	xq0, xq1, xq2, xq3 := xqs[0], xqs[1], xqs[2], xqs[3]
+	xq4, xq5, xq6, xq7 := xqs[4], xqs[5], xqs[6], xqs[7]
 	gsf := make([]Float, 8*groups)
 	gsc := make([]int32, 8*groups)
 	for r := 0; r < 8; r++ {
@@ -304,15 +283,14 @@ func q4matmulCols8(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 					for i4 := ib; i4 < ie; i4++ {
 						v := loadU8x16(tile[i4*2*q4Tile:]).ExtendToUint16()
 						pair := v.And(mLo).Or(v.ShiftAllLeft(4).And(mHi)).AsUint8x32()
-						xf := xq[i4*8 : i4*8+8 : i4*8+8]
-						a0 = a0.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[0]).AsInt8x32()).DotProductPairs(ones))
-						a1 = a1.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[1]).AsInt8x32()).DotProductPairs(ones))
-						a2 = a2.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[2]).AsInt8x32()).DotProductPairs(ones))
-						a3 = a3.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[3]).AsInt8x32()).DotProductPairs(ones))
-						a4 = a4.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[4]).AsInt8x32()).DotProductPairs(ones))
-						a5 = a5.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[5]).AsInt8x32()).DotProductPairs(ones))
-						a6 = a6.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[6]).AsInt8x32()).DotProductPairs(ones))
-						a7 = a7.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[7]).AsInt8x32()).DotProductPairs(ones))
+						a0 = a0.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq0[i4]).AsInt8x32()).DotProductPairs(ones))
+						a1 = a1.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq1[i4]).AsInt8x32()).DotProductPairs(ones))
+						a2 = a2.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq2[i4]).AsInt8x32()).DotProductPairs(ones))
+						a3 = a3.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq3[i4]).AsInt8x32()).DotProductPairs(ones))
+						a4 = a4.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq4[i4]).AsInt8x32()).DotProductPairs(ones))
+						a5 = a5.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq5[i4]).AsInt8x32()).DotProductPairs(ones))
+						a6 = a6.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq6[i4]).AsInt8x32()).DotProductPairs(ones))
+						a7 = a7.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq7[i4]).AsInt8x32()).DotProductPairs(ones))
 					}
 					u := loadU32x8(tab[g*q4Tile:])
 					sc := u.ShiftAllLeft(16).AsFloat32x8()
@@ -344,15 +322,14 @@ func q4matmulCols8(out *Matrix, xus [][]uint8, sxs []Float, gsums [][]int32, r0 
 					for i4 := ib; i4 < ie; i4++ {
 						v := loadU8x16(tile[i4*2*q4Tile:]).ExtendToUint16()
 						pair := v.And(mLo).Or(v.ShiftAllLeft(4).And(mHi)).AsUint8x32()
-						xf := xq[i4*8 : i4*8+8 : i4*8+8]
-						a0 = a0.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[0]).AsInt8x32()).DotProductPairs(ones))
-						a1 = a1.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[1]).AsInt8x32()).DotProductPairs(ones))
-						a2 = a2.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[2]).AsInt8x32()).DotProductPairs(ones))
-						a3 = a3.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[3]).AsInt8x32()).DotProductPairs(ones))
-						a4 = a4.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[4]).AsInt8x32()).DotProductPairs(ones))
-						a5 = a5.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[5]).AsInt8x32()).DotProductPairs(ones))
-						a6 = a6.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[6]).AsInt8x32()).DotProductPairs(ones))
-						a7 = a7.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xf[7]).AsInt8x32()).DotProductPairs(ones))
+						a0 = a0.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq0[i4]).AsInt8x32()).DotProductPairs(ones))
+						a1 = a1.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq1[i4]).AsInt8x32()).DotProductPairs(ones))
+						a2 = a2.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq2[i4]).AsInt8x32()).DotProductPairs(ones))
+						a3 = a3.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq3[i4]).AsInt8x32()).DotProductPairs(ones))
+						a4 = a4.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq4[i4]).AsInt8x32()).DotProductPairs(ones))
+						a5 = a5.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq5[i4]).AsInt8x32()).DotProductPairs(ones))
+						a6 = a6.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq6[i4]).AsInt8x32()).DotProductPairs(ones))
+						a7 = a7.Add(pair.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq7[i4]).AsInt8x32()).DotProductPairs(ones))
 					}
 					sc := loadF32x8(tab[g*q4Tile:])
 					gr := gsc[8*g : 8*g+8 : 8*g+8]
