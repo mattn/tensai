@@ -178,3 +178,49 @@ func TestSiluMul(t *testing.T) {
 		}
 	}
 }
+
+// TestDotVecsAxpys pins the grouped attention helpers to their per-row
+// twins bit for bit, across group widths, head sizes, and both the
+// vector and sub-16 generic paths.
+func TestDotVecsAxpys(t *testing.T) {
+	rng := rand.New(rand.NewSource(63))
+	for _, d := range []int{8, 16, 64, 128, 130} {
+		for nq := 1; nq <= 8; nq++ {
+			qs := make([]Float, nq*d)
+			k := make([]Float, d)
+			for i := range qs {
+				qs[i] = Float(rng.NormFloat64())
+			}
+			for i := range k {
+				k[i] = Float(rng.NormFloat64())
+			}
+			out := make([]Float, nq)
+			DotVecs(qs, k, out)
+			for i := 0; i < nq; i++ {
+				if want := DotVec(qs[i*d:(i+1)*d], k); out[i] != want {
+					t.Fatalf("DotVecs d=%d nq=%d row %d: got %v want %v", d, nq, i, out[i], want)
+				}
+			}
+
+			ws := make([]Float, nq)
+			for i := range ws {
+				ws[i] = Float(rng.NormFloat64())
+			}
+			outs := make([]Float, nq*d)
+			ref := make([]Float, nq*d)
+			for i := range outs {
+				outs[i] = Float(rng.NormFloat64())
+				ref[i] = outs[i]
+			}
+			Axpys(ws, k, outs)
+			for i := 0; i < nq; i++ {
+				Axpy(ws[i], k, ref[i*d:(i+1)*d])
+			}
+			for i := range outs {
+				if outs[i] != ref[i] {
+					t.Fatalf("Axpys d=%d nq=%d elem %d: got %v want %v", d, nq, i, outs[i], ref[i])
+				}
+			}
+		}
+	}
+}

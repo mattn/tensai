@@ -317,3 +317,26 @@ func SiluMul(gate, up []Float) {
 	}
 	siluMul(gate, up)
 }
+
+// DotVecs is the grouped-query form of DotVec: out[i] gets the dot of k
+// with the i-th of len(out) query vectors packed contiguously in qs, the
+// shared k streamed once for up to four of them per pass — the score
+// kernel of grouped-query attention, where several query heads share one
+// cached key row. Every result is bit-identical to the matching DotVec.
+func DotVecs(qs, k []Float, out []Float) {
+	if len(qs) != len(out)*len(k) {
+		panic("tensai: DotVecs length mismatch")
+	}
+	dotVecs(qs, k, out)
+}
+
+// Axpys is the grouped form of Axpy: the i-th of len(ws) rows packed
+// contiguously in outs accumulates ws[i]*v, the shared v streamed once
+// for up to four rows per pass — grouped-query attention's weighted
+// value accumulation. Bit-identical to per-row Axpy.
+func Axpys(ws []Float, v, outs []Float) {
+	if len(outs) != len(ws)*len(v) {
+		panic("tensai: Axpys length mismatch")
+	}
+	axpys(ws, v, outs)
+}
