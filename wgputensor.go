@@ -1199,6 +1199,189 @@ fn qmatmul_i(@builtin(workgroup_id) wid: vec3<u32>,
 }
 `
 
+// attnF16WGSL is the f16 module: the grouped attention kernel reading a
+// half-precision KV cache, and the conversion kernel that appends f32
+// rows into it. Compiled only when the device granted shader-f16;
+// accumulation stays in f32, so only the cache storage narrows.
+const attnF16WGSL = `
+enable f16;
+
+struct APParams { seqQ: u32, seqKV: u32, dh: u32, d: u32, rows: u32, off: u32, dkv: u32, window: u32 }
+@group(0) @binding(3) var<storage, read> offs: array<vec4<u32>>;
+@group(0) @binding(10) var<uniform> ap: APParams;
+@group(0) @binding(11) var<storage, read> aq: array<f32>;
+@group(0) @binding(12) var<storage, read> akh: array<f16>;
+@group(0) @binding(13) var<storage, read> avh: array<f16>;
+@group(0) @binding(14) var<storage, read_write> aout: array<f32>;
+
+struct CVParams { n: u32, off: u32, pad0: u32, pad1: u32 }
+@group(0) @binding(20) var<uniform> cvp: CVParams;
+@group(0) @binding(21) var<storage, read> cvsrc: array<f32>;
+@group(0) @binding(22) var<storage, read_write> cvdst: array<f16>;
+
+@compute @workgroup_size(256, 1, 1)
+fn rows_to_f16(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (gid.x < cvp.n) {
+        cvdst[cvp.off + gid.x] = f16(cvsrc[gid.x]);
+    }
+}
+
+const AT = 64u;
+var<workgroup> qrow_h: array<f32, 2048>;
+var<workgroup> sc_h: array<f32, 512>;
+var<workgroup> red_h: array<f32, 512>;
+
+@compute @workgroup_size(64, 1, 1)
+fn attn_causal_gh(@builtin(workgroup_id) wid: vec3<u32>,
+                  @builtin(num_workgroups) nwg: vec3<u32>,
+                  @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.y * nwg.x + wid.x;
+    if (row >= ap.rows) {
+        return;
+    }
+    let grp = ap.d / ap.dkv;
+    let bh = row / ap.seqQ;
+    let qi = row % ap.seqQ;
+    let offQ = offs[bh].x;
+    let offKV = offs[bh].y;
+    let offO = offs[bh].z;
+    let t = lid.x;
+    for (var c = t; c < grp * ap.dh; c = c + 64u) {
+        qrow_h[c] = aq[offQ + qi * ap.d + c];
+    }
+    workgroupBarrier();
+    let limit = qi + ap.off + 1u;
+    var start = 0u;
+    if (ap.window > 0u && limit > ap.window) {
+        start = limit - ap.window;
+    }
+    let scale = inverseSqrt(f32(ap.dh));
+    var m: array<f32, 8>;
+    var l: array<f32, 8>;
+    var acc: array<vec4<f32>, 8>;
+    for (var h = 0u; h < 8u; h = h + 1u) {
+        m[h] = -3.40282e38;
+    }
+    let tiles = (limit + AT - 1u) / AT;
+    for (var tt = start / AT; tt < tiles; tt = tt + 1u) {
+        let j = tt * AT + t;
+        let valid = j >= start && j < limit;
+        var dot: array<f32, 8>;
+        for (var h = 0u; h < 8u; h = h + 1u) {
+            dot[h] = 0.0;
+        }
+        if (valid) {
+            for (var c = 0u; c < ap.dh; c = c + 1u) {
+                let kv = f32(akh[offKV + j * ap.dkv + c]);
+                for (var h = 0u; h < 8u; h = h + 1u) {
+                    if (h < grp) {
+                        dot[h] = dot[h] + qrow_h[h * ap.dh + c] * kv;
+                    }
+                }
+            }
+        }
+        for (var h = 0u; h < 8u; h = h + 1u) {
+            if (h < grp) {
+                var sv = -3.40282e38;
+                if (valid) {
+                    sv = dot[h] * scale;
+                }
+                dot[h] = sv;
+                red_h[h * 64u + t] = sv;
+            }
+        }
+        workgroupBarrier();
+        for (var r = 32u; r > 0u; r = r >> 1u) {
+            if (t < r) {
+                for (var h = 0u; h < 8u; h = h + 1u) {
+                    if (h < grp) {
+                        red_h[h * 64u + t] = max(red_h[h * 64u + t], red_h[h * 64u + t + r]);
+                    }
+                }
+            }
+            workgroupBarrier();
+        }
+        var mNew: array<f32, 8>;
+        var p: array<f32, 8>;
+        for (var h = 0u; h < 8u; h = h + 1u) {
+            p[h] = 0.0;
+            if (h < grp) {
+                mNew[h] = max(m[h], red_h[h * 64u]);
+                if (valid) {
+                    p[h] = exp(dot[h] - mNew[h]);
+                }
+            }
+        }
+        workgroupBarrier();
+        for (var h = 0u; h < 8u; h = h + 1u) {
+            if (h < grp) {
+                sc_h[h * 64u + t] = p[h];
+                red_h[h * 64u + t] = p[h];
+            }
+        }
+        workgroupBarrier();
+        for (var r = 32u; r > 0u; r = r >> 1u) {
+            if (t < r) {
+                for (var h = 0u; h < 8u; h = h + 1u) {
+                    if (h < grp) {
+                        red_h[h * 64u + t] = red_h[h * 64u + t] + red_h[h * 64u + t + r];
+                    }
+                }
+            }
+            workgroupBarrier();
+        }
+        for (var h = 0u; h < 8u; h = h + 1u) {
+            if (h < grp) {
+                // exp underflows to zero on the first tile, where m is -inf-like.
+                let rescale = exp(m[h] - mNew[h]);
+                l[h] = l[h] * rescale + red_h[h * 64u];
+                m[h] = mNew[h];
+                acc[h] = acc[h] * rescale;
+            }
+        }
+        let jEnd = min(limit, tt * AT + AT);
+        for (var jj = max(start, tt * AT); jj < jEnd; jj = jj + 1u) {
+            var vv = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            if (t < ap.dh) {
+                vv.x = f32(avh[offKV + jj * ap.dkv + t]);
+            }
+            if (64u + t < ap.dh) {
+                vv.y = f32(avh[offKV + jj * ap.dkv + 64u + t]);
+            }
+            if (128u + t < ap.dh) {
+                vv.z = f32(avh[offKV + jj * ap.dkv + 128u + t]);
+            }
+            if (192u + t < ap.dh) {
+                vv.w = f32(avh[offKV + jj * ap.dkv + 192u + t]);
+            }
+            for (var h = 0u; h < 8u; h = h + 1u) {
+                if (h < grp) {
+                    acc[h] = acc[h] + sc_h[h * 64u + jj - tt * AT] * vv;
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+    for (var h = 0u; h < 8u; h = h + 1u) {
+        if (h < grp) {
+            let o = offO + qi * ap.d + h * ap.dh;
+            if (t < ap.dh) {
+                aout[o + t] = acc[h].x / l[h];
+            }
+            if (64u + t < ap.dh) {
+                aout[o + 64u + t] = acc[h].y / l[h];
+            }
+            if (128u + t < ap.dh) {
+                aout[o + 128u + t] = acc[h].z / l[h];
+            }
+            if (192u + t < ap.dh) {
+                aout[o + 192u + t] = acc[h].w / l[h];
+            }
+        }
+    }
+}
+`
+
 // IntDot reports whether the optional integer-dot GEMM module compiled
 // on this device; without it large batches use the f32 tiled kernel.
 func (g *GPU) IntDot() bool { return g.hasIntDot }
@@ -1211,12 +1394,13 @@ type gpuPipelines struct {
 	scale, softmax, attn, qmatmul                  uintptr
 	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
 	geluMulIP, qmatmulB, attnG, qmatmulT           uintptr
-	qacts, qmatmulI                                uintptr
+	qacts, qmatmulI, attnF16, rowsToF16            uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
 	layScale, laySoftmax, layAttn, layQmatmul      uintptr
 	layRmsnorm, layRope, layAddIP, laySiluMulIP    uintptr
 	layQ4matmul, layGeluMulIP, layQmatmulB         uintptr
 	layAttnG, layQmatmulT, layQacts, layQmatmulI   uintptr
+	layAttnF16, layRowsToF16                       uintptr
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -1272,6 +1456,31 @@ func (g *GPU) initPipelines() error {
 		g.hasIntDot = ok
 	}
 	uncapturedCB = ""
+	// The f16 module needs the shader-f16 device feature; failure to
+	// compile just leaves the f32 cache path.
+	if g.hasF16 {
+		ok := false
+		g.module3 = g.makeModuleFrom(attnF16WGSL)
+		if g.module3 != 0 && uncapturedCB == "" {
+			ok = true
+			for _, x := range []struct {
+				pipe, lay *uintptr
+				entry     string
+			}{
+				{&g.pipes.attnF16, &g.pipes.layAttnF16, "attn_causal_gh"},
+				{&g.pipes.rowsToF16, &g.pipes.layRowsToF16, "rows_to_f16"},
+			} {
+				*x.pipe = g.makePipelineIn(g.module3, x.entry)
+				if *x.pipe == 0 || uncapturedCB != "" {
+					ok = false
+					break
+				}
+				*x.lay = fnPipelineGetLayout(*x.pipe, 0)
+			}
+		}
+		g.hasF16 = ok
+		uncapturedCB = ""
+	}
 	return nil
 }
 
@@ -1285,6 +1494,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.layAddIP, g.pipes.laySiluMulIP, g.pipes.layQ4matmul,
 		g.pipes.layGeluMulIP, g.pipes.layQmatmulB, g.pipes.layAttnG,
 		g.pipes.layQmatmulT, g.pipes.layQacts, g.pipes.layQmatmulI,
+		g.pipes.layAttnF16, g.pipes.layRowsToF16,
 	} {
 		if h != 0 {
 			fnLayoutRelease(h)
@@ -1297,6 +1507,7 @@ func (g *GPU) releasePipelines() {
 		g.pipes.addIP, g.pipes.siluMulIP, g.pipes.q4matmul,
 		g.pipes.geluMulIP, g.pipes.qmatmulB, g.pipes.attnG,
 		g.pipes.qmatmulT, g.pipes.qacts, g.pipes.qmatmulI,
+		g.pipes.attnF16, g.pipes.rowsToF16,
 	} {
 		if h != 0 {
 			fnPipelineRelease(h)
@@ -1611,6 +1822,49 @@ type GPUTensor struct {
 	buf   uintptr
 	shape []int
 	freed bool
+	f16   bool // half-precision storage (KV caches); most kernels want f32
+}
+
+// byteLen is the tensor's buffer size, which the pool keys on.
+func (t *GPUTensor) byteLen() uint64 {
+	if t.f16 {
+		return (uint64(t.Size())*2 + 3) &^ 3
+	}
+	return uint64(t.Size()) * 4
+}
+
+// HasF16 reports whether the device granted shader-f16 and the f16
+// kernels compiled: NewF16Tensor and the half-precision KV cache path
+// are usable only then.
+func (g *GPU) HasF16() bool { return g.hasF16 }
+
+// NewF16Tensor allocates a zeroed half-precision GPU tensor. Only the
+// attention cache kernels read and write f16 tensors: fill it with
+// CopyRowsInto, feed it to GroupedCausalAttention.
+func (g *GPU) NewF16Tensor(shape ...int) (*GPUTensor, error) {
+	if !g.hasF16 {
+		return nil, errors.New("tensai: device has no shader-f16 support")
+	}
+	n := 1
+	for _, d := range shape {
+		n *= d
+	}
+	if n <= 0 {
+		return nil, errors.New("tensai: empty f16 tensor")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	t := &GPUTensor{g: g, shape: append([]int(nil), shape...), f16: true}
+	t.buf = g.newBuffer(gpuTensorUsage, t.byteLen())
+	if t.buf == 0 {
+		return nil, errors.New("tensai: gpu buffer allocation failed")
+	}
+	return t, nil
 }
 
 // Every GPUTensor buffer is storage-usable (kernel input and output),
@@ -1813,7 +2067,7 @@ func (t *GPUTensor) Free() {
 		return
 	}
 	t.freed = true
-	t.g.putBuffer(gpuTensorUsage, uint64(t.Size())*4, t.buf)
+	t.g.putBuffer(gpuTensorUsage, t.byteLen(), t.buf)
 }
 
 // MatMul multiplies two GPU-resident tensors with the same shape and
@@ -2765,6 +3019,29 @@ func (t *GPUTensor) CopyRowsInto(dst *GPUTensor, off int) error {
 		return errors.New("tensai: gpu is closed")
 	}
 	uncapturedCB = ""
+	if dst.f16 {
+		// A half-precision destination converts through a kernel; the
+		// pass batches it like any other dispatch, no copy involved.
+		n := t.Size()
+		params := [4]uint32{uint32(n), uint32(off)}
+		bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+		defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
+		fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+		entries := [3]wgpuBindGroupEntry{
+			{binding: 20, buffer: bufParams, size: 16},
+			{binding: 21, buffer: t.buf, size: uint64(n) * 4},
+			{binding: 22, buffer: dst.buf, size: dst.byteLen()},
+		}
+		bindGroup := g.cachedBindGroup(g.pipes.layRowsToF16, entries[:])
+		runtime.KeepAlive(&entries)
+		if err := g.dispatch(g.pipes.rowsToF16, bindGroup, uint32((n+255)/256), 1, 1); err != nil {
+			return err
+		}
+		if uncapturedCB != "" {
+			return fmt.Errorf("tensai: gpu f16 copy failed: %s", uncapturedCB)
+		}
+		return nil
+	}
 	if g.batchEnc != 0 {
 		g.endBatchPass()
 		fnEncoderCopyBuffer(g.batchEnc, t.buf, 0, dst.buf, uint64(off)*4, uint64(t.Size())*4)
@@ -2822,6 +3099,12 @@ func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqK
 	// group; other shapes keep the per-head kernel.
 	group := heads / kvHeads
 	grouped := group > 1 && group <= 8 && dh <= 256
+	if k.f16 != v.f16 {
+		return nil, errors.New("tensai: k and v caches must share a precision")
+	}
+	if k.f16 && !grouped {
+		return nil, fmt.Errorf("tensai: the f16 cache path needs a query-head group of 2..8, got %d", group)
+	}
 	nwg := heads
 	if grouped {
 		nwg = kvHeads
@@ -2867,13 +3150,16 @@ func (q *GPUTensor) GroupedCausalAttention(k, v *GPUTensor, heads, kvHeads, seqK
 		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
 		{binding: 10, buffer: bufParams, size: 32},
 		{binding: 11, buffer: q.buf, size: uint64(q.Size()) * 4},
-		{binding: 12, buffer: k.buf, size: uint64(k.Size()) * 4},
-		{binding: 13, buffer: v.buf, size: uint64(v.Size()) * 4},
+		{binding: 12, buffer: k.buf, size: k.byteLen()},
+		{binding: 13, buffer: v.buf, size: v.byteLen()},
 		{binding: 14, buffer: bufOut, size: outBytes},
 	}
 	pipe, lay := g.pipes.attn, g.pipes.layAttn
 	if grouped {
 		pipe, lay = g.pipes.attnG, g.pipes.layAttnG
+		if k.f16 {
+			pipe, lay = g.pipes.attnF16, g.pipes.layAttnF16
+		}
 	}
 	bindGroup := g.cachedBindGroup(lay, entries[:])
 	runtime.KeepAlive(&entries)

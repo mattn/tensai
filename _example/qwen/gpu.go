@@ -133,6 +133,10 @@ func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 	hs := m.cfg.Heads * m.headSz // query dimension; equals hidden except qwen3
 	inter := m.cfg.Intermediate
 	gq := &gpuQwen{m: m, g: g, nCtx: nCtx, layers: make([]gpuLayer, len(m.blocks))}
+	// A half-precision KV cache halves the resident cache when the device
+	// has shader-f16 and the model's head grouping fits the f16 kernel.
+	group := m.cfg.Heads / m.cfg.KVHeads
+	useF16 := g.HasF16() && group > 1 && group <= 8 && m.headSz <= 256
 	// upSlice uploads a column range of a fused weight in whichever width
 	// it was quantized to; up uploads a whole one.
 	upSlice := func(q *qmat, lo, hi int) gpuMat {
@@ -170,8 +174,13 @@ func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
 		l.qGate = upSlice(b.qGU, 0, inter)
 		l.qUp = upSlice(b.qGU, inter, 2*inter)
 		l.qDown = up(b.qDown)
-		l.kc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
-		l.vc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
+		if useF16 {
+			l.kc = must(g.NewF16Tensor(nCtx, kvDim))
+			l.vc = must(g.NewF16Tensor(nCtx, kvDim))
+		} else {
+			l.kc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
+			l.vc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
+		}
 	}
 	// Warm every kernel the decode and both prefill batch sizes touch:
 	// drivers like dozen compile a pipeline's GPU code at first dispatch,

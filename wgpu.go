@@ -39,7 +39,9 @@ type GPU struct {
 	queue      uintptr
 	module     uintptr
 	module2    uintptr // optional integer-dot module; 0 if unsupported
+	module3    uintptr // optional f16 module; 0 if unsupported
 	hasIntDot  bool
+	hasF16     bool
 	pipes      gpuPipelines
 	readback   gpuReadbackBuffer
 	pool       gpuBufferPool
@@ -542,6 +544,7 @@ func (g *GPU) Close() {
 		fn func(uintptr)
 		h  uintptr
 	}{
+		{fnShaderModRelease, g.module3},
 		{fnShaderModRelease, g.module2},
 		{fnShaderModRelease, g.module},
 		{fnQueueRelease, g.queue},
