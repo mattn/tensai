@@ -185,3 +185,19 @@ func axpyGeneric(a Float, x, y []Float) {
 		y[i] += a * x[i]
 	}
 }
+
+// dotVecsGeneric and axpysGeneric are the scalar bodies of the grouped
+// DotVecs and Axpys attention helpers.
+func dotVecsGeneric(qs, k []Float, out []Float) {
+	d := len(k)
+	for i := range out {
+		out[i] = dotVecGeneric(qs[i*d:(i+1)*d], k)
+	}
+}
+
+func axpysGeneric(ws []Float, v, outs []Float) {
+	d := len(v)
+	for i := range ws {
+		axpyGeneric(ws[i], v, outs[i*d:(i+1)*d])
+	}
+}

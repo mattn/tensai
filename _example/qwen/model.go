@@ -635,7 +635,10 @@ func mmb(x, w *tensai.Matrix, q *qmat, bias []float32) *tensai.Matrix {
 // attendHead runs one head of cached-KV attention: SIMD dot-product
 // scores over the cache, a float64 softmax, and SIMD weighted value
 // accumulation into attn's slot for the head. Heads touch disjoint
-// output ranges, so callers fan heads out across goroutines freely.
+// output ranges, so callers fan heads out across goroutines freely —
+// which is why decode uses it: at short and medium contexts the KV
+// rows sit in L3 anyway, so attendGroup's shared streaming buys
+// nothing there while head-level fan-out keeps every core busy.
 func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, scores []float64) {
 	// Sliding-window layers (Gemma) see only the last window positions.
 	start := 0
@@ -670,6 +673,63 @@ func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, sco
 	out := attn[qOff : qOff+m.headSz]
 	for t := start; t < steps; t++ {
 		tensai.Axpy(float32(scores[t]/sum), b.vc[t][kvOff:kvOff+m.headSz], out)
+	}
+}
+
+// attendGroup runs one KV head's worth of cached-KV attention — the
+// `group` query heads that share it — streaming each cached key and
+// value row once for all of them: grouped SIMD scores (DotVecs), a
+// per-head float64 softmax, and grouped SIMD value accumulation
+// (Axpys). Per head the arithmetic order matches the old one-head-at-
+// a-time path exactly, so the output is bit-identical; KV heads touch
+// disjoint output ranges, so callers fan them out across goroutines.
+// scores needs group*steps float64s, ws group*steps float32s.
+func (m *qwen) attendGroup(b *qblock, q, attn []float32, kh, group, steps int, scores []float64, ws []float32) {
+	// Sliding-window layers (Gemma, gpt-oss) see only the last window
+	// positions.
+	start := 0
+	if b.window > 0 && steps > b.window {
+		start = steps - b.window
+	}
+	d := m.headSz
+	qOff := kh * group * d
+	kvOff := kh * d
+	scale := 1 / math.Sqrt(float64(d))
+	qg := q[qOff : qOff+group*d]
+	for t := start; t < steps; t++ {
+		tensai.DotVecs(qg, b.kc[t][kvOff:kvOff+d], ws[t*group:(t+1)*group])
+	}
+	for i := 0; i < group; i++ {
+		si := scores[i*steps : (i+1)*steps]
+		maxs := math.Inf(-1)
+		for t := start; t < steps; t++ {
+			s := float64(ws[t*group+i]) * scale
+			si[t] = s
+			if s > maxs {
+				maxs = s
+			}
+		}
+		h := kh*group + i
+		if b.sinks != nil && float64(b.sinks[h]) > maxs {
+			maxs = float64(b.sinks[h])
+		}
+		var sum float64
+		for t := start; t < steps; t++ {
+			si[t] = math.Exp(si[t] - maxs)
+			sum += si[t]
+		}
+		if b.sinks != nil {
+			// The sink is an extra softmax slot with no value: it only
+			// absorbs probability mass.
+			sum += math.Exp(float64(b.sinks[h]) - maxs)
+		}
+		for t := start; t < steps; t++ {
+			ws[t*group+i] = float32(si[t] / sum)
+		}
+	}
+	og := attn[qOff : qOff+group*d]
+	for t := start; t < steps; t++ {
+		tensai.Axpys(ws[t*group:(t+1)*group], b.vc[t][kvOff:kvOff+d], og)
 	}
 }
 
@@ -823,13 +883,14 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				scores := make([]float64, startPos+n)
+				scores := make([]float64, group*(startPos+n))
+				ws := make([]float32, group*(startPos+n))
 				for t := range rowCh {
 					steps := startPos + t + 1
 					qr := qkv.Data[t*qkvW : t*qkvW+qDim]
 					ar := attn.Data[t*qDim : (t+1)*qDim]
-					for h := 0; h < cfg.Heads; h++ {
-						m.attendHead(b, qr, ar, h, group, steps, scores[:steps])
+					for kh := 0; kh < cfg.KVHeads; kh++ {
+						m.attendGroup(b, qr, ar, kh, group, steps, scores, ws)
 					}
 				}
 			}()

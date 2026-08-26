@@ -441,3 +441,489 @@ func axpy(a Float, x, y []Float) {
 		y[i] += a * x[i]
 	}
 }
+
+// dotVecs computes out[i] = qs[i*d:(i+1)*d] . k for the len(out) query
+// vectors packed contiguously in qs, streaming the shared k once for up
+// to four rows per pass. Each row keeps dotVec's exact accumulation
+// order — same chunked FMA, same linear horizontal sum, same scalar
+// tail — so every result is bit-identical to per-row dotVec.
+func dotVecs(qs, k []Float, out []Float) {
+	if !hasAVX2 || len(k) < 16 {
+		dotVecsGeneric(qs, k, out)
+		return
+	}
+	d := len(k)
+	switch len(out) {
+	case 8:
+		dotVec8(qs, k, out)
+		return
+	case 7:
+		dotVec7(qs, k, out)
+		return
+	case 6:
+		dotVec6(qs, k, out)
+		return
+	}
+	i := 0
+	for ; i+4 <= len(out); i += 4 {
+		dotVec4(qs[i*d:(i+4)*d], k, out[i:i+4])
+	}
+	if i+2 <= len(out) {
+		dotVec2(qs[i*d:(i+2)*d], k, out[i:i+2])
+		i += 2
+	}
+	if i < len(out) {
+		out[i] = dotVec(qs[i*d:(i+1)*d], k)
+	}
+}
+
+func dotVec4(qs, k []Float, out []Float) {
+	d := len(k)
+	q0 := qs[0*d : 1*d : 1*d]
+	q1 := qs[1*d : 2*d : 2*d]
+	q2 := qs[2*d : 3*d : 3*d]
+	q3 := qs[3*d : 4*d : 4*d]
+	n := d &^ 7
+	n2 := d &^ 15
+	var a0, a1, a2, a3 archsimd.Float32x8
+	// Two chunks per iteration: the four loop-carried accumulators make
+	// the compiler rotate registers at the back edge, so halving the
+	// trips halves that tax; the FMA order per accumulator is unchanged.
+	for i := 0; i < n2; i += 16 {
+		kv := loadF32x8(k[i:])
+		a0 = loadF32x8(q0[i:]).MulAdd(kv, a0)
+		a1 = loadF32x8(q1[i:]).MulAdd(kv, a1)
+		a2 = loadF32x8(q2[i:]).MulAdd(kv, a2)
+		a3 = loadF32x8(q3[i:]).MulAdd(kv, a3)
+		kw := loadF32x8(k[i+8:])
+		a0 = loadF32x8(q0[i+8:]).MulAdd(kw, a0)
+		a1 = loadF32x8(q1[i+8:]).MulAdd(kw, a1)
+		a2 = loadF32x8(q2[i+8:]).MulAdd(kw, a2)
+		a3 = loadF32x8(q3[i+8:]).MulAdd(kw, a3)
+	}
+	for i := n2; i < n; i += 8 {
+		kv := loadF32x8(k[i:])
+		a0 = loadF32x8(q0[i:]).MulAdd(kv, a0)
+		a1 = loadF32x8(q1[i:]).MulAdd(kv, a1)
+		a2 = loadF32x8(q2[i:]).MulAdd(kv, a2)
+		a3 = loadF32x8(q3[i:]).MulAdd(kv, a3)
+	}
+	// One buffer per accumulator, all stored before any is read: reusing
+	// a single slot chains the horizontal sums through store-to-load
+	// dependencies, and with six of them back to back per position there
+	// is no surrounding work to hide that latency under.
+	var buf0, buf1, buf2, buf3 [8]Float
+	storeF32x8(a0, buf0[:])
+	storeF32x8(a1, buf1[:])
+	storeF32x8(a2, buf2[:])
+	storeF32x8(a3, buf3[:])
+	s0 := buf0[0] + buf0[1] + buf0[2] + buf0[3] + buf0[4] + buf0[5] + buf0[6] + buf0[7]
+	s1 := buf1[0] + buf1[1] + buf1[2] + buf1[3] + buf1[4] + buf1[5] + buf1[6] + buf1[7]
+	s2 := buf2[0] + buf2[1] + buf2[2] + buf2[3] + buf2[4] + buf2[5] + buf2[6] + buf2[7]
+	s3 := buf3[0] + buf3[1] + buf3[2] + buf3[3] + buf3[4] + buf3[5] + buf3[6] + buf3[7]
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < d; i++ {
+		s0 += q0[i] * k[i]
+		s1 += q1[i] * k[i]
+		s2 += q2[i] * k[i]
+		s3 += q3[i] * k[i]
+	}
+	out[0], out[1], out[2], out[3] = s0, s1, s2, s3
+}
+
+func dotVec2(qs, k []Float, out []Float) {
+	d := len(k)
+	q0 := qs[0*d : 1*d : 1*d]
+	q1 := qs[1*d : 2*d : 2*d]
+	n := d &^ 7
+	n2 := d &^ 15
+	var a0, a1 archsimd.Float32x8
+	for i := 0; i < n2; i += 16 {
+		kv := loadF32x8(k[i:])
+		a0 = loadF32x8(q0[i:]).MulAdd(kv, a0)
+		a1 = loadF32x8(q1[i:]).MulAdd(kv, a1)
+		kw := loadF32x8(k[i+8:])
+		a0 = loadF32x8(q0[i+8:]).MulAdd(kw, a0)
+		a1 = loadF32x8(q1[i+8:]).MulAdd(kw, a1)
+	}
+	for i := n2; i < n; i += 8 {
+		kv := loadF32x8(k[i:])
+		a0 = loadF32x8(q0[i:]).MulAdd(kv, a0)
+		a1 = loadF32x8(q1[i:]).MulAdd(kv, a1)
+	}
+	var buf0, buf1 [8]Float
+	storeF32x8(a0, buf0[:])
+	storeF32x8(a1, buf1[:])
+	s0 := buf0[0] + buf0[1] + buf0[2] + buf0[3] + buf0[4] + buf0[5] + buf0[6] + buf0[7]
+	s1 := buf1[0] + buf1[1] + buf1[2] + buf1[3] + buf1[4] + buf1[5] + buf1[6] + buf1[7]
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < d; i++ {
+		s0 += q0[i] * k[i]
+		s1 += q1[i] * k[i]
+	}
+	out[0], out[1] = s0, s1
+}
+
+// axpys accumulates outs[i*d:(i+1)*d] += ws[i] * v for the len(ws) rows
+// packed contiguously in outs, streaming the shared v once for up to
+// four rows per pass; per row it is bit-identical to axpy.
+func axpys(ws []Float, v, outs []Float) {
+	if !hasAVX2 || len(v) < 16 {
+		axpysGeneric(ws, v, outs)
+		return
+	}
+	d := len(v)
+	switch len(ws) {
+	case 8:
+		axpy8(ws, v, outs)
+		return
+	case 7:
+		axpy7(ws, v, outs)
+		return
+	case 6:
+		axpy6(ws, v, outs)
+		return
+	}
+	i := 0
+	for ; i+4 <= len(ws); i += 4 {
+		axpy4(ws[i:i+4], v, outs[i*d:(i+4)*d])
+	}
+	if i+2 <= len(ws) {
+		axpy2(ws[i:i+2], v, outs[i*d:(i+2)*d])
+		i += 2
+	}
+	if i < len(ws) {
+		axpy(ws[i], v, outs[i*d:(i+1)*d])
+	}
+}
+
+func axpy4(ws []Float, v, outs []Float) {
+	d := len(v)
+	o0 := outs[0*d : 1*d : 1*d]
+	o1 := outs[1*d : 2*d : 2*d]
+	o2 := outs[2*d : 3*d : 3*d]
+	o3 := outs[3*d : 4*d : 4*d]
+	w0 := archsimd.BroadcastFloat32x8(ws[0])
+	w1 := archsimd.BroadcastFloat32x8(ws[1])
+	w2 := archsimd.BroadcastFloat32x8(ws[2])
+	w3 := archsimd.BroadcastFloat32x8(ws[3])
+	n := d &^ 7
+	for i := 0; i < n; i += 8 {
+		vv := loadF32x8(v[i:])
+		storeF32x8(vv.MulAdd(w0, loadF32x8(o0[i:])), o0[i:])
+		storeF32x8(vv.MulAdd(w1, loadF32x8(o1[i:])), o1[i:])
+		storeF32x8(vv.MulAdd(w2, loadF32x8(o2[i:])), o2[i:])
+		storeF32x8(vv.MulAdd(w3, loadF32x8(o3[i:])), o3[i:])
+	}
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < d; i++ {
+		o0[i] += ws[0] * v[i]
+		o1[i] += ws[1] * v[i]
+		o2[i] += ws[2] * v[i]
+		o3[i] += ws[3] * v[i]
+	}
+}
+
+func axpy2(ws []Float, v, outs []Float) {
+	d := len(v)
+	o0 := outs[0*d : 1*d : 1*d]
+	o1 := outs[1*d : 2*d : 2*d]
+	w0 := archsimd.BroadcastFloat32x8(ws[0])
+	w1 := archsimd.BroadcastFloat32x8(ws[1])
+	n := d &^ 7
+	for i := 0; i < n; i += 8 {
+		vv := loadF32x8(v[i:])
+		storeF32x8(vv.MulAdd(w0, loadF32x8(o0[i:])), o0[i:])
+		storeF32x8(vv.MulAdd(w1, loadF32x8(o1[i:])), o1[i:])
+	}
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < d; i++ {
+		o0[i] += ws[0] * v[i]
+		o1[i] += ws[1] * v[i]
+	}
+}
+
+// dotVec6/7/8 and axpy6/7/8 are the single-pass forms for the group
+// widths real models use (llama 4, qwen 6-7, gpt-oss 8): one call, one
+// k stream, one horizontal-sum block per position.
+func dotVec6(qs, k []Float, out []Float) {
+	d := len(k)
+	q0 := qs[0*d : 1*d : 1*d]
+	q1 := qs[1*d : 2*d : 2*d]
+	q2 := qs[2*d : 3*d : 3*d]
+	q3 := qs[3*d : 4*d : 4*d]
+	q4 := qs[4*d : 5*d : 5*d]
+	q5 := qs[5*d : 6*d : 6*d]
+	n := d &^ 7
+	var a0, a1, a2, a3, a4, a5 archsimd.Float32x8
+	for i := 0; i < n; i += 8 {
+		kv := loadF32x8(k[i:])
+		a0 = loadF32x8(q0[i:]).MulAdd(kv, a0)
+		a1 = loadF32x8(q1[i:]).MulAdd(kv, a1)
+		a2 = loadF32x8(q2[i:]).MulAdd(kv, a2)
+		a3 = loadF32x8(q3[i:]).MulAdd(kv, a3)
+		a4 = loadF32x8(q4[i:]).MulAdd(kv, a4)
+		a5 = loadF32x8(q5[i:]).MulAdd(kv, a5)
+	}
+	var buf0, buf1, buf2, buf3, buf4, buf5 [8]Float
+	storeF32x8(a0, buf0[:])
+	storeF32x8(a1, buf1[:])
+	storeF32x8(a2, buf2[:])
+	storeF32x8(a3, buf3[:])
+	storeF32x8(a4, buf4[:])
+	storeF32x8(a5, buf5[:])
+	s0 := buf0[0] + buf0[1] + buf0[2] + buf0[3] + buf0[4] + buf0[5] + buf0[6] + buf0[7]
+	s1 := buf1[0] + buf1[1] + buf1[2] + buf1[3] + buf1[4] + buf1[5] + buf1[6] + buf1[7]
+	s2 := buf2[0] + buf2[1] + buf2[2] + buf2[3] + buf2[4] + buf2[5] + buf2[6] + buf2[7]
+	s3 := buf3[0] + buf3[1] + buf3[2] + buf3[3] + buf3[4] + buf3[5] + buf3[6] + buf3[7]
+	s4 := buf4[0] + buf4[1] + buf4[2] + buf4[3] + buf4[4] + buf4[5] + buf4[6] + buf4[7]
+	s5 := buf5[0] + buf5[1] + buf5[2] + buf5[3] + buf5[4] + buf5[5] + buf5[6] + buf5[7]
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < d; i++ {
+		s0 += q0[i] * k[i]
+		s1 += q1[i] * k[i]
+		s2 += q2[i] * k[i]
+		s3 += q3[i] * k[i]
+		s4 += q4[i] * k[i]
+		s5 += q5[i] * k[i]
+	}
+	out[0] = s0
+	out[1] = s1
+	out[2] = s2
+	out[3] = s3
+	out[4] = s4
+	out[5] = s5
+}
+
+func dotVec7(qs, k []Float, out []Float) {
+	d := len(k)
+	q0 := qs[0*d : 1*d : 1*d]
+	q1 := qs[1*d : 2*d : 2*d]
+	q2 := qs[2*d : 3*d : 3*d]
+	q3 := qs[3*d : 4*d : 4*d]
+	q4 := qs[4*d : 5*d : 5*d]
+	q5 := qs[5*d : 6*d : 6*d]
+	q6 := qs[6*d : 7*d : 7*d]
+	n := d &^ 7
+	var a0, a1, a2, a3, a4, a5, a6 archsimd.Float32x8
+	for i := 0; i < n; i += 8 {
+		kv := loadF32x8(k[i:])
+		a0 = loadF32x8(q0[i:]).MulAdd(kv, a0)
+		a1 = loadF32x8(q1[i:]).MulAdd(kv, a1)
+		a2 = loadF32x8(q2[i:]).MulAdd(kv, a2)
+		a3 = loadF32x8(q3[i:]).MulAdd(kv, a3)
+		a4 = loadF32x8(q4[i:]).MulAdd(kv, a4)
+		a5 = loadF32x8(q5[i:]).MulAdd(kv, a5)
+		a6 = loadF32x8(q6[i:]).MulAdd(kv, a6)
+	}
+	var buf0, buf1, buf2, buf3, buf4, buf5, buf6 [8]Float
+	storeF32x8(a0, buf0[:])
+	storeF32x8(a1, buf1[:])
+	storeF32x8(a2, buf2[:])
+	storeF32x8(a3, buf3[:])
+	storeF32x8(a4, buf4[:])
+	storeF32x8(a5, buf5[:])
+	storeF32x8(a6, buf6[:])
+	s0 := buf0[0] + buf0[1] + buf0[2] + buf0[3] + buf0[4] + buf0[5] + buf0[6] + buf0[7]
+	s1 := buf1[0] + buf1[1] + buf1[2] + buf1[3] + buf1[4] + buf1[5] + buf1[6] + buf1[7]
+	s2 := buf2[0] + buf2[1] + buf2[2] + buf2[3] + buf2[4] + buf2[5] + buf2[6] + buf2[7]
+	s3 := buf3[0] + buf3[1] + buf3[2] + buf3[3] + buf3[4] + buf3[5] + buf3[6] + buf3[7]
+	s4 := buf4[0] + buf4[1] + buf4[2] + buf4[3] + buf4[4] + buf4[5] + buf4[6] + buf4[7]
+	s5 := buf5[0] + buf5[1] + buf5[2] + buf5[3] + buf5[4] + buf5[5] + buf5[6] + buf5[7]
+	s6 := buf6[0] + buf6[1] + buf6[2] + buf6[3] + buf6[4] + buf6[5] + buf6[6] + buf6[7]
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < d; i++ {
+		s0 += q0[i] * k[i]
+		s1 += q1[i] * k[i]
+		s2 += q2[i] * k[i]
+		s3 += q3[i] * k[i]
+		s4 += q4[i] * k[i]
+		s5 += q5[i] * k[i]
+		s6 += q6[i] * k[i]
+	}
+	out[0] = s0
+	out[1] = s1
+	out[2] = s2
+	out[3] = s3
+	out[4] = s4
+	out[5] = s5
+	out[6] = s6
+}
+
+func dotVec8(qs, k []Float, out []Float) {
+	d := len(k)
+	q0 := qs[0*d : 1*d : 1*d]
+	q1 := qs[1*d : 2*d : 2*d]
+	q2 := qs[2*d : 3*d : 3*d]
+	q3 := qs[3*d : 4*d : 4*d]
+	q4 := qs[4*d : 5*d : 5*d]
+	q5 := qs[5*d : 6*d : 6*d]
+	q6 := qs[6*d : 7*d : 7*d]
+	q7 := qs[7*d : 8*d : 8*d]
+	n := d &^ 7
+	var a0, a1, a2, a3, a4, a5, a6, a7 archsimd.Float32x8
+	for i := 0; i < n; i += 8 {
+		kv := loadF32x8(k[i:])
+		a0 = loadF32x8(q0[i:]).MulAdd(kv, a0)
+		a1 = loadF32x8(q1[i:]).MulAdd(kv, a1)
+		a2 = loadF32x8(q2[i:]).MulAdd(kv, a2)
+		a3 = loadF32x8(q3[i:]).MulAdd(kv, a3)
+		a4 = loadF32x8(q4[i:]).MulAdd(kv, a4)
+		a5 = loadF32x8(q5[i:]).MulAdd(kv, a5)
+		a6 = loadF32x8(q6[i:]).MulAdd(kv, a6)
+		a7 = loadF32x8(q7[i:]).MulAdd(kv, a7)
+	}
+	var buf0, buf1, buf2, buf3, buf4, buf5, buf6, buf7 [8]Float
+	storeF32x8(a0, buf0[:])
+	storeF32x8(a1, buf1[:])
+	storeF32x8(a2, buf2[:])
+	storeF32x8(a3, buf3[:])
+	storeF32x8(a4, buf4[:])
+	storeF32x8(a5, buf5[:])
+	storeF32x8(a6, buf6[:])
+	storeF32x8(a7, buf7[:])
+	s0 := buf0[0] + buf0[1] + buf0[2] + buf0[3] + buf0[4] + buf0[5] + buf0[6] + buf0[7]
+	s1 := buf1[0] + buf1[1] + buf1[2] + buf1[3] + buf1[4] + buf1[5] + buf1[6] + buf1[7]
+	s2 := buf2[0] + buf2[1] + buf2[2] + buf2[3] + buf2[4] + buf2[5] + buf2[6] + buf2[7]
+	s3 := buf3[0] + buf3[1] + buf3[2] + buf3[3] + buf3[4] + buf3[5] + buf3[6] + buf3[7]
+	s4 := buf4[0] + buf4[1] + buf4[2] + buf4[3] + buf4[4] + buf4[5] + buf4[6] + buf4[7]
+	s5 := buf5[0] + buf5[1] + buf5[2] + buf5[3] + buf5[4] + buf5[5] + buf5[6] + buf5[7]
+	s6 := buf6[0] + buf6[1] + buf6[2] + buf6[3] + buf6[4] + buf6[5] + buf6[6] + buf6[7]
+	s7 := buf7[0] + buf7[1] + buf7[2] + buf7[3] + buf7[4] + buf7[5] + buf7[6] + buf7[7]
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < d; i++ {
+		s0 += q0[i] * k[i]
+		s1 += q1[i] * k[i]
+		s2 += q2[i] * k[i]
+		s3 += q3[i] * k[i]
+		s4 += q4[i] * k[i]
+		s5 += q5[i] * k[i]
+		s6 += q6[i] * k[i]
+		s7 += q7[i] * k[i]
+	}
+	out[0] = s0
+	out[1] = s1
+	out[2] = s2
+	out[3] = s3
+	out[4] = s4
+	out[5] = s5
+	out[6] = s6
+	out[7] = s7
+}
+
+func axpy6(ws []Float, v, outs []Float) {
+	d := len(v)
+	o0 := outs[0*d : 1*d : 1*d]
+	o1 := outs[1*d : 2*d : 2*d]
+	o2 := outs[2*d : 3*d : 3*d]
+	o3 := outs[3*d : 4*d : 4*d]
+	o4 := outs[4*d : 5*d : 5*d]
+	o5 := outs[5*d : 6*d : 6*d]
+	w0 := archsimd.BroadcastFloat32x8(ws[0])
+	w1 := archsimd.BroadcastFloat32x8(ws[1])
+	w2 := archsimd.BroadcastFloat32x8(ws[2])
+	w3 := archsimd.BroadcastFloat32x8(ws[3])
+	w4 := archsimd.BroadcastFloat32x8(ws[4])
+	w5 := archsimd.BroadcastFloat32x8(ws[5])
+	n := d &^ 7
+	for i := 0; i < n; i += 8 {
+		vv := loadF32x8(v[i:])
+		storeF32x8(vv.MulAdd(w0, loadF32x8(o0[i:])), o0[i:])
+		storeF32x8(vv.MulAdd(w1, loadF32x8(o1[i:])), o1[i:])
+		storeF32x8(vv.MulAdd(w2, loadF32x8(o2[i:])), o2[i:])
+		storeF32x8(vv.MulAdd(w3, loadF32x8(o3[i:])), o3[i:])
+		storeF32x8(vv.MulAdd(w4, loadF32x8(o4[i:])), o4[i:])
+		storeF32x8(vv.MulAdd(w5, loadF32x8(o5[i:])), o5[i:])
+	}
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < d; i++ {
+		o0[i] += ws[0] * v[i]
+		o1[i] += ws[1] * v[i]
+		o2[i] += ws[2] * v[i]
+		o3[i] += ws[3] * v[i]
+		o4[i] += ws[4] * v[i]
+		o5[i] += ws[5] * v[i]
+	}
+}
+
+func axpy7(ws []Float, v, outs []Float) {
+	d := len(v)
+	o0 := outs[0*d : 1*d : 1*d]
+	o1 := outs[1*d : 2*d : 2*d]
+	o2 := outs[2*d : 3*d : 3*d]
+	o3 := outs[3*d : 4*d : 4*d]
+	o4 := outs[4*d : 5*d : 5*d]
+	o5 := outs[5*d : 6*d : 6*d]
+	o6 := outs[6*d : 7*d : 7*d]
+	w0 := archsimd.BroadcastFloat32x8(ws[0])
+	w1 := archsimd.BroadcastFloat32x8(ws[1])
+	w2 := archsimd.BroadcastFloat32x8(ws[2])
+	w3 := archsimd.BroadcastFloat32x8(ws[3])
+	w4 := archsimd.BroadcastFloat32x8(ws[4])
+	w5 := archsimd.BroadcastFloat32x8(ws[5])
+	w6 := archsimd.BroadcastFloat32x8(ws[6])
+	n := d &^ 7
+	for i := 0; i < n; i += 8 {
+		vv := loadF32x8(v[i:])
+		storeF32x8(vv.MulAdd(w0, loadF32x8(o0[i:])), o0[i:])
+		storeF32x8(vv.MulAdd(w1, loadF32x8(o1[i:])), o1[i:])
+		storeF32x8(vv.MulAdd(w2, loadF32x8(o2[i:])), o2[i:])
+		storeF32x8(vv.MulAdd(w3, loadF32x8(o3[i:])), o3[i:])
+		storeF32x8(vv.MulAdd(w4, loadF32x8(o4[i:])), o4[i:])
+		storeF32x8(vv.MulAdd(w5, loadF32x8(o5[i:])), o5[i:])
+		storeF32x8(vv.MulAdd(w6, loadF32x8(o6[i:])), o6[i:])
+	}
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < d; i++ {
+		o0[i] += ws[0] * v[i]
+		o1[i] += ws[1] * v[i]
+		o2[i] += ws[2] * v[i]
+		o3[i] += ws[3] * v[i]
+		o4[i] += ws[4] * v[i]
+		o5[i] += ws[5] * v[i]
+		o6[i] += ws[6] * v[i]
+	}
+}
+
+func axpy8(ws []Float, v, outs []Float) {
+	d := len(v)
+	o0 := outs[0*d : 1*d : 1*d]
+	o1 := outs[1*d : 2*d : 2*d]
+	o2 := outs[2*d : 3*d : 3*d]
+	o3 := outs[3*d : 4*d : 4*d]
+	o4 := outs[4*d : 5*d : 5*d]
+	o5 := outs[5*d : 6*d : 6*d]
+	o6 := outs[6*d : 7*d : 7*d]
+	o7 := outs[7*d : 8*d : 8*d]
+	w0 := archsimd.BroadcastFloat32x8(ws[0])
+	w1 := archsimd.BroadcastFloat32x8(ws[1])
+	w2 := archsimd.BroadcastFloat32x8(ws[2])
+	w3 := archsimd.BroadcastFloat32x8(ws[3])
+	w4 := archsimd.BroadcastFloat32x8(ws[4])
+	w5 := archsimd.BroadcastFloat32x8(ws[5])
+	w6 := archsimd.BroadcastFloat32x8(ws[6])
+	w7 := archsimd.BroadcastFloat32x8(ws[7])
+	n := d &^ 7
+	for i := 0; i < n; i += 8 {
+		vv := loadF32x8(v[i:])
+		storeF32x8(vv.MulAdd(w0, loadF32x8(o0[i:])), o0[i:])
+		storeF32x8(vv.MulAdd(w1, loadF32x8(o1[i:])), o1[i:])
+		storeF32x8(vv.MulAdd(w2, loadF32x8(o2[i:])), o2[i:])
+		storeF32x8(vv.MulAdd(w3, loadF32x8(o3[i:])), o3[i:])
+		storeF32x8(vv.MulAdd(w4, loadF32x8(o4[i:])), o4[i:])
+		storeF32x8(vv.MulAdd(w5, loadF32x8(o5[i:])), o5[i:])
+		storeF32x8(vv.MulAdd(w6, loadF32x8(o6[i:])), o6[i:])
+		storeF32x8(vv.MulAdd(w7, loadF32x8(o7[i:])), o7[i:])
+	}
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < d; i++ {
+		o0[i] += ws[0] * v[i]
+		o1[i] += ws[1] * v[i]
+		o2[i] += ws[2] * v[i]
+		o3[i] += ws[3] * v[i]
+		o4[i] += ws[4] * v[i]
+		o5[i] += ws[5] * v[i]
+		o6[i] += ws[6] * v[i]
+		o7[i] += ws[7] * v[i]
+	}
+}
