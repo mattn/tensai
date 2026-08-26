@@ -219,10 +219,12 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 	grp := q.group()
 	groups := (q.Rows + grp - 1) / grp
 	xus := make([][]uint8, rows)
+	xqs := make([][]uint32, rows)
 	sxs := make([]Float, rows)
 	gsums := make([][]int32, rows)
 	for r := 0; r < rows; r++ {
 		xus[r], sxs[r] = quantizeActs(x.Data[r*x.Cols : (r+1)*x.Cols])
+		xqs[r] = packQuads(xus[r])
 		gsums[r] = make([]int32, groups)
 		for i, u := range xus[r] {
 			gsums[r][min(i/grp, groups-1)] += int32(u) - 64
@@ -234,6 +236,7 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 	// work scales with padded rows too, and speculative decoding's
 	// four-row verification block must not pay double.
 	var pxus [][]uint8
+	var pxqs [][]uint32
 	var psxs []Float
 	var pgs [][]int32
 	var scratch *Matrix
@@ -241,6 +244,10 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 	if rem != 0 && rem != 4 {
 		t := rows - rem
 		pxus, psxs, scratch = padRows8(xus[t:], sxs[t:], len(xus[0]), q.Cols)
+		pxqs = make([][]uint32, 8)
+		for i := range pxqs {
+			pxqs[i] = packQuads(pxus[i])
+		}
 		pgs = make([][]int32, 8)
 		copy(pgs, gsums[t:])
 		for i := rem; i < 8; i++ {
@@ -250,17 +257,17 @@ func (q *Q4Matrix) MatMul(x, out *Matrix) error {
 	run := func(lo, hi int) {
 		var r int
 		for ; r+8 <= rows; r += 8 {
-			q4matmulCols8(out, xus[r:r+8], sxs[r:r+8], gsums[r:r+8], r, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
+			q4matmulCols8(out, xus[r:r+8], xqs[r:r+8], sxs[r:r+8], gsums[r:r+8], r, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
 		}
 		switch {
 		case rem == 0:
 		case rem == 4:
-			q4matmulCols4(out, xus[r:r+4], sxs[r:r+4], gsums[r:r+4], r, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
+			q4matmulCols4(out, xus[r:r+4], xqs[r:r+4], sxs[r:r+4], gsums[r:r+4], r, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
 		default:
 			if rem < 4 {
-				q4matmulCols4(scratch, pxus[:4], psxs[:4], pgs[:4], 0, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
+				q4matmulCols4(scratch, pxus[:4], pxqs[:4], psxs[:4], pgs[:4], 0, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
 			} else {
-				q4matmulCols8(scratch, pxus, psxs, pgs, 0, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
+				q4matmulCols8(scratch, pxus, pxqs, psxs, pgs, 0, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
 			}
 			for i := 0; i < rem; i++ {
 				copy(out.Data[(r+i)*q.Cols+lo:(r+i)*q.Cols+hi], scratch.Data[i*q.Cols+lo:i*q.Cols+hi])
