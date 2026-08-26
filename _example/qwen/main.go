@@ -41,8 +41,9 @@ type sampleCandidate struct {
 }
 
 type sampleScratch struct {
-	ps    []float64
-	cands []sampleCandidate
+	ps      []float64
+	buckets []uint16
+	cands   []sampleCandidate
 }
 
 var sampleScratchPool sync.Pool
@@ -159,6 +160,10 @@ func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 		scratch.ps = make([]float64, len(logits))
 	}
 	ps := scratch.ps[:len(logits)]
+	if cap(scratch.buckets) < len(logits) {
+		scratch.buckets = make([]uint16, len(logits))
+	}
+	buckets := scratch.buckets[:len(logits)]
 	cands := scratch.cands[:0]
 	defer func() {
 		scratch.cands = cands[:0]
@@ -204,9 +209,11 @@ func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 		}
 		return b
 	}
-	for _, p := range ps {
+	for i, p := range ps {
 		if p > 0 {
-			bsum[bucket(p)] += p
+			b := bucket(p)
+			buckets[i] = uint16(b)
+			bsum[b] += p
 		}
 	}
 	target := topP * sum
@@ -220,7 +227,7 @@ func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 		}
 	}
 	for i, p := range ps {
-		if p > 0 && bucket(p) <= cut {
+		if p > 0 && int(buckets[i]) <= cut {
 			cands = append(cands, sampleCandidate{i, p})
 		}
 	}
