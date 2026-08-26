@@ -65,6 +65,7 @@ _example/tensor     Tour of the n-d Tensor: broadcasting, batched MatMul, attent
 _example/wgpu       WebGPU MatMul: adapter info, CPU cross-check, GPU vs CPU sweep
 _example/gpt2       The published GPT-2 (124M) checkpoint generating text in pure Go
 _example/qwen       Qwen2.5-0.5B-Instruct chatting in pure Go: RoPE, GQA, SwiGLU
+cmd/tensai          The tensai command: run, chat, and serve subcommands over internal/llm
 ```
 
 ## Usage
@@ -410,6 +411,12 @@ go run ./_example/plasma
 go run ./_example/tensor
 GOEXPERIMENT=simd go run ./_example/gpt2          # downloads the GPT-2 checkpoint (~550MB) on first run
 GOEXPERIMENT=simd go run ./_example/qwen -q8      # downloads Qwen2.5-0.5B-Instruct (~1GB) on first run
+
+# The tensai command wraps the same engine as subcommands:
+GOEXPERIMENT=simd go install ./cmd/tensai
+tensai run -q8 "What is the capital of France?"
+tensai chat -q8 -gguf model.gguf
+tensai serve -q8 -addr :8080                      # OpenAI-compatible API
 go run -tags wgpu ./_example/wgpu          # needs wgpu-native, see above
 go run -tags wgpu ./_example/wgpu -sweep  # GPU vs CPU across sizes
 go test ./...

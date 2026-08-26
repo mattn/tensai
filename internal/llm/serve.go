@@ -1,4 +1,4 @@
-package main
+package llm
 
 // -serve turns the example into a minimal OpenAI-compatible endpoint:
 // POST /v1/chat/completions accepts the familiar messages array (with
