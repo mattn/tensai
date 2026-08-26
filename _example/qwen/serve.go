@@ -189,6 +189,44 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// Byte-fallback BPE tokens can split a multi-byte character, so a
+	// chunk holds back an incomplete trailing rune until the next token
+	// completes it; deliberately invalid bytes still flush once older
+	// than one rune, so garbage cannot stall the stream.
+	var pend []byte
+	push := func(piece string, final bool) {
+		pend = append(pend, piece...)
+		cut := len(pend)
+		if !final {
+			for k := 1; k <= 3 && k <= len(pend); k++ {
+				b := pend[len(pend)-k]
+				if b&0xC0 == 0x80 {
+					continue
+				}
+				var l int
+				switch {
+				case b < 0x80:
+					l = 1
+				case b >= 0xF0:
+					l = 4
+				case b >= 0xE0:
+					l = 3
+				case b >= 0xC0:
+					l = 2
+				default:
+					l = 1
+				}
+				if l > k {
+					cut = len(pend) - k
+				}
+				break
+			}
+		}
+		if cut > 0 {
+			flush(string(pend[:cut]))
+			pend = append(pend[:0], pend[cut:]...)
+		}
+	}
 
 	logits := s.prefill(ids, 0)
 	steps := len(ids)
@@ -212,7 +250,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, next)
 		if flush != nil {
-			flush(s.tok.Decode([]int{next}))
+			push(s.tok.Decode([]int{next}), false)
 		}
 		logits = s.step(next, steps)
 		steps++
@@ -222,6 +260,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
+		if len(pend) > 0 {
+			push("", true)
+		}
 		final := map[string]any{
 			"id": id, "object": "chat.completion.chunk", "created": created,
 			"model": "tensai",
