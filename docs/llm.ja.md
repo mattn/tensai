@@ -98,17 +98,21 @@ prefill 401 tokens, decode 32 tokens, int8 weights
 cpu: AVX2 kernels
 gpu: Microsoft Direct3D12 (AMD Radeon(TM) Graphics) (integrated) via -tags wgpu24
 
-               prefill       decode
-cpu            398.2 t/s       39.4 t/s
-gpu           2020.9 t/s       29.7 t/s
-gpu/cpu          5.08x         0.75x
+median of 5 runs after one warm-up, tokens/sec
+
+           prefill                  decode
+cpu          430.7 (357-446)          38.3 (38-39)
+gpu         2241.5 (1663-2295)        28.7 (25-29)
+gpu/cpu      5.20x                   0.75x
 ```
 
-`-p` でプロンプトのおおよそのトークン数、`-n` でデコードするトークン数を指定
-します。GPU ビルドタグなしの場合は、GPU 行に理由が表示されます。 プレフィルの t/s はプロンプトが
-長くなるほど下がり (attention が二次)、変換レイヤー越しでは実行ごとに数 %
-ぶれます。長さをまたいだ単発の数値ではなく、同じ長さで数回の中央値を比べて
-ください。
+`-p` でプロンプトのおおよそのトークン数、`-n` でデコードするトークン数、`-r`
+で計測の反復回数を指定します。GPU ビルドタグなしの場合は、GPU 行に理由が
+表示されます。反復の間モデルは常駐したままで、最初の 1 回は捨てられるので、
+サンプルは定常状態を表します — この経路ではコールドのプレフィルが 3 割ほど
+低く出ることがあり、定常状態を報告するツールと比べるとそれが不公平になり
+ます。プレフィルの t/s は attention が二次なのでプロンプトが長いほど下がり
+ます。比較は同じ長さで行ってください。
 
 ### OpenAI 互換 API の提供
 
