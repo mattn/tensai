@@ -12,32 +12,34 @@ import (
 	"fmt"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/gpu"
+	"github.com/mattn/tensai/quant"
 )
 
 // gpuMat is the resident weight interface both quantization widths
 // satisfy.
 type gpuMat interface {
-	MatMul(*tensai.GPUTensor) (*tensai.GPUTensor, error)
-	MatMulOpts(x, bias, dst *tensai.GPUTensor) (*tensai.GPUTensor, error)
+	MatMul(*gpu.Tensor) (*gpu.Tensor, error)
+	MatMulOpts(x, bias, dst *gpu.Tensor) (*gpu.Tensor, error)
 	Free()
 }
 
 type gpuLayer struct {
-	ln1, ln2                          *tensai.GPUTensor
-	qNorm, kNorm                      *tensai.GPUTensor // Qwen3/Gemma QK-norm; nil otherwise
-	postAttn, postFFN                 *tensai.GPUTensor // Gemma sandwich norms; nil otherwise
+	ln1, ln2                          *gpu.Tensor
+	qNorm, kNorm                      *gpu.Tensor // Qwen3/Gemma QK-norm; nil otherwise
+	postAttn, postFFN                 *gpu.Tensor // Gemma sandwich norms; nil otherwise
 	noPE                              bool
 	window                            int
 	ropeTheta                         float64
 	geglu                             bool
-	bq, bk, bv                        *tensai.GPUTensor
+	bq, bk, bv                        *gpu.Tensor
 	qq, qk, qv, qo, qGate, qUp, qDown gpuMat
-	kc, vc                            *tensai.GPUTensor // [nCtx, kvDim]
+	kc, vc                            *gpu.Tensor // [nCtx, kvDim]
 }
 
 type gpuQwen struct {
 	m      *qwen
-	g      *tensai.GPU
+	g      *gpu.Device
 	layers []gpuLayer
 	nCtx   int
 	gpuLen int // cache positions currently valid on the GPU
@@ -47,7 +49,7 @@ type gpuQwen struct {
 // scales are per (group, column), so the slice is exact. Tile-aligned
 // ranges (every fused projection boundary in practice) copy whole
 // contiguous tile blocks; anything else moves nibble by nibble.
-func sliceQ4(q *tensai.Q4Matrix, lo, hi int) *tensai.Q4Matrix {
+func sliceQ4(q *quant.Q4Matrix, lo, hi int) *quant.Q4Matrix {
 	quads := (q.Rows + 3) / 4
 	gsz := q.Group
 	if gsz == 0 {
@@ -55,7 +57,7 @@ func sliceQ4(q *tensai.Q4Matrix, lo, hi int) *tensai.Q4Matrix {
 	}
 	groups := (q.Rows + gsz - 1) / gsz
 	cols := hi - lo
-	out := tensai.NewQ4Matrix(q.Rows, cols, q.Group, false)
+	out := quant.NewQ4Matrix(q.Rows, cols, q.Group, false)
 	if lo%32 == 0 && cols%32 == 0 {
 		block := quads * 64
 		copy(out.Q[:(cols/32)*block], q.Q[(lo/32)*block:(hi/32)*block])
@@ -79,10 +81,10 @@ func sliceQ4(q *tensai.Q4Matrix, lo, hi int) *tensai.Q4Matrix {
 // sliceQ copies a column range out of a fused quantized matrix: the GPU
 // path keeps q, k, v (and gate, up) as separate resident weights, and
 // per-column quantization makes the slice exact.
-func sliceQ(q *tensai.QMatrix, lo, hi int) *tensai.QMatrix {
+func sliceQ(q *quant.QMatrix, lo, hi int) *quant.QMatrix {
 	quads := (q.Rows + 3) / 4
 	cols := hi - lo
-	out := &tensai.QMatrix{
+	out := &quant.QMatrix{
 		Rows:     q.Rows,
 		Cols:     cols,
 		Q:        make([]int8, ((cols+31)/32)*quads*4*32+32),
@@ -122,9 +124,9 @@ func must[T any](v T, err error) T {
 // newGPUQwen uploads the model's transformer blocks to the GPU: the int8
 // weight twins, the norm weights and biases, and zeroed KV caches sized
 // for nCtx positions.
-func newGPUQwen(m *qwen, g *tensai.GPU, nCtx int) (*gpuQwen, error) {
+func newGPUQwen(m *qwen, g *gpu.Device, nCtx int) (*gpuQwen, error) {
 	kvDim := m.cfg.KVHeads * m.headSz
-	vec := func(v []float32) *tensai.GPUTensor {
+	vec := func(v []float32) *gpu.Tensor {
 		if v == nil { // llama: no attention biases
 			return nil
 		}

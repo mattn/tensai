@@ -24,6 +24,7 @@ import (
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/gguf"
+	"github.com/mattn/tensai/quant"
 	"github.com/mattn/tensai/tokenizer"
 )
 
@@ -138,7 +139,7 @@ func unpermuteVec(v []float32, heads int) []float32 {
 // transposed Q8GMatrix, integer work only: the weights never pass through
 // float32. colMap permutes output rows on the way in (the llama-family
 // q/k rope unpermutation).
-func repackQ8(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+func repackQ8(dst *quant.Q8GMatrix, raw []byte, out, in, colOff int, colMap func(int) int) {
 	nb := in / 32
 	for r := 0; r < out; r++ {
 		j := colOff + r
@@ -164,7 +165,7 @@ func repackQ8(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap fun
 // into columns [colOff, colOff+out) of a transposed Group-32 Q4Matrix.
 // The nibble encoding matches tensai's exactly, so this is integer work
 // plus one f16 widen per block.
-func repackQ4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+func repackQ4(dst *quant.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
 	nb := in / 32
 	for r := 0; r < out; r++ {
 		j := colOff + r
@@ -189,7 +190,7 @@ func repackQ4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func
 // a 32-bit high-bit plane, and 32 offset-binary five-bit values apiece —
 // into columns of a transposed Group-32 Q8GMatrix: the 5-bit values
 // (offset removed they span -16..15) widen losslessly to int8.
-func repackQ50(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+func repackQ50(dst *quant.Q8GMatrix, raw []byte, out, in, colOff int, colMap func(int) int) {
 	nb := in / 32
 	for r := 0; r < out; r++ {
 		j := colOff + r
@@ -218,7 +219,7 @@ func repackQ50(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap fu
 // Q4Matrix: each five-bit value rounds to half its magnitude on the
 // nibble grid and the scale doubles, losing one bit of weight precision
 // with pure integer work.
-func repackQ504(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+func repackQ504(dst *quant.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
 	nb := in / 32
 	nib := func(v int) uint8 {
 		if v >= 0 {
@@ -299,7 +300,7 @@ func kScaleMin(is int, q []byte) (sc, mn uint8) {
 // against two f16 super-factors — into columns of a transposed Group-32
 // min-form Q4Matrix. Nibbles copy raw; the per-group scale and min pairs
 // round to packed bfloat16, the only lossy step (~0.2% on the tables).
-func repackQ4K(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+func repackQ4K(dst *quant.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
 	nb := in / 256
 	for r := 0; r < out; r++ {
 		j := colOff + r
@@ -315,7 +316,7 @@ func repackQ4K(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fun
 			for is := 0; is < 8; is++ {
 				sc, mn := kScaleMin(is, scales)
 				g := b*8 + is
-				dst.ScaleMin[dst.TableIndex(g, j)] = tensai.PackScaleMin(d*float32(sc), dmin*float32(mn))
+				dst.ScaleMin[dst.TableIndex(g, j)] = quant.PackScaleMin(d*float32(sc), dmin*float32(mn))
 			}
 			for c := 0; c < 4; c++ {
 				for l := 0; l < 32; l++ {
@@ -335,7 +336,7 @@ func repackQ4K(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fun
 // f16 super-factor — into columns of a transposed Group-16 Q8GMatrix.
 // The 6-bit values land in int8 exactly (they span ±32 after the offset),
 // so only the per-group scale table touches floats.
-func repackQ6K(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+func repackQ6K(dst *quant.Q8GMatrix, raw []byte, out, in, colOff int, colMap func(int) int) {
 	nb := in / 256
 	var q [256]int8
 	for r := 0; r < out; r++ {
@@ -389,7 +390,7 @@ func decodeQ6K(blk []byte, q *[256]int8) {
 // when -q4 asks for a 4-bit runtime; -q8 keeps all six bits via
 // repackQ6K. (A Group-16 destination would preserve slightly more, but
 // folding every 16 rows costs ~25% of decode throughput.)
-func repackQ6K4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+func repackQ6K4(dst *quant.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
 	nb := in / 256
 	var q [256]int8
 	var v [32]float32
@@ -420,9 +421,9 @@ func repackQ6K4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fu
 				// Quantize against the bfloat16-rounded pair the kernel
 				// will unpack, so the rounding lands on the nibble choice
 				// rather than stacking onto the reconstruction.
-				packed := tensai.PackScaleMin((vmax-vmin)/15, -vmin)
+				packed := quant.PackScaleMin((vmax-vmin)/15, -vmin)
 				dst.ScaleMin[dst.TableIndex(g, j)] = packed
-				scale, mn := tensai.UnpackScaleMin(packed)
+				scale, mn := quant.UnpackScaleMin(packed)
 				if scale == 0 {
 					continue
 				}
@@ -459,7 +460,7 @@ func decodeQ4K(blk []byte, q *[256]uint8) {
 // Group-32 Q8GMatrix, the -q8 counterpart of repackQ4K: the int8 grid is
 // eight times finer than the stored nibbles, so the round trip costs
 // well under the source's own quantization step.
-func repackQ4K8(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+func repackQ4K8(dst *quant.Q8GMatrix, raw []byte, out, in, colOff int, colMap func(int) int) {
 	nb := in / 256
 	var q [256]uint8
 	var v [32]float32
@@ -538,7 +539,7 @@ func decodeQ5K(blk []byte, q *[256]uint8) {
 // under the source's own quantization step, and the values stream from
 // the mmap'd blocks without materializing a float tensor. Used under
 // -q8; -q4 narrows through repackQ5K4 instead.
-func repackQ5K8(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+func repackQ5K8(dst *quant.Q8GMatrix, raw []byte, out, in, colOff int, colMap func(int) int) {
 	nb := in / 256
 	var q [256]uint8
 	var v [32]float32
@@ -590,7 +591,7 @@ func repackQ5K8(dst *tensai.Q8GMatrix, raw []byte, out, in, colOff int, colMap f
 // min-form Q4Matrix: each sub-group's five-bit span renormalizes onto
 // [0, 15] with integer rounding, losing at most one bit of weight
 // precision, and only the packed scale/min pair touches floats.
-func repackQ5K4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
+func repackQ5K4(dst *quant.Q4Matrix, raw []byte, out, in, colOff int, colMap func(int) int) {
 	nb := in / 256
 	var q [256]uint8
 	for r := 0; r < out; r++ {
@@ -621,7 +622,7 @@ func repackQ5K4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fu
 				}
 				span := int(qhi) - int(qlo)
 				g := b*8 + is
-				dst.ScaleMin[dst.TableIndex(g, j)] = tensai.PackScaleMin(
+				dst.ScaleMin[dst.TableIndex(g, j)] = quant.PackScaleMin(
 					s*float32(sgn)*float32(span)/15, m-s*float32(qref))
 				if span == 0 {
 					continue
@@ -639,20 +640,20 @@ func repackQ5K4(dst *tensai.Q4Matrix, raw []byte, out, in, colOff int, colMap fu
 // repackMXFP4 copies an MXFP4 tensor's blocks — [out, in] with one E8M0
 // exponent and 32 FP4 codes apiece — into columns of a transposed
 // MXFP4Matrix: the codes move verbatim, so the repack is exact.
-func repackMXFP4(dst *tensai.MXFP4Matrix, raw []byte, out, in, colOff int) {
+func repackMXFP4(dst *quant.MXFP4Matrix, raw []byte, out, in, colOff int) {
 	nb := in / 32
 	for r := 0; r < out; r++ {
 		j := colOff + r
 		for b := 0; b < nb; b++ {
 			blk := raw[(r*nb+b)*17:]
-			dst.Scale[dst.TableIndex(b, j)] = tensai.MXFP4Scale(blk[0])
+			dst.Scale[dst.TableIndex(b, j)] = quant.MXFP4Scale(blk[0])
 			var sum int32
 			for i := 0; i < 16; i++ {
 				q := blk[1+i]
 				iLo, iHi := b*32+i, b*32+i+16
 				dst.Q[dst.Index(iLo, j)] |= (q & 0x0F) << (4 * (iLo % 2))
 				dst.Q[dst.Index(iHi, j)] |= (q >> 4) << (4 * (iHi % 2))
-				sum += int32(tensai.MXFP4Value(q&0x0F)) + int32(tensai.MXFP4Value(q>>4))
+				sum += int32(quant.MXFP4Value(q&0x0F)) + int32(quant.MXFP4Value(q>>4))
 			}
 			dst.ColSum64[dst.TableIndex(b, j)] = 64 * sum
 		}
@@ -832,14 +833,14 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 		}
 		return m.T()
 	}
-	quant := func(w *tensai.Matrix) (*tensai.Matrix, *qmat) {
+	quantize := func(w *tensai.Matrix) (*tensai.Matrix, *qmat) {
 		if bits == 0 {
 			return w, nil
 		}
 		return nil, quantizeMat(w, bits)
 	}
 	lin := func(name string, unpermute int) (*tensai.Matrix, *qmat) {
-		return quant(trans(name, unpermute))
+		return quantize(trans(name, unpermute))
 	}
 	// allQ8 reports whether every named tensor is stored as Q8_0, the
 	// precondition for the direct repack.
@@ -911,7 +912,7 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 			total += o
 		}
 		if bits == 8 {
-			dst := tensai.NewQ8GMatrix(in, total, 0)
+			dst := quant.NewQ8GMatrix(in, total, 0)
 			colOff := 0
 			for i, name := range names {
 				_, raw, err := g.RawTensor(name)
@@ -923,7 +924,7 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 			}
 			return qmatQ8G(dst)
 		}
-		dst := tensai.NewQ4Matrix(in, total, 32, true)
+		dst := quant.NewQ4Matrix(in, total, 32, true)
 		colOff := 0
 		for i, name := range names {
 			_, raw, err := g.RawTensor(name)
@@ -965,7 +966,7 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 			total += o
 		}
 		if bits == 8 {
-			dst := tensai.NewQ8GMatrix(in, total, 16)
+			dst := quant.NewQ8GMatrix(in, total, 16)
 			colOff := 0
 			for i, name := range names {
 				_, raw, err := g.RawTensor(name)
@@ -977,7 +978,7 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 			}
 			return qmatQ8G(dst)
 		}
-		dst := tensai.NewQ4Matrix(in, total, 32, true)
+		dst := quant.NewQ4Matrix(in, total, 32, true)
 		colOff := 0
 		for i, name := range names {
 			_, raw, err := g.RawTensor(name)
@@ -1004,7 +1005,7 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 			total += o
 		}
 		if bits == 8 {
-			dst := tensai.NewQ8GMatrix(in, total, 0)
+			dst := quant.NewQ8GMatrix(in, total, 0)
 			colOff := 0
 			for i, name := range names {
 				_, raw, err := g.RawTensor(name)
@@ -1016,7 +1017,7 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 			}
 			return qmatQ8G(dst)
 		}
-		dst := tensai.NewQ4Matrix(in, total, 32, true)
+		dst := quant.NewQ4Matrix(in, total, 32, true)
 		colOff := 0
 		for i, name := range names {
 			_, raw, err := g.RawTensor(name)
@@ -1041,7 +1042,7 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 		for _, o := range outs {
 			total += o
 		}
-		dst := tensai.NewQ4Matrix(in, total, 32, false)
+		dst := quant.NewQ4Matrix(in, total, 32, false)
 		colOff := 0
 		for i, name := range names {
 			_, raw, err := g.RawTensor(name)
@@ -1068,7 +1069,7 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 		for _, o := range outs {
 			total += o
 		}
-		dst := tensai.NewQ8GMatrix(in, total, 0)
+		dst := quant.NewQ8GMatrix(in, total, 0)
 		colOff := 0
 		for i, name := range names {
 			_, raw, err := g.RawTensor(name)
@@ -1107,7 +1108,7 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 		for i, name := range names {
 			parts = append(parts, trans(name, perms[i]))
 		}
-		return quant(hcat(parts))
+		return quantize(hcat(parts))
 	}
 
 	// moeExpert repacks one expert's plane of the named 3D tensors —
@@ -1153,43 +1154,43 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 		if rb == 0 {
 			panic(fmt.Sprintf("moe: expert tensor %s stored as %s is unsupported", names[0], typ0))
 		}
-		var q4 *tensai.Q4Matrix
-		var q8 *tensai.Q8GMatrix
-		var mx *tensai.MXFP4Matrix
+		var q4 *quant.Q4Matrix
+		var q8 *quant.Q8GMatrix
+		var mx *quant.MXFP4Matrix
 		var pack func(raw []byte, out, colOff int)
 		switch {
 		case typ0 == "MXFP4":
-			mx = tensai.NewMXFP4Matrix(in, total)
+			mx = quant.NewMXFP4Matrix(in, total)
 			pack = func(raw []byte, out, colOff int) { repackMXFP4(mx, raw, out, in, colOff) }
 		case typ0 == "Q8_0":
-			q8 = tensai.NewQ8GMatrix(in, total, 0)
+			q8 = quant.NewQ8GMatrix(in, total, 0)
 			pack = func(raw []byte, out, colOff int) { repackQ8(q8, raw, out, in, colOff, nil) }
 		case typ0 == "Q4_0":
-			q4 = tensai.NewQ4Matrix(in, total, 32, false)
+			q4 = quant.NewQ4Matrix(in, total, 32, false)
 			pack = func(raw []byte, out, colOff int) { repackQ4(q4, raw, out, in, colOff, nil) }
 		case typ0 == "Q5_0" && bits == 8:
-			q8 = tensai.NewQ8GMatrix(in, total, 0)
+			q8 = quant.NewQ8GMatrix(in, total, 0)
 			pack = func(raw []byte, out, colOff int) { repackQ50(q8, raw, out, in, colOff, nil) }
 		case typ0 == "Q5_0":
-			q4 = tensai.NewQ4Matrix(in, total, 32, false)
+			q4 = quant.NewQ4Matrix(in, total, 32, false)
 			pack = func(raw []byte, out, colOff int) { repackQ504(q4, raw, out, in, colOff, nil) }
 		case typ0 == "Q4_K" && bits == 8:
-			q8 = tensai.NewQ8GMatrix(in, total, 0)
+			q8 = quant.NewQ8GMatrix(in, total, 0)
 			pack = func(raw []byte, out, colOff int) { repackQ4K8(q8, raw, out, in, colOff, nil) }
 		case typ0 == "Q4_K":
-			q4 = tensai.NewQ4Matrix(in, total, 32, true)
+			q4 = quant.NewQ4Matrix(in, total, 32, true)
 			pack = func(raw []byte, out, colOff int) { repackQ4K(q4, raw, out, in, colOff, nil) }
 		case typ0 == "Q5_K" && bits == 8:
-			q8 = tensai.NewQ8GMatrix(in, total, 0)
+			q8 = quant.NewQ8GMatrix(in, total, 0)
 			pack = func(raw []byte, out, colOff int) { repackQ5K8(q8, raw, out, in, colOff, nil) }
 		case typ0 == "Q5_K":
-			q4 = tensai.NewQ4Matrix(in, total, 32, true)
+			q4 = quant.NewQ4Matrix(in, total, 32, true)
 			pack = func(raw []byte, out, colOff int) { repackQ5K4(q4, raw, out, in, colOff, nil) }
 		case typ0 == "Q6_K" && bits == 8:
-			q8 = tensai.NewQ8GMatrix(in, total, 16)
+			q8 = quant.NewQ8GMatrix(in, total, 16)
 			pack = func(raw []byte, out, colOff int) { repackQ6K(q8, raw, out, in, colOff, nil) }
 		default: // Q6_K under -q4
-			q4 = tensai.NewQ4Matrix(in, total, 32, true)
+			q4 = quant.NewQ4Matrix(in, total, 32, true)
 			pack = func(raw []byte, out, colOff int) { repackQ6K4(q4, raw, out, in, colOff, nil) }
 		}
 		colOff := 0

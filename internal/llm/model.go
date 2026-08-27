@@ -21,6 +21,7 @@ import (
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
+	"github.com/mattn/tensai/quant"
 )
 
 type config struct {
@@ -62,34 +63,34 @@ type qmat struct {
 	cols int
 	f    func(x, out []float32) error
 	mm   func(x, out *tensai.Matrix) error
-	q8   *tensai.QMatrix     // retained for GPU upload
-	q4   *tensai.Q4Matrix    // likewise, for the int4 twin
-	q8g  *tensai.Q8GMatrix   // retained for the repack cache
-	mx   *tensai.MXFP4Matrix // likewise
+	q8   *quant.QMatrix     // retained for GPU upload
+	q4   *quant.Q4Matrix    // likewise, for the int4 twin
+	q8g  *quant.Q8GMatrix   // retained for the repack cache
+	mx   *quant.MXFP4Matrix // likewise
 }
 
-func qmatQ8(q *tensai.QMatrix) *qmat {
+func qmatQ8(q *quant.QMatrix) *qmat {
 	return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, q8: q}
 }
 
-func qmatQ4(q *tensai.Q4Matrix) *qmat {
+func qmatQ4(q *quant.Q4Matrix) *qmat {
 	return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, q4: q}
 }
 
-func qmatQ8G(q *tensai.Q8GMatrix) *qmat {
+func qmatQ8G(q *quant.Q8GMatrix) *qmat {
 	return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, q8g: q}
 }
 
-func qmatMX(q *tensai.MXFP4Matrix) *qmat {
+func qmatMX(q *quant.MXFP4Matrix) *qmat {
 	return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, mx: q}
 }
 
 func quantizeMat(m *tensai.Matrix, bits int) *qmat {
 	switch bits {
 	case 8:
-		return qmatQ8(tensai.QuantizeMatrix(m))
+		return qmatQ8(quant.Quantize(m))
 	case 4:
-		q, err := tensai.QuantizeMatrix4(m)
+		q, err := quant.Quantize4(m)
 		if err != nil {
 			panic(err)
 		}

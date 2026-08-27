@@ -24,6 +24,10 @@ import (
 	"time"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/layer"
+	"github.com/mattn/tensai/loss"
+	"github.com/mattn/tensai/model"
+	"github.com/mattn/tensai/optim"
 )
 
 const features = 5 // x, y, r, sin wave, cos wave
@@ -32,23 +36,23 @@ const features = 5 // x, y, r, sin wave, cos wave
 // their weights can be re-randomized: Glorot initialization is tuned for
 // trainability, but a CPPN wants big weights so tanh folds the coordinate
 // space into rich patterns.
-func buildCPPN(seed int64, gain float32) *tensai.Sequential {
-	denses := []*tensai.Dense{
-		tensai.NewDense(32),
-		tensai.NewDense(32),
-		tensai.NewDense(32),
-		tensai.NewDense(3),
+func buildCPPN(seed int64, gain float32) *model.Sequential {
+	denses := []*layer.Dense{
+		layer.NewDense(32),
+		layer.NewDense(32),
+		layer.NewDense(32),
+		layer.NewDense(3),
 	}
-	model := tensai.NewSequential()
+	model := model.NewSequential()
 	model.Add(denses[0])
-	model.Add(&tensai.Tanh{})
+	model.Add(&layer.Tanh{})
 	model.Add(denses[1])
-	model.Add(&tensai.Tanh{})
+	model.Add(&layer.Tanh{})
 	model.Add(denses[2])
-	model.Add(&tensai.Tanh{})
+	model.Add(&layer.Tanh{})
 	model.Add(denses[3])
-	model.Add(&tensai.Sigmoid{})
-	if err := model.Compile(features, tensai.MeanSquaredError{}, tensai.NewSGD(0, 0)); err != nil {
+	model.Add(&layer.Sigmoid{})
+	if err := model.Compile(features, loss.MeanSquaredError{}, optim.NewSGD(0, 0)); err != nil {
 		panic(err)
 	}
 	rng := rand.New(rand.NewSource(seed))

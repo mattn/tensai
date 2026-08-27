@@ -12,6 +12,8 @@ import (
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
+	"github.com/mattn/tensai/gpu"
+	"github.com/mattn/tensai/quant"
 )
 
 const (
@@ -32,13 +34,13 @@ type block struct {
 	kc, vc                 [][]float32 // KV cache, one [768] per position
 
 	// int8 twins of the four weight matrices, used by decode when -q8.
-	qAttnW, qProjW, qFcW, qFc2W *tensai.QMatrix
+	qAttnW, qProjW, qFcW, qFc2W *quant.QMatrix
 }
 
 type gpt2 struct {
 	wte, wpe   *tensai.Tensor // [50257,768], [1024,768]
 	wteT       *tensai.Matrix // [768,50257], for the tied lm head
-	qWteT      *tensai.QMatrix
+	qWteT      *quant.QMatrix
 	lnfW, lnfB []float32
 	blocks     [nLayer]block
 	vocab      int
@@ -49,18 +51,18 @@ type gpt2 struct {
 // compute bound, while decode streams the whole checkpoint per token and
 // is bandwidth bound — exactly where int8 pays.
 func (m *gpt2) quantize() {
-	m.qWteT = tensai.QuantizeMatrix(m.wteT)
+	m.qWteT = quant.Quantize(m.wteT)
 	for i := range m.blocks {
 		b := &m.blocks[i]
-		b.qAttnW = tensai.QuantizeMatrix(b.attnW)
-		b.qProjW = tensai.QuantizeMatrix(b.projW)
-		b.qFcW = tensai.QuantizeMatrix(b.fcW)
-		b.qFc2W = tensai.QuantizeMatrix(b.fc2W)
+		b.qAttnW = quant.Quantize(b.attnW)
+		b.qProjW = quant.Quantize(b.projW)
+		b.qFcW = quant.Quantize(b.fcW)
+		b.qFc2W = quant.Quantize(b.fc2W)
 	}
 }
 
 // mv routes a decode matvec through the int8 weights when they exist.
-func mv(x []float32, w *tensai.Matrix, q *tensai.QMatrix, bias []float32) []float32 {
+func mv(x []float32, w *tensai.Matrix, q *quant.QMatrix, bias []float32) []float32 {
 	if q == nil {
 		return matvec(x, w, bias)
 	}
@@ -325,8 +327,8 @@ func cpuCausalMHA(q, k, v *tensai.Matrix) *tensai.Matrix {
 
 // gpuCausalMHA runs the same attention as one masked multi-head dispatch
 // on resident tensors.
-func gpuCausalMHA(g *tensai.GPU, q, k, v *tensai.Matrix) *tensai.Matrix {
-	upload := func(m *tensai.Matrix) *tensai.GPUTensor {
+func gpuCausalMHA(g *gpu.Device, q, k, v *tensai.Matrix) *tensai.Matrix {
+	upload := func(m *tensai.Matrix) *gpu.Tensor {
 		t, err := g.Upload(m.Tensor())
 		if err != nil {
 			panic(err)
@@ -358,7 +360,7 @@ func gpuCausalMHA(g *tensai.GPU, q, k, v *tensai.Matrix) *tensai.Matrix {
 // matmuls run on tensai's Dot kernel; with a non-nil GPU the causal
 // attention of every block runs as one masked multi-head dispatch on the
 // GPU instead of the CPU loops.
-func (m *gpt2) prefill(tokens []int, g *tensai.GPU) []float32 {
+func (m *gpt2) prefill(tokens []int, g *gpu.Device) []float32 {
 	T := len(tokens)
 	x := tensai.NewMatrix(T, nEmbd)
 	for t, tok := range tokens {

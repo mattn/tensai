@@ -21,6 +21,8 @@ import (
 	"os"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/layer"
+	"github.com/mattn/tensai/model"
 )
 
 // Constants below are taken from the TFLite schema (schema.fbs).
@@ -138,7 +140,7 @@ func (g *graph) constRaw(name string, shape []int32, tensorType byte, raw []byte
 func (g *graph) addOp(o op) { g.ops = append(g.ops, o) }
 
 // Marshal encodes a compiled Sequential model as a TFLite flatbuffer.
-func Marshal(m *tensai.Sequential) ([]byte, error) {
+func Marshal(m *model.Sequential) ([]byte, error) {
 	layers := m.Layers()
 	if len(layers) == 0 {
 		return nil, fmt.Errorf("tflite: model has no layers")
@@ -150,11 +152,11 @@ func Marshal(m *tensai.Sequential) ([]byte, error) {
 	var spatialH, spatialW, spatialC int
 	spatial := false
 	switch l := layers[0].(type) {
-	case *tensai.Conv2D:
+	case *layer.Conv2D:
 		h, w, c, _, _, _, _ := l.Shape()
 		spatialH, spatialW, spatialC, spatial = h, w, c, true
 		cur = g.tensor("input", []int32{1, int32(h), int32(w), int32(c)}, tensorFloat32, 0)
-	case *tensai.Dense:
+	case *layer.Dense:
 		weights, _ := l.Params()
 		cur = g.tensor("input", []int32{1, int32(weights.Rows)}, tensorFloat32, 0)
 	default:
@@ -163,14 +165,14 @@ func Marshal(m *tensai.Sequential) ([]byte, error) {
 
 	features := 0 // valid when !spatial
 	if !spatial {
-		w, _ := layers[0].(*tensai.Dense).Params()
+		w, _ := layers[0].(*layer.Dense).Params()
 		features = w.Rows
 	}
 
-	for li, layer := range layers {
+	for li, lyr := range layers {
 		name := fmt.Sprintf("l%d", li)
-		switch l := layer.(type) {
-		case *tensai.Dense:
+		switch l := lyr.(type) {
+		case *layer.Dense:
 			weights, bias := l.Params()
 			if spatial {
 				if spatialH*spatialW*spatialC != weights.Rows {
@@ -182,14 +184,14 @@ func Marshal(m *tensai.Sequential) ([]byte, error) {
 			cur = g.fullyConnected(name, cur, weights, bias, spatial, spatialH, spatialW, spatialC)
 			spatial = false
 			features = weights.Cols
-		case *tensai.Conv2D:
+		case *layer.Conv2D:
 			var err error
 			cur, spatialH, spatialW, spatialC, err = g.conv2D(name, cur, l, spatial, spatialH, spatialW, spatialC)
 			if err != nil {
 				return nil, err
 			}
 			spatial = true
-		case *tensai.MaxPool2D:
+		case *layer.MaxPool2D:
 			h, w, c, size := l.Shape()
 			if !spatial || h != spatialH || w != spatialW || c != spatialC {
 				return nil, fmt.Errorf("tflite: %s: maxpool input mismatch", name)
@@ -206,28 +208,28 @@ func Marshal(m *tensai.Sequential) ([]byte, error) {
 			g.addOp(op{code: opMaxPool2D, inputs: []int32{cur}, outputs: []int32{out}, optType: optPool2D, options: opts})
 			cur = out
 			spatialH, spatialW = outH, outW
-		case *tensai.BatchNorm:
+		case *layer.BatchNorm:
 			cur = g.batchNorm(name, cur, l)
-		case *tensai.Dropout:
+		case *layer.Dropout:
 			// Identity at inference time.
-		case *tensai.ReLU:
+		case *layer.ReLU:
 			cur = g.activation(name, cur, opRelu, optNone, 0, spatial, spatialH, spatialW, spatialC, features)
-		case *tensai.Sigmoid:
+		case *layer.Sigmoid:
 			cur = g.activation(name, cur, opLogistic, optNone, 0, spatial, spatialH, spatialW, spatialC, features)
-		case *tensai.Tanh:
+		case *layer.Tanh:
 			cur = g.activation(name, cur, opTanh, optNone, 0, spatial, spatialH, spatialW, spatialC, features)
-		case *tensai.LeakyReLU:
+		case *layer.LeakyReLU:
 			g.b.startObject(1)
 			g.b.float32Slot(0, float32(l.Alpha), 0)
 			opts := g.b.endObject()
 			cur = g.activation(name, cur, opLeakyRelu, optLeakyRelu, opts, spatial, spatialH, spatialW, spatialC, features)
-		case *tensai.Softmax:
+		case *layer.Softmax:
 			g.b.startObject(1)
 			g.b.float32Slot(0, 1.0, 0)
 			opts := g.b.endObject()
 			cur = g.activation(name, cur, opSoftmax, optSoftmax, opts, spatial, spatialH, spatialW, spatialC, features)
 		default:
-			return nil, fmt.Errorf("tflite: unsupported layer %T", layer)
+			return nil, fmt.Errorf("tflite: unsupported layer %T", lyr)
 		}
 	}
 
@@ -235,7 +237,7 @@ func Marshal(m *tensai.Sequential) ([]byte, error) {
 }
 
 // MarshalFile writes the marshaled model to a file.
-func MarshalFile(path string, m *tensai.Sequential) error {
+func MarshalFile(path string, m *model.Sequential) error {
 	data, err := Marshal(m)
 	if err != nil {
 		return err
@@ -300,7 +302,7 @@ func (g *graph) fullyConnected(name string, in int32, weights *tensai.Matrix, bi
 }
 
 // conv2D emits CONV_2D with the filter reordered to [outC, kh, kw, inC].
-func (g *graph) conv2D(name string, in int32, l *tensai.Conv2D,
+func (g *graph) conv2D(name string, in int32, l *layer.Conv2D,
 	spatial bool, curH, curW, curC int) (int32, int, int, int, error) {
 	h, w, c, outC, k, stride, pad := l.Shape()
 	if !spatial || h != curH || w != curW || c != curC {
@@ -350,7 +352,7 @@ func (g *graph) conv2D(name string, in int32, l *tensai.Conv2D,
 }
 
 // batchNorm folds inference-time BatchNorm into Mul + Add constants.
-func (g *graph) batchNorm(name string, in int32, l *tensai.BatchNorm) int32 {
+func (g *graph) batchNorm(name string, in int32, l *layer.BatchNorm) int32 {
 	mean, variance := l.RunningStats()
 	gamma, beta := l.Params()
 	n := gamma.Cols

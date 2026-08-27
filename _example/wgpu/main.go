@@ -36,14 +36,15 @@ import (
 	"time"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/gpu"
 )
 
 // Power preferences are a hint: with a single adapter you always get that
 // one, so this only matters on machines with an iGPU and a dGPU.
-var powers = map[string]tensai.GPUPower{
-	"default": tensai.GPUDefault,
-	"low":     tensai.GPULowPower,
-	"high":    tensai.GPUHighPerformance,
+var powers = map[string]gpu.Power{
+	"default": gpu.Default,
+	"low":     gpu.LowPower,
+	"high":    gpu.HighPerformance,
 }
 
 // shape is one (batch, m, k, n) point on the sweep ladder.
@@ -111,7 +112,7 @@ func timeOp(fn func() error) (time.Duration, error) {
 // result on every call, both to synchronize the GPU and to model inference
 // that consumes its final output on the host; only repeated input uploads are
 // removed. The first calls warm the driver's caches and are not timed.
-func measure(gpu *tensai.GPU, s shape, reps int) (transferTime, residentTime, cpuTime time.Duration, diff float64, err error) {
+func measure(gpu *gpu.Device, s shape, reps int) (transferTime, residentTime, cpuTime time.Duration, diff float64, err error) {
 	rng := rand.New(rand.NewSource(1))
 	a := randTensor(rng, s.batch, s.m, s.k)
 	w := randTensor(rng, s.k, s.n)
@@ -187,7 +188,7 @@ func mflop(s shape) float64 {
 	return 2 * float64(s.batch) * float64(s.m) * float64(s.k) * float64(s.n) / 1e6
 }
 
-func sweep(gpu *tensai.GPU, reps int) {
+func sweep(gpu *gpu.Device, reps int) {
 	fmt.Printf("%-12s %-18s %10s %10s %10s %10s %9s   %s\n",
 		"", "shape", "MFLOP", "gpu+xfer", "resident", "cpu", "res/cpu", "max diff")
 	crossed := false
@@ -235,7 +236,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	gpu, err := tensai.OpenGPU(pref)
+	gpu, err := gpu.Open(pref)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "no GPU backend:", err)
 		fmt.Fprintln(os.Stderr, "hint: build with -tags wgpu (linux, darwin, or windows) and")

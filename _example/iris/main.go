@@ -8,6 +8,11 @@ import (
 	"strings"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/dataset"
+	"github.com/mattn/tensai/layer"
+	"github.com/mattn/tensai/loss"
+	"github.com/mattn/tensai/model"
+	"github.com/mattn/tensai/optim"
 )
 
 const (
@@ -123,7 +128,7 @@ func argmaxRow(m *tensai.Matrix, row int) int {
 	return best
 }
 
-func evaluate(model *tensai.Sequential, inputs, targets *tensai.Matrix) (int, [classCount][classCount]int, error) {
+func evaluate(model *model.Sequential, inputs, targets *tensai.Matrix) (int, [classCount][classCount]int, error) {
 	pred, err := model.Predict(inputs)
 	if err != nil {
 		return 0, [classCount][classCount]int{}, err
@@ -151,16 +156,16 @@ func main() {
 	trainInputs, trainTargets := matrices(train)
 	testInputs, testTargets := matrices(test)
 
-	model := tensai.NewSequential()
-	model.Add(tensai.NewDense(12))
-	model.Add(&tensai.Tanh{})
-	model.Add(tensai.NewDense(classCount))
-	if err := model.Compile(featureCount, tensai.SoftmaxCrossEntropy{}, tensai.NewAdam(0.03)); err != nil {
+	model := model.NewSequential()
+	model.Add(layer.NewDense(12))
+	model.Add(&layer.Tanh{})
+	model.Add(layer.NewDense(classCount))
+	if err := model.Compile(featureCount, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.03)); err != nil {
 		panic(err)
 	}
 
 	rng := rand.New(rand.NewSource(seed + 1))
-	ds, err := tensai.NewDataset(trainInputs, trainTargets)
+	ds, err := dataset.New(trainInputs, trainTargets)
 	if err != nil {
 		panic(err)
 	}
