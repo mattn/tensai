@@ -1099,8 +1099,12 @@ fn qacts_pack(@builtin(workgroup_id) wid: vec3<u32>,
 
 const QIR = 64u; // output rows per workgroup
 const QIC = 64u; // output columns per workgroup
-var<workgroup> qita: array<u32, 512>; // 64 rows x 8 kwords
-var<workgroup> qitw: array<u32, 512>; // 64 cols x 8 kwords, K-packed
+const QIKW = 16u; // kwords staged per barrier period
+// Staged slices live as [kword][quad] vec4s: one vec4 holds four
+// consecutive rows (or columns), so the inner loop issues two vec4 loads
+// per kword instead of eight scalar ones.
+var<workgroup> qita: array<vec4<u32>, 256>; // [kw][rowQuad] 16x16
+var<workgroup> qitw: array<vec4<u32>, 256>; // [kw][colQuad] 16x16, K-packed
 
 @compute @workgroup_size(256, 1, 1)
 fn qmatmul_i(@builtin(workgroup_id) wid: vec3<u32>,
@@ -1113,51 +1117,53 @@ fn qmatmul_i(@builtin(workgroup_id) wid: vec3<u32>,
     var a10 = 0; var a11 = 0; var a12 = 0; var a13 = 0;
     var a20 = 0; var a21 = 0; var a22 = 0; var a23 = 0;
     var a30 = 0; var a31 = 0; var a32 = 0; var a33 = 0;
-    let kwTiles = (qip.kw4 + 7u) / 8u;
+    let stgKW = lid.x / 16u;  // kword this thread stages
+    let stgQ = lid.x % 16u;   // row/col quad this thread stages
+    let kwTiles = (qip.kw4 + QIKW - 1u) / QIKW;
     for (var kt = 0u; kt < kwTiles; kt = kt + 1u) {
-        let kwb = kt * 8u;
-        for (var s = 0u; s < 2u; s = s + 1u) {
-            let idx = lid.x * 2u + s;
-            let rr = idx / 8u;
-            let kw = idx % 8u;
-            var wa = 0u;
-            if (r0 + rr < qip.m && kwb + kw < qip.kw4) {
-                wa = qia[(r0 + rr) * qip.kw4 + kwb + kw];
-            }
-            qita[idx] = wa;
-        }
-        // Transpose the col-packed weight slice to K-packed: byte lane
-        // col%4 of four consecutive K rows becomes one dot4 operand.
-        for (var s = 0u; s < 2u; s = s + 1u) {
-            let idx = lid.x * 2u + s;
-            let cc = idx / 8u;
-            let kw = idx % 8u;
-            let col = c0 + cc;
-            let word = col / 4u;
-            let sh = (col % 4u) * 8u;
-            let k = (kwb + kw) * 4u;
-            var wpk = 0u;
-            if (word < qip.words) {
-                for (var b = 0u; b < 4u; b = b + 1u) {
-                    if (k + b < qip.rows) {
-                        wpk = wpk | (((qiw[(k + b) * qip.words + word] >> sh) & 0xFFu) << (8u * b));
-                    }
+        let kwb = kt * QIKW;
+        let kwOK = kwb + stgKW < qip.kw4;
+        // Activations: four consecutive rows at this kword.
+        var av = vec4<u32>(0u, 0u, 0u, 0u);
+        if (kwOK) {
+            for (var b = 0u; b < 4u; b = b + 1u) {
+                let r = r0 + stgQ * 4u + b;
+                if (r < qip.m) {
+                    av[b] = qia[r * qip.kw4 + kwb + stgKW];
                 }
             }
-            qitw[idx] = wpk;
         }
+        qita[stgKW * 16u + stgQ] = av;
+        // Weights: the four columns of one quad share a packed word, so
+        // four global loads (one per K row) transpose into four K-packed
+        // lanes at once.
+        var wv = vec4<u32>(0u, 0u, 0u, 0u);
+        let wcol = (c0 + stgQ * 4u) / 4u;
+        if (kwOK && wcol < qip.words) {
+            let k = (kwb + stgKW) * 4u;
+            for (var b = 0u; b < 4u; b = b + 1u) {
+                if (k + b < qip.rows) {
+                    let wd = qiw[(k + b) * qip.words + wcol];
+                    wv.x = wv.x | (((wd >> 0u) & 0xFFu) << (8u * b));
+                    wv.y = wv.y | (((wd >> 8u) & 0xFFu) << (8u * b));
+                    wv.z = wv.z | (((wd >> 16u) & 0xFFu) << (8u * b));
+                    wv.w = wv.w | (((wd >> 24u) & 0xFFu) << (8u * b));
+                }
+            }
+        }
+        qitw[stgKW * 16u + stgQ] = wv;
         workgroupBarrier();
-        let ra = rsub * 32u;
-        let ca = csub * 32u;
-        for (var kw = 0u; kw < 8u; kw = kw + 1u) {
-            let v0 = qita[ra + kw];
-            let v1 = qita[ra + 8u + kw];
-            let v2 = qita[ra + 16u + kw];
-            let v3 = qita[ra + 24u + kw];
-            let w0 = qitw[ca + kw];
-            let w1 = qitw[ca + 8u + kw];
-            let w2 = qitw[ca + 16u + kw];
-            let w3 = qitw[ca + 24u + kw];
+        for (var kw = 0u; kw < QIKW; kw = kw + 1u) {
+            let va = qita[kw * 16u + rsub];
+            let wa = qitw[kw * 16u + csub];
+            let v0 = va.x;
+            let v1 = va.y;
+            let v2 = va.z;
+            let v3 = va.w;
+            let w0 = wa.x;
+            let w1 = wa.y;
+            let w2 = wa.z;
+            let w3 = wa.w;
             a00 = a00 + dot4I8Packed(v0, w0);
             a01 = a01 + dot4I8Packed(v0, w1);
             a02 = a02 + dot4I8Packed(v0, w2);
