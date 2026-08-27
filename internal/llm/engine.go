@@ -245,6 +245,16 @@ func Open(o Options) (*Engine, error) {
 	return e, nil
 }
 
+// GPUName reports the adapter the engine is running on, empty when
+// decoding on the CPU. Backend names the binding generation the binary
+// was built with.
+func (e *Engine) GPUName() string {
+	if e.g == nil {
+		return ""
+	}
+	return e.g.Name()
+}
+
 // Close releases the GPU residency, if any.
 func (e *Engine) Close() {
 	if e.g != nil {

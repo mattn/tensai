@@ -9,15 +9,19 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime/pprof"
 	"strings"
 	"time"
 
+	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/internal/llm"
 )
 
@@ -32,6 +36,7 @@ commands:
   run      generate a completion for a prompt
   chat     interactive multi-turn chat on stdin
   serve    OpenAI-compatible /v1/chat/completions server
+  bench    compare CPU and GPU prefill and decode speed
   models   list cached models; "models rm <name>" deletes one
   version  print the version
 
@@ -166,6 +171,19 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+	case "bench":
+		fs := flag.NewFlagSet("tensai bench", flag.ExitOnError)
+		o, finish := modelFlags(fs)
+		p := fs.Int("p", 512, "approximate prompt tokens to prefill")
+		n := fs.Int("n", 32, "tokens to decode")
+		fs.Parse(args)
+		finish()
+		if o.Bits == 0 {
+			// The GPU path needs quantized weights; bench both sides
+			// the same way.
+			o.Bits = 8
+		}
+		benchCmd(o, *p, *n)
 	case "models":
 		if err := modelsCmd(args); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -179,6 +197,118 @@ func main() {
 		fmt.Fprintf(os.Stderr, "tensai: unknown command %q\n\n%s\n", cmd, usage)
 		os.Exit(2)
 	}
+}
+
+// benchCmd compares prefill and decode speed on the CPU and the GPU.
+// Each side runs in its own child process so the second measurement never
+// pays for the first one's heap: a freed model keeps its pages resident
+// long enough to distort a back-to-back run in one process.
+func benchCmd(o *llm.Options, p, n int) {
+	if side := os.Getenv("TENSAI_BENCH_CHILD"); side != "" {
+		benchChild(side)
+		return
+	}
+	var sb strings.Builder
+	for sb.Len() < p*4 {
+		sb.WriteString("The quick brown fox jumps over the lazy dog while considering cache coherency protocols and memory hierarchies in modern processors. ")
+	}
+	cfg := benchConfig{Opts: *o, Prompt: sb.String(), N: n}
+	cfg.Opts.Log = nil
+	blob, err := json.Marshal(&cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	run := func(side string) (benchResult, error) {
+		cmd := exec.Command(exe, "bench")
+		cmd.Env = append(os.Environ(), "TENSAI_BENCH_CHILD="+side, "TENSAI_BENCH_CONFIG="+string(blob))
+		cmd.Stderr = os.Stderr
+		out, err := cmd.Output()
+		if err != nil {
+			return benchResult{}, err
+		}
+		var r benchResult
+		if err := json.Unmarshal(out, &r); err != nil {
+			return benchResult{}, err
+		}
+		if r.Err != "" {
+			return benchResult{}, errors.New(r.Err)
+		}
+		return r, nil
+	}
+	cpu, err := run("cpu")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "cpu:", err)
+		os.Exit(1)
+	}
+	dev, gpuErr := run("gpu")
+
+	fmt.Printf("prefill %d tokens, decode %d tokens, int%d weights\n", cpu.Tokens, n, o.Bits)
+	// The two binding generations reach different adapters and differ in
+	// speed on the same one, so the table names which build measured.
+	tag := gpu.Backend()
+	if tag == "" {
+		tag = "no gpu build tag"
+	}
+	if gpuErr == nil && dev.Adapter != "" {
+		fmt.Printf("gpu: %s via -tags %s\n", dev.Adapter, tag)
+	} else {
+		fmt.Printf("gpu build: %s\n", tag)
+	}
+	fmt.Printf("\n%-9s %12s %12s\n", "", "prefill", "decode")
+	fmt.Printf("%-9s %10.1f %s %10.1f %s\n", "cpu", cpu.Prefill, "t/s", cpu.Decode, "t/s")
+	if gpuErr != nil {
+		fmt.Printf("%-9s unavailable: %v\n", "gpu", gpuErr)
+		return
+	}
+	fmt.Printf("%-9s %10.1f %s %10.1f %s\n", "gpu", dev.Prefill, "t/s", dev.Decode, "t/s")
+	fmt.Printf("%-9s %11.2fx %12.2fx\n", "gpu/cpu", dev.Prefill/cpu.Prefill, dev.Decode/cpu.Decode)
+}
+
+type benchConfig struct {
+	Opts   llm.Options
+	Prompt string
+	N      int
+}
+
+type benchResult struct {
+	Tokens  int
+	Prefill float64
+	Decode  float64
+	Adapter string `json:",omitempty"`
+	Err     string `json:",omitempty"`
+}
+
+// benchChild measures one side and prints the result as one JSON line.
+func benchChild(side string) {
+	var cfg benchConfig
+	if err := json.Unmarshal([]byte(os.Getenv("TENSAI_BENCH_CONFIG")), &cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	cfg.Opts.Log = os.Stderr
+	cfg.Opts.GPU = side == "gpu"
+	var r benchResult
+	e, err := llm.Open(cfg.Opts)
+	if err != nil {
+		r.Err = err.Error()
+	} else {
+		defer e.Close()
+		res := e.Generate(io.Discard, cfg.Prompt, true, cfg.N)
+		r = benchResult{
+			Tokens:  res.PromptTokens,
+			Prefill: float64(res.PromptTokens) / res.Prefill.Seconds(),
+			Decode:  float64(res.CompletionTokens) / (res.Total - res.Prefill).Seconds(),
+			Adapter: e.GPUName(),
+		}
+	}
+	out, _ := json.Marshal(&r)
+	fmt.Println(string(out))
 }
 
 // modelsCmd lists the model cache, or deletes entries with

@@ -29,6 +29,9 @@ var errNoWGPU = errors.New("tensai: built without wgpu support (rebuild with -ta
 // Open always fails in builds without the wgpu tag.
 func Open(power ...Power) (*Device, error) { return nil, errNoWGPU }
 
+// Backend returns the empty string: this build has no GPU support.
+func Backend() string { return "" }
+
 // Name always returns "" in builds without the wgpu tag.
 func (g *Device) Name() string { return "" }
 
