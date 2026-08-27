@@ -6,8 +6,30 @@ on:
     - 'v*'
 
 jobs:
+  # A tag that does not match the version embedded in cmd/tensai (e.g. a
+  # module-retraction tag) must not publish binaries or move the image tags.
+  check:
+    name: Check tag
+    runs-on: ubuntu-latest
+    outputs:
+      match: ${{ steps.v.outputs.match }}
+    steps:
+    - uses: actions/checkout@v4
+    - id: v
+      run: |
+        # Mirrors "make show-version" without a Go toolchain.
+        want="v$(sed -n 's/^const version = "\(.*\)"$/\1/p' cmd/tensai/main.go)"
+        echo "tag=$GITHUB_REF_NAME embedded=$want"
+        if [ "$want" = "$GITHUB_REF_NAME" ]; then
+          echo match=true >> "$GITHUB_OUTPUT"
+        else
+          echo match=false >> "$GITHUB_OUTPUT"
+        fi
+
   release:
     name: Release
+    needs: check
+    if: needs.check.outputs.match == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -28,6 +50,8 @@ jobs:
 
   docker:
     name: Docker
+    needs: check
+    if: needs.check.outputs.match == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
