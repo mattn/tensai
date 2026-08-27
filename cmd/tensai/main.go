@@ -8,10 +8,14 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"runtime/pprof"
+	"time"
 
 	"github.com/mattn/tensai/internal/llm"
 )
@@ -27,6 +31,7 @@ commands:
   run      generate a completion for a prompt
   chat     interactive multi-turn chat on stdin
   serve    OpenAI-compatible /v1/chat/completions server
+  models   list cached models; "models rm <name>" deletes one
   version  print the version
 
 Run "tensai <command> -h" for the command's flags.`
@@ -139,6 +144,11 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+	case "models":
+		if err := modelsCmd(args); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "version":
 		fmt.Printf("tensai v%s (%s)\n", version, revision)
 	case "-h", "--help", "help":
@@ -146,6 +156,93 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "tensai: unknown command %q\n\n%s\n", cmd, usage)
 		os.Exit(2)
+	}
+}
+
+// modelsCmd lists the model cache, or deletes entries with
+// "models rm <name>...". Names are the directory names "models" prints.
+func modelsCmd(args []string) error {
+	root := llm.CacheRoot()
+	if len(args) > 0 && args[0] == "rm" {
+		if len(args) < 2 {
+			return fmt.Errorf("usage: tensai models rm <name>...")
+		}
+		for _, name := range args[1:] {
+			if name != filepath.Base(name) || name == "." || name == ".." {
+				return fmt.Errorf("invalid model name %q", name)
+			}
+			dir := filepath.Join(root, name)
+			if _, err := os.Stat(dir); err != nil {
+				return fmt.Errorf("no cached model %q (see \"tensai models\")", name)
+			}
+			if err := os.RemoveAll(dir); err != nil {
+				return err
+			}
+			fmt.Println("removed", dir)
+		}
+		return nil
+	}
+	if len(args) > 0 {
+		return fmt.Errorf("usage: tensai models [rm <name>...]")
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "no cached models under %s\n", root)
+			return nil
+		}
+		return err
+	}
+	var total int64
+	found := false
+	for _, ent := range entries {
+		if !ent.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, ent.Name())
+		var size int64
+		newest := time.Time{}
+		filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			if info, err := d.Info(); err == nil {
+				size += info.Size()
+				if info.ModTime().After(newest) {
+					newest = info.ModTime()
+				}
+			}
+			return nil
+		})
+		kind := "?"
+		if raw, err := os.ReadFile(filepath.Join(dir, "config.json")); err == nil {
+			var cfg struct {
+				ModelType string `json:"model_type"`
+			}
+			if json.Unmarshal(raw, &cfg) == nil && cfg.ModelType != "" {
+				kind = cfg.ModelType
+			}
+		}
+		fmt.Printf("%-28s %8s  %-8s %s\n", ent.Name(), humanSize(size), kind, newest.Format("2006-01-02"))
+		total += size
+		found = true
+	}
+	if !found {
+		fmt.Fprintf(os.Stderr, "no cached models under %s\n", root)
+		return nil
+	}
+	fmt.Printf("%-28s %8s  (%s)\n", "total", humanSize(total), root)
+	return nil
+}
+
+func humanSize(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1fGB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.0fMB", float64(n)/(1<<20))
+	default:
+		return fmt.Sprintf("%dB", n)
 	}
 }
 

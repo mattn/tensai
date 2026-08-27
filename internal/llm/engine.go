@@ -33,17 +33,22 @@ const DefaultRepo = "Qwen/Qwen2.5-0.5B-Instruct"
 // left it at this default.
 const DefaultSystem = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
 
+// CacheRoot is the directory model caches live under
+// (~/.cache/tensai on Linux).
+func CacheRoot() string {
+	if dir, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(dir, "tensai")
+	}
+	return "tensai-data"
+}
+
 // DefaultDataDir is where a repo's files live when Options.Data is
-// empty: a per-repo directory under the user cache (~/.cache/tensai/...
-// on Linux).
+// empty: a per-repo directory under CacheRoot.
 func DefaultDataDir(repo string) string {
 	if repo == "" {
 		repo = DefaultRepo
 	}
-	if dir, err := os.UserCacheDir(); err == nil {
-		return filepath.Join(dir, "tensai", path.Base(repo))
-	}
-	return filepath.Join("tensai-data", path.Base(repo))
+	return filepath.Join(CacheRoot(), path.Base(repo))
 }
 
 // Options selects and configures a model. The zero value is not runnable:
