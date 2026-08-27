@@ -2,7 +2,6 @@
 
 <p align="center"><img src="assets/logo.svg" width="420" alt="tensai"></p>
 
-<p align="center"><a href="https://github.com/mattn/tensai/releases/latest"><img src="https://img.shields.io/github/v/release/mattn/tensai" alt="latest release"></a> <a href="https://pkg.go.dev/github.com/mattn/tensai"><img src="https://pkg.go.dev/badge/github.com/mattn/tensai.svg" alt="Go Reference"></a></p>
 
 **tensai** is a small machine-learning framework for learning and experiments, written in pure Go. It implements forward passes, backpropagation, and optimization with no external dependencies in the default build — no cgo, no assembly files, no C compiler.
 

@@ -2,7 +2,6 @@
 
 <p align="center"><img src="../assets/logo.svg" width="420" alt="tensai"></p>
 
-<p align="center"><a href="https://github.com/mattn/tensai/releases/latest"><img src="https://img.shields.io/github/v/release/mattn/tensai" alt="latest release"></a> <a href="https://pkg.go.dev/github.com/mattn/tensai"><img src="https://pkg.go.dev/badge/github.com/mattn/tensai.svg" alt="Go Reference"></a></p>
 
 **tensai** は学習と実験のための小さな機械学習フレームワークです。純粋な Go で書かれており、順伝播・誤差逆伝播・最適化をすべて自前で実装しています。デフォルトビルドは外部依存ゼロ — cgo なし、アセンブリなし、C コンパイラ不要です。
 
