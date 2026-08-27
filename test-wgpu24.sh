@@ -65,7 +65,11 @@ export MESA_VK_IGNORE_CONFORMANCE_WARNING=1
 # -count=1: VK_DRIVER_FILES is read by the C library, not by Go, so the
 # test cache cannot tell runs on different Vulkan drivers apart.
 step "GPU tests on the host GPU via dozen"
-VK_DRIVER_FILES=$DZN_DIR/dzn_icd.json go test -tags wgpu24 -count=1 -run TestGPU -v .
+VK_DRIVER_FILES=$DZN_DIR/dzn_icd.json go test -tags wgpu24 -count=1 ./gpu/
+
+step "kernel benchmarks on the host GPU: int8 GEMM and grouped attention"
+VK_DRIVER_FILES=$DZN_DIR/dzn_icd.json go test -tags wgpu24 -count=1 -run xxx \
+	-bench 'GPUQ8GEMM|GPUGroupedAttnPrefill' ./gpu/
 
 step "sweep on the host GPU: AVX2 kernel vs GPU"
 VK_DRIVER_FILES=$DZN_DIR/dzn_icd.json GOEXPERIMENT=simd \
