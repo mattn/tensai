@@ -49,16 +49,8 @@ func (s *SGD) Step(idx int, weights, gradW *Matrix, bias, gradB []Float) {
 	if s.velB[idx] == nil {
 		s.velB[idx] = make([]Float, len(bias))
 	}
-	vw := s.velW[idx]
-	vb := s.velB[idx]
-	for i := range weights.Data {
-		vw.Data[i] = s.Momentum*vw.Data[i] - s.LR*gradW.Data[i]
-		weights.Data[i] += vw.Data[i]
-	}
-	for i := range bias {
-		vb[i] = s.Momentum*vb[i] - s.LR*gradB[i]
-		bias[i] += vb[i]
-	}
+	sgdStepSlice(weights.Data, gradW.Data, s.velW[idx].Data, s.Momentum, s.LR)
+	sgdStepSlice(bias, gradB, s.velB[idx], s.Momentum, s.LR)
 }
 
 // Adam optimizer. With WeightDecay > 0 it becomes AdamW: decay is decoupled

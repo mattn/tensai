@@ -252,6 +252,51 @@ func TestSoftmaxBwdAdd(t *testing.T) {
 	}
 }
 
+func TestSGDStepKernelMatchesGeneric(t *testing.T) {
+	rng := rand.New(rand.NewSource(29))
+	for _, n := range []int{1, 3, 7, 8, 9, 31, 64} {
+		w := make([]Float, n)
+		vel := make([]Float, n)
+		wantW := make([]Float, n)
+		wantVel := make([]Float, n)
+		for i := range w {
+			w[i] = Float(rng.NormFloat64())
+			wantW[i] = w[i]
+		}
+		g := make([]Float, n)
+		for step := 0; step < 3; step++ {
+			for i := range g {
+				g[i] = Float(rng.NormFloat64())
+			}
+			sgdStepSlice(w, g, vel, 0.9, 0.05)
+			sgdStepGeneric(wantW, g, wantVel, 0.9, 0.05)
+		}
+		for i := range w {
+			if math.Abs(float64(w[i]-wantW[i])) > 1e-6*(1+math.Abs(float64(wantW[i]))) {
+				t.Fatalf("n=%d w[%d]: got %g want %g", n, i, w[i], wantW[i])
+			}
+			if math.Abs(float64(vel[i]-wantVel[i])) > 1e-6*(1+math.Abs(float64(wantVel[i]))) {
+				t.Fatalf("n=%d vel[%d]: got %g want %g", n, i, vel[i], wantVel[i])
+			}
+		}
+	}
+}
+
+func BenchmarkSGDStep4096(b *testing.B) {
+	w := make([]Float, 4096)
+	g := make([]Float, 4096)
+	vel := make([]Float, 4096)
+	for i := range w {
+		w[i] = Float(i%17) / 17
+		g[i] = Float(i%31) / 31
+	}
+	b.SetBytes(int64(len(w) * 4 * 3))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		sgdStepSlice(w, g, vel, 0.9, 0.001)
+	}
+}
+
 func BenchmarkSoftmaxBackward4096(b *testing.B) {
 	dst := make([]Float, 4096)
 	grad := make([]Float, 4096)
