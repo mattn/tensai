@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -31,6 +32,19 @@ const DefaultRepo = "Qwen/Qwen2.5-0.5B-Instruct"
 // families swap it for a neutral one (see Open), exactly when the caller
 // left it at this default.
 const DefaultSystem = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
+
+// DefaultDataDir is where a repo's files live when Options.Data is
+// empty: a per-repo directory under the user cache (~/.cache/tensai/...
+// on Linux).
+func DefaultDataDir(repo string) string {
+	if repo == "" {
+		repo = DefaultRepo
+	}
+	if dir, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(dir, "tensai", path.Base(repo))
+	}
+	return filepath.Join("tensai-data", path.Base(repo))
+}
 
 // Options selects and configures a model. The zero value is not runnable:
 // fill Data or GGUF, and usually Bits.

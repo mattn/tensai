@@ -11,8 +11,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path"
-	"path/filepath"
 	"runtime/debug"
 	"runtime/pprof"
 
@@ -57,11 +55,7 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 			o.Bits = 4
 		}
 		if o.Data == "" && o.GGUF == "" {
-			if dir, err := os.UserCacheDir(); err == nil {
-				o.Data = filepath.Join(dir, "tensai", path.Base(o.Repo))
-			} else {
-				o.Data = filepath.Join("tensai-data", path.Base(o.Repo))
-			}
+			o.Data = llm.DefaultDataDir(o.Repo)
 		}
 	}
 	return o, finish

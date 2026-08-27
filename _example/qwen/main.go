@@ -22,7 +22,7 @@ import (
 
 func main() {
 	o := llm.Options{Log: os.Stderr}
-	flag.StringVar(&o.Data, "data", "_example/qwen/data", "directory for the downloaded model files")
+	flag.StringVar(&o.Data, "data", "", "directory for the downloaded model files (default: the per-repo directory under the user cache)")
 	flag.StringVar(&o.Repo, "repo", llm.DefaultRepo, "Hugging Face repo to download missing model files from")
 	prompt := flag.String("prompt", "What is the capital of France?", "user message (or raw prompt with -raw)")
 	flag.StringVar(&o.System, "system", llm.DefaultSystem, "system message for the chat template (Qwen's branding swaps for a neutral one on other models)")
@@ -49,6 +49,9 @@ func main() {
 	}
 	if *q4 {
 		o.Bits = 4
+	}
+	if o.Data == "" && o.GGUF == "" {
+		o.Data = llm.DefaultDataDir(o.Repo)
 	}
 
 	e, err := llm.Open(o)
