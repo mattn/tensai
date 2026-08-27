@@ -620,6 +620,10 @@ func (g *Device) makePipeline(entry string) uintptr {
 	return p
 }
 
+// Backend names the wgpu-native C API these bindings target, for builds
+// that report which GPU path they were compiled with.
+func Backend() string { return "wgpu24" }
+
 // Name reports the adapter wgpu selected, e.g. "Microsoft Direct3D12 (AMD
 // Radeon(TM) Graphics) (integrated)" — handy for checking which Device a power
 // preference landed on.

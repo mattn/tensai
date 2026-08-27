@@ -417,6 +417,7 @@ GOEXPERIMENT=simd go install ./cmd/tensai
 tensai run -q8 "What is the capital of France?"
 tensai chat -q8 -gguf model.gguf
 tensai serve -q8 -addr :8080                      # OpenAI-compatible API
+GOEXPERIMENT=simd go run -tags wgpu24 ./cmd/tensai bench -q8   # CPU vs GPU
 go run -tags wgpu ./_example/wgpu          # needs wgpu-native, see above
 go run -tags wgpu ./_example/wgpu -sweep  # GPU vs CPU across sizes
 go test ./...

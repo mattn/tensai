@@ -66,6 +66,7 @@ commands:
   run      generate a completion for a prompt
   chat     interactive multi-turn chat on stdin
   serve    OpenAI-compatible /v1/chat/completions server
+  bench    compare CPU and GPU prefill and decode speed
   models   list cached models; "models rm <name>" deletes one
   version  print the version
 ```
@@ -77,7 +78,35 @@ tensai run -q8 "What is the capital of France?"
 tensai run -q8 -json "Explain RoPE briefly"      # one JSON object with usage counts
 tensai chat -q8 -gguf model.gguf                 # multi-turn; the KV cache carries the dialogue
 tensai models                                    # list the cache; "models rm <name>" deletes
+tensai bench -q8                                 # CPU vs GPU, prefill and decode
 ```
+
+### Measuring CPU against GPU
+
+`bench` prefills a synthetic prompt and decodes a few tokens twice — once on
+the CPU, once on the GPU — and prints both with the ratio. Each side runs in
+its own child process, so a freed model's pages never distort the other
+measurement. The header names the adapter and the build tag, which matters:
+the two binding generations reach different adapters (only `wgpu24` sees
+non-conformant drivers such as Mesa's dozen inside WSL2), so a build without
+that tag may silently fall back to a CPU Vulkan implementation.
+
+```
+$ GOEXPERIMENT=simd go run -tags wgpu24 ./cmd/tensai bench -q8
+prefill 401 tokens, decode 32 tokens, int8 weights
+gpu: Microsoft Direct3D12 (AMD Radeon(TM) Graphics) (integrated) via -tags wgpu24
+
+               prefill       decode
+cpu            398.2 t/s       39.4 t/s
+gpu           2020.9 t/s       29.7 t/s
+gpu/cpu          5.08x         0.75x
+```
+
+`-p` sets the approximate prompt length and `-n` the tokens to decode. Without
+a GPU build tag the GPU row reports why it is unavailable. Prefill throughput falls as the prompt
+grows (attention is quadratic) and varies a few percent run to run through a
+translation layer, so compare medians of a few runs at one length rather than
+single numbers across lengths.
 
 ### Serving an OpenAI-compatible API
 

@@ -66,6 +66,7 @@ commands:
   run      generate a completion for a prompt
   chat     interactive multi-turn chat on stdin
   serve    OpenAI-compatible /v1/chat/completions server
+  bench    compare CPU and GPU prefill and decode speed
   models   list cached models; "models rm <name>" deletes one
   version  print the version
 ```
@@ -77,7 +78,34 @@ tensai run -q8 "What is the capital of France?"
 tensai run -q8 -json "Explain RoPE briefly"      # 補完と使用量を 1 つの JSON で
 tensai chat -q8 -gguf model.gguf                 # マルチターン。KV キャッシュが対話全体を運ぶ
 tensai models                                    # キャッシュ一覧。"models rm <name>" で削除
+tensai bench -q8                                 # CPU vs GPU のプレフィル/デコード比較
 ```
+
+### CPU と GPU の比較
+
+`bench` は合成プロンプトのプレフィルと数トークンのデコードを CPU と GPU で 1
+回ずつ実行し、両方と倍率を表示します。各側は別プロセスで走るので、解放済み
+モデルのページがもう一方の測定を汚しません。ヘッダにはアダプタ名とビルドタグ
+が出ます — これが重要で、2 つのバインディング世代は届くアダプタが異なり
+(WSL2 の Mesa dozen のような非準拠ドライバが見えるのは `wgpu24` だけ)、
+タグを間違えると気付かないまま CPU Vulkan 実装にフォールバックします。
+
+```
+$ GOEXPERIMENT=simd go run -tags wgpu24 ./cmd/tensai bench -q8
+prefill 401 tokens, decode 32 tokens, int8 weights
+gpu: Microsoft Direct3D12 (AMD Radeon(TM) Graphics) (integrated) via -tags wgpu24
+
+               prefill       decode
+cpu            398.2 t/s       39.4 t/s
+gpu           2020.9 t/s       29.7 t/s
+gpu/cpu          5.08x         0.75x
+```
+
+`-p` でプロンプトのおおよそのトークン数、`-n` でデコードするトークン数を指定
+します。GPU ビルドタグなしの場合は、GPU 行に理由が表示されます。 プレフィルの t/s はプロンプトが
+長くなるほど下がり (attention が二次)、変換レイヤー越しでは実行ごとに数 %
+ぶれます。長さをまたいだ単発の数値ではなく、同じ長さで数回の中央値を比べて
+ください。
 
 ### OpenAI 互換 API の提供
 
