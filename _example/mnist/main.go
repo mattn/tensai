@@ -48,20 +48,12 @@ func predictChunked(model model.Model, inputs *tensai.Matrix) (*tensai.Matrix, e
 	return out, nil
 }
 
-func evaluate(model model.Model, inputs, targets *tensai.Matrix) (int, [][]int, error) {
+func evaluate(model model.Model, inputs, targets *tensai.Matrix) (*metrics.Result, error) {
 	pred, err := predictChunked(model, inputs)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
-	correct, err := metrics.Correct(pred, targets)
-	if err != nil {
-		return 0, nil, err
-	}
-	confusion, err := metrics.Confusion(pred, targets)
-	if err != nil {
-		return 0, nil, err
-	}
-	return correct, confusion, nil
+	return metrics.Report(pred, targets)
 }
 
 // buildModel constructs either the plain MLP or a small CNN and compiles it.
@@ -130,12 +122,12 @@ func main() {
 		if err := knn.Fit(train.Inputs, train.Targets); err != nil {
 			panic(err)
 		}
-		correct, confusion, err := evaluate(knn, test.Inputs, test.Targets)
+		res, err := evaluate(knn, test.Inputs, test.Targets)
 		if err != nil {
 			panic(err)
 		}
-		fmt.Printf("knn (k=3) test accuracy: %d/%d\n", correct, test.Len())
-		printConfusion(confusion)
+		fmt.Printf("knn (k=3) test accuracy: %d/%d\n", res.Correct, res.Total)
+		printConfusion(res.Confusion)
 		return
 	}
 
@@ -161,17 +153,17 @@ func main() {
 		fmt.Printf("epoch %2d: loss=%.6f\n", epoch, lossSum/float32(steps))
 	}
 
-	trainCorrect, _, err := evaluate(model, train.Inputs, train.Targets)
+	trainRes, err := evaluate(model, train.Inputs, train.Targets)
 	if err != nil {
 		panic(err)
 	}
-	testCorrect, confusion, err := evaluate(model, test.Inputs, test.Targets)
+	testRes, err := evaluate(model, test.Inputs, test.Targets)
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Printf("\ntrain accuracy: %d/%d\n", trainCorrect, train.Len())
-	fmt.Printf("test accuracy:  %d/%d\n", testCorrect, test.Len())
+	fmt.Printf("\ntrain accuracy: %d/%d\n", trainRes.Correct, trainRes.Total)
+	fmt.Printf("test accuracy:  %d/%d\n", testRes.Correct, testRes.Total)
 
 	// Round-trip the trained parameters through JSON to demonstrate
 	// serialization: a freshly built model must score identically.
@@ -192,11 +184,11 @@ func main() {
 	if err := reloaded.LoadFile(modelPath); err != nil {
 		panic(err)
 	}
-	reloadedCorrect, _, err := evaluate(reloaded, test.Inputs, test.Targets)
+	reloadedRes, err := evaluate(reloaded, test.Inputs, test.Targets)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("saved to %s, reloaded accuracy: %d/%d\n", modelPath, reloadedCorrect, test.Len())
+	fmt.Printf("saved to %s, reloaded accuracy: %d/%d\n", modelPath, reloadedRes.Correct, reloadedRes.Total)
 
 	if *export != "" {
 		// MNIST is single-channel, so the flat rows already match the NHWC
@@ -207,7 +199,7 @@ func main() {
 		}
 		fmt.Printf("exported TFLite model to %s\n", *export)
 	}
-	printConfusion(confusion)
+	printConfusion(testRes.Confusion)
 }
 
 func printConfusion(confusion [][]int) {

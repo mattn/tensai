@@ -48,22 +48,6 @@ func makeSpiral() *dataset.Dataset {
 	return ds
 }
 
-func evaluate(model *model.Sequential, ds *dataset.Dataset) (int, [][]int, error) {
-	pred, err := model.Predict(ds.Inputs)
-	if err != nil {
-		return 0, nil, err
-	}
-	correct, err := metrics.Correct(pred, ds.Targets)
-	if err != nil {
-		return 0, nil, err
-	}
-	confusion, err := metrics.Confusion(pred, ds.Targets)
-	if err != nil {
-		return 0, nil, err
-	}
-	return correct, confusion, nil
-}
-
 func main() {
 	splitRng := rand.New(rand.NewSource(trainingSeed + 2))
 	train, test, err := makeSpiral().SplitStratified(testFraction, splitRng)
@@ -99,21 +83,21 @@ func main() {
 		}
 	}
 
-	trainCorrect, _, err := evaluate(model, train)
+	trainRes, err := metrics.Evaluate(model, train.Inputs, train.Targets)
 	if err != nil {
 		panic(err)
 	}
-	testCorrect, confusion, err := evaluate(model, test)
+	testRes, err := metrics.Evaluate(model, test.Inputs, test.Targets)
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Printf("\ntrain accuracy: %d/%d\n", trainCorrect, train.Len())
-	fmt.Printf("test accuracy:  %d/%d\n", testCorrect, test.Len())
+	fmt.Printf("\ntrain accuracy: %d/%d\n", trainRes.Correct, trainRes.Total)
+	fmt.Printf("test accuracy:  %d/%d\n", testRes.Correct, testRes.Total)
 	fmt.Println("\nconfusion matrix (rows = actual, columns = predicted):")
-	for r := range confusion {
+	for r := range testRes.Confusion {
 		fmt.Printf("  class %d:", r)
-		for _, n := range confusion[r] {
+		for _, n := range testRes.Confusion[r] {
 			fmt.Printf(" %3d", n)
 		}
 		fmt.Println()

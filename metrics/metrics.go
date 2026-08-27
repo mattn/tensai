@@ -11,6 +11,47 @@ import (
 	"github.com/mattn/tensai"
 )
 
+// Predictor is anything that maps input rows to one column of scores per
+// class. model.Sequential and knn.KNN satisfy it.
+type Predictor interface {
+	Predict(*tensai.Matrix) (*tensai.Matrix, error)
+}
+
+// Result summarizes a classification evaluation.
+type Result struct {
+	Correct   int
+	Total     int
+	Confusion [][]int // rows are actual classes, columns are predicted
+}
+
+// Accuracy returns the fraction of correctly classified samples.
+func (r *Result) Accuracy() float64 {
+	return float64(r.Correct) / float64(r.Total)
+}
+
+// Report builds a Result from an existing prediction matrix, for callers
+// that produce predictions themselves (e.g. in chunks).
+func Report(pred, targets *tensai.Matrix) (*Result, error) {
+	correct, err := Correct(pred, targets)
+	if err != nil {
+		return nil, err
+	}
+	confusion, err := Confusion(pred, targets)
+	if err != nil {
+		return nil, err
+	}
+	return &Result{Correct: correct, Total: pred.Rows, Confusion: confusion}, nil
+}
+
+// Evaluate runs the predictor over inputs and reports the result.
+func Evaluate(p Predictor, inputs, targets *tensai.Matrix) (*Result, error) {
+	pred, err := p.Predict(inputs)
+	if err != nil {
+		return nil, err
+	}
+	return Report(pred, targets)
+}
+
 func check(pred, targets *tensai.Matrix) error {
 	if pred == nil || targets == nil {
 		return fmt.Errorf("tensai: metrics: nil matrix")
