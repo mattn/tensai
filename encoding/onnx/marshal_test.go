@@ -76,13 +76,13 @@ func TestMarshalMLP(t *testing.T) {
 func TestMarshalCNN(t *testing.T) {
 	rng := rand.New(rand.NewSource(2))
 	m := model.NewSequential()
-	m.Add(layer.NewConv2D(8, 8, 2, 6, 3, 1, 1))
+	m.Add(layer.NewConv2D(6, 3, 1, 1))
 	m.Add(&layer.ReLU{})
-	m.Add(layer.NewMaxPool2D(8, 8, 6, 2))
-	m.Add(layer.NewConv2D(4, 4, 6, 4, 3, 1, 0))
+	m.Add(layer.NewMaxPool2D(2))
+	m.Add(layer.NewConv2D(4, 3, 1, 0))
 	m.Add(&layer.Sigmoid{})
 	m.Add(layer.NewDense(5))
-	if err := m.Compile(8*8*2, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.01)); err != nil {
+	if err := m.CompileImage(layer.Image{H: 8, W: 8, C: 2}, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.01)); err != nil {
 		t.Fatal(err)
 	}
 	trainStep(t, m, 8*8*2, 5, true, rng)
@@ -114,9 +114,9 @@ func TestMarshalErrors(t *testing.T) {
 
 	rng := rand.New(rand.NewSource(3))
 	sm := model.NewSequential()
-	sm.Add(layer.NewConv2D(4, 4, 1, 2, 3, 1, 1))
+	sm.Add(layer.NewConv2D(2, 3, 1, 1))
 	sm.Add(&layer.Softmax{})
-	if err := sm.Compile(16, loss.MeanSquaredError{}, optim.NewAdam(0.01)); err != nil {
+	if err := sm.CompileImage(layer.Image{H: 4, W: 4, C: 1}, loss.MeanSquaredError{}, optim.NewAdam(0.01)); err != nil {
 		t.Fatal(err)
 	}
 	trainStep(t, sm, 16, 32, false, rng)

@@ -23,8 +23,8 @@ type Layer interface {
 |---|---|---|
 | Dense | `layer.NewDense(outCols)` | 全結合。Glorot/He スタイルの初期化 |
 | Embedding | `layer.NewEmbedding(vocabSize, dim)` | 入力行は `Float` に格納された整数トークン ID。引いたベクトルは行方向に連結 |
-| Conv2D | `layer.NewConv2D(inH, inW, inC, outC, kernel, stride, pad)` | im2col + `Dot` カーネル |
-| MaxPool2D | `layer.NewMaxPool2D(inH, inW, channels, size)` | |
+| Conv2D | `layer.NewConv2D(outC, kernel, stride, pad)` | im2col + `Dot` カーネル。入力形状は `CompileImage` から |
+| MaxPool2D | `layer.NewMaxPool2D(size)` | 入力形状は `CompileImage` から |
 | BatchNorm | `layer.NewBatchNorm()` | 移動統計量はモデルと一緒に保存されます |
 | LayerNorm | `layer.NewLayerNorm()` | 行ごとの正規化 |
 | Dropout | `layer.NewDropout(rate)` | 学習時のみ有効 |

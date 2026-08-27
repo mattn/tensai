@@ -7,6 +7,28 @@ import (
 	"github.com/mattn/tensai"
 )
 
+// Image describes the spatial shape of one flattened sample row: C
+// channels of HxW pixels in channel-major order,
+// index = (channel*H + y)*W + x.
+type Image struct {
+	H, W, C int
+}
+
+// Cols is the flattened row width of the image.
+func (im Image) Cols() int { return im.H * im.W * im.C }
+
+// ImageLayer is implemented by layers that consume a spatial input shape.
+// Sequential models thread the Image through the stack: hand the input
+// shape to CompileImage, and layers that keep the row width (activations,
+// BatchNorm, LayerNorm, Dropout) pass it along automatically, so Conv2D and
+// MaxPool2D never state their input dimensions.
+type ImageLayer interface {
+	Layer
+	// InitImage configures the layer from the incoming image shape and
+	// returns the outgoing one.
+	InitImage(in Image, rng *rand.Rand) (Image, error)
+}
+
 // Conv2D is a 2D convolution layer. Because the framework moves data as flat
 // MxN matrices, each sample row must be laid out channel-major:
 // index = (channel*height + y)*width + x. The output uses the same layout.
@@ -36,31 +58,36 @@ type Conv2D struct {
 	prod, wT, gRe, dcols, gradIn *tensai.Matrix
 }
 
-// NewConv2D returns a convolution layer for inH x inW inputs with inC
-// channels, producing outC channels with a square kernel.
-func NewConv2D(inH, inW, inC, outC, kernel, stride, pad int) *Conv2D {
-	return &Conv2D{inH: inH, inW: inW, inC: inC, outC: outC, kernel: kernel, stride: stride, pad: pad}
+// NewConv2D returns a convolution layer producing outC channels with a
+// square kernel. The input dimensions come from the model: compile with
+// CompileImage and the spatial shape threads through the stack.
+func NewConv2D(outC, kernel, stride, pad int) *Conv2D {
+	return &Conv2D{outC: outC, kernel: kernel, stride: stride, pad: pad}
 }
 
+// Init without a spatial shape cannot configure a convolution.
 func (c *Conv2D) Init(inputCols int, rng *rand.Rand) (int, error) {
+	return 0, fmt.Errorf("tensai: conv2d needs a spatial input shape; compile the model with CompileImage")
+}
+
+// InitImage configures the convolution from the incoming image shape.
+func (c *Conv2D) InitImage(in Image, rng *rand.Rand) (Image, error) {
+	c.inH, c.inW, c.inC = in.H, in.W, in.C
 	if c.inH <= 0 || c.inW <= 0 || c.inC <= 0 || c.outC <= 0 || c.kernel <= 0 || c.stride <= 0 || c.pad < 0 {
-		return 0, fmt.Errorf("tensai: conv2d invalid config: in=%dx%dx%d out=%d kernel=%d stride=%d pad=%d",
+		return Image{}, fmt.Errorf("tensai: conv2d invalid config: in=%dx%dx%d out=%d kernel=%d stride=%d pad=%d",
 			c.inH, c.inW, c.inC, c.outC, c.kernel, c.stride, c.pad)
-	}
-	if inputCols != c.inH*c.inW*c.inC {
-		return 0, fmt.Errorf("tensai: conv2d input cols %d != %dx%dx%d", inputCols, c.inH, c.inW, c.inC)
 	}
 	c.outH = (c.inH+2*c.pad-c.kernel)/c.stride + 1
 	c.outW = (c.inW+2*c.pad-c.kernel)/c.stride + 1
 	if c.outH <= 0 || c.outW <= 0 {
-		return 0, fmt.Errorf("tensai: conv2d kernel %d does not fit input %dx%d (pad %d)",
+		return Image{}, fmt.Errorf("tensai: conv2d kernel %d does not fit input %dx%d (pad %d)",
 			c.kernel, c.inH, c.inW, c.pad)
 	}
 	c.weights = tensai.RandomMatrix(c.inC*c.kernel*c.kernel, c.outC, rng)
 	c.bias = make([]tensai.Float, c.outC)
 	c.gradW = tensai.NewMatrix(c.weights.Rows, c.weights.Cols)
 	c.gradB = make([]tensai.Float, c.outC)
-	return c.outH * c.outW * c.outC, nil
+	return Image{H: c.outH, W: c.outW, C: c.outC}, nil
 }
 
 // im2col expands the input batch into patch rows: one row per output pixel,
@@ -218,26 +245,32 @@ type MaxPool2D struct {
 	inCols     int
 }
 
-// NewMaxPool2D returns a max-pooling layer with stride equal to size.
-func NewMaxPool2D(inH, inW, channels, size int) *MaxPool2D {
-	return &MaxPool2D{inH: inH, inW: inW, channels: channels, size: size}
+// NewMaxPool2D returns a max-pooling layer with stride equal to size. The
+// input dimensions come from the model: compile with CompileImage and the
+// spatial shape threads through the stack.
+func NewMaxPool2D(size int) *MaxPool2D {
+	return &MaxPool2D{size: size}
 }
 
+// Init without a spatial shape cannot configure a pooling layer.
 func (p *MaxPool2D) Init(inputCols int, _ *rand.Rand) (int, error) {
+	return 0, fmt.Errorf("tensai: maxpool2d needs a spatial input shape; compile the model with CompileImage")
+}
+
+// InitImage configures the pooling layer from the incoming image shape.
+func (p *MaxPool2D) InitImage(in Image, _ *rand.Rand) (Image, error) {
+	p.inH, p.inW, p.channels = in.H, in.W, in.C
 	if p.inH <= 0 || p.inW <= 0 || p.channels <= 0 || p.size <= 0 {
-		return 0, fmt.Errorf("tensai: maxpool2d invalid config: in=%dx%dx%d size=%d",
+		return Image{}, fmt.Errorf("tensai: maxpool2d invalid config: in=%dx%dx%d size=%d",
 			p.inH, p.inW, p.channels, p.size)
-	}
-	if inputCols != p.inH*p.inW*p.channels {
-		return 0, fmt.Errorf("tensai: maxpool2d input cols %d != %dx%dx%d", inputCols, p.inH, p.inW, p.channels)
 	}
 	p.outH = p.inH / p.size
 	p.outW = p.inW / p.size
 	if p.outH == 0 || p.outW == 0 {
-		return 0, fmt.Errorf("tensai: maxpool2d size %d larger than input %dx%d", p.size, p.inH, p.inW)
+		return Image{}, fmt.Errorf("tensai: maxpool2d size %d larger than input %dx%d", p.size, p.inH, p.inW)
 	}
-	p.inCols = inputCols
-	return p.outH * p.outW * p.channels, nil
+	p.inCols = in.Cols()
+	return Image{H: p.outH, W: p.outW, C: p.channels}, nil
 }
 
 func (p *MaxPool2D) Forward(input *tensai.Matrix) (*tensai.Matrix, error) {

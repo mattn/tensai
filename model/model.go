@@ -42,8 +42,26 @@ func (s *Sequential) Add(layer layer.Layer) *Sequential {
 }
 
 // Compile wires the loss and optimizer and initializes all parameters.
-// inputCols is the number of features in a single input row.
+// inputCols is the number of features in a single input row. Models that
+// start from flattened images should use CompileImage instead, which also
+// threads the spatial shape through the stack.
 func (s *Sequential) Compile(inputCols int, loss loss.Loss, optimizer optim.Optimizer) error {
+	return s.compile(inputCols, layer.Image{}, loss, optimizer)
+}
+
+// CompileImage is Compile for models whose input rows are flattened
+// channel-major images. The spatial shape threads through the stack:
+// Conv2D and MaxPool2D take their input dimensions from it, and layers
+// that keep the row width (activations, BatchNorm, LayerNorm, Dropout)
+// pass it along, so only the model input states its geometry.
+func (s *Sequential) CompileImage(in layer.Image, loss loss.Loss, optimizer optim.Optimizer) error {
+	if in.H <= 0 || in.W <= 0 || in.C <= 0 {
+		return fmt.Errorf("tensai: CompileImage needs a positive input shape, got %dx%dx%d", in.H, in.W, in.C)
+	}
+	return s.compile(in.Cols(), in, loss, optimizer)
+}
+
+func (s *Sequential) compile(inputCols int, img layer.Image, loss loss.Loss, optimizer optim.Optimizer) error {
 	if len(s.layers) == 0 {
 		return fmt.Errorf("tensai: cannot compile a model with no layers")
 	}
@@ -59,9 +77,27 @@ func (s *Sequential) Compile(inputCols int, loss loss.Loss, optimizer optim.Opti
 
 	currentCols := inputCols
 	for i, l := range s.layers {
-		out, err := l.Init(currentCols, s.rng)
-		if err != nil {
-			return fmt.Errorf("tensai: layer %d init: %w", i, err)
+		var out int
+		if il, ok := l.(layer.ImageLayer); ok {
+			if img == (layer.Image{}) {
+				return fmt.Errorf("tensai: layer %d init: %T needs a spatial input shape; compile the model with CompileImage", i, l)
+			}
+			outImg, err := il.InitImage(img, s.rng)
+			if err != nil {
+				return fmt.Errorf("tensai: layer %d init: %w", i, err)
+			}
+			img = outImg
+			out = outImg.Cols()
+		} else {
+			var err error
+			out, err = l.Init(currentCols, s.rng)
+			if err != nil {
+				return fmt.Errorf("tensai: layer %d init: %w", i, err)
+			}
+			if out != currentCols {
+				// The layer reshaped the row; the spatial reading is gone.
+				img = layer.Image{}
+			}
 		}
 		// Layers that expose parameters register with the optimizer.
 		if w, _ := l.Params(); w != nil {

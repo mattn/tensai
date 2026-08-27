@@ -25,15 +25,15 @@ func buildMLP(t *testing.T) *model.Sequential {
 func buildCNN(t *testing.T) *model.Sequential {
 	t.Helper()
 	m := model.NewSequential()
-	m.Add(layer.NewConv2D(8, 8, 1, 4, 3, 1, 1))
+	m.Add(layer.NewConv2D(4, 3, 1, 1))
 	m.Add(&layer.ReLU{})
-	m.Add(layer.NewMaxPool2D(8, 8, 4, 2))
+	m.Add(layer.NewMaxPool2D(2))
 	m.Add(layer.NewDense(8))
 	m.Add(layer.NewBatchNorm())
 	m.Add(layer.NewLeakyReLU(0.1))
 	m.Add(layer.NewDropout(0.2))
 	m.Add(layer.NewDense(2))
-	if err := m.Compile(8*8, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.01)); err != nil {
+	if err := m.CompileImage(layer.Image{H: 8, W: 8, C: 1}, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.01)); err != nil {
 		t.Fatal(err)
 	}
 	return m
@@ -72,8 +72,8 @@ func TestMarshalRejectsUnsupported(t *testing.T) {
 	}
 
 	m = model.NewSequential()
-	m.Add(layer.NewConv2D(8, 8, 1, 4, 5, 1, 1)) // k=5, pad=1: neither VALID nor SAME
-	if err := m.Compile(8*8, loss.MeanSquaredError{}, optim.NewAdam(0.01)); err != nil {
+	m.Add(layer.NewConv2D(4, 5, 1, 1)) // k=5, pad=1: neither VALID nor SAME
+	if err := m.CompileImage(layer.Image{H: 8, W: 8, C: 1}, loss.MeanSquaredError{}, optim.NewAdam(0.01)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Marshal(m); err == nil {
