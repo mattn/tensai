@@ -4,6 +4,8 @@
 
 `tensai` is a small machine-learning framework for learning and experiments. It implements forward passes, backpropagation, and optimization in pure Go; the default build has no external dependencies (the optional `wgpu` build tag adds exactly one, cgo-free: `ebitengine/purego`).
 
+**Documentation: [mattn.github.io/tensai](https://mattn.github.io/tensai/)** — guides for every package, in English and [日本語](https://mattn.github.io/tensai/ja/).
+
 ## Features
 
 - **Matrix operations** - `Matrix` plus basic operations such as `Dot`, `Add`, `T`, and `AddBias`. Tensors are float32 (`tensai.Float`)
