@@ -1,14 +1,14 @@
+// Command iris trains a small classifier on Fisher's iris dataset using
+// the built-in dataset/iris loader.
 package main
 
 import (
 	"fmt"
-	"math"
 	"math/rand"
-	"strconv"
-	"strings"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/dataset"
+	"github.com/mattn/tensai/dataset/iris"
 	"github.com/mattn/tensai/layer"
 	"github.com/mattn/tensai/loss"
 	"github.com/mattn/tensai/model"
@@ -16,106 +16,48 @@ import (
 )
 
 const (
-	featureCount  = 4
-	classCount    = 3
 	trainPerClass = 40
 	epochs        = 900
 	batchSize     = 32
 	seed          = 3
 )
 
-type sample struct {
-	x     [featureCount]float32
-	class int
-}
-
-func parseData() ([]sample, error) {
-	lines := strings.Split(strings.TrimSpace(irisCSV), "\n")
-	data := make([]sample, 0, len(lines))
-	for _, line := range lines {
-		fields := strings.Split(line, ",")
-		if len(fields) != featureCount+1 {
-			return nil, fmt.Errorf("bad row: %q", line)
-		}
-		var s sample
-		for i := 0; i < featureCount; i++ {
-			v, err := strconv.ParseFloat(fields[i], 64)
-			if err != nil {
-				return nil, err
-			}
-			s.x[i] = float32(v)
-		}
-		cls, err := strconv.Atoi(fields[featureCount])
-		if err != nil {
-			return nil, err
-		}
-		s.class = cls
-		data = append(data, s)
-	}
-	return data, nil
-}
-
-func split(data []sample) (train, test []sample) {
-	rng := rand.New(rand.NewSource(seed))
-	for cls := 0; cls < classCount; cls++ {
-		var rows []sample
-		for _, s := range data {
-			if s.class == cls {
-				rows = append(rows, s)
+// splitStratified shuffles each class independently and keeps
+// trainPerClass rows of every class in the training split, so both splits
+// preserve the 1/3-per-class balance.
+func splitStratified(ds *dataset.Dataset, rng *rand.Rand) (train, test *dataset.Dataset, err error) {
+	var trainIdx, testIdx []int
+	for cls := 0; cls < iris.ClassCount; cls++ {
+		var rows []int
+		for r := 0; r < ds.Len(); r++ {
+			if int(ds.Targets.At(r, 0)) == cls {
+				rows = append(rows, r)
 			}
 		}
 		rng.Shuffle(len(rows), func(i, j int) {
 			rows[i], rows[j] = rows[j], rows[i]
 		})
-		train = append(train, rows[:trainPerClass]...)
-		test = append(test, rows[trainPerClass:]...)
+		trainIdx = append(trainIdx, rows[:trainPerClass]...)
+		testIdx = append(testIdx, rows[trainPerClass:]...)
 	}
-	return train, test
-}
-
-func standardize(train, test []sample) {
-	var mean, variance [featureCount]float32
-	for _, s := range train {
-		for c, v := range s.x {
-			mean[c] += v
-		}
-	}
-	for c := range mean {
-		mean[c] /= float32(len(train))
-	}
-	for _, s := range train {
-		for c, v := range s.x {
-			diff := v - mean[c]
-			variance[c] += diff * diff
-		}
-	}
-	for c := range variance {
-		variance[c] /= float32(len(train))
-		if variance[c] == 0 {
-			variance[c] = 1
-		}
-	}
-	apply := func(rows []sample) {
-		for i := range rows {
-			for c := range rows[i].x {
-				rows[i].x[c] = (rows[i].x[c] - mean[c]) / float32(math.Sqrt(float64(variance[c])))
+	pick := func(idx []int) (*dataset.Dataset, error) {
+		inputs := tensai.NewMatrix(len(idx), ds.Inputs.Cols)
+		targets := tensai.NewMatrix(len(idx), 1)
+		for i, r := range idx {
+			for c := 0; c < ds.Inputs.Cols; c++ {
+				inputs.Set(i, c, ds.Inputs.At(r, c))
 			}
+			targets.Set(i, 0, ds.Targets.At(r, 0))
 		}
+		return dataset.New(inputs, targets)
 	}
-	apply(train)
-	apply(test)
-}
-
-func matrices(data []sample) (*tensai.Matrix, *tensai.Matrix) {
-	inputs := tensai.NewMatrix(len(data), featureCount)
-	targets := tensai.NewMatrix(len(data), 1)
-	for r, s := range data {
-		for c, v := range s.x {
-			inputs.Set(r, c, v)
-		}
-		targets.Set(r, 0, float32(s.class))
+	if train, err = pick(trainIdx); err != nil {
+		return nil, nil, err
 	}
-	return inputs, targets
+	if test, err = pick(testIdx); err != nil {
+		return nil, nil, err
+	}
+	return train, test, nil
 }
 
 func argmaxRow(m *tensai.Matrix, row int) int {
@@ -128,16 +70,16 @@ func argmaxRow(m *tensai.Matrix, row int) int {
 	return best
 }
 
-func evaluate(model *model.Sequential, inputs, targets *tensai.Matrix) (int, [classCount][classCount]int, error) {
-	pred, err := model.Predict(inputs)
+func evaluate(net *model.Sequential, ds *dataset.Dataset) (int, [iris.ClassCount][iris.ClassCount]int, error) {
+	pred, err := net.Predict(ds.Inputs)
 	if err != nil {
-		return 0, [classCount][classCount]int{}, err
+		return 0, [iris.ClassCount][iris.ClassCount]int{}, err
 	}
-	var confusion [classCount][classCount]int
+	var confusion [iris.ClassCount][iris.ClassCount]int
 	correct := 0
 	for r := 0; r < pred.Rows; r++ {
 		got := argmaxRow(pred, r)
-		want := int(targets.At(r, 0))
+		want := int(ds.Targets.At(r, 0))
 		confusion[want][got]++
 		if got == want {
 			correct++
@@ -147,33 +89,29 @@ func evaluate(model *model.Sequential, inputs, targets *tensai.Matrix) (int, [cl
 }
 
 func main() {
-	data, err := parseData()
+	rng := rand.New(rand.NewSource(seed))
+	train, test, err := splitStratified(iris.Load(), rng)
 	if err != nil {
 		panic(err)
 	}
-	train, test := split(data)
-	standardize(train, test)
-	trainInputs, trainTargets := matrices(train)
-	testInputs, testTargets := matrices(test)
+	// Standardize with training statistics only.
+	mean, std := train.Standardize()
+	test.StandardizeWith(mean, std)
 
-	model := model.NewSequential()
-	model.Add(layer.NewDense(12))
-	model.Add(&layer.Tanh{})
-	model.Add(layer.NewDense(classCount))
-	if err := model.Compile(featureCount, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.03)); err != nil {
+	net := model.NewSequential()
+	net.Add(layer.NewDense(12))
+	net.Add(&layer.Tanh{})
+	net.Add(layer.NewDense(iris.ClassCount))
+	if err := net.Compile(iris.FeatureCount, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.03)); err != nil {
 		panic(err)
 	}
 
-	rng := rand.New(rand.NewSource(seed + 1))
-	ds, err := dataset.New(trainInputs, trainTargets)
-	if err != nil {
-		panic(err)
-	}
+	batchRng := rand.New(rand.NewSource(seed + 1))
 	for epoch := 1; epoch <= epochs; epoch++ {
 		var lossSum float32
 		var steps int
-		err := ds.Batches(batchSize, rng, func(in, tgt *tensai.Matrix) error {
-			loss, err := model.FitStep(in, tgt)
+		err := train.Batches(batchSize, batchRng, func(in, tgt *tensai.Matrix) error {
+			loss, err := net.FitStep(in, tgt)
 			lossSum += loss
 			steps++
 			return err
@@ -186,171 +124,22 @@ func main() {
 		}
 	}
 
-	trainCorrect, _, err := evaluate(model, trainInputs, trainTargets)
+	trainCorrect, _, err := evaluate(net, train)
 	if err != nil {
 		panic(err)
 	}
-	testCorrect, confusion, err := evaluate(model, testInputs, testTargets)
+	testCorrect, confusion, err := evaluate(net, test)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("\ntrain accuracy: %d/%d\n", trainCorrect, trainInputs.Rows)
-	fmt.Printf("test accuracy:  %d/%d\n", testCorrect, testInputs.Rows)
+	fmt.Printf("\ntrain accuracy: %d/%d\n", trainCorrect, train.Len())
+	fmt.Printf("test accuracy:  %d/%d\n", testCorrect, test.Len())
 	fmt.Println("\nconfusion matrix (rows = actual, columns = predicted):")
-	for r := 0; r < classCount; r++ {
-		fmt.Printf("  class %d: %3d %3d %3d\n", r, confusion[r][0], confusion[r][1], confusion[r][2])
+	for r := 0; r < iris.ClassCount; r++ {
+		fmt.Printf("  %-10s:", iris.ClassNames[r])
+		for c := 0; c < iris.ClassCount; c++ {
+			fmt.Printf(" %3d", confusion[r][c])
+		}
+		fmt.Println()
 	}
 }
-
-const irisCSV = `
-5.1,3.5,1.4,0.2,0
-4.9,3.0,1.4,0.2,0
-4.7,3.2,1.3,0.2,0
-4.6,3.1,1.5,0.2,0
-5.0,3.6,1.4,0.2,0
-5.4,3.9,1.7,0.4,0
-4.6,3.4,1.4,0.3,0
-5.0,3.4,1.5,0.2,0
-4.4,2.9,1.4,0.2,0
-4.9,3.1,1.5,0.1,0
-5.4,3.7,1.5,0.2,0
-4.8,3.4,1.6,0.2,0
-4.8,3.0,1.4,0.1,0
-4.3,3.0,1.1,0.1,0
-5.8,4.0,1.2,0.2,0
-5.7,4.4,1.5,0.4,0
-5.4,3.9,1.3,0.4,0
-5.1,3.5,1.4,0.3,0
-5.7,3.8,1.7,0.3,0
-5.1,3.8,1.5,0.3,0
-5.4,3.4,1.7,0.2,0
-5.1,3.7,1.5,0.4,0
-4.6,3.6,1.0,0.2,0
-5.1,3.3,1.7,0.5,0
-4.8,3.4,1.9,0.2,0
-5.0,3.0,1.6,0.2,0
-5.0,3.4,1.6,0.4,0
-5.2,3.5,1.5,0.2,0
-5.2,3.4,1.4,0.2,0
-4.7,3.2,1.6,0.2,0
-4.8,3.1,1.6,0.2,0
-5.4,3.4,1.5,0.4,0
-5.2,4.1,1.5,0.1,0
-5.5,4.2,1.4,0.2,0
-4.9,3.1,1.5,0.2,0
-5.0,3.2,1.2,0.2,0
-5.5,3.5,1.3,0.2,0
-4.9,3.6,1.4,0.1,0
-4.4,3.0,1.3,0.2,0
-5.1,3.4,1.5,0.2,0
-5.0,3.5,1.3,0.3,0
-4.5,2.3,1.3,0.3,0
-4.4,3.2,1.3,0.2,0
-5.0,3.5,1.6,0.6,0
-5.1,3.8,1.9,0.4,0
-4.8,3.0,1.4,0.3,0
-5.1,3.8,1.6,0.2,0
-4.6,3.2,1.4,0.2,0
-5.3,3.7,1.5,0.2,0
-5.0,3.3,1.4,0.2,0
-7.0,3.2,4.7,1.4,1
-6.4,3.2,4.5,1.5,1
-6.9,3.1,4.9,1.5,1
-5.5,2.3,4.0,1.3,1
-6.5,2.8,4.6,1.5,1
-5.7,2.8,4.5,1.3,1
-6.3,3.3,4.7,1.6,1
-4.9,2.4,3.3,1.0,1
-6.6,2.9,4.6,1.3,1
-5.2,2.7,3.9,1.4,1
-5.0,2.0,3.5,1.0,1
-5.9,3.0,4.2,1.5,1
-6.0,2.2,4.0,1.0,1
-6.1,2.9,4.7,1.4,1
-5.6,2.9,3.6,1.3,1
-6.7,3.1,4.4,1.4,1
-5.6,3.0,4.5,1.5,1
-5.8,2.7,4.1,1.0,1
-6.2,2.2,4.5,1.5,1
-5.6,2.5,3.9,1.1,1
-5.9,3.2,4.8,1.8,1
-6.1,2.8,4.0,1.3,1
-6.3,2.5,4.9,1.5,1
-6.1,2.8,4.7,1.2,1
-6.4,2.9,4.3,1.3,1
-6.6,3.0,4.4,1.4,1
-6.8,2.8,4.8,1.4,1
-6.7,3.0,5.0,1.7,1
-6.0,2.9,4.5,1.5,1
-5.7,2.6,3.5,1.0,1
-5.5,2.4,3.8,1.1,1
-5.5,2.4,3.7,1.0,1
-5.8,2.7,3.9,1.2,1
-6.0,2.7,5.1,1.6,1
-5.4,3.0,4.5,1.5,1
-6.0,3.4,4.5,1.6,1
-6.7,3.1,4.7,1.5,1
-6.3,2.3,4.4,1.3,1
-5.6,3.0,4.1,1.3,1
-5.5,2.5,4.0,1.3,1
-5.5,2.6,4.4,1.2,1
-6.1,3.0,4.6,1.4,1
-5.8,2.6,4.0,1.2,1
-5.0,2.3,3.3,1.0,1
-5.6,2.7,4.2,1.3,1
-5.7,3.0,4.2,1.2,1
-5.7,2.9,4.2,1.3,1
-6.2,2.9,4.3,1.3,1
-5.1,2.5,3.0,1.1,1
-5.7,2.8,4.1,1.3,1
-6.3,3.3,6.0,2.5,2
-5.8,2.7,5.1,1.9,2
-7.1,3.0,5.9,2.1,2
-6.3,2.9,5.6,1.8,2
-6.5,3.0,5.8,2.2,2
-7.6,3.0,6.6,2.1,2
-4.9,2.5,4.5,1.7,2
-7.3,2.9,6.3,1.8,2
-6.7,2.5,5.8,1.8,2
-7.2,3.6,6.1,2.5,2
-6.5,3.2,5.1,2.0,2
-6.4,2.7,5.3,1.9,2
-6.8,3.0,5.5,2.1,2
-5.7,2.5,5.0,2.0,2
-5.8,2.8,5.1,2.4,2
-6.4,3.2,5.3,2.3,2
-6.5,3.0,5.5,1.8,2
-7.7,3.8,6.7,2.2,2
-7.7,2.6,6.9,2.3,2
-6.0,2.2,5.0,1.5,2
-6.9,3.2,5.7,2.3,2
-5.6,2.8,4.9,2.0,2
-7.7,2.8,6.7,2.0,2
-6.3,2.7,4.9,1.8,2
-6.7,3.3,5.7,2.1,2
-7.2,3.2,6.0,1.8,2
-6.2,2.8,4.8,1.8,2
-6.1,3.0,4.9,1.8,2
-6.4,2.8,5.6,2.1,2
-7.2,3.0,5.8,1.6,2
-7.4,2.8,6.1,1.9,2
-7.9,3.8,6.4,2.0,2
-6.4,2.8,5.6,2.2,2
-6.3,2.8,5.1,1.5,2
-6.1,2.6,5.6,1.4,2
-7.7,3.0,6.1,2.3,2
-6.3,3.4,5.6,2.4,2
-6.4,3.1,5.5,1.8,2
-6.0,3.0,4.8,1.8,2
-6.9,3.1,5.4,2.1,2
-6.7,3.1,5.6,2.4,2
-6.9,3.1,5.1,2.3,2
-5.8,2.7,5.1,1.9,2
-6.8,3.2,5.9,2.3,2
-6.7,3.3,5.7,2.5,2
-6.7,3.0,5.2,2.3,2
-6.3,2.5,5.0,1.9,2
-6.5,3.0,5.2,2.0,2
-6.2,3.4,5.4,2.3,2
-5.9,3.0,5.1,1.8,2
-`
