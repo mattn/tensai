@@ -18,3 +18,7 @@ _example/wgpu/wgpu
 *.exe
 /*.dll
 tokenizer/testdata/
+/tensai
+/goxz/
+*.gguf
+*.gguf.tensai-*.cache

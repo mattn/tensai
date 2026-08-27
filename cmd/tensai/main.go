@@ -188,14 +188,23 @@ func modelsCmd(args []string) error {
 			if name != filepath.Base(name) || name == "." || name == ".." {
 				return fmt.Errorf("invalid model name %q", name)
 			}
-			dir := filepath.Join(root, name)
-			if _, err := os.Stat(dir); err != nil {
+			target := filepath.Join(root, name)
+			if _, err := os.Stat(target); err != nil {
 				return fmt.Errorf("no cached model %q (see \"tensai models\")", name)
 			}
-			if err := os.RemoveAll(dir); err != nil {
+			if err := os.RemoveAll(target); err != nil {
 				return err
 			}
-			fmt.Println("removed", dir)
+			fmt.Println("removed", target)
+			if strings.HasSuffix(name, ".gguf") {
+				// The repack caches live beside their gguf.
+				caches, _ := filepath.Glob(target + ".tensai-*.cache")
+				for _, c := range caches {
+					if os.Remove(c) == nil {
+						fmt.Println("removed", c)
+					}
+				}
+			}
 		}
 		return nil
 	}
@@ -214,6 +223,23 @@ func modelsCmd(args []string) error {
 	found := false
 	for _, ent := range entries {
 		if !ent.IsDir() {
+			if !strings.HasSuffix(ent.Name(), ".gguf") {
+				continue
+			}
+			var size int64
+			newest := time.Time{}
+			names, _ := filepath.Glob(filepath.Join(root, ent.Name()) + ".tensai-*.cache")
+			for _, n := range append(names, filepath.Join(root, ent.Name())) {
+				if info, err := os.Stat(n); err == nil {
+					size += info.Size()
+					if info.ModTime().After(newest) {
+						newest = info.ModTime()
+					}
+				}
+			}
+			fmt.Printf("%-40s %8s  %-8s %s\n", ent.Name(), humanSize(size), "gguf", newest.Format("2006-01-02"))
+			total += size
+			found = true
 			continue
 		}
 		dir := filepath.Join(root, ent.Name())
@@ -240,7 +266,7 @@ func modelsCmd(args []string) error {
 				kind = cfg.ModelType
 			}
 		}
-		fmt.Printf("%-28s %8s  %-8s %s\n", ent.Name(), humanSize(size), kind, newest.Format("2006-01-02"))
+		fmt.Printf("%-40s %8s  %-8s %s\n", ent.Name(), humanSize(size), kind, newest.Format("2006-01-02"))
 		total += size
 		found = true
 	}
@@ -248,7 +274,7 @@ func modelsCmd(args []string) error {
 		fmt.Fprintf(os.Stderr, "no cached models under %s\n", root)
 		return nil
 	}
-	fmt.Printf("%-28s %8s  (%s)\n", "total", humanSize(total), root)
+	fmt.Printf("%-40s %8s  (%s)\n", "total", humanSize(total), root)
 	return nil
 }
 
