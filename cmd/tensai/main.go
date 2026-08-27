@@ -11,11 +11,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"runtime/debug"
 	"runtime/pprof"
 
 	"github.com/mattn/tensai/internal/llm"
 )
+
+const version = "0.0.2"
+
+// revision is stamped by the release build (-X main.revision=...).
+var revision = "HEAD"
 
 const usage = `usage: tensai <command> [flags]
 
@@ -136,11 +140,7 @@ func main() {
 			os.Exit(1)
 		}
 	case "version":
-		if bi, ok := debug.ReadBuildInfo(); ok {
-			fmt.Println("tensai", bi.Main.Version)
-			return
-		}
-		fmt.Println("tensai (unknown)")
+		fmt.Printf("tensai v%s (%s)\n", version, revision)
 	case "-h", "--help", "help":
 		fmt.Println(usage)
 	default:
