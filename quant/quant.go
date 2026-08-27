@@ -47,15 +47,20 @@ func padRows8(xus [][]uint8, sxs []tensai.Float, rowLen, cols int) ([][]uint8, [
 // contiguous group of eight per weight load. Packing here runs once
 // per row block instead of once per column chunk.
 func packQuadsRows8(xus [][]uint8) []uint32 {
+	xq := make([]uint32, 8*(len(xus[0])/4))
+	packQuadsRows8Into(xq, xus)
+	return xq
+}
+
+// packQuadsRows8Into is packQuadsRows8 into a caller-owned buffer.
+func packQuadsRows8Into(xq []uint32, xus [][]uint8) {
 	quads := len(xus[0]) / 4
-	xq := make([]uint32, 8*quads)
 	for r, xu := range xus {
 		for i4 := 0; i4 < quads; i4++ {
 			xq[i4*8+r] = uint32(xu[4*i4]) | uint32(xu[4*i4+1])<<8 |
 				uint32(xu[4*i4+2])<<16 | uint32(xu[4*i4+3])<<24
 		}
 	}
-	return xq
 }
 
 // parallelChunks splits [0, n) into align-rounded chunks across the
@@ -265,19 +270,52 @@ func (q *QMatrix) MatMul(x, out *tensai.Matrix) error {
 			x.Rows, x.Cols, out.Rows, out.Cols, q.Rows, q.Cols)
 	}
 	rows := x.Rows
+	// Quantizing and packing the activations is O(rows*cols), so leaving
+	// it serial in front of a parallel matmul put a fixed cost on every
+	// call that grew with the batch — cancelling exactly the weight
+	// amortization a longer prompt is supposed to buy. One flat buffer
+	// per stage replaces the per-row allocations, and the rows split
+	// across the same workers the product uses.
+	prep := matvecWorkerCount(x.Cols, rows*x.Cols)
+	padded := (x.Cols + 3) &^ 3
+	flat := make([]uint8, rows*padded)
 	xus := make([][]uint8, rows)
 	sxs := make([]tensai.Float, rows)
-	for r := 0; r < rows; r++ {
-		xus[r], sxs[r] = quantizeActs(x.Data[r*x.Cols : (r+1)*x.Cols])
+	quantRows := func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			xu := flat[r*padded : (r+1)*padded]
+			for i := x.Cols; i < padded; i++ {
+				xu[i] = 64 // pairs with a zero weight row: contributes 64*0
+			}
+			sxs[r] = quantizeActsInto(x.Data[r*x.Cols:(r+1)*x.Cols], xu)
+			xus[r] = xu
+		}
+	}
+	if prep == 1 {
+		quantRows(0, rows)
+	} else {
+		parallelChunks(rows, prep, 8, quantRows)
 	}
 	// The row tail (rows%8 leftovers) pads to one full block: zero
 	// rows are harmless in the integer kernels, the scratch matrix is
 	// shared by every column chunk (they write disjoint ranges), and
 	// only the real rows copy back — so the tail streams the weights
 	// once instead of once per row.
-	xqb := make([][]uint32, rows/8)
-	for b := range xqb {
-		xqb[b] = packQuadsRows8(xus[b*8 : b*8+8])
+	nb := rows / 8
+	quads := padded / 4
+	packFlat := make([]uint32, nb*8*quads)
+	xqb := make([][]uint32, nb)
+	packBlocks := func(lo, hi int) {
+		for b := lo; b < hi; b++ {
+			xq := packFlat[b*8*quads : (b+1)*8*quads]
+			packQuadsRows8Into(xq, xus[b*8:b*8+8])
+			xqb[b] = xq
+		}
+	}
+	if prep == 1 || nb < 2 {
+		packBlocks(0, nb)
+	} else {
+		parallelChunks(nb, prep, 1, packBlocks)
 	}
 	var pxus [][]uint8
 	var pxq []uint32
