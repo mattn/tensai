@@ -13,13 +13,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
 	"path/filepath"
-	"time"
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/dataset"
+	"github.com/mattn/tensai/dataset/internal/fetch"
 )
 
 const (
@@ -65,11 +64,7 @@ type Data struct {
 // DefaultDir returns the default cache directory,
 // os.UserCacheDir()/tensai/mnist.
 func DefaultDir() (string, error) {
-	cache, err := os.UserCacheDir()
-	if err != nil {
-		return "", fmt.Errorf("tensai: mnist: %w", err)
-	}
-	return filepath.Join(cache, "tensai", "mnist"), nil
+	return fetch.DefaultDir("mnist")
 }
 
 // Load returns the MNIST dataset, downloading it into the cache directory
@@ -135,42 +130,11 @@ func ensure(dir string) error {
 		if exists(dir, name) {
 			continue
 		}
-		url := baseURL + "/" + name + ".gz"
-		fmt.Fprintf(os.Stderr, "tensai: downloading %s\n", url)
-		if err := download(url, filepath.Join(dir, name+".gz")); err != nil {
+		if err := fetch.Download(baseURL+"/"+name+".gz", filepath.Join(dir, name+".gz")); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-func download(url, path string) error {
-	client := http.Client{Timeout: 2 * time.Minute}
-	resp, err := client.Get(url)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("tensai: mnist: %s: %s", url, resp.Status)
-	}
-
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	_, copyErr := io.Copy(f, resp.Body)
-	closeErr := f.Close()
-	if copyErr != nil {
-		_ = os.Remove(tmp)
-		return copyErr
-	}
-	if closeErr != nil {
-		_ = os.Remove(tmp)
-		return closeErr
-	}
-	return os.Rename(tmp, path)
 }
 
 func openMaybeGzip(dir, name string) (io.ReadCloser, string, error) {

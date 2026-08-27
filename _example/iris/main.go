@@ -40,8 +40,12 @@ func evaluate(net *model.Sequential, ds *dataset.Dataset) (int, [][]int, error) 
 }
 
 func main() {
+	ds, err := iris.Load(nil)
+	if err != nil {
+		panic(err)
+	}
 	rng := rand.New(rand.NewSource(seed))
-	train, test, err := iris.Load().SplitStratified(testFraction, rng)
+	train, test, err := ds.SplitStratified(testFraction, rng)
 	if err != nil {
 		panic(err)
 	}

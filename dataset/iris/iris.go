@@ -1,16 +1,22 @@
-// Package iris provides Fisher's iris dataset as a ready-to-use Dataset.
+// Package iris downloads, caches, and loads Fisher's iris dataset as a
+// ready-to-use Dataset.
 //
-// The data is embedded in the binary, so Load involves no I/O and cannot
-// fail. Each call returns a fresh copy that the caller may shuffle,
-// standardize, or otherwise mutate freely.
+// The CSV (about 4KB) is fetched from the UCI Machine Learning Repository
+// on first use and cached under os.UserCacheDir()/tensai/iris
+// (~/.cache/tensai/iris on Linux); subsequent loads read from the cache
+// without touching the network.
 package iris
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/dataset"
+	"github.com/mattn/tensai/dataset/internal/fetch"
 )
 
 const (
@@ -20,6 +26,9 @@ const (
 	ClassCount = 3
 	// SampleCount is the total number of samples.
 	SampleCount = 150
+
+	url      = "https://archive.ics.uci.edu/ml/machine-learning-databases/iris/iris.data"
+	fileName = "iris.data"
 )
 
 // FeatureNames names the input columns, in order.
@@ -28,185 +37,87 @@ var FeatureNames = []string{"sepal length", "sepal width", "petal length", "peta
 // ClassNames maps a class index to its species name.
 var ClassNames = []string{"setosa", "versicolor", "virginica"}
 
-// Load returns the iris dataset: inputs of shape 150x4 (centimeters) and
-// targets of shape 150x1 holding the class index. Rows are grouped by
+// Options configures Load. The zero value (or a nil pointer) loads from
+// the default cache directory.
+type Options struct {
+	// Dir is the directory holding (or receiving) the CSV file. Empty
+	// means DefaultDir().
+	Dir string
+}
+
+// DefaultDir returns the default cache directory,
+// os.UserCacheDir()/tensai/iris.
+func DefaultDir() (string, error) {
+	return fetch.DefaultDir("iris")
+}
+
+// Load returns the iris dataset, downloading it into the cache directory
+// first if it is not already present: inputs of shape 150x4 (centimeters)
+// and targets of shape 150x1 holding the class index. Rows are grouped by
 // class; shuffle or split before training as needed.
-func Load() *dataset.Dataset {
+func Load(opt *Options) (*dataset.Dataset, error) {
+	if opt == nil {
+		opt = &Options{}
+	}
+	dir := opt.Dir
+	if dir == "" {
+		var err error
+		if dir, err = DefaultDir(); err != nil {
+			return nil, err
+		}
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
+	}
+	path := filepath.Join(dir, fileName)
+	if _, err := os.Stat(path); err != nil {
+		if err := fetch.Download(url, path); err != nil {
+			return nil, err
+		}
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return parse(path, string(raw))
+}
+
+func parse(path, raw string) (*dataset.Dataset, error) {
+	classes := map[string]int{}
+	for i, name := range ClassNames {
+		classes["Iris-"+name] = i
+	}
 	inputs := tensai.NewMatrix(SampleCount, FeatureCount)
 	targets := tensai.NewMatrix(SampleCount, 1)
-	for r, line := range strings.Split(strings.TrimSpace(csv), "\n") {
+	row := 0
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if row >= SampleCount {
+			return nil, fmt.Errorf("tensai: iris: %s: more than %d rows", path, SampleCount)
+		}
 		fields := strings.Split(line, ",")
+		if len(fields) != FeatureCount+1 {
+			return nil, fmt.Errorf("tensai: iris: %s: bad row %q", path, line)
+		}
 		for c := 0; c < FeatureCount; c++ {
 			v, err := strconv.ParseFloat(fields[c], 32)
 			if err != nil {
-				panic("tensai: iris: corrupt embedded data: " + err.Error())
+				return nil, fmt.Errorf("tensai: iris: %s: bad row %q: %w", path, line, err)
 			}
-			inputs.Set(r, c, tensai.Float(v))
+			inputs.Set(row, c, tensai.Float(v))
 		}
-		cls, err := strconv.Atoi(fields[FeatureCount])
-		if err != nil {
-			panic("tensai: iris: corrupt embedded data: " + err.Error())
+		cls, ok := classes[fields[FeatureCount]]
+		if !ok {
+			return nil, fmt.Errorf("tensai: iris: %s: unknown class %q", path, fields[FeatureCount])
 		}
-		targets.Set(r, 0, tensai.Float(cls))
+		targets.Set(row, 0, tensai.Float(cls))
+		row++
 	}
-	ds, err := dataset.New(inputs, targets)
-	if err != nil {
-		panic("tensai: iris: " + err.Error())
+	if row != SampleCount {
+		return nil, fmt.Errorf("tensai: iris: %s: %d rows, want %d", path, row, SampleCount)
 	}
-	return ds
+	return dataset.New(inputs, targets)
 }
-
-// Fisher's iris dataset: sepal length, sepal width, petal length, petal
-// width, class (0=setosa, 1=versicolor, 2=virginica).
-const csv = `
-5.1,3.5,1.4,0.2,0
-4.9,3.0,1.4,0.2,0
-4.7,3.2,1.3,0.2,0
-4.6,3.1,1.5,0.2,0
-5.0,3.6,1.4,0.2,0
-5.4,3.9,1.7,0.4,0
-4.6,3.4,1.4,0.3,0
-5.0,3.4,1.5,0.2,0
-4.4,2.9,1.4,0.2,0
-4.9,3.1,1.5,0.1,0
-5.4,3.7,1.5,0.2,0
-4.8,3.4,1.6,0.2,0
-4.8,3.0,1.4,0.1,0
-4.3,3.0,1.1,0.1,0
-5.8,4.0,1.2,0.2,0
-5.7,4.4,1.5,0.4,0
-5.4,3.9,1.3,0.4,0
-5.1,3.5,1.4,0.3,0
-5.7,3.8,1.7,0.3,0
-5.1,3.8,1.5,0.3,0
-5.4,3.4,1.7,0.2,0
-5.1,3.7,1.5,0.4,0
-4.6,3.6,1.0,0.2,0
-5.1,3.3,1.7,0.5,0
-4.8,3.4,1.9,0.2,0
-5.0,3.0,1.6,0.2,0
-5.0,3.4,1.6,0.4,0
-5.2,3.5,1.5,0.2,0
-5.2,3.4,1.4,0.2,0
-4.7,3.2,1.6,0.2,0
-4.8,3.1,1.6,0.2,0
-5.4,3.4,1.5,0.4,0
-5.2,4.1,1.5,0.1,0
-5.5,4.2,1.4,0.2,0
-4.9,3.1,1.5,0.2,0
-5.0,3.2,1.2,0.2,0
-5.5,3.5,1.3,0.2,0
-4.9,3.6,1.4,0.1,0
-4.4,3.0,1.3,0.2,0
-5.1,3.4,1.5,0.2,0
-5.0,3.5,1.3,0.3,0
-4.5,2.3,1.3,0.3,0
-4.4,3.2,1.3,0.2,0
-5.0,3.5,1.6,0.6,0
-5.1,3.8,1.9,0.4,0
-4.8,3.0,1.4,0.3,0
-5.1,3.8,1.6,0.2,0
-4.6,3.2,1.4,0.2,0
-5.3,3.7,1.5,0.2,0
-5.0,3.3,1.4,0.2,0
-7.0,3.2,4.7,1.4,1
-6.4,3.2,4.5,1.5,1
-6.9,3.1,4.9,1.5,1
-5.5,2.3,4.0,1.3,1
-6.5,2.8,4.6,1.5,1
-5.7,2.8,4.5,1.3,1
-6.3,3.3,4.7,1.6,1
-4.9,2.4,3.3,1.0,1
-6.6,2.9,4.6,1.3,1
-5.2,2.7,3.9,1.4,1
-5.0,2.0,3.5,1.0,1
-5.9,3.0,4.2,1.5,1
-6.0,2.2,4.0,1.0,1
-6.1,2.9,4.7,1.4,1
-5.6,2.9,3.6,1.3,1
-6.7,3.1,4.4,1.4,1
-5.6,3.0,4.5,1.5,1
-5.8,2.7,4.1,1.0,1
-6.2,2.2,4.5,1.5,1
-5.6,2.5,3.9,1.1,1
-5.9,3.2,4.8,1.8,1
-6.1,2.8,4.0,1.3,1
-6.3,2.5,4.9,1.5,1
-6.1,2.8,4.7,1.2,1
-6.4,2.9,4.3,1.3,1
-6.6,3.0,4.4,1.4,1
-6.8,2.8,4.8,1.4,1
-6.7,3.0,5.0,1.7,1
-6.0,2.9,4.5,1.5,1
-5.7,2.6,3.5,1.0,1
-5.5,2.4,3.8,1.1,1
-5.5,2.4,3.7,1.0,1
-5.8,2.7,3.9,1.2,1
-6.0,2.7,5.1,1.6,1
-5.4,3.0,4.5,1.5,1
-6.0,3.4,4.5,1.6,1
-6.7,3.1,4.7,1.5,1
-6.3,2.3,4.4,1.3,1
-5.6,3.0,4.1,1.3,1
-5.5,2.5,4.0,1.3,1
-5.5,2.6,4.4,1.2,1
-6.1,3.0,4.6,1.4,1
-5.8,2.6,4.0,1.2,1
-5.0,2.3,3.3,1.0,1
-5.6,2.7,4.2,1.3,1
-5.7,3.0,4.2,1.2,1
-5.7,2.9,4.2,1.3,1
-6.2,2.9,4.3,1.3,1
-5.1,2.5,3.0,1.1,1
-5.7,2.8,4.1,1.3,1
-6.3,3.3,6.0,2.5,2
-5.8,2.7,5.1,1.9,2
-7.1,3.0,5.9,2.1,2
-6.3,2.9,5.6,1.8,2
-6.5,3.0,5.8,2.2,2
-7.6,3.0,6.6,2.1,2
-4.9,2.5,4.5,1.7,2
-7.3,2.9,6.3,1.8,2
-6.7,2.5,5.8,1.8,2
-7.2,3.6,6.1,2.5,2
-6.5,3.2,5.1,2.0,2
-6.4,2.7,5.3,1.9,2
-6.8,3.0,5.5,2.1,2
-5.7,2.5,5.0,2.0,2
-5.8,2.8,5.1,2.4,2
-6.4,3.2,5.3,2.3,2
-6.5,3.0,5.5,1.8,2
-7.7,3.8,6.7,2.2,2
-7.7,2.6,6.9,2.3,2
-6.0,2.2,5.0,1.5,2
-6.9,3.2,5.7,2.3,2
-5.6,2.8,4.9,2.0,2
-7.7,2.8,6.7,2.0,2
-6.3,2.7,4.9,1.8,2
-6.7,3.3,5.7,2.1,2
-7.2,3.2,6.0,1.8,2
-6.2,2.8,4.8,1.8,2
-6.1,3.0,4.9,1.8,2
-6.4,2.8,5.6,2.1,2
-7.2,3.0,5.8,1.6,2
-7.4,2.8,6.1,1.9,2
-7.9,3.8,6.4,2.0,2
-6.4,2.8,5.6,2.2,2
-6.3,2.8,5.1,1.5,2
-6.1,2.6,5.6,1.4,2
-7.7,3.0,6.1,2.3,2
-6.3,3.4,5.6,2.4,2
-6.4,3.1,5.5,1.8,2
-6.0,3.0,4.8,1.8,2
-6.9,3.1,5.4,2.1,2
-6.7,3.1,5.6,2.4,2
-6.9,3.1,5.1,2.3,2
-5.8,2.7,5.1,1.9,2
-6.8,3.2,5.9,2.3,2
-6.7,3.3,5.7,2.5,2
-6.7,3.0,5.2,2.3,2
-6.3,2.5,5.0,1.9,2
-6.5,3.0,5.2,2.0,2
-6.2,3.4,5.4,2.3,2
-5.9,3.0,5.1,1.8,2
-`
