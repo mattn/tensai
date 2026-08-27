@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/pprof"
+	"strings"
 	"time"
 
 	"github.com/mattn/tensai/internal/llm"
@@ -105,6 +106,7 @@ func main() {
 		o, finish := modelFlags(fs)
 		prompt := fs.String("prompt", "", "user message (or raw prompt with -raw); positional arguments join into one")
 		raw := fs.Bool("raw", false, "skip the chat template, complete the prompt as-is")
+		jsonOut := fs.Bool("json", false, "print one JSON object with the completion and usage instead of streaming text")
 		n := fs.Int("n", 256, "max tokens to generate")
 		cpuprofile := fs.String("cpuprofile", "", "write a CPU profile of generation to this file")
 		fs.Parse(args)
@@ -124,7 +126,22 @@ func main() {
 		defer e.Close()
 		stop := profileTo(*cpuprofile)
 		defer stop()
-		e.Generate(os.Stdout, text, *raw, *n)
+		if *jsonOut {
+			var sb strings.Builder
+			res := e.Generate(&sb, text, *raw, *n)
+			out, _ := json.Marshal(map[string]any{
+				"content":           strings.TrimSuffix(sb.String(), "\n"),
+				"finish":            res.Finish,
+				"prompt_tokens":     res.PromptTokens,
+				"completion_tokens": res.CompletionTokens,
+				"prefill_ms":        res.Prefill.Milliseconds(),
+				"total_ms":          res.Total.Milliseconds(),
+				"tok_per_sec":       float64(res.CompletionTokens) / (res.Total - res.Prefill).Seconds(),
+			})
+			fmt.Println(string(out))
+		} else {
+			e.Generate(os.Stdout, text, *raw, *n)
+		}
 	case "chat":
 		fs := flag.NewFlagSet("tensai chat", flag.ExitOnError)
 		o, finish := modelFlags(fs)

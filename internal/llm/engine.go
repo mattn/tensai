@@ -274,13 +274,15 @@ func (e *Engine) feed(ids []int) {
 }
 
 // generate emits up to limit sampled tokens to w, speculatively when a
-// draft model is loaded, and reports throughput to the Log writer.
-func (e *Engine) generate(w io.Writer, limit int) {
+// draft model is loaded, and reports throughput to the Log writer. It
+// returns the token count and why generation ended.
+func (e *Engine) generate(w io.Writer, limit int) (int, string) {
 	start := time.Now()
 	gen := 0
 	if e.draft != nil {
 		var stats specStats
-		e.logits, e.steps, _, stats = generateSpeculative(e.model, e.draft, e.logits, e.steps,
+		var finish string
+		e.logits, e.steps, finish, stats = generateSpeculative(e.model, e.draft, e.logits, e.steps,
 			limit, e.nCtx, e.opts.SpecK, e.opts.Temp, e.opts.TopP, func(id int) bool {
 				return id == e.imEnd || id == e.eot
 			}, e.rng, func(id int) bool {
@@ -291,12 +293,14 @@ func (e *Engine) generate(w io.Writer, limit int) {
 		fmt.Fprintln(w)
 		fmt.Fprintf(e.opts.Log, "(%d tokens, %.1f tok/s, %d/%d drafts accepted)\n",
 			gen, float64(gen)/time.Since(start).Seconds(), stats.accepted, stats.proposed)
-		return
+		return gen, finish
 	}
+	finish := "length"
 	for ; gen < limit && e.steps < e.nCtx-1; gen++ {
 		next := sample(e.logits, e.opts.Temp, e.opts.TopP, e.rng)
 		if next == e.imEnd || next == e.eot {
 			e.feed([]int{next})
+			finish = "stop"
 			break
 		}
 		fmt.Fprint(w, e.tok.Decode([]int{next}))
@@ -305,11 +309,21 @@ func (e *Engine) generate(w io.Writer, limit int) {
 	fmt.Fprintln(w)
 	fmt.Fprintf(e.opts.Log, "(%d tokens, %.1f tok/s)\n",
 		gen, float64(gen)/time.Since(start).Seconds())
+	return gen, finish
+}
+
+// RunResult reports what one Generate call did.
+type RunResult struct {
+	PromptTokens     int
+	CompletionTokens int
+	Finish           string // "stop" or "length"
+	Prefill          time.Duration
+	Total            time.Duration
 }
 
 // Generate runs one completion: the prompt goes through the model's chat
 // template (or verbatim when raw), and up to n sampled tokens stream to w.
-func (e *Engine) Generate(w io.Writer, prompt string, raw bool, n int) {
+func (e *Engine) Generate(w io.Writer, prompt string, raw bool, n int) RunResult {
 	text := prompt
 	if !raw {
 		if e.tm.foldSystem {
@@ -323,10 +337,15 @@ func (e *Engine) Generate(w io.Writer, prompt string, raw bool, n int) {
 	fmt.Fprintf(e.opts.Log, "prompt: %d tokens\n", len(ids))
 	start := time.Now()
 	e.feed(ids)
-	fmt.Fprintf(e.opts.Log, "prefill: %v\n", time.Since(start).Round(time.Millisecond))
-	e.generate(w, n)
+	prefill := time.Since(start)
+	fmt.Fprintf(e.opts.Log, "prefill: %v\n", prefill.Round(time.Millisecond))
+	gen, finish := e.generate(w, n)
 	fmt.Fprintf(e.opts.Log, "%d tokens total in %v\n",
 		e.steps, time.Since(start).Round(time.Millisecond))
+	return RunResult{
+		PromptTokens: len(ids), CompletionTokens: gen, Finish: finish,
+		Prefill: prefill, Total: time.Since(start),
+	}
 }
 
 // Chat runs an interactive multi-turn loop: one line of in per turn, the
