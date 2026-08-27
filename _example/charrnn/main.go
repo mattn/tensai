@@ -11,6 +11,9 @@ import (
 	"strings"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/autograd"
+	"github.com/mattn/tensai/optim"
+	"github.com/mattn/tensai/rnn"
 )
 
 const (
@@ -23,17 +26,17 @@ const (
 )
 
 type charModel struct {
-	cell       *tensai.LSTMCell
-	wOut, bOut *tensai.Node
+	cell       *rnn.LSTMCell
+	wOut, bOut *autograd.Node
 	vocab      []rune
 	index      map[rune]int
 }
 
 func newCharModel(vocab []rune, rng *rand.Rand) *charModel {
 	m := &charModel{
-		cell:  tensai.NewLSTMCell(len(vocab), hidden, rng),
-		wOut:  tensai.Param(tensai.RandomMatrix(hidden, len(vocab), rng)),
-		bOut:  tensai.Param(tensai.NewMatrix(1, len(vocab))),
+		cell:  rnn.NewLSTMCell(len(vocab), hidden, rng),
+		wOut:  autograd.Param(tensai.RandomMatrix(hidden, len(vocab), rng)),
+		bOut:  autograd.Param(tensai.NewMatrix(1, len(vocab))),
 		vocab: vocab,
 		index: make(map[rune]int, len(vocab)),
 	}
@@ -43,12 +46,12 @@ func newCharModel(vocab []rune, rng *rand.Rand) *charModel {
 	return m
 }
 
-func (m *charModel) params() []*tensai.Node {
+func (m *charModel) params() []*autograd.Node {
 	return append(m.cell.Params(), m.wOut, m.bOut)
 }
 
 // step feeds one time step and returns (logits, hidden, cell).
-func (m *charModel) step(x, h, c *tensai.Node) (*tensai.Node, *tensai.Node, *tensai.Node) {
+func (m *charModel) step(x, h, c *autograd.Node) (*autograd.Node, *autograd.Node, *autograd.Node) {
 	h, c = m.cell.Step(x, h, c)
 	return h.MatMul(m.wOut).AddRow(m.bOut), h, c
 }
@@ -64,11 +67,11 @@ func (m *charModel) oneHot(text []rune, pos []int, t int) *tensai.Matrix {
 
 // loss builds the unrolled training graph for one batch of subsequences:
 // at every step the model predicts the next character.
-func (m *charModel) loss(text []rune, pos []int) *tensai.Node {
+func (m *charModel) loss(text []rune, pos []int) *autograd.Node {
 	h, c := m.cell.InitState(len(pos))
-	var total *tensai.Node
+	var total *autograd.Node
 	for t := 0; t < seqLen; t++ {
-		logits, hn, cn := m.step(tensai.Input(m.oneHot(text, pos, t)), h, c)
+		logits, hn, cn := m.step(autograd.Input(m.oneHot(text, pos, t)), h, c)
 		h, c = hn, cn
 		targets := tensai.NewMatrix(len(pos), 1)
 		for i, p := range pos {
@@ -89,11 +92,11 @@ func (m *charModel) generate(prefix string, n int, temperature float32, rng *ran
 	var sb strings.Builder
 	sb.WriteString(prefix)
 	h, c := m.cell.InitState(1)
-	var logits *tensai.Node
+	var logits *autograd.Node
 	feed := func(r rune) {
 		x := tensai.NewMatrix(1, len(m.vocab))
 		x.Data[m.index[r]] = 1
-		logits, h, c = m.step(tensai.Input(x), h, c)
+		logits, h, c = m.step(autograd.Input(x), h, c)
 	}
 	for _, r := range prefix {
 		feed(r)
@@ -138,7 +141,7 @@ func main() {
 
 	rng := rand.New(rand.NewSource(seed))
 	model := newCharModel(vocab, rng)
-	trainer := tensai.NewTrainer(tensai.NewAdam(0.01), model.params()...)
+	trainer := autograd.NewTrainer(optim.NewAdam(0.01), model.params()...)
 
 	for it := 1; it <= iters; it++ {
 		pos := make([]int, batchSize)
@@ -153,14 +156,14 @@ func main() {
 
 	// Save the trained parameters, then restore them into a fresh model to
 	// demonstrate the round trip; generation runs on the reloaded model.
-	if err := tensai.SaveParamsFile(paramFile, model.params()...); err != nil {
+	if err := autograd.SaveParamsFile(paramFile, model.params()...); err != nil {
 		fmt.Fprintf(os.Stderr, "charrnn: %v\n", err)
 		os.Exit(1)
 	}
 	fmt.Printf("parameters saved to %s\n", paramFile)
 
 	reloaded := newCharModel(vocab, rand.New(rand.NewSource(seed+1)))
-	if err := tensai.LoadParamsFile(paramFile, reloaded.params()...); err != nil {
+	if err := autograd.LoadParamsFile(paramFile, reloaded.params()...); err != nil {
 		fmt.Fprintf(os.Stderr, "charrnn: %v\n", err)
 		os.Exit(1)
 	}

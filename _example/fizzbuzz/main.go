@@ -5,6 +5,11 @@ import (
 	"math/rand"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/dataset"
+	"github.com/mattn/tensai/layer"
+	"github.com/mattn/tensai/loss"
+	"github.com/mattn/tensai/model"
+	"github.com/mattn/tensai/optim"
 )
 
 const (
@@ -53,7 +58,7 @@ func label(n, cls int) string {
 }
 
 // dataset builds input/target matrices for the numbers lo..hi inclusive.
-func dataset(lo, hi int) (*tensai.Matrix, *tensai.Matrix, error) {
+func makeDataset(lo, hi int) (*tensai.Matrix, *tensai.Matrix, error) {
 	rows := hi - lo + 1
 	inputData := make([]float32, 0, rows*numFeatures)
 	targetData := make([]float32, 0, rows)
@@ -75,17 +80,17 @@ func dataset(lo, hi int) (*tensai.Matrix, *tensai.Matrix, error) {
 func main() {
 	// The classic "FizzBuzz as machine learning" joke: train on 101..1023
 	// and see whether the network generalizes to the unseen 1..100.
-	model := tensai.NewSequential()
-	model.Add(tensai.NewDense(16))
-	model.Add(&tensai.ReLU{})
-	model.Add(tensai.NewDense(numClasses))
+	model := model.NewSequential()
+	model.Add(layer.NewDense(16))
+	model.Add(&layer.ReLU{})
+	model.Add(layer.NewDense(numClasses))
 
-	adam := tensai.NewAdam(0.02)
-	if err := model.Compile(numFeatures, tensai.SoftmaxCrossEntropy{}, adam); err != nil {
+	adam := optim.NewAdam(0.02)
+	if err := model.Compile(numFeatures, loss.SoftmaxCrossEntropy{}, adam); err != nil {
 		panic(err)
 	}
 
-	trainIn, trainTgt, err := dataset(101, 1<<numBits-1)
+	trainIn, trainTgt, err := makeDataset(101, 1<<numBits-1)
 	if err != nil {
 		panic(err)
 	}
@@ -97,7 +102,7 @@ func main() {
 		batchSize = 128
 	)
 	rng := rand.New(rand.NewSource(1))
-	ds, err := tensai.NewDataset(trainIn, trainTgt)
+	ds, err := dataset.New(trainIn, trainTgt)
 	if err != nil {
 		panic(err)
 	}
@@ -118,7 +123,7 @@ func main() {
 		}
 	}
 
-	testIn, testTgt, err := dataset(1, 100)
+	testIn, testTgt, err := makeDataset(1, 100)
 	if err != nil {
 		panic(err)
 	}

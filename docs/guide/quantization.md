@@ -2,20 +2,20 @@
 
 Decoding a language model streams every weight once per token, so decode speed is memory bandwidth. Weight-only quantization pulls fewer bytes for the same matmul: int8 moves a quarter of the float32 bytes, int4 an eighth. tensai builds quantized *twins* of a `Matrix` — the float32 original stays untouched, and the quantized copy answers `MatVec`/`MatMul` with float32 inputs and outputs.
 
-## int8: `QuantizeMatrix`
+## int8: `quant.Quantize`
 
 ```go
-q := tensai.QuantizeMatrix(w)     // *QMatrix, per-column scales
+q := quant.Quantize(w)     // *QMatrix, per-column scales
 q.MatVec(x, out)                  // decode: one vector in, one out
 q.MatMul(x, out)                  // prefill: batched rows
 ```
 
 The int8 path is a full integer pipeline: weights are stored in interleaved row quads, activations are dynamically quantized to 7 bits per call, and the whole dot product runs on the 256-bit u8 x s8 pairwise multiply-add plus a widening pair-add — two instructions per column, four rows deep. That reaches memory bandwidth (~31GB/s of weights on 16 cores), which is the practical ceiling for a decode matvec.
 
-## int4: `QuantizeMatrix4`
+## int4: `quant.Quantize4`
 
 ```go
-q4, err := tensai.QuantizeMatrix4(w)  // *Q4Matrix, group-wise scales
+q4, err := quant.Quantize4(w)  // *Q4Matrix, group-wise scales
 ```
 
 int4 quantizes group-wise (a scale — or scale/min pair — per group of rows within a column) and accumulates in float32 at group boundaries. It halves the weights again relative to int8 — the difference between a 7B model fitting in RAM or not.

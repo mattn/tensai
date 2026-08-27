@@ -4,18 +4,22 @@ import (
 	"fmt"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/layer"
+	"github.com/mattn/tensai/loss"
+	"github.com/mattn/tensai/model"
+	"github.com/mattn/tensai/optim"
 )
 
 func main() {
 	// Classic XOR problem: a 2-input network with one hidden layer can learn
 	// it when a non-linear activation is used.
-	model := tensai.NewSequential()
-	model.Add(tensai.NewDense(8))
-	model.Add(&tensai.Tanh{})
-	model.Add(tensai.NewDense(1))
-	model.Add(&tensai.Sigmoid{})
+	net := model.NewSequential()
+	net.Add(layer.NewDense(8))
+	net.Add(&layer.Tanh{})
+	net.Add(layer.NewDense(1))
+	net.Add(&layer.Sigmoid{})
 
-	if err := model.Compile(2, tensai.MeanSquaredError{}, tensai.NewAdam(0.05)); err != nil {
+	if err := net.Compile(2, loss.MeanSquaredError{}, optim.NewAdam(0.05)); err != nil {
 		panic(err)
 	}
 
@@ -35,12 +39,12 @@ func main() {
 		panic(err)
 	}
 
-	if err := model.Fit(inputs, targets, 5000); err != nil {
+	if err := net.Fit(inputs, targets, 5000); err != nil {
 		panic(err)
 	}
 
 	fmt.Println("\nXOR predictions after training:")
-	pred, err := model.Predict(inputs)
+	pred, err := net.Predict(inputs)
 	if err != nil {
 		panic(err)
 	}
@@ -52,11 +56,11 @@ func main() {
 	// Quick sanity check that the framework also works for classification
 	// with softmax + cross-entropy on the same XOR inputs as 2 classes.
 	fmt.Println("\nSoftmax + cross-entropy sanity check:")
-	cls := tensai.NewSequential()
-	cls.Add(tensai.NewDense(8))
-	cls.Add(&tensai.ReLU{})
-	cls.Add(tensai.NewDense(2))
-	if err := cls.Compile(2, tensai.SoftmaxCrossEntropy{}, tensai.NewAdam(0.05)); err != nil {
+	cls := model.NewSequential()
+	cls.Add(layer.NewDense(8))
+	cls.Add(&layer.ReLU{})
+	cls.Add(layer.NewDense(2))
+	if err := cls.Compile(2, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.05)); err != nil {
 		panic(err)
 	}
 	clsTargets, err := tensai.NewMatrixFromSlice(4, 1, []float32{
@@ -70,7 +74,7 @@ func main() {
 	}
 
 	// Full-batch FitStep loop, demonstrating the lower-level training API
-	// (the same thing model.Fit wraps for regression above).
+	// (the same thing Fit wraps for regression above).
 	for epoch := 0; epoch < 5000; epoch++ {
 		if _, err := cls.FitStep(inputs, clsTargets); err != nil {
 			panic(err)

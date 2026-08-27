@@ -5,18 +5,18 @@ When a model doesn't fit the Sequential mold (weight sharing, custom losses, exo
 ## Params, Inputs, and the Trainer
 
 ```go
-w1 := tensai.Param(tensai.RandomMatrix(2, 8, rng))
-b1 := tensai.Param(tensai.NewMatrix(1, 8))
-w2 := tensai.Param(tensai.RandomMatrix(8, 1, rng))
-trainer := tensai.NewTrainer(tensai.NewAdam(0.05), w1, b1, w2)
+w1 := autograd.Param(tensai.RandomMatrix(2, 8, rng))
+b1 := autograd.Param(tensai.NewMatrix(1, 8))
+w2 := autograd.Param(tensai.RandomMatrix(8, 1, rng))
+trainer := autograd.NewTrainer(optim.NewAdam(0.05), w1, b1, w2)
 
 for step := 0; step < 2000; step++ {
-	loss := tensai.Input(x).MatMul(w1).AddRow(b1).Tanh().MatMul(w2).Sigmoid().MSELoss(y)
+	loss := autograd.Input(x).MatMul(w1).AddRow(b1).Tanh().MatMul(w2).Sigmoid().MSELoss(y)
 	trainer.Step(loss) // backward + update + zero grads, returns the loss value
 }
 ```
 
-`Param` wraps a matrix whose gradient should be tracked and updated; `Input` wraps data. For manual control, the pieces are still public: `loss.Backward()`, `p.Grad`, and `tensai.ZeroGrads(params...)`.
+`Param` wraps a matrix whose gradient should be tracked and updated; `Input` wraps data. For manual control, the pieces are still public: `loss.Backward()`, `p.Grad`, and `autograd.ZeroGrads(params...)`.
 
 ## Available ops
 
@@ -34,18 +34,18 @@ go run ./_example/dot | dot -Tsvg > graph.svg
 
 ## Recurrent networks
 
-`RNNCell` and `LSTMCell` are built on the autograd engine, so unrolling a sequence is a plain Go loop and backpropagation through time comes for free:
+`rnn.Cell` and `rnn.LSTMCell` are built on the autograd engine, so unrolling a sequence is a plain Go loop and backpropagation through time comes for free:
 
 ```go
-cell := tensai.NewLSTMCell(inSize, hidden, rng)
-wOut := tensai.Param(tensai.RandomMatrix(hidden, numClasses, rng))
-bOut := tensai.Param(tensai.NewMatrix(1, numClasses))
-trainer := tensai.NewTrainer(tensai.NewAdam(0.01), append(cell.Params(), wOut, bOut)...)
+cell := rnn.NewLSTMCell(inSize, hidden, rng)
+wOut := autograd.Param(tensai.RandomMatrix(hidden, numClasses, rng))
+bOut := autograd.Param(tensai.NewMatrix(1, numClasses))
+trainer := autograd.NewTrainer(optim.NewAdam(0.01), append(cell.Params(), wOut, bOut)...)
 
 for step := 0; step < epochs; step++ {
 	h, c := cell.InitState(batch)
 	for _, x := range steps { // one (batch x inSize) matrix per time step
-		h, c = cell.Step(tensai.Input(x), h, c)
+		h, c = cell.Step(autograd.Input(x), h, c)
 	}
 	logits := h.MatMul(wOut).AddRow(bOut)
 	trainer.Step(logits.SoftmaxCELoss(labels))
@@ -56,14 +56,14 @@ for step := 0; step < epochs; step++ {
 
 ## Attention
 
-`SelfAttention` operates on one `(seqLen x inSize)` sequence node: `attn.Forward(x)` computes `softmax(Q*K^T/sqrt(d))*V` with learned projections. The raw `tensai.Attention(q, k, v)` form is also exposed.
+`rnn.SelfAttention` operates on one `(seqLen x inSize)` sequence node: `attn.Forward(x)` computes `softmax(Q*K^T/sqrt(d))*V` with learned projections. The raw `rnn.Attention(q, k, v)` form is also exposed.
 
 ## Saving parameters
 
 Autograd parameters are saved and restored positionally:
 
 ```go
-tensai.SaveParamsFile("cell.json", cell.Params()...)
+autograd.SaveParamsFile("cell.json", cell.Params()...)
 // build the same cell, then
-tensai.LoadParamsFile("cell.json", cell.Params()...)
+autograd.LoadParamsFile("cell.json", cell.Params()...)
 ```

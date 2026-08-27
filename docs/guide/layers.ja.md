@@ -21,13 +21,13 @@ type Layer interface {
 
 | レイヤー | コンストラクタ | 備考 |
 |---|---|---|
-| Dense | `NewDense(outCols)` | 全結合。Glorot/He スタイルの初期化 |
-| Embedding | `NewEmbedding(vocabSize, dim)` | 入力行は `Float` に格納された整数トークン ID。引いたベクトルは行方向に連結 |
-| Conv2D | `NewConv2D(inH, inW, inC, outC, kernel, stride, pad)` | im2col + `Dot` カーネル |
-| MaxPool2D | `NewMaxPool2D(inH, inW, channels, size)` | |
-| BatchNorm | `NewBatchNorm()` | 移動統計量はモデルと一緒に保存されます |
-| LayerNorm | `NewLayerNorm()` | 行ごとの正規化 |
-| Dropout | `NewDropout(rate)` | 学習時のみ有効 |
+| Dense | `layer.NewDense(outCols)` | 全結合。Glorot/He スタイルの初期化 |
+| Embedding | `layer.NewEmbedding(vocabSize, dim)` | 入力行は `Float` に格納された整数トークン ID。引いたベクトルは行方向に連結 |
+| Conv2D | `layer.NewConv2D(inH, inW, inC, outC, kernel, stride, pad)` | im2col + `Dot` カーネル |
+| MaxPool2D | `layer.NewMaxPool2D(inH, inW, channels, size)` | |
+| BatchNorm | `layer.NewBatchNorm()` | 移動統計量はモデルと一緒に保存されます |
+| LayerNorm | `layer.NewLayerNorm()` | 行ごとの正規化 |
+| Dropout | `layer.NewDropout(rate)` | 学習時のみ有効 |
 
 `Conv2D` と `MaxPool2D` は各行をチャンネル優先の画像として扱います: `index = (channel*height + y)*width + x`。`Dropout` と `BatchNorm` は `Fit`/`FitStep` 内では学習時の挙動、`Predict` 内では推論時の挙動へ自動的に切り替わります。
 
@@ -39,20 +39,20 @@ type Layer interface {
 
 | 活性化 | 使い方 |
 |---|---|
-| ReLU | `&tensai.ReLU{}` |
-| LeakyReLU | `tensai.NewLeakyReLU(0.01)` |
-| GELU | `&tensai.GELU{}` (SIMD ビルドではベクトル化 `erf`) |
-| Sigmoid | `&tensai.Sigmoid{}` |
-| Tanh | `&tensai.Tanh{}` |
-| Softmax | `&tensai.Softmax{}` (通常は `SoftmaxCrossEntropy` の方を使います) |
+| ReLU | `&layer.ReLU{}` |
+| LeakyReLU | `layer.NewLeakyReLU(0.01)` |
+| GELU | `&layer.GELU{}` (SIMD ビルドではベクトル化 `erf`) |
+| Sigmoid | `&layer.Sigmoid{}` |
+| Tanh | `&layer.Tanh{}` |
+| Softmax | `&layer.Softmax{}` (通常は `SoftmaxCrossEntropy` の方を使います) |
 
 ## 損失関数
 
 | 損失 | 用途 | ターゲット |
 |---|---|---|
-| `MeanSquaredError{}` | 回帰 | 予測と同じ形状 |
-| `SoftmaxCrossEntropy{}` | 多クラス分類 | クラス番号の `Mx1` 行列 |
-| `BinaryCrossEntropy{}` | 二値ターゲット | 予測と同じ形状 |
+| `loss.MeanSquaredError{}` | 回帰 | 予測と同じ形状 |
+| `loss.SoftmaxCrossEntropy{}` | 多クラス分類 | クラス番号の `Mx1` 行列 |
+| `loss.BinaryCrossEntropy{}` | 二値ターゲット | 予測と同じ形状 |
 
 softmax は `SoftmaxCrossEntropy` の*内部*で適用されます (数値安定性のため行の最大値を引いてから)。モデルの最後は素の `Dense` で終わり、`Predict` は生のロジットを返すので、クラスは argmax で取ってください。
 
@@ -60,12 +60,12 @@ softmax は `SoftmaxCrossEntropy` の*内部*で適用されます (数値安定
 
 | オプティマイザ | コンストラクタ |
 |---|---|
-| モーメンタム SGD | `NewSGD(lr, momentum)` |
-| Adam | `NewAdam(lr)` |
-| AdamW | `NewAdamW(lr, weightDecay)` — decoupled weight decay |
+| モーメンタム SGD | `optim.NewSGD(lr, momentum)` |
+| Adam | `optim.NewAdam(lr)` |
+| AdamW | `optim.NewAdamW(lr, weightDecay)` — decoupled weight decay |
 
 Adam/AdamW のパラメータ更新は SIMD ビルドで AVX2 ベクトル化されるカーネルの 1 つです。
 
 ## k-NN ベースライン
 
-`NewKNN(k)` は学習不要のベースライン分類器です — `Fit` はデータを保持するだけで、`Predict` が距離行列を同じ SIMD matmul カーネルで組み立てます。MNIST の 5000 サンプルサブセットで約 91% (MLP は約 92%、CNN は約 95%) — ネットワークの隣に置く健全性チェックの床として便利です。
+`knn.New(k)` は学習不要のベースライン分類器です — `Fit` はデータを保持するだけで、`Predict` が距離行列を同じ SIMD matmul カーネルで組み立てます。MNIST の 5000 サンプルサブセットで約 91% (MLP は約 92%、CNN は約 95%) — ネットワークの隣に置く健全性チェックの床として便利です。

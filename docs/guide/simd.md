@@ -13,7 +13,7 @@ Requirements: amd64 and Go 1.26 or 1.27 (both `simd` API generations are support
 
 Where the AVX2 kernels apply today, and where they still could:
 
-- [x] Matmul (`Dot`/`DotInto`) — used by `Dense`, `Conv2D` (im2col product), `KNN` distances, and autograd `MatMul`
+- [x] Matmul (`Dot`/`DotInto`) — used by `Dense`, `Conv2D` (im2col product), `knn.Classifier` distances, and autograd `MatMul`
 - [x] ReLU / LeakyReLU forward & backward
 - [x] Sigmoid / Tanh forward & backward (vectorized polynomial `exp`)
 - [x] GELU forward & backward (vectorized `erf`)

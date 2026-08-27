@@ -21,7 +21,7 @@ import (
 	"sync"
 	"time"
 
-	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/tokenizer"
 )
 
@@ -83,7 +83,7 @@ type Engine struct {
 	imEnd   int
 	eot     int
 	nCtx    int
-	g       *tensai.GPU
+	g       *gpu.Device
 	gq      *gpuQwen
 	prefill func([]int, int) []float32
 	step    func(int, int) []float32
@@ -209,7 +209,7 @@ func Open(o Options) (*Engine, error) {
 		if o.Bits == 0 {
 			return nil, fmt.Errorf("GPU decoding requires quantized weights")
 		}
-		g, err := tensai.OpenGPU(tensai.GPUHighPerformance)
+		g, err := gpu.Open(gpu.HighPerformance)
 		if err != nil {
 			return nil, err
 		}

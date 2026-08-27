@@ -13,7 +13,7 @@ GOEXPERIMENT=simd go test -bench=Dot .
 
 AVX2 カーネルが今日適用されている場所と、まだ適用できる場所:
 
-- [x] Matmul (`Dot`/`DotInto`) — `Dense`、`Conv2D` (im2col 積)、`KNN` 距離、自動微分 `MatMul` が使用
+- [x] Matmul (`Dot`/`DotInto`) — `Dense`、`Conv2D` (im2col 積)、`knn.Classifier` 距離、自動微分 `MatMul` が使用
 - [x] ReLU / LeakyReLU の順伝播と逆伝播
 - [x] Sigmoid / Tanh の順伝播と逆伝播 (ベクトル化した多項式 `exp`)
 - [x] GELU の順伝播と逆伝播 (ベクトル化した `erf`)

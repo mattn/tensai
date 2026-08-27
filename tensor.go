@@ -69,11 +69,11 @@ func (m *Matrix) T() *Matrix {
 	return out
 }
 
-// ensureMatrix returns m when it already has the wanted shape, otherwise a
+// EnsureMatrix returns m when it already has the wanted shape, otherwise a
 // freshly allocated matrix. The contents are unspecified; callers must
 // overwrite (or clear) every element. Layers use this to reuse forward and
 // backward scratch buffers between training steps.
-func ensureMatrix(m *Matrix, rows, cols int) *Matrix {
+func EnsureMatrix(m *Matrix, rows, cols int) *Matrix {
 	if m != nil && m.Rows == rows && m.Cols == cols {
 		return m
 	}

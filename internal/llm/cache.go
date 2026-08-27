@@ -20,6 +20,7 @@ import (
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/internal/mmapfile"
+	"github.com/mattn/tensai/quant"
 )
 
 const cacheMagic = "TSAICCH\x00"
@@ -329,25 +330,25 @@ func (r *cacheReader) qmat(p **qmat) {
 	switch r.u64() {
 	case kindNil:
 	case kindQ:
-		q := &tensai.QMatrix{Rows: r.num(), Cols: r.num()}
+		q := &quant.QMatrix{Rows: r.num(), Cols: r.num()}
 		q.Q = sliceOf[int8](r.blob())
 		q.Scale = sliceOf[float32](r.blob())
 		q.ColSum64 = sliceOf[int32](r.blob())
 		*p = qmatQ8(q)
 	case kindQ4:
-		q := &tensai.Q4Matrix{Rows: r.num(), Cols: r.num(), Group: r.num()}
+		q := &quant.Q4Matrix{Rows: r.num(), Cols: r.num(), Group: r.num()}
 		q.Q = sliceOf[uint8](r.blob())
 		q.Scale = sliceOf[float32](r.blob())
 		q.ScaleMin = sliceOf[uint32](r.blob())
 		*p = qmatQ4(q)
 	case kindQ8G:
-		q := &tensai.Q8GMatrix{Rows: r.num(), Cols: r.num(), Group: r.num()}
+		q := &quant.Q8GMatrix{Rows: r.num(), Cols: r.num(), Group: r.num()}
 		q.Q = sliceOf[int8](r.blob())
 		q.Scale = sliceOf[float32](r.blob())
 		q.ColSum64 = sliceOf[int32](r.blob())
 		*p = qmatQ8G(q)
 	case kindMX:
-		q := &tensai.MXFP4Matrix{Rows: r.num(), Cols: r.num()}
+		q := &quant.MXFP4Matrix{Rows: r.num(), Cols: r.num()}
 		q.Q = sliceOf[uint8](r.blob())
 		q.Scale = sliceOf[float32](r.blob())
 		q.ColSum64 = sliceOf[int32](r.blob())

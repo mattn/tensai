@@ -4,6 +4,8 @@
 
 `tensai` is a small machine-learning framework for learning and experiments. It implements forward passes, backpropagation, and optimization in pure Go; the default build has no external dependencies (the optional `wgpu` build tag adds exactly one, cgo-free: `ebitengine/purego`).
 
+**Documentation: [mattn.github.io/tensai](https://mattn.github.io/tensai/)** — guides for every package, in English and [日本語](https://mattn.github.io/tensai/ja/).
+
 ## Features
 
 - **Matrix operations** - `Matrix` plus basic operations such as `Dot`, `Add`, `T`, and `AddBias`. Tensors are float32 (`tensai.Float`)
@@ -11,15 +13,15 @@
 - **SIMD acceleration** - AVX2 kernels written with Go's experimental `simd/archsimd` package: still pure Go, no cgo, no assembly files. Matmul, ReLU/LeakyReLU, Sigmoid/Tanh/Softmax (via a vectorized polynomial `exp`), GELU (via a vectorized `erf`), LayerNorm, and the Adam update are all 8-lane vectorized. Build with `GOEXPERIMENT=simd` on amd64 (Go 1.26 and 1.27 APIs both supported via build tags); every other build uses the portable fallbacks automatically
 - **Low-allocation training** - layers reuse their forward/backward scratch buffers across training steps (a full MLP step runs in ~29 allocations), so GC stays out of the training loop; `Predict` always returns freshly allocated results
 - **Layers** - `Embedding`, `Dense`, `Conv2D`, `MaxPool2D`, `BatchNorm`, `LayerNorm`, `Dropout`, plus `ReLU`, `LeakyReLU`, `GELU`, `Sigmoid`, `Tanh`, and `Softmax` activations
-- **WebGPU backend (experimental)** - build with `-tags wgpu` (linux, macOS, Windows) and `OpenGPU()` runs batched `MatMul` as a WGSL compute shader on any GPU wgpu-native reaches (Vulkan, Metal, D3D12 — AMD, Intel, Apple, NVIDIA). The bindings go through `ebitengine/purego`, so there is still no cgo and no C compiler: the wgpu-native shared library is dlopen-ed at runtime
-- **int8 / int4 quantization** - `QuantizeMatrix` / `QuantizeMatrix4` build weight-only quantized twins: int4 group-wise with float32 accumulation, and int8 as a full integer path — weights in interleaved row quads, activations dynamically quantized to 7 bits, and the whole dot product running on the 256-bit u8 x s8 pairwise multiply-add plus a widening pair-add — two instructions per column, four rows deep — which reaches memory bandwidth (~31GB/s of weights on 16 cores). int4 halves the weights again — the difference between a 7B model fitting in RAM or not
+- **WebGPU backend (experimental)** - build with `-tags wgpu` (linux, macOS, Windows) and `gpu.Open()` runs batched `MatMul` as a WGSL compute shader on any GPU wgpu-native reaches (Vulkan, Metal, D3D12 — AMD, Intel, Apple, NVIDIA). The bindings go through `ebitengine/purego`, so there is still no cgo and no C compiler: the wgpu-native shared library is dlopen-ed at runtime
+- **int8 / int4 quantization** - `quant.Quantize` / `quant.Quantize4` build weight-only quantized twins: int4 group-wise with float32 accumulation, and int8 as a full integer path — weights in interleaved row quads, activations dynamically quantized to 7 bits, and the whole dot product running on the 256-bit u8 x s8 pairwise multiply-add plus a widening pair-add — two instructions per column, four rows deep — which reaches memory bandwidth (~31GB/s of weights on 16 cores). int4 halves the weights again — the difference between a 7B model fitting in RAM or not
 - **Loss functions** - `MeanSquaredError` for regression, `SoftmaxCrossEntropy` for multi-class classification, and `BinaryCrossEntropy` for binary targets
 - **Optimizers** - momentum `SGD`, `Adam`, and `AdamW` (decoupled weight decay)
-- **k-NN baseline** - a `KNN` classifier whose distance matrix runs on the same SIMD matmul kernel; useful as a no-training baseline next to the networks
+- **k-NN baseline** - a `knn.Classifier` whose distance matrix runs on the same SIMD matmul kernel; useful as a no-training baseline next to the networks
 - **Dataset utilities** - `Dataset` pairs inputs with targets and provides `Shuffle`, train/test `Split` (copy-free views), buffer-reusing mini-batch iteration with `Batches`, and `Standardize`/`StandardizeWith`
 - **Sequential models** - stack layers and run `Compile` -> `Fit` / `FitStep` -> `Predict`
 - **Automatic differentiation** - a micrograd-style reverse-mode autograd engine over matrices (`Param` / `Input` / `Backward`), for models that don't fit the Sequential mold; `ToDot` renders the computation graph for Graphviz
-- **Recurrence and attention** - `RNNCell`, `LSTMCell`, and single-head `SelfAttention` built on the autograd engine, with backpropagation through time handled automatically
+- **Recurrence and attention** - `rnn.Cell`, `rnn.LSTMCell`, and single-head `rnn.SelfAttention` built on the autograd engine, with backpropagation through time handled automatically
 - **Serialization** - `Save`/`Load` (and `SaveFile`/`LoadFile`) round-trip trained Sequential parameters as JSON, including BatchNorm running statistics; `SaveParams`/`LoadParams` do the same for autograd parameters (RNN/LSTM/attention cells)
 - **TFLite export** - the `encoding/tflite` package marshals Sequential models (FP32, NHWC) into `.tflite` flatbuffers that run on the TFLite/LiteRT runtimes and [go-tflite](https://github.com/mattn/go-tflite), with the FlatBuffers writer implemented in-tree — still no dependencies
 - **safetensors** - `encoding/safetensors` reads the checkpoint format most published model weights ship in — lazily, one tensor at a time, with F16/BF16/F64 converted to float32 — and writes F32 checkpoints; interoperability is verified against the reference implementation in both directions. Also dependency-free
@@ -31,26 +33,20 @@
 
 ```
 go.mod              Module definition (github.com/mattn/tensai)
-tensor.go           Matrix and vector operations
-ndtensor.go         N-d Tensor: broadcasting element-wise ops, batched MatMul
-wgpu.go             WebGPU MatMul backend via purego + wgpu-native (build tag wgpu)
-dot_simd.go         AVX2 matmul kernel (GOEXPERIMENT=simd, amd64)
-dot_generic.go      Portable matmul kernel (all other builds)
+.                   Core: Float, Matrix, N-d Tensor, Dot and the AVX2/portable matmul kernels
+layer               Layer interface, Dense, Conv2D, MaxPool2D, BatchNorm, LayerNorm, Dropout, Embedding, activations
+loss                Loss functions (MSE, SoftmaxCrossEntropy, BCE)
+optim               Optimizers (SGD, Adam, AdamW)
+model               Sequential model, training loop, and JSON save/load
+autograd            Reverse-mode automatic differentiation (Node graph), Trainer, parameter save/load
+rnn                 rnn.Cell / LSTMCell / SelfAttention on the autograd engine
+knn                 k-NN baseline classifier
+dataset             Shuffle, split, standardize, mini-batch iteration
+quant               int8 / int4 / grouped-int8 / MXFP4 weight-only quantization
+gpu                 WebGPU backend via purego + wgpu-native (build tags wgpu / wgpu24)
 internal/kernels    Element-wise kernels: scalar bodies plus the AVX2 versions incl. vectorized exp
 internal/simd       Load/store shims over both simd/archsimd API generations
-internal/dims       Shape arithmetic shared with the GPU backend
-layer.go            Layer interface plus Dense and activations
-conv.go             Conv2D and MaxPool2D layers
-batchnorm.go        BatchNorm layer
-dropout.go          Dropout layer
-loss.go             Loss functions (MSE, SoftmaxCrossEntropy, BCE)
-optimizer.go        Optimizers (SGD, Adam, AdamW)
-model.go            Sequential model and training loop
-autograd.go         Reverse-mode automatic differentiation (Node graph)
-rnn.go              RNNCell / LSTMCell / SelfAttention on the autograd engine
-serialize.go        Model parameter save/load (JSON)
-tensai_test.go      Unit tests plus XOR convergence test
-features_test.go    Gradient checks and tests for the newer layers
+internal/dims       Shape arithmetic shared between the core and the GPU backend
 _example/helloworld Smallest possible program: add two values on the graph
 _example/dataset    Dataset workflow: shuffle, split, standardize, batches
 _example/xor        Runnable XOR training example
@@ -73,27 +69,27 @@ cmd/tensai          The tensai command: run, chat, and serve subcommands over in
 ### Regression: learn XOR with MSE
 
 ```go
-model := tensai.NewSequential()
-model.Add(tensai.NewDense(8))
-model.Add(&tensai.Tanh{})
-model.Add(tensai.NewDense(1))
-model.Add(&tensai.Sigmoid{})
+net := model.NewSequential()
+net.Add(layer.NewDense(8))
+net.Add(&layer.Tanh{})
+net.Add(layer.NewDense(1))
+net.Add(&layer.Sigmoid{})
 
-model.Compile(2, tensai.MeanSquaredError{}, tensai.NewAdam(0.05))
-model.Fit(inputs, targets, 5000)
+net.Compile(2, loss.MeanSquaredError{}, optim.NewAdam(0.05))
+net.Fit(inputs, targets, 5000)
 
-pred, _ := model.Predict(inputs)
+pred, _ := net.Predict(inputs)
 ```
 
 ### Classification: softmax + cross-entropy
 
 ```go
-model := tensai.NewSequential()
-model.Add(tensai.NewDense(8))
-model.Add(&tensai.ReLU{})
-model.Add(tensai.NewDense(2)) // output width = number of classes
+net := model.NewSequential()
+net.Add(layer.NewDense(8))
+net.Add(&layer.ReLU{})
+net.Add(layer.NewDense(2)) // output width = number of classes
 
-model.Compile(2, tensai.SoftmaxCrossEntropy{}, tensai.NewAdam(0.05))
+net.Compile(2, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.05))
 ```
 
 `SoftmaxCrossEntropy` expects targets as an `Mx1` matrix of class indices. Softmax is applied inside the loss, so `Predict` returns raw logits. Use argmax for classification.
@@ -101,7 +97,7 @@ model.Compile(2, tensai.SoftmaxCrossEntropy{}, tensai.NewAdam(0.05))
 ### Datasets
 
 ```go
-ds, _ := tensai.NewDataset(inputs, targets)
+ds, _ := dataset.New(inputs, targets)
 ds.Shuffle(rng)
 train, test, _ := ds.Split(0.2)          // views, no copying
 mean, std := train.Standardize()         // fit on train...
@@ -109,7 +105,7 @@ test.StandardizeWith(mean, std)          // ...apply to test
 
 for epoch := 0; epoch < epochs; epoch++ {
 	train.Batches(32, rng, func(in, tgt *tensai.Matrix) error {
-		_, err := model.FitStep(in, tgt)
+		_, err := net.FitStep(in, tgt)
 		return err
 	})
 }
@@ -118,22 +114,22 @@ for epoch := 0; epoch < epochs; epoch++ {
 ### Convolution, regularization, and saving
 
 ```go
-model := tensai.NewSequential()
-model.Add(tensai.NewConv2D(28, 28, 1, 8, 3, 1, 1)) // inH, inW, inC, outC, kernel, stride, pad
-model.Add(&tensai.ReLU{})
-model.Add(tensai.NewMaxPool2D(28, 28, 8, 2))
-model.Add(tensai.NewDense(64))
-model.Add(tensai.NewBatchNorm())
-model.Add(tensai.NewLeakyReLU(0.01))
-model.Add(tensai.NewDropout(0.3))
-model.Add(tensai.NewDense(10))
+net := model.NewSequential()
+net.Add(layer.NewConv2D(28, 28, 1, 8, 3, 1, 1)) // inH, inW, inC, outC, kernel, stride, pad
+net.Add(&layer.ReLU{})
+net.Add(layer.NewMaxPool2D(28, 28, 8, 2))
+net.Add(layer.NewDense(64))
+net.Add(layer.NewBatchNorm())
+net.Add(layer.NewLeakyReLU(0.01))
+net.Add(layer.NewDropout(0.3))
+net.Add(layer.NewDense(10))
 
-model.Compile(28*28, tensai.SoftmaxCrossEntropy{}, tensai.NewAdamW(0.001, 0.01))
-model.Fit(inputs, targets, 10)
+net.Compile(28*28, loss.SoftmaxCrossEntropy{}, optim.NewAdamW(0.001, 0.01))
+net.Fit(inputs, targets, 10)
 
-model.SaveFile("model.json")
+net.SaveFile("model.json")
 // Later: build + Compile the same architecture, then
-model.LoadFile("model.json")
+net.LoadFile("model.json")
 ```
 
 `Conv2D` and `MaxPool2D` treat each row as a channel-major image: `index = (channel*height + y)*width + x`. `Dropout` and `BatchNorm` switch automatically between training behavior (inside `Fit`/`FitStep`) and inference behavior (inside `Predict`).
@@ -237,18 +233,18 @@ The capital of France is Paris.
 When a model doesn't fit the Sequential mold (weight sharing, custom losses, exotic architectures), build the computation directly and let reverse-mode autodiff derive the gradients:
 
 ```go
-w1 := tensai.Param(tensai.RandomMatrix(2, 8, rng))
-b1 := tensai.Param(tensai.NewMatrix(1, 8))
-w2 := tensai.Param(tensai.RandomMatrix(8, 1, rng))
-trainer := tensai.NewTrainer(tensai.NewAdam(0.05), w1, b1, w2)
+w1 := autograd.Param(tensai.RandomMatrix(2, 8, rng))
+b1 := autograd.Param(tensai.NewMatrix(1, 8))
+w2 := autograd.Param(tensai.RandomMatrix(8, 1, rng))
+trainer := autograd.NewTrainer(optim.NewAdam(0.05), w1, b1, w2)
 
 for step := 0; step < 2000; step++ {
-	loss := tensai.Input(x).MatMul(w1).AddRow(b1).Tanh().MatMul(w2).Sigmoid().MSELoss(y)
+	loss := autograd.Input(x).MatMul(w1).AddRow(b1).Tanh().MatMul(w2).Sigmoid().MSELoss(y)
 	trainer.Step(loss) // backward + update + zero grads, returns the loss value
 }
 ```
 
-For manual control, the pieces are still public: `loss.Backward()`, `p.Grad`, and `tensai.ZeroGrads(params...)`.
+For manual control, the pieces are still public: `loss.Backward()`, `p.Grad`, and `autograd.ZeroGrads(params...)`.
 
 The graph a loss node holds can be visualized: `loss.ToDot()` returns Graphviz DOT (label leaves with `.Named("w1")`), so `go run ./_example/dot | dot -Tsvg > graph.svg` draws the network the same way Gorgonia's encoding/dot does.
 
@@ -256,27 +252,27 @@ Graphs are built dynamically per step (define-by-run) and are single-use. Availa
 
 ### Recurrent networks and attention
 
-`RNNCell`, `LSTMCell`, and `SelfAttention` are built on the autograd engine, so unrolling a sequence is a plain Go loop and backpropagation through time comes for free:
+`rnn.Cell`, `rnn.LSTMCell`, and `rnn.SelfAttention` are built on the autograd engine, so unrolling a sequence is a plain Go loop and backpropagation through time comes for free:
 
 ```go
-cell := tensai.NewLSTMCell(inSize, hidden, rng)
-wOut := tensai.Param(tensai.RandomMatrix(hidden, numClasses, rng))
-bOut := tensai.Param(tensai.NewMatrix(1, numClasses))
-trainer := tensai.NewTrainer(tensai.NewAdam(0.01), append(cell.Params(), wOut, bOut)...)
+cell := rnn.NewLSTMCell(inSize, hidden, rng)
+wOut := autograd.Param(tensai.RandomMatrix(hidden, numClasses, rng))
+bOut := autograd.Param(tensai.NewMatrix(1, numClasses))
+trainer := autograd.NewTrainer(optim.NewAdam(0.01), append(cell.Params(), wOut, bOut)...)
 
 for step := 0; step < epochs; step++ {
 	h, c := cell.InitState(batch)
 	for _, x := range steps { // one (batch x inSize) matrix per time step
-		h, c = cell.Step(tensai.Input(x), h, c)
+		h, c = cell.Step(autograd.Input(x), h, c)
 	}
 	logits := h.MatMul(wOut).AddRow(bOut)
 	trainer.Step(logits.SoftmaxCELoss(labels))
 }
 ```
 
-`SelfAttention` operates on one `(seqLen x inSize)` sequence node: `attn.Forward(x)` computes `softmax(Q*K^T/sqrt(d))*V` with learned projections; the raw `tensai.Attention(q, k, v)` form is also exposed.
+`rnn.SelfAttention` operates on one `(seqLen x inSize)` sequence node: `attn.Forward(x)` computes `softmax(Q*K^T/sqrt(d))*V` with learned projections; the raw `rnn.Attention(q, k, v)` form is also exposed.
 
-Autograd parameters are saved and restored positionally with `tensai.SaveParamsFile("cell.json", cell.Params()...)` / `tensai.LoadParamsFile("cell.json", cell.Params()...)` — build the same cell, then load.
+Autograd parameters are saved and restored positionally with `autograd.SaveParamsFile("cell.json", cell.Params()...)` / `autograd.LoadParamsFile("cell.json", cell.Params()...)` — build the same cell, then load.
 
 ### N-d tensors: broadcasting and batched MatMul
 
@@ -301,27 +297,27 @@ Tensors are contiguous and row-major; `Reshape` (with `-1` inference) and the `M
 Building with `-tags wgpu` (linux/darwin/windows) enables a GPU backend for batched `MatMul` with the same shape and broadcasting semantics as the CPU version:
 
 ```go
-gpu, err := tensai.OpenGPU() // fails cleanly when no GPU / library is present
+dev, err := gpu.Open() // fails cleanly when no GPU / library is present
 if err != nil { /* fall back to tensai.MatMul */ }
-defer gpu.Close()
-fmt.Println(gpu.Name()) // e.g. "AMD Radeon 780M (integrated)"
-out, err := gpu.MatMul(a, b)
+defer dev.Close()
+fmt.Println(dev.Name()) // e.g. "AMD Radeon 780M (integrated)"
+out, err := dev.MatMul(a, b)
 ```
 
-On machines with both an integrated and a discrete GPU, pass a preference: `tensai.OpenGPU(tensai.GPULowPower)` steers to the iGPU, `tensai.GPUHighPerformance` to the dGPU (it is a hint — with a single adapter you always get that one).
+On machines with both an integrated and a discrete GPU, pass a preference: `gpu.Open(gpu.LowPower)` steers to the iGPU, `gpu.HighPerformance` to the dGPU (it is a hint — with a single adapter you always get that one).
 
 Buffers can also stay resident on the GPU, so a weight rides the bus once instead of on every call and intermediates never leave the device:
 
 ```go
-gw, _ := gpu.Upload(w)              // weight uploaded once
+gw, _ := dev.Upload(w)              // weight uploaded once
 defer gw.Free()                     // GPU memory is not garbage collected
-gx, _ := gpu.Upload(x)
+gx, _ := dev.Upload(x)
 h, _ := gx.MatMul(gw)               // chain freely; nothing touches the host
 out, _ := h.MatMul(gw2)
 result, _ := out.Download()         // one readback at the end
 ```
 
-`gpu.MatMul(a, b)` is shorthand for Upload → MatMul → Download → Free. Residency matters most on discrete GPUs, where every transfer crosses PCIe; on shared-memory iGPUs the win is smaller and comes mainly from skipping intermediate readbacks.
+`dev.MatMul(a, b)` is shorthand for Upload → MatMul → Download → Free. Residency matters most on discrete GPUs, where every transfer crosses PCIe; on shared-memory iGPUs the win is smaller and comes mainly from skipping intermediate readbacks.
 
 Beyond MatMul, resident tensors support `MatMulT` (multiply by a transposed operand without materializing the transpose), an in-place `Scale`, and a row-parallel `Softmax` over the last axis — enough to run single-head attention entirely on the GPU:
 
@@ -370,15 +366,15 @@ huge         64x512x512@512x512    17179.9  116.374ms   62.128ms  566.726ms     
 
 Arithmetic no longer dominates the convenient path — `gpu+xfer` at `large` spends two thirds of its time on the bus — which is exactly what keeping inputs resident is for. Through a translation layer like dozen inside WSL2 the ratios shrink to roughly parity-to-3x, and on CPU Vulkan implementations the GPU path loses outright; measure on the driver you will ship on.
 
-Quantized weights stay quantized on the device too: `UploadQ8` packs a `QMatrix` four int8 weights per u32, and `GPUQMatrix.MatMul` dequantizes them in registers, so a decode matvec — whose cost is streaming the weights — moves a quarter of the f32 bytes. On the same iGPU through dozen it runs the matvec 2.2x faster than the resident f32 kernel.
+Quantized weights stay quantized on the device too: `UploadQ8` packs a `QMatrix` four int8 weights per u32, and `gpu.QMatrix.MatMul` dequantizes them in registers, so a decode matvec — whose cost is streaming the weights — moves a quarter of the f32 bytes. On the same iGPU through dozen it runs the matvec 2.2x faster than the resident f32 kernel.
 
 `UploadQ4` does the same for the int4 twin — nibbles packed four row-pair bytes per u32, group scales folded at group boundaries in registers — so `-q4 -gpu` runs models whose int8 weights would not fit. The rest of a transformer decode step is there as well — `RMSNorm`, in-place `RoPE`, `Add`, `SiluMul`, `GroupedCausalAttention` (a KV cache packing fewer heads than the queries, read up to a valid length), and `CopyRowsInto` to append fresh k/v rows to a resident cache — so `_example/qwen -q8 -gpu` runs every block on the device and only the hidden state comes back per token. `BeginBatch`/`Flush` record a whole token's dispatches into one submission, and freed intermediates recycle through a buffer pool, which together took a dozen-translated decode from 1.2 to ~17 tok/s steady state on the machine above. On native Windows the same iGPU speaks D3D12 directly, and `-q8 -gpu` held the 0.5B decode crown for a while — 29.7 tok/s against 23.2 on the AVX2 path — until the tiled integer kernels took it back: the CPU now decodes the same model at ~42 tok/s against ~30 on the GPU, which stays useful for keeping the cores free.
 
-wgpu-native picks Vulkan on Linux, Vulkan or D3D12 on Windows, and Metal on macOS, so AMD, Intel, Apple, and NVIDIA GPUs all work — as do CPU Vulkan implementations like lavapipe, which is how the tests run on machines without a GPU. `gpu.MatMul` uploads the operands and reads the product back on every call; `Upload` plus `GPUTensor.MatMul` keeps inputs and intermediates resident, so only the final result needs to cross the bus. Without the build tag `OpenGPU` returns an error and nothing else changes.
+wgpu-native picks Vulkan on Linux, Vulkan or D3D12 on Windows, and Metal on macOS, so AMD, Intel, Apple, and NVIDIA GPUs all work — as do CPU Vulkan implementations like lavapipe, which is how the tests run on machines without a GPU. `gpu.MatMul` uploads the operands and reads the product back on every call; `Upload` plus `gpu.Tensor.MatMul` keeps inputs and intermediates resident, so only the final result needs to cross the bus. Without the build tag `gpu.Open` returns an error and nothing else changes.
 
 #### `-tags wgpu24`: the new wgpu-native API, and the real GPU inside WSL2
 
-`-tags wgpu24` (linux/darwin/windows) builds the same `OpenGPU` API against the reworked wgpu-native C API instead — pair it with a **v29-series** release binary. The new API's payoff is `WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter`, which un-hides non-conformant Vulkan drivers. Concretely: Mesa's dozen (Vulkan-on-D3D12, shipped in the kisak-mesa PPA) exposes the real host GPU inside WSL2, but the v22 API hides it as non-conformant and falls back to lavapipe; the wgpu24 build reaches it:
+`-tags wgpu24` (linux/darwin/windows) builds the same `gpu.Open` API against the reworked wgpu-native C API instead — pair it with a **v29-series** release binary. The new API's payoff is `WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter`, which un-hides non-conformant Vulkan drivers. Concretely: Mesa's dozen (Vulkan-on-D3D12, shipped in the kisak-mesa PPA) exposes the real host GPU inside WSL2, but the v22 API hides it as non-conformant and falls back to lavapipe; the wgpu24 build reaches it:
 
 ```bash
 VK_DRIVER_FILES=/path/to/dzn_icd.json \
@@ -457,7 +453,7 @@ Both raw IDX files and `.gz` variants are accepted.
 
 Where the AVX2 kernels apply today, and where they still could:
 
-- [x] Matmul (`Dot`/`DotInto`) — used by `Dense`, `Conv2D` (im2col product), `KNN` distances, and autograd `MatMul`
+- [x] Matmul (`Dot`/`DotInto`) — used by `Dense`, `Conv2D` (im2col product), `knn.Classifier` distances, and autograd `MatMul`
 - [x] ReLU / LeakyReLU forward & backward
 - [x] Sigmoid / Tanh forward & backward (vectorized polynomial `exp`)
 - [x] GELU forward & backward (vectorized `erf`)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/autograd"
 )
 
 func scalar(v float32) *tensai.Matrix {
@@ -16,8 +17,8 @@ func scalar(v float32) *tensai.Matrix {
 }
 
 func main() {
-	x := tensai.Param(scalar(2)).Named("x")
-	y := tensai.Param(scalar(3)).Named("y")
+	x := autograd.Param(scalar(2)).Named("x")
+	y := autograd.Param(scalar(3)).Named("y")
 
 	// The graph is built by simply writing the expression.
 	z := x.Add(y).Named("z")
