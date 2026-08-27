@@ -1,0 +1,103 @@
+site_name: tensai
+site_description: A tiny machine-learning framework in pure Go
+site_url: https://mattn.github.io/tensai/
+repo_url: https://github.com/mattn/tensai
+repo_name: mattn/tensai
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  icon:
+    repo: fontawesome/brands/github
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - content.code.copy
+    - search.suggest
+    - search.highlight
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.details
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+plugins:
+  - search
+  - i18n:
+      docs_structure: suffix
+      fallback_to_default: true
+      reconfigure_material: true
+      reconfigure_search: true
+      languages:
+        - locale: en
+          name: English
+          build: true
+          default: true
+        - locale: ja
+          name: 日本語
+          build: true
+          nav_translations:
+            Home: ホーム
+            Getting Started: はじめに
+            Guide: ガイド
+            Tensors and Matrices: テンソルと行列
+            Layers, Losses, Optimizers: レイヤー・損失・最適化
+            Training Models: モデルの学習
+            Automatic Differentiation: 自動微分
+            Quantization: 量子化
+            SIMD Acceleration: SIMD アクセラレーション
+            GPU (WebGPU): GPU (WebGPU)
+            Model Formats: モデルフォーマット
+            Tokenizers: トークナイザ
+            LLM Inference: LLM 推論
+            Examples: サンプル
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Guide:
+      - Tensors and Matrices: guide/tensors.md
+      - Layers, Losses, Optimizers: guide/layers.md
+      - Training Models: guide/training.md
+      - Automatic Differentiation: guide/autograd.md
+      - Quantization: guide/quantization.md
+      - SIMD Acceleration: guide/simd.md
+      - GPU (WebGPU): guide/gpu.md
+  - Model Formats: formats.md
+  - Tokenizers: tokenizers.md
+  - LLM Inference: llm.md
+  - Examples: examples.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/mattn
+
+copyright: MIT License &mdash; Yasuhiro Matsumoto (a.k.a. mattn)
