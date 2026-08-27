@@ -2,8 +2,9 @@ package tensai
 
 import (
 	"fmt"
-	"math"
 	"math/rand"
+
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 // Layer is a single differentiable stage of a Sequential model.
@@ -86,7 +87,7 @@ func (d *Dense) Forward(input *Matrix) (*Matrix, error) {
 		return nil, err
 	}
 	for r := 0; r < out.Rows; r++ {
-		addSlice(out.Data[r*out.Cols:(r+1)*out.Cols], d.bias)
+		kernels.AddSlice(out.Data[r*out.Cols:(r+1)*out.Cols], d.bias)
 	}
 	return out, nil
 }
@@ -105,7 +106,7 @@ func (d *Dense) Backward(gradOutput *Matrix) (*Matrix, error) {
 	// gradB = sum over batch of gradOutput
 	clear(d.gradB)
 	for r := 0; r < gradOutput.Rows; r++ {
-		addSlice(d.gradB, gradOutput.Data[r*gradOutput.Cols:(r+1)*gradOutput.Cols])
+		kernels.AddSlice(d.gradB, gradOutput.Data[r*gradOutput.Cols:(r+1)*gradOutput.Cols])
 	}
 
 	// gradInput = gradOutput * weights^T  (batch x in)
@@ -204,7 +205,7 @@ func (r *ReLU) Forward(input *Matrix) (*Matrix, error) {
 	}
 	r.input = input
 	out := r.fwdBuf(input.Rows, input.Cols)
-	reluFwd(out.Data, input.Data)
+	kernels.ReluFwd(out.Data, input.Data)
 	r.output = out
 	return out, nil
 }
@@ -214,7 +215,7 @@ func (r *ReLU) Backward(gradOutput *Matrix) (*Matrix, error) {
 		return nil, fmt.Errorf("tensai: relu backward called before forward")
 	}
 	out := r.bwdBuf(gradOutput.Rows, gradOutput.Cols)
-	reluBwd(out.Data, gradOutput.Data, r.input.Data)
+	kernels.ReluBwd(out.Data, gradOutput.Data, r.input.Data)
 	return out, nil
 }
 
@@ -250,7 +251,7 @@ func (l *LeakyReLU) Forward(input *Matrix) (*Matrix, error) {
 	}
 	l.input = input
 	out := l.fwdBuf(input.Rows, input.Cols)
-	leakyFwd(out.Data, input.Data, l.Alpha)
+	kernels.LeakyFwd(out.Data, input.Data, l.Alpha)
 	l.output = out
 	return out, nil
 }
@@ -260,7 +261,7 @@ func (l *LeakyReLU) Backward(gradOutput *Matrix) (*Matrix, error) {
 		return nil, fmt.Errorf("tensai: leakyrelu backward called before forward")
 	}
 	out := l.bwdBuf(gradOutput.Rows, gradOutput.Cols)
-	leakyBwd(out.Data, gradOutput.Data, l.input.Data, l.Alpha)
+	kernels.LeakyBwd(out.Data, gradOutput.Data, l.input.Data, l.Alpha)
 	return out, nil
 }
 
@@ -268,7 +269,7 @@ func (l *LeakyReLU) Backward(gradOutput *Matrix) (*Matrix, error) {
 type Sigmoid struct{ activationBase }
 
 func (s *Sigmoid) apply(x Float) Float {
-	return 1.0 / (1.0 + expF(-x))
+	return 1.0 / (1.0 + kernels.ExpF(-x))
 }
 func (s *Sigmoid) applyGrad(x Float) Float {
 	// derivative in terms of the output y = sigmoid(x): y*(1-y)
@@ -284,7 +285,7 @@ func (s *Sigmoid) Forward(input *Matrix) (*Matrix, error) {
 	}
 	s.input = input
 	out := s.fwdBuf(input.Rows, input.Cols)
-	sigmoidFwd(out.Data, input.Data)
+	kernels.SigmoidFwd(out.Data, input.Data)
 	s.output = out
 	return out, nil
 }
@@ -294,14 +295,14 @@ func (s *Sigmoid) Backward(gradOutput *Matrix) (*Matrix, error) {
 		return nil, fmt.Errorf("tensai: sigmoid backward called before forward")
 	}
 	out := s.bwdBuf(gradOutput.Rows, gradOutput.Cols)
-	sigmoidBwd(out.Data, gradOutput.Data, s.output.Data)
+	kernels.SigmoidBwd(out.Data, gradOutput.Data, s.output.Data)
 	return out, nil
 }
 
 // Tanh activation: f(x) = tanh(x).
 type Tanh struct{ activationBase }
 
-func (t *Tanh) apply(x Float) Float { return tanhF(x) }
+func (t *Tanh) apply(x Float) Float { return kernels.TanhF(x) }
 func (t *Tanh) applyGrad(x Float) Float {
 	y := t.apply(x)
 	return 1 - y*y
@@ -315,7 +316,7 @@ func (t *Tanh) Forward(input *Matrix) (*Matrix, error) {
 	}
 	t.input = input
 	out := t.fwdBuf(input.Rows, input.Cols)
-	tanhFwd(out.Data, input.Data)
+	kernels.TanhFwd(out.Data, input.Data)
 	t.output = out
 	return out, nil
 }
@@ -325,7 +326,7 @@ func (t *Tanh) Backward(gradOutput *Matrix) (*Matrix, error) {
 		return nil, fmt.Errorf("tensai: tanh backward called before forward")
 	}
 	out := t.bwdBuf(gradOutput.Rows, gradOutput.Cols)
-	tanhBwd(out.Data, gradOutput.Data, t.output.Data)
+	kernels.TanhBwd(out.Data, gradOutput.Data, t.output.Data)
 	return out, nil
 }
 
@@ -340,7 +341,7 @@ func (g *GELU) Forward(input *Matrix) (*Matrix, error) {
 	}
 	g.input = input
 	out := g.fwdBuf(input.Rows, input.Cols)
-	geluFwd(out.Data, input.Data)
+	kernels.GeluFwd(out.Data, input.Data)
 	g.output = out
 	return out, nil
 }
@@ -350,7 +351,7 @@ func (g *GELU) Backward(gradOutput *Matrix) (*Matrix, error) {
 		return nil, fmt.Errorf("tensai: gelu backward called before forward")
 	}
 	out := g.bwdBuf(gradOutput.Rows, gradOutput.Cols)
-	geluBwd(out.Data, gradOutput.Data, g.input.Data)
+	kernels.GeluBwd(out.Data, gradOutput.Data, g.input.Data)
 	return out, nil
 }
 
@@ -408,7 +409,7 @@ func (l *LayerNorm) Forward(input *Matrix) (*Matrix, error) {
 		inRow := input.Data[r*input.Cols : (r+1)*input.Cols]
 		normRow := l.normalized.Data[r*input.Cols : (r+1)*input.Cols]
 		outRow := out.Data[r*input.Cols : (r+1)*input.Cols]
-		l.invStd[r] = lnFwdRow(outRow, normRow, inRow, l.gamma.Data, l.beta, l.eps)
+		l.invStd[r] = kernels.LnFwdRow(outRow, normRow, inRow, l.gamma.Data, l.beta, l.eps)
 	}
 	return out, nil
 }
@@ -425,7 +426,7 @@ func (l *LayerNorm) Backward(gradOutput *Matrix) (*Matrix, error) {
 		gRow := gradOutput.Data[r*gradOutput.Cols : (r+1)*gradOutput.Cols]
 		xhatRow := l.normalized.Data[r*gradOutput.Cols : (r+1)*gradOutput.Cols]
 		outRow := out.Data[r*gradOutput.Cols : (r+1)*gradOutput.Cols]
-		lnBwdRow(outRow, gRow, xhatRow, l.gamma.Data, l.gradGamma.Data, l.gradBeta, l.invStd[r])
+		kernels.LnBwdRow(outRow, gRow, xhatRow, l.gamma.Data, l.gradGamma.Data, l.gradBeta, l.invStd[r])
 	}
 	return out, nil
 }
@@ -513,7 +514,7 @@ func (e *Embedding) Backward(gradOutput *Matrix) (*Matrix, error) {
 			if err != nil {
 				return nil, err
 			}
-			addSlice(e.gradW.Data[idx*e.weights.Cols:(idx+1)*e.weights.Cols], gRow[c*e.weights.Cols:(c+1)*e.weights.Cols])
+			kernels.AddSlice(e.gradW.Data[idx*e.weights.Cols:(idx+1)*e.weights.Cols], gRow[c*e.weights.Cols:(c+1)*e.weights.Cols])
 		}
 	}
 	gradInput := e.bwdBuf(e.input.Rows, e.input.Cols)
@@ -562,12 +563,12 @@ func (s *Softmax) Forward(input *Matrix) (*Matrix, error) {
 				maxVal = v
 			}
 		}
-		expShift(outRow, row, maxVal)
+		kernels.ExpShift(outRow, row, maxVal)
 		var denom Float
 		for _, e := range outRow {
 			denom += e
 		}
-		scaleSlice(outRow, 1/denom)
+		kernels.ScaleSlice(outRow, 1/denom)
 	}
 	s.output = out
 	return out, nil
@@ -592,15 +593,6 @@ func (s *Softmax) Backward(gradOutput *Matrix) (*Matrix, error) {
 		}
 	}
 	return out, nil
-}
-
-func geluF(x Float) Float {
-	return 0.5 * x * (1 + Float(math.Erf(float64(x/math.Sqrt2))))
-}
-
-func geluGrad(x Float) Float {
-	const invSqrt2Pi = 0.3989422804014327
-	return 0.5*(1+Float(math.Erf(float64(x/math.Sqrt2)))) + x*Float(invSqrt2Pi)*expF(-0.5*x*x)
 }
 
 func shapeString(m *Matrix) string {

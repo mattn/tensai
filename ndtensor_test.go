@@ -4,15 +4,17 @@ import (
 	"math"
 	"math/rand"
 	"testing"
+
+	"github.com/mattn/tensai/internal/dims"
 )
 
 // refBinOp is a slow reference for broadcast element-wise ops: every output
 // index is mapped into each operand by clamping broadcast axes to 0.
 func refBinOp(t *testing.T, a, b *Tensor, fn func(x, y Float) Float) *Tensor {
 	t.Helper()
-	shape, err := broadcastShapes(a.Shape, b.Shape)
+	shape, err := dims.Broadcast(a.Shape, b.Shape)
 	if err != nil {
-		t.Fatalf("broadcastShapes: %v", err)
+		t.Fatalf("dims.Broadcast: %v", err)
 	}
 	out := NewTensor(shape...)
 	idx := make([]int, len(shape))
@@ -48,7 +50,7 @@ func randTensor(rng *rand.Rand, shape ...int) *Tensor {
 
 func tensorsClose(t *testing.T, got, want *Tensor, tol float64) {
 	t.Helper()
-	if !sameDims(got.Shape, want.Shape) {
+	if !dims.Same(got.Shape, want.Shape) {
 		t.Fatalf("shape mismatch: got %v want %v", got.Shape, want.Shape)
 	}
 	for i := range want.Data {
@@ -129,14 +131,14 @@ func refMatMul(t *testing.T, a, b *Tensor) *Tensor {
 	t.Helper()
 	na, nb := len(a.Shape), len(b.Shape)
 	m, k, n := a.Shape[na-2], a.Shape[na-1], b.Shape[nb-1]
-	batch, err := broadcastShapes(a.Shape[:na-2], b.Shape[:nb-2])
+	batch, err := dims.Broadcast(a.Shape[:na-2], b.Shape[:nb-2])
 	if err != nil {
 		t.Fatalf("batch broadcast: %v", err)
 	}
 	out := NewTensor(append(append([]int(nil), batch...), m, n)...)
-	as := broadcastStrides(a.Shape[:na-2], batch)
-	bs := broadcastStrides(b.Shape[:nb-2], batch)
-	for bi := 0; bi < prodDims(batch); bi++ {
+	as := dims.BroadcastStrides(a.Shape[:na-2], batch)
+	bs := dims.BroadcastStrides(b.Shape[:nb-2], batch)
+	for bi := 0; bi < dims.Prod(batch); bi++ {
 		offA, offB := 0, 0
 		for d, rem := len(batch)-1, bi; d >= 0; d-- {
 			offA += (rem % batch[d]) * as[d]
@@ -209,7 +211,7 @@ func TestTensorTranspose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transpose: %v", err)
 	}
-	if !sameDims(bt.Shape, []int{2, 4, 3}) {
+	if !dims.Same(bt.Shape, []int{2, 4, 3}) {
 		t.Fatalf("shape: got %v", bt.Shape)
 	}
 	for i := 0; i < 2; i++ {
@@ -226,7 +228,7 @@ func TestTensorTranspose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("transpose perm: %v", err)
 	}
-	if !sameDims(bp.Shape, []int{4, 2, 3}) {
+	if !dims.Same(bp.Shape, []int{4, 2, 3}) {
 		t.Fatalf("shape: got %v", bp.Shape)
 	}
 	for i := 0; i < 2; i++ {
@@ -260,7 +262,7 @@ func TestTensorTranspose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("matmul: %v", err)
 	}
-	if !sameDims(scores.Shape, []int{2, 3, 5}) {
+	if !dims.Same(scores.Shape, []int{2, 3, 5}) {
 		t.Fatalf("scores shape: got %v", scores.Shape)
 	}
 }
@@ -274,7 +276,7 @@ func TestTensorReshapeAndViews(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reshape: %v", err)
 	}
-	if !sameDims(r.Shape, []int{3, 2}) {
+	if !dims.Same(r.Shape, []int{3, 2}) {
 		t.Fatalf("reshape shape: got %v", r.Shape)
 	}
 	r.Set(42, 0, 0)

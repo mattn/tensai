@@ -1,4 +1,4 @@
-package tensai
+package kernels
 
 import (
 	"math"
@@ -10,13 +10,13 @@ import (
 // AVX2 polynomial versions, depending on the build) against float64
 // references over a wide input range.
 func TestKernelAccuracy(t *testing.T) {
-	var src []Float
+	var src []float32
 	for x := -30.0; x <= 30.0; x += 0.037 {
-		src = append(src, Float(x))
+		src = append(src, float32(x))
 	}
-	dst := make([]Float, len(src))
+	dst := make([]float32, len(src))
 
-	check := func(name string, got []Float, ref func(float64) float64, tol float64) {
+	check := func(name string, got []float32, ref func(float64) float64, tol float64) {
 		t.Helper()
 		for i, x := range src {
 			want := ref(float64(x))
@@ -27,19 +27,19 @@ func TestKernelAccuracy(t *testing.T) {
 		}
 	}
 
-	expShift(dst, src, 0)
+	ExpShift(dst, src, 0)
 	check("exp", dst, math.Exp, 2e-6)
 
-	sigmoidFwd(dst, src)
+	SigmoidFwd(dst, src)
 	check("sigmoid", dst, func(x float64) float64 { return 1 / (1 + math.Exp(-x)) }, 2e-6)
 
-	tanhFwd(dst, src)
+	TanhFwd(dst, src)
 	check("tanh", dst, math.Tanh, 2e-6)
 
-	reluFwd(dst, src)
+	ReluFwd(dst, src)
 	check("relu", dst, func(x float64) float64 { return math.Max(0, x) }, 0)
 
-	leakyFwd(dst, src, 0.1)
+	LeakyFwd(dst, src, 0.1)
 	check("leakyrelu", dst, func(x float64) float64 {
 		if x > 0 {
 			return x
@@ -52,13 +52,13 @@ func TestKernelAccuracy(t *testing.T) {
 // the vector width) writes exactly the requested elements.
 func TestKernelTails(t *testing.T) {
 	for _, n := range []int{1, 3, 7, 8, 9, 31} {
-		src := make([]Float, n)
+		src := make([]float32, n)
 		for i := range src {
-			src[i] = Float(i) - 2
+			src[i] = float32(i) - 2
 		}
-		dst := make([]Float, n+1)
+		dst := make([]float32, n+1)
 		dst[n] = 42 // canary just past the writable range
-		reluFwd(dst[:n], src)
+		ReluFwd(dst[:n], src)
 		if dst[n] != 42 {
 			t.Fatalf("n=%d: kernel wrote past the slice end", n)
 		}
@@ -77,17 +77,17 @@ func TestKernelTails(t *testing.T) {
 // TestGELUKernelAccuracy compares the (possibly vectorized) GELU kernels
 // against a float64 reference.
 func TestGELUKernelAccuracy(t *testing.T) {
-	var src []Float
+	var src []float32
 	for x := -8.0; x <= 8.0; x += 0.011 {
-		src = append(src, Float(x))
+		src = append(src, float32(x))
 	}
-	dst := make([]Float, len(src))
-	grad := make([]Float, len(src))
+	dst := make([]float32, len(src))
+	grad := make([]float32, len(src))
 	for i := range grad {
 		grad[i] = 1
 	}
 
-	geluFwd(dst, src)
+	GeluFwd(dst, src)
 	for i, x := range src {
 		want := 0.5 * float64(x) * (1 + math.Erf(float64(x)/math.Sqrt2))
 		if diff := math.Abs(float64(dst[i]) - want); diff > 2e-6*(1+math.Abs(want)) {
@@ -95,7 +95,7 @@ func TestGELUKernelAccuracy(t *testing.T) {
 		}
 	}
 
-	geluBwd(dst, grad, src)
+	GeluBwd(dst, grad, src)
 	for i, x := range src {
 		xf := float64(x)
 		want := 0.5*(1+math.Erf(xf/math.Sqrt2)) + xf*math.Exp(-0.5*xf*xf)/math.Sqrt(2*math.Pi)
@@ -110,22 +110,22 @@ func TestGELUKernelAccuracy(t *testing.T) {
 func TestLayerNormKernelMatchesGeneric(t *testing.T) {
 	rng := rand.New(rand.NewSource(83))
 	for _, cols := range []int{3, 8, 13, 64, 100} {
-		src := make([]Float, cols)
-		g := make([]Float, cols)
-		gamma := make([]Float, cols)
-		beta := make([]Float, cols)
+		src := make([]float32, cols)
+		g := make([]float32, cols)
+		gamma := make([]float32, cols)
+		beta := make([]float32, cols)
 		for i := range src {
-			src[i] = Float(rng.NormFloat64())
-			g[i] = Float(rng.NormFloat64())
-			gamma[i] = Float(0.5 + rng.Float64())
-			beta[i] = Float(rng.NormFloat64() * 0.1)
+			src[i] = float32(rng.NormFloat64())
+			g[i] = float32(rng.NormFloat64())
+			gamma[i] = float32(0.5 + rng.Float64())
+			beta[i] = float32(rng.NormFloat64() * 0.1)
 		}
-		out := make([]Float, cols)
-		xhat := make([]Float, cols)
-		wantOut := make([]Float, cols)
-		wantXhat := make([]Float, cols)
+		out := make([]float32, cols)
+		xhat := make([]float32, cols)
+		wantOut := make([]float32, cols)
+		wantXhat := make([]float32, cols)
 
-		invStd := lnFwdRow(out, xhat, src, gamma, beta, 1e-5)
+		invStd := LnFwdRow(out, xhat, src, gamma, beta, 1e-5)
 		wantInvStd := lnFwdRowGeneric(wantOut, wantXhat, src, gamma, beta, 1e-5)
 		if math.Abs(float64(invStd-wantInvStd)) > 1e-4*float64(wantInvStd) {
 			t.Fatalf("cols=%d invStd: got %g want %g", cols, invStd, wantInvStd)
@@ -136,13 +136,13 @@ func TestLayerNormKernelMatchesGeneric(t *testing.T) {
 			}
 		}
 
-		gradGamma := make([]Float, cols)
-		gradBeta := make([]Float, cols)
-		wantGradGamma := make([]Float, cols)
-		wantGradBeta := make([]Float, cols)
-		bwdOut := make([]Float, cols)
-		wantBwdOut := make([]Float, cols)
-		lnBwdRow(bwdOut, g, wantXhat, gamma, gradGamma, gradBeta, wantInvStd)
+		gradGamma := make([]float32, cols)
+		gradBeta := make([]float32, cols)
+		wantGradGamma := make([]float32, cols)
+		wantGradBeta := make([]float32, cols)
+		bwdOut := make([]float32, cols)
+		wantBwdOut := make([]float32, cols)
+		LnBwdRow(bwdOut, g, wantXhat, gamma, gradGamma, gradBeta, wantInvStd)
 		lnBwdRowGeneric(wantBwdOut, g, wantXhat, gamma, wantGradGamma, wantGradBeta, wantInvStd)
 		for i := range bwdOut {
 			if math.Abs(float64(bwdOut[i]-wantBwdOut[i])) > 1e-4*(1+math.Abs(float64(wantBwdOut[i]))) {
@@ -161,14 +161,14 @@ func TestLayerNormKernelMatchesGeneric(t *testing.T) {
 func TestSiluMul(t *testing.T) {
 	rng := rand.New(rand.NewSource(21))
 	for _, n := range []int{1, 7, 8, 33, 1000} {
-		gate := make([]Float, n)
-		up := make([]Float, n)
-		want := make([]Float, n)
+		gate := make([]float32, n)
+		up := make([]float32, n)
+		want := make([]float32, n)
 		for i := range gate {
-			gate[i] = Float(rng.NormFloat64() * 4)
-			up[i] = Float(rng.NormFloat64())
+			gate[i] = float32(rng.NormFloat64() * 4)
+			up[i] = float32(rng.NormFloat64())
 			g := float64(gate[i])
-			want[i] = Float(g/(1+math.Exp(-g))) * up[i]
+			want[i] = float32(g/(1+math.Exp(-g))) * up[i]
 		}
 		SiluMul(gate, up)
 		for i := range gate {
@@ -186,15 +186,15 @@ func TestDotVecsAxpys(t *testing.T) {
 	rng := rand.New(rand.NewSource(63))
 	for _, d := range []int{8, 16, 64, 128, 130} {
 		for nq := 1; nq <= 8; nq++ {
-			qs := make([]Float, nq*d)
-			k := make([]Float, d)
+			qs := make([]float32, nq*d)
+			k := make([]float32, d)
 			for i := range qs {
-				qs[i] = Float(rng.NormFloat64())
+				qs[i] = float32(rng.NormFloat64())
 			}
 			for i := range k {
-				k[i] = Float(rng.NormFloat64())
+				k[i] = float32(rng.NormFloat64())
 			}
-			out := make([]Float, nq)
+			out := make([]float32, nq)
 			DotVecs(qs, k, out)
 			for i := 0; i < nq; i++ {
 				if want := DotVec(qs[i*d:(i+1)*d], k); out[i] != want {
@@ -202,14 +202,14 @@ func TestDotVecsAxpys(t *testing.T) {
 				}
 			}
 
-			ws := make([]Float, nq)
+			ws := make([]float32, nq)
 			for i := range ws {
-				ws[i] = Float(rng.NormFloat64())
+				ws[i] = float32(rng.NormFloat64())
 			}
-			outs := make([]Float, nq*d)
-			ref := make([]Float, nq*d)
+			outs := make([]float32, nq*d)
+			ref := make([]float32, nq*d)
 			for i := range outs {
-				outs[i] = Float(rng.NormFloat64())
+				outs[i] = float32(rng.NormFloat64())
 				ref[i] = outs[i]
 			}
 			Axpys(ws, k, outs)
@@ -228,22 +228,22 @@ func TestDotVecsAxpys(t *testing.T) {
 func TestSoftmaxBwdAdd(t *testing.T) {
 	rng := rand.New(rand.NewSource(81))
 	for _, n := range []int{1, 7, 8, 15, 16, 127, 128, 130, 4096} {
-		dst := make([]Float, n)
-		grad := make([]Float, n)
-		y := make([]Float, n)
-		var sum Float
+		dst := make([]float32, n)
+		grad := make([]float32, n)
+		y := make([]float32, n)
+		var sum float32
 		for i := range dst {
-			dst[i] = Float(rng.NormFloat64())
-			grad[i] = Float(rng.NormFloat64())
-			y[i] = Float(rng.Float64())
+			dst[i] = float32(rng.NormFloat64())
+			grad[i] = float32(rng.NormFloat64())
+			y[i] = float32(rng.Float64())
 			sum += y[i]
 		}
 		for i := range y {
 			y[i] /= sum
 		}
-		want := append([]Float(nil), dst...)
+		want := append([]float32(nil), dst...)
 		softmaxBwdAddGeneric(want, grad, y)
-		softmaxBwdAdd(dst, grad, y)
+		SoftmaxBwdAdd(dst, grad, y)
 		for i := range dst {
 			if diff := math.Abs(float64(dst[i] - want[i])); diff > 2e-5*(1+math.Abs(float64(want[i]))) {
 				t.Fatalf("n=%d idx=%d: got %g want %g", n, i, dst[i], want[i])
@@ -255,20 +255,20 @@ func TestSoftmaxBwdAdd(t *testing.T) {
 func TestSGDStepKernelMatchesGeneric(t *testing.T) {
 	rng := rand.New(rand.NewSource(29))
 	for _, n := range []int{1, 3, 7, 8, 9, 31, 64} {
-		w := make([]Float, n)
-		vel := make([]Float, n)
-		wantW := make([]Float, n)
-		wantVel := make([]Float, n)
+		w := make([]float32, n)
+		vel := make([]float32, n)
+		wantW := make([]float32, n)
+		wantVel := make([]float32, n)
 		for i := range w {
-			w[i] = Float(rng.NormFloat64())
+			w[i] = float32(rng.NormFloat64())
 			wantW[i] = w[i]
 		}
-		g := make([]Float, n)
+		g := make([]float32, n)
 		for step := 0; step < 3; step++ {
 			for i := range g {
-				g[i] = Float(rng.NormFloat64())
+				g[i] = float32(rng.NormFloat64())
 			}
-			sgdStepSlice(w, g, vel, 0.9, 0.05)
+			SGDStep(w, g, vel, 0.9, 0.05)
 			sgdStepGeneric(wantW, g, wantVel, 0.9, 0.05)
 		}
 		for i := range w {
@@ -283,43 +283,31 @@ func TestSGDStepKernelMatchesGeneric(t *testing.T) {
 }
 
 func BenchmarkSGDStep4096(b *testing.B) {
-	w := make([]Float, 4096)
-	g := make([]Float, 4096)
-	vel := make([]Float, 4096)
+	w := make([]float32, 4096)
+	g := make([]float32, 4096)
+	vel := make([]float32, 4096)
 	for i := range w {
-		w[i] = Float(i%17) / 17
-		g[i] = Float(i%31) / 31
+		w[i] = float32(i%17) / 17
+		g[i] = float32(i%31) / 31
 	}
 	b.SetBytes(int64(len(w) * 4 * 3))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		sgdStepSlice(w, g, vel, 0.9, 0.001)
+		SGDStep(w, g, vel, 0.9, 0.001)
 	}
 }
 
 func BenchmarkSoftmaxBackward4096(b *testing.B) {
-	dst := make([]Float, 4096)
-	grad := make([]Float, 4096)
-	y := make([]Float, 4096)
+	dst := make([]float32, 4096)
+	grad := make([]float32, 4096)
+	y := make([]float32, 4096)
 	for i := range y {
-		grad[i] = Float(i%17) / 17
-		y[i] = (Float(i%31) / 31) / 2048
+		grad[i] = float32(i%17) / 17
+		y[i] = (float32(i%31) / 31) / 2048
 	}
 	b.SetBytes(int64(len(y) * 4 * 3))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		softmaxBwdAdd(dst, grad, y)
-	}
-}
-
-func BenchmarkTranspose1024(b *testing.B) {
-	src := NewMatrix(1024, 1024)
-	dst := NewMatrix(1024, 1024)
-	b.SetBytes(int64(len(src.Data) * 4))
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		if err := TInto(dst, src); err != nil {
-			b.Fatal(err)
-		}
+		SoftmaxBwdAdd(dst, grad, y)
 	}
 }

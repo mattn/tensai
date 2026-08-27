@@ -2,6 +2,8 @@ package tensai
 
 import (
 	"fmt"
+
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 // Optimizer updates a set of (weights, bias) parameter pairs using their
@@ -49,8 +51,8 @@ func (s *SGD) Step(idx int, weights, gradW *Matrix, bias, gradB []Float) {
 	if s.velB[idx] == nil {
 		s.velB[idx] = make([]Float, len(bias))
 	}
-	sgdStepSlice(weights.Data, gradW.Data, s.velW[idx].Data, s.Momentum, s.LR)
-	sgdStepSlice(bias, gradB, s.velB[idx], s.Momentum, s.LR)
+	kernels.SGDStep(weights.Data, gradW.Data, s.velW[idx].Data, s.Momentum, s.LR)
+	kernels.SGDStep(bias, gradB, s.velB[idx], s.Momentum, s.LR)
 }
 
 // Adam optimizer. With WeightDecay > 0 it becomes AdamW: decay is decoupled
@@ -106,13 +108,13 @@ func (a *Adam) Step(idx int, weights, gradW *Matrix, bias, gradB []Float) {
 	mB, vB := a.mB[idx], a.vB[idx]
 
 	// Bias corrections depend only on t, so hoist them out of the loops.
-	rc1 := 1 / (1 - powF(a.Beta1, Float(a.t)))
-	rc2 := 1 / (1 - powF(a.Beta2, Float(a.t)))
+	rc1 := 1 / (1 - kernels.PowF(a.Beta1, Float(a.t)))
+	rc2 := 1 / (1 - kernels.PowF(a.Beta2, Float(a.t)))
 
-	adamStepSlice(weights.Data, gradW.Data, mW.Data, vW.Data,
+	kernels.AdamStep(weights.Data, gradW.Data, mW.Data, vW.Data,
 		a.Beta1, a.Beta2, rc1, rc2, a.LR, a.Eps, a.WeightDecay)
 	// Decoupled weight decay is never applied to biases.
-	adamStepSlice(bias, gradB, mB, vB, a.Beta1, a.Beta2, rc1, rc2, a.LR, a.Eps, 0)
+	kernels.AdamStep(bias, gradB, mB, vB, a.Beta1, a.Beta2, rc1, rc2, a.LR, a.Eps, 0)
 }
 
 // Assert Optimizer implementations conform to the interface at compile time.

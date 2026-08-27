@@ -4,6 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/mattn/tensai/internal/dims"
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 // Tensor is an n-dimensional, contiguous, row-major array of Float — the
@@ -21,40 +24,18 @@ type Tensor struct {
 func NewTensor(shape ...int) *Tensor {
 	return &Tensor{
 		Shape: append([]int(nil), shape...),
-		Data:  make([]Float, prodDims(shape)),
+		Data:  make([]Float, dims.Prod(shape)),
 	}
 }
 
 // NewTensorFromSlice creates a tensor of the given shape from row-major data.
 func NewTensorFromSlice(data []Float, shape ...int) (*Tensor, error) {
-	if len(data) != prodDims(shape) {
+	if len(data) != dims.Prod(shape) {
 		return nil, fmt.Errorf("tensai: data length %d != shape %v", len(data), shape)
 	}
 	t := NewTensor(shape...)
 	copy(t.Data, data)
 	return t, nil
-}
-
-// prodDims returns the element count of a shape; the empty shape counts as
-// a single scalar element.
-func prodDims(shape []int) int {
-	n := 1
-	for _, d := range shape {
-		n *= d
-	}
-	return n
-}
-
-func sameDims(a, b []int) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i, d := range a {
-		if b[i] != d {
-			return false
-		}
-	}
-	return true
 }
 
 // contiguousStrides returns the row-major element strides of a shape.
@@ -69,7 +50,7 @@ func contiguousStrides(shape []int) []int {
 }
 
 // Size returns the total number of elements.
-func (t *Tensor) Size() int { return prodDims(t.Shape) }
+func (t *Tensor) Size() int { return dims.Prod(t.Shape) }
 
 func (t *Tensor) offset(idx []int) int {
 	if len(idx) != len(t.Shape) {
@@ -89,7 +70,7 @@ func (t *Tensor) At(idx ...int) Float { return t.Data[t.offset(idx)] }
 func (t *Tensor) Set(v Float, idx ...int) { t.Data[t.offset(idx)] = v }
 
 // Scale multiplies every element by s, in place.
-func (t *Tensor) Scale(s Float) { scaleSlice(t.Data, s) }
+func (t *Tensor) Scale(s Float) { kernels.ScaleSlice(t.Data, s) }
 
 // Reshape returns a tensor with a new shape sharing the same backing data.
 // One dimension may be -1 and is inferred from the element count.
@@ -148,72 +129,27 @@ func (t *Tensor) Validate() error {
 			return fmt.Errorf("tensai: tensor has invalid shape %v", t.Shape)
 		}
 	}
-	if len(t.Data) != prodDims(t.Shape) {
+	if len(t.Data) != dims.Prod(t.Shape) {
 		return fmt.Errorf("tensai: tensor %v has %d elements", t.Shape, len(t.Data))
 	}
 	return nil
 }
 
-// broadcastShapes combines two shapes under NumPy rules: the shapes are
-// aligned at their trailing dimensions and each aligned pair must be equal
-// or contain a 1.
-func broadcastShapes(a, b []int) ([]int, error) {
-	n := max(len(a), len(b))
-	out := make([]int, n)
-	for i := 1; i <= n; i++ {
-		da, db := 1, 1
-		if i <= len(a) {
-			da = a[len(a)-i]
-		}
-		if i <= len(b) {
-			db = b[len(b)-i]
-		}
-		switch {
-		case da == db, db == 1:
-			out[n-i] = da
-		case da == 1:
-			out[n-i] = db
-		default:
-			return nil, fmt.Errorf("tensai: cannot broadcast %v with %v", a, b)
-		}
-	}
-	return out, nil
-}
-
-// broadcastStrides returns, for each axis of the broadcast shape out, the
-// element stride to advance through a contiguous tensor of the given shape:
-// 0 for axes the tensor is broadcast along (including the leading axes it
-// lacks), its contiguous stride otherwise.
-func broadcastStrides(shape, out []int) []int {
-	strides := make([]int, len(out))
-	stride := 1
-	for i := 1; i <= len(shape); i++ {
-		d := len(out) - i
-		if shape[len(shape)-i] == 1 && out[d] != 1 {
-			strides[d] = 0
-		} else {
-			strides[d] = stride
-		}
-		stride *= shape[len(shape)-i]
-	}
-	return strides
-}
-
 // tensorBinOp applies fn element-wise over the broadcast of a and b.
 func tensorBinOp(a, b *Tensor, fn func(x, y Float) Float) (*Tensor, error) {
-	shape, err := broadcastShapes(a.Shape, b.Shape)
+	shape, err := dims.Broadcast(a.Shape, b.Shape)
 	if err != nil {
 		return nil, err
 	}
 	out := NewTensor(shape...)
-	if sameDims(a.Shape, shape) && sameDims(b.Shape, shape) {
+	if dims.Same(a.Shape, shape) && dims.Same(b.Shape, shape) {
 		for i := range out.Data {
 			out.Data[i] = fn(a.Data[i], b.Data[i])
 		}
 		return out, nil
 	}
-	as := broadcastStrides(a.Shape, shape)
-	bs := broadcastStrides(b.Shape, shape)
+	as := dims.BroadcastStrides(a.Shape, shape)
+	bs := dims.BroadcastStrides(b.Shape, shape)
 	// Walk the output row-major: the innermost axis runs as a tight loop
 	// (each operand's innermost stride is 1, or 0 when broadcast) and an
 	// odometer over the outer axes carries the operand offsets.
@@ -357,12 +293,12 @@ func MatMul(a, b *Tensor) (*Tensor, error) {
 		return nil, fmt.Errorf("tensai: matmul shape mismatch: %v * %v", a.Shape, b.Shape)
 	}
 	n := b.Shape[nb-1]
-	batch, err := broadcastShapes(a.Shape[:na-2], b.Shape[:nb-2])
+	batch, err := dims.Broadcast(a.Shape[:na-2], b.Shape[:nb-2])
 	if err != nil {
 		return nil, err
 	}
 	out := NewTensor(append(append([]int(nil), batch...), m, n)...)
-	batches := prodDims(batch)
+	batches := dims.Prod(batch)
 	if batches == 1 {
 		// A single product: let DotInto split its rows across CPUs.
 		am := &Matrix{Rows: m, Cols: k, Data: a.Data}
@@ -374,8 +310,8 @@ func MatMul(a, b *Tensor) (*Tensor, error) {
 		return out, nil
 	}
 	// Strides are in whole matrices; broadcast batch axes advance by 0.
-	as := broadcastStrides(a.Shape[:na-2], batch)
-	bs := broadcastStrides(b.Shape[:nb-2], batch)
+	as := dims.BroadcastStrides(a.Shape[:na-2], batch)
+	bs := dims.BroadcastStrides(b.Shape[:nb-2], batch)
 	sizeA, sizeB, sizeO := m*k, k*n, m*n
 	run := func(lo, hi int) {
 		for bi := lo; bi < hi; bi++ {

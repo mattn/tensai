@@ -3,6 +3,8 @@ package tensai
 import (
 	"fmt"
 	"math/rand"
+
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 // Dataset pairs an input matrix with its target matrix, row-aligned, and
@@ -119,7 +121,7 @@ func (d *Dataset) Standardize() (mean, std []Float) {
 	mean = make([]Float, cols)
 	std = make([]Float, cols)
 	for r := 0; r < d.Len(); r++ {
-		addSlice(mean, d.Inputs.Data[r*cols:(r+1)*cols])
+		kernels.AddSlice(mean, d.Inputs.Data[r*cols:(r+1)*cols])
 	}
 	for c := range mean {
 		mean[c] /= n
@@ -132,7 +134,7 @@ func (d *Dataset) Standardize() (mean, std []Float) {
 		}
 	}
 	for c := range std {
-		std[c] = sqrtF(std[c] / n)
+		std[c] = kernels.SqrtF(std[c] / n)
 		if std[c] == 0 {
 			std[c] = 1
 		}

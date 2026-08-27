@@ -2,6 +2,8 @@ package tensai
 
 import (
 	"fmt"
+
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 // Node is a matrix-valued node in a dynamically built computation graph for
@@ -229,7 +231,7 @@ func (n *Node) AddRow(row *Node) *Node {
 // ReLU applies max(0, x) element-wise.
 func (n *Node) ReLU() *Node {
 	v := NewMatrix(n.Value.Rows, n.Value.Cols)
-	reluFwd(v.Data, n.Value.Data)
+	kernels.ReluFwd(v.Data, n.Value.Data)
 	return newNode("relu", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for i, gv := range out.Grad.Data {
@@ -243,7 +245,7 @@ func (n *Node) ReLU() *Node {
 // Sigmoid applies 1/(1+e^-x) element-wise.
 func (n *Node) Sigmoid() *Node {
 	v := NewMatrix(n.Value.Rows, n.Value.Cols)
-	sigmoidFwd(v.Data, n.Value.Data)
+	kernels.SigmoidFwd(v.Data, n.Value.Data)
 	return newNode("sigmoid", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for i, gv := range out.Grad.Data {
@@ -256,7 +258,7 @@ func (n *Node) Sigmoid() *Node {
 // Tanh applies tanh(x) element-wise.
 func (n *Node) Tanh() *Node {
 	v := NewMatrix(n.Value.Rows, n.Value.Cols)
-	tanhFwd(v.Data, n.Value.Data)
+	kernels.TanhFwd(v.Data, n.Value.Data)
 	return newNode("tanh", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for i, gv := range out.Grad.Data {
@@ -286,19 +288,19 @@ func (n *Node) Softmax() *Node {
 				maxVal = x
 			}
 		}
-		expShift(outRow, row, maxVal)
+		kernels.ExpShift(outRow, row, maxVal)
 		var denom Float
 		for _, e := range outRow {
 			denom += e
 		}
-		scaleSlice(outRow, 1/denom)
+		kernels.ScaleSlice(outRow, 1/denom)
 	}
 	return newNode("softmax", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for r := 0; r < v.Rows; r++ {
 			y := v.Data[r*cols : (r+1)*cols]
 			gv := out.Grad.Data[r*cols : (r+1)*cols]
-			softmaxBwdAdd(g.Data[r*cols:(r+1)*cols], gv, y)
+			kernels.SoftmaxBwdAdd(g.Data[r*cols:(r+1)*cols], gv, y)
 		}
 	})
 }

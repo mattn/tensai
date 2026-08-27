@@ -2,6 +2,8 @@ package tensai
 
 import (
 	"math/rand"
+
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 // The recurrent cells and attention below are built on the autograd Node
@@ -107,7 +109,7 @@ func (c *LSTMCell) Params() []*Node {
 // Attention computes scaled dot-product attention softmax(q*k^T/sqrt(d))*v
 // for a single sequence, where q, k, v are (seqLen x d) nodes.
 func Attention(q, k, v *Node) *Node {
-	scale := 1 / sqrtF(Float(k.Value.Cols))
+	scale := 1 / kernels.SqrtF(Float(k.Value.Cols))
 	return q.MatMul(k.T()).Scale(scale).Softmax().MatMul(v)
 }
 

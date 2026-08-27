@@ -16,6 +16,9 @@ import (
 	"math"
 	"runtime"
 	"unsafe"
+
+	"github.com/mattn/tensai/internal/dims"
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 // gpuBlock is the square output-block edge one matmul workgroup produces;
@@ -1930,7 +1933,7 @@ func (g *GPU) checkSize(bytes uint64) error {
 func (t *GPUTensor) Shape() []int { return append([]int(nil), t.shape...) }
 
 // Size returns the total number of elements.
-func (t *GPUTensor) Size() int { return prodDims(t.shape) }
+func (t *GPUTensor) Size() int { return dims.Prod(t.shape) }
 
 // Upload copies a tensor into GPU memory. The returned GPUTensor is
 // independent of t.
@@ -2110,16 +2113,16 @@ func (t *GPUTensor) matmul(o *GPUTensor, transB bool) (*GPUTensor, error) {
 		}
 		n = o.shape[nb-1]
 	}
-	batch, err := broadcastShapes(t.shape[:na-2], o.shape[:nb-2])
+	batch, err := dims.Broadcast(t.shape[:na-2], o.shape[:nb-2])
 	if err != nil {
 		return nil, err
 	}
-	batches := prodDims(batch)
+	batches := dims.Prod(batch)
 	outShape := append(append([]int(nil), batch...), m, n)
 
 	// Element offsets of each batch's (contiguous) matrix in t, o, out.
-	as := broadcastStrides(t.shape[:na-2], batch)
-	bs := broadcastStrides(o.shape[:nb-2], batch)
+	as := dims.BroadcastStrides(t.shape[:na-2], batch)
+	bs := dims.BroadcastStrides(o.shape[:nb-2], batch)
 	offs := make([]uint32, 4*batches)
 	for bi := 0; bi < batches; bi++ {
 		offA, offB := 0, 0
@@ -2164,7 +2167,7 @@ func (g *GPU) stridedMatMul(a, b *GPUTensor, outShape []int, transB bool, m, k, 
 	}
 	uncapturedCB = ""
 
-	outBytes := uint64(prodDims(outShape)) * 4
+	outBytes := uint64(dims.Prod(outShape)) * 4
 	if err := g.checkSize(outBytes); err != nil {
 		return nil, err
 	}
@@ -2337,7 +2340,7 @@ func (q *GPUTensor) attention(k, v *GPUTensor, causal bool) (*GPUTensor, error) 
 		return nil, err
 	}
 	defer scores.Free()
-	if err := scores.Scale(1 / sqrtF(Float(q.shape[nq-1]))); err != nil {
+	if err := scores.Scale(1 / kernels.SqrtF(Float(q.shape[nq-1]))); err != nil {
 		return nil, err
 	}
 	qmod, off := 0, 0
@@ -2384,10 +2387,10 @@ func (q *GPUTensor) multiHeadAttention(k, v *GPUTensor, heads int, causal bool) 
 	if heads <= 0 || d%heads != 0 {
 		return nil, fmt.Errorf("tensai: %d heads do not divide model dimension %d", heads, d)
 	}
-	if !sameDims(k.shape, v.shape) {
+	if !dims.Same(k.shape, v.shape) {
 		return nil, fmt.Errorf("tensai: attention k and v shapes differ: %v vs %v", k.shape, v.shape)
 	}
-	if len(k.shape) != nq || k.shape[nq-1] != d || !sameDims(k.shape[:nq-2], q.shape[:nq-2]) {
+	if len(k.shape) != nq || k.shape[nq-1] != d || !dims.Same(k.shape[:nq-2], q.shape[:nq-2]) {
 		return nil, fmt.Errorf("tensai: attention shape mismatch: q %v, k %v", q.shape, k.shape)
 	}
 	seq := q.shape[nq-2]
@@ -2395,7 +2398,7 @@ func (q *GPUTensor) multiHeadAttention(k, v *GPUTensor, heads int, causal bool) 
 	if causal && seqKV < seq {
 		return nil, fmt.Errorf("tensai: causal attention needs seqKV >= seqQ, got %d < %d", seqKV, seq)
 	}
-	batch := prodDims(q.shape[:nq-2])
+	batch := dims.Prod(q.shape[:nq-2])
 	dh := d / heads
 	bh := batch * heads
 	if causal && dh <= 128 {
@@ -2419,7 +2422,7 @@ func (q *GPUTensor) multiHeadAttention(k, v *GPUTensor, heads int, causal bool) 
 		return nil, err
 	}
 	defer scores.Free()
-	if err := scores.Scale(1 / sqrtF(Float(dh))); err != nil {
+	if err := scores.Scale(1 / kernels.SqrtF(Float(dh))); err != nil {
 		return nil, err
 	}
 	qmod, off := 0, 0
@@ -2478,7 +2481,7 @@ func (q *GPUTensor) fusedCausalMHA(k, v *GPUTensor, heads, batch, seq, seqKV, d,
 	}
 	uncapturedCB = ""
 
-	outBytes := uint64(prodDims(outShape)) * 4
+	outBytes := uint64(dims.Prod(outShape)) * 4
 	if err := g.checkSize(outBytes); err != nil {
 		return nil, err
 	}
