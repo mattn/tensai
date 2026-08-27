@@ -96,13 +96,16 @@ prefill 401 tokens, decode 32 tokens, int8 weights
 gpu: Microsoft Direct3D12 (AMD Radeon(TM) Graphics) (integrated) via -tags wgpu24
 
                prefill       decode
-cpu            397.5 t/s       40.1 t/s
-gpu           2113.1 t/s       30.1 t/s
-gpu/cpu          5.32x         0.75x
+cpu            398.2 t/s       39.4 t/s
+gpu           2020.9 t/s       29.7 t/s
+gpu/cpu          5.08x         0.75x
 ```
 
 `-p` でプロンプトのおおよそのトークン数、`-n` でデコードするトークン数を指定
-します。GPU ビルドタグなしの場合は、GPU 行に理由が表示されます。
+します。GPU ビルドタグなしの場合は、GPU 行に理由が表示されます。 プレフィルの t/s はプロンプトが
+長くなるほど下がり (attention が二次)、変換レイヤー越しでは実行ごとに数 %
+ぶれます。長さをまたいだ単発の数値ではなく、同じ長さで数回の中央値を比べて
+ください。
 
 ### OpenAI 互換 API の提供
 

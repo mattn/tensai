@@ -97,13 +97,16 @@ prefill 401 tokens, decode 32 tokens, int8 weights
 gpu: Microsoft Direct3D12 (AMD Radeon(TM) Graphics) (integrated) via -tags wgpu24
 
                prefill       decode
-cpu            397.5 t/s       40.1 t/s
-gpu           2113.1 t/s       30.1 t/s
-gpu/cpu          5.32x         0.75x
+cpu            398.2 t/s       39.4 t/s
+gpu           2020.9 t/s       29.7 t/s
+gpu/cpu          5.08x         0.75x
 ```
 
 `-p` sets the approximate prompt length and `-n` the tokens to decode. Without
-a GPU build tag the GPU row reports why it is unavailable.
+a GPU build tag the GPU row reports why it is unavailable. Prefill throughput falls as the prompt
+grows (attention is quadratic) and varies a few percent run to run through a
+translation layer, so compare medians of a few runs at one length rather than
+single numbers across lengths.
 
 ### Serving an OpenAI-compatible API
 
