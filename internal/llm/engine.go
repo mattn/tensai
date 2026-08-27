@@ -381,10 +381,13 @@ func (e *Engine) Chat(in io.Reader, w io.Writer, n int) {
 	}
 }
 
-// Serve blocks on an OpenAI-compatible /v1/chat/completions server.
-func (e *Engine) Serve(addr string) error {
+// Serve blocks on an OpenAI-compatible /v1/chat/completions server,
+// with a demo page on GET /. A non-empty apiKey guards the /v1 routes
+// behind an Authorization: Bearer header.
+func (e *Engine) Serve(addr, apiKey string) error {
 	s := &server{
-		model: e.model, tok: e.tok, system: e.system, nCtx: e.nCtx,
+		apiKey: apiKey,
+		model:  e.model, tok: e.tok, system: e.system, nCtx: e.nCtx,
 		temp: e.opts.Temp, topP: e.opts.TopP, imEnd: e.imEnd, eot: e.eot,
 		tm: e.tm, prefill: e.prefill, step: e.step, reset: e.reset,
 		draft: e.draft, specK: e.opts.SpecK,

@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tensai</title>
+<style>
+:root { color-scheme: light dark; }
+body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; }
+h1 { font-size: 1.2rem; } h1 small { font-weight: normal; opacity: .6; }
+textarea { width: 100%; box-sizing: border-box; min-height: 5rem; font: inherit; padding: .5rem; }
+#out { white-space: pre-wrap; border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+       border-radius: 6px; padding: .75rem; min-height: 6rem; margin-top: 1rem; }
+.row { display: flex; gap: 1rem; align-items: center; margin: .5rem 0; flex-wrap: wrap; }
+#key-row { display: none; }
+button { font: inherit; padding: .3rem 1.2rem; }
+input[type=password] { font: inherit; }
+.err { color: #c33; }
+</style>
+</head>
+<body>
+<h1>tensai <small id="model"></small></h1>
+<textarea id="prompt" placeholder="Ask something..."></textarea>
+<div class="row">
+  <button id="send">Send</button>
+  <label>temp <input id="temp" type="range" min="0" max="1.5" step="0.1" value="0.7">
+  <span id="tempv">0.7</span></label>
+</div>
+<div class="row" id="key-row">
+  <label>API key <input id="key" type="password"></label>
+  <button id="savekey">Save</button>
+</div>
+<div id="out"></div>
+<script>
+const $ = id => document.getElementById(id);
+const headers = () => {
+  const h = { "Content-Type": "application/json" };
+  let k = "";
+  try { k = localStorage.getItem("tensai-api-key") || ""; } catch {}
+  if (k) h["Authorization"] = "Bearer " + k;
+  return h;
+};
+const needKey = () => { $("key-row").style.display = "flex"; };
+$("savekey").onclick = () => {
+  try { localStorage.setItem("tensai-api-key", $("key").value); } catch {}
+  $("key-row").style.display = "none";
+  load();
+};
+$("temp").oninput = () => $("tempv").textContent = $("temp").value;
+
+async function load() {
+  try {
+    const r = await fetch("v1/models", { headers: headers() });
+    if (r.status === 401) return needKey();
+    const d = await r.json();
+    $("model").textContent = d.data?.[0]?.id || "";
+  } catch {}
+}
+load();
+
+$("send").onclick = async () => {
+  const out = $("out");
+  out.textContent = "";
+  out.classList.remove("err");
+  $("send").disabled = true;
+  try {
+    const r = await fetch("v1/chat/completions", {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({
+        model: "tensai",
+        messages: [{ role: "user", content: $("prompt").value }],
+        temperature: parseFloat($("temp").value),
+        max_tokens: 1024,
+        stream: true,
+      }),
+    });
+    if (r.status === 401) { needKey(); out.textContent = "unauthorized: enter the API key"; out.classList.add("err"); return; }
+    if (!r.ok) { out.textContent = r.status + " " + await r.text(); out.classList.add("err"); return; }
+    const rd = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { done, value } = await rd.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf("\n\n")) >= 0) {
+        const line = buf.slice(0, i).trim();
+        buf = buf.slice(i + 2);
+        if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+        try {
+          const c = JSON.parse(line.slice(6));
+          out.textContent += c.choices?.[0]?.delta?.content || "";
+        } catch {}
+      }
+    }
+  } catch (e) {
+    out.textContent = String(e);
+    out.classList.add("err");
+  } finally {
+    $("send").disabled = false;
+  }
+};
+</script>
+</body>
+</html>

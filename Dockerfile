@@ -22,6 +22,9 @@ FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /tensai /tensai
 ENV XDG_CACHE_HOME=/cache
+# serve binds loopback by default; inside a container it must answer on
+# the bridge for -p to work.
+ENV TENSAI_ADDR=:8080
 VOLUME /cache
 ENTRYPOINT ["/tensai"]
 CMD ["chat"]

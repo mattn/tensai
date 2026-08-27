@@ -9,6 +9,8 @@ package llm
 // address works against a pure-Go model.
 
 import (
+	"crypto/subtle"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -76,6 +78,7 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string) string {
 
 type server struct {
 	mu      sync.Mutex // one request drives the model at a time
+	apiKey  string     // "" leaves /v1 open
 	model   *qwen
 	draft   *qwen
 	specK   int
@@ -98,16 +101,50 @@ type tokenizerIface interface {
 	Decode([]int) string
 }
 
+// auth wraps a /v1 handler with the bearer check. The demo page stays
+// open — static HTML holds no secrets and a browser cannot attach a
+// bearer header to plain navigation anyway — while every API route
+// answers 401 until the right key arrives.
+func (s *server) auth(h http.HandlerFunc) http.HandlerFunc {
+	if s.apiKey == "" {
+		return h
+	}
+	want := []byte("Bearer " + s.apiKey)
+	return func(w http.ResponseWriter, r *http.Request) {
+		got := []byte(r.Header.Get("Authorization"))
+		if subtle.ConstantTimeCompare(got, want) == 0 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]any{
+				"error": map[string]any{"message": "invalid api key", "type": "invalid_request_error"},
+			})
+			return
+		}
+		h(w, r)
+	}
+}
+
+//go:embed webui.html
+var webUI []byte
+
 func (s *server) listen(addr string) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", s.chatCompletions)
-	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/chat/completions", s.auth(s.chatCompletions))
+	mux.HandleFunc("/v1/models", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{
 			"object": "list",
 			"data": []map[string]any{{
 				"id": "tensai", "object": "model", "owned_by": "tensai",
 			}},
 		})
+	}))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(webUI)
 	})
 	fmt.Printf("listening on %s (POST /v1/chat/completions)\n", addr)
 	return http.ListenAndServe(addr, mux)
