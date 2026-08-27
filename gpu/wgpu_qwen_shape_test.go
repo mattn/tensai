@@ -215,3 +215,57 @@ func float16round(x float32) float32 {
 		return math.Float32frombits(hs | (he-15+127)<<23 | hm<<13)
 	}
 }
+
+// BenchmarkGPUGroupedAttnPrefill measures grouped causal attention at the
+// Qwen2.5-0.5B prefill shape: a 512-token chunk against a 625-position
+// cache, through the f16 cache path when the device grants shader-f16.
+func BenchmarkGPUGroupedAttnPrefill(b *testing.B) {
+	g, err := Open()
+	if err != nil {
+		b.Skipf("wgpu unavailable: %v", err)
+	}
+	defer g.Close()
+	rng := rand.New(rand.NewSource(9))
+	const heads, kvHeads, dh = 14, 2, 64
+	const d, kvDim = heads * dh, kvHeads * dh
+	const seqQ, seqKV = 512, 625
+	upload := func(f *tensai.Tensor) *Tensor {
+		if g.HasF16() {
+			c, err := g.NewF16Tensor(seqKV, kvDim)
+			if err != nil {
+				b.Fatal(err)
+			}
+			src, err := g.Upload(f)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := src.CopyRowsInto(c, 0); err != nil {
+				b.Fatal(err)
+			}
+			src.Free()
+			return c
+		}
+		gt, err := g.Upload(f)
+		if err != nil {
+			b.Fatal(err)
+		}
+		return gt
+	}
+	gk := upload(randTensor(rng, seqKV, kvDim))
+	defer gk.Free()
+	gv := upload(randTensor(rng, seqKV, kvDim))
+	defer gv.Free()
+	gq, err := g.Upload(randTensor(rng, seqQ, d))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer gq.Free()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, err := gq.GroupedCausalAttention(gk, gv, heads, kvHeads, seqKV, 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+		out.Free()
+	}
+}

@@ -1267,40 +1267,46 @@ fn attn_causal_gh(@builtin(workgroup_id) wid: vec3<u32>,
         start = limit - ap.window;
     }
     let scale = inverseSqrt(f32(ap.dh));
-    var m: array<f32, 8>;
-    var l: array<f32, 8>;
-    var acc: array<vec4<f32>, 8>;
-    for (var h = 0u; h < 8u; h = h + 1u) {
-        m[h] = -3.40282e38;
-    }
+    // Per-head state lives in named scalars, never in indexed arrays:
+    // function-scope arrays with dynamic indices land in scratch memory
+    // and made this kernel about twice as slow. Heads past grp
+    // accumulate zeros (workgroup memory is zero-initialized) and are
+    // never written back, so the unrolled arithmetic matches the old
+    // per-head loop bit for bit.
+    var m0 = -3.40282e38; var m1 = -3.40282e38; var m2 = -3.40282e38; var m3 = -3.40282e38;
+    var m4 = -3.40282e38; var m5 = -3.40282e38; var m6 = -3.40282e38; var m7 = -3.40282e38;
+    var l0 = 0.0; var l1 = 0.0; var l2 = 0.0; var l3 = 0.0;
+    var l4 = 0.0; var l5 = 0.0; var l6 = 0.0; var l7 = 0.0;
+    var acc0 = vec4<f32>(); var acc1 = vec4<f32>(); var acc2 = vec4<f32>(); var acc3 = vec4<f32>();
+    var acc4 = vec4<f32>(); var acc5 = vec4<f32>(); var acc6 = vec4<f32>(); var acc7 = vec4<f32>();
     let tiles = (limit + AT - 1u) / AT;
     for (var tt = start / AT; tt < tiles; tt = tt + 1u) {
         let j = tt * AT + t;
         let valid = j >= start && j < limit;
-        var dot: array<f32, 8>;
-        for (var h = 0u; h < 8u; h = h + 1u) {
-            dot[h] = 0.0;
-        }
+        var d0 = 0.0; var d1 = 0.0; var d2 = 0.0; var d3 = 0.0;
+        var d4 = 0.0; var d5 = 0.0; var d6 = 0.0; var d7 = 0.0;
         if (valid) {
             for (var c = 0u; c < ap.dh; c = c + 1u) {
                 let kv = f32(akh[offKV + j * ap.dkv + c]);
-                for (var h = 0u; h < 8u; h = h + 1u) {
-                    if (h < grp) {
-                        dot[h] = dot[h] + qrow_h[h * ap.dh + c] * kv;
-                    }
-                }
+                d0 = d0 + qrow_h[c] * kv;
+                d1 = d1 + qrow_h[ap.dh + c] * kv;
+                d2 = d2 + qrow_h[2u * ap.dh + c] * kv;
+                d3 = d3 + qrow_h[3u * ap.dh + c] * kv;
+                d4 = d4 + qrow_h[4u * ap.dh + c] * kv;
+                d5 = d5 + qrow_h[5u * ap.dh + c] * kv;
+                d6 = d6 + qrow_h[6u * ap.dh + c] * kv;
+                d7 = d7 + qrow_h[7u * ap.dh + c] * kv;
             }
+            d0 = d0 * scale; d1 = d1 * scale; d2 = d2 * scale; d3 = d3 * scale;
+            d4 = d4 * scale; d5 = d5 * scale; d6 = d6 * scale; d7 = d7 * scale;
+        } else {
+            d0 = -3.40282e38; d1 = -3.40282e38; d2 = -3.40282e38; d3 = -3.40282e38;
+            d4 = -3.40282e38; d5 = -3.40282e38; d6 = -3.40282e38; d7 = -3.40282e38;
         }
-        for (var h = 0u; h < 8u; h = h + 1u) {
-            if (h < grp) {
-                var sv = -3.40282e38;
-                if (valid) {
-                    sv = dot[h] * scale;
-                }
-                dot[h] = sv;
-                red_h[h * 64u + t] = sv;
-            }
-        }
+        red_h[t] = d0;         red_h[64u + t] = d1;
+        red_h[128u + t] = d2;  red_h[192u + t] = d3;
+        red_h[256u + t] = d4;  red_h[320u + t] = d5;
+        red_h[384u + t] = d6;  red_h[448u + t] = d7;
         workgroupBarrier();
         for (var r = 32u; r > 0u; r = r >> 1u) {
             if (t < r) {
@@ -1312,24 +1318,25 @@ fn attn_causal_gh(@builtin(workgroup_id) wid: vec3<u32>,
             }
             workgroupBarrier();
         }
-        var mNew: array<f32, 8>;
-        var p: array<f32, 8>;
-        for (var h = 0u; h < 8u; h = h + 1u) {
-            p[h] = 0.0;
-            if (h < grp) {
-                mNew[h] = max(m[h], red_h[h * 64u]);
-                if (valid) {
-                    p[h] = exp(dot[h] - mNew[h]);
-                }
-            }
+        let n0 = max(m0, red_h[0]);   let n1 = max(m1, red_h[64]);
+        let n2 = max(m2, red_h[128]); let n3 = max(m3, red_h[192]);
+        let n4 = max(m4, red_h[256]); let n5 = max(m5, red_h[320]);
+        let n6 = max(m6, red_h[384]); let n7 = max(m7, red_h[448]);
+        var p0 = 0.0; var p1 = 0.0; var p2 = 0.0; var p3 = 0.0;
+        var p4 = 0.0; var p5 = 0.0; var p6 = 0.0; var p7 = 0.0;
+        if (valid) {
+            p0 = exp(d0 - n0); p1 = exp(d1 - n1); p2 = exp(d2 - n2); p3 = exp(d3 - n3);
+            p4 = exp(d4 - n4); p5 = exp(d5 - n5); p6 = exp(d6 - n6); p7 = exp(d7 - n7);
         }
         workgroupBarrier();
-        for (var h = 0u; h < 8u; h = h + 1u) {
-            if (h < grp) {
-                sc_h[h * 64u + t] = p[h];
-                red_h[h * 64u + t] = p[h];
-            }
-        }
+        sc_h[t] = p0;         sc_h[64u + t] = p1;
+        sc_h[128u + t] = p2;  sc_h[192u + t] = p3;
+        sc_h[256u + t] = p4;  sc_h[320u + t] = p5;
+        sc_h[384u + t] = p6;  sc_h[448u + t] = p7;
+        red_h[t] = p0;         red_h[64u + t] = p1;
+        red_h[128u + t] = p2;  red_h[192u + t] = p3;
+        red_h[256u + t] = p4;  red_h[320u + t] = p5;
+        red_h[384u + t] = p6;  red_h[448u + t] = p7;
         workgroupBarrier();
         for (var r = 32u; r > 0u; r = r >> 1u) {
             if (t < r) {
@@ -1341,15 +1348,17 @@ fn attn_causal_gh(@builtin(workgroup_id) wid: vec3<u32>,
             }
             workgroupBarrier();
         }
-        for (var h = 0u; h < 8u; h = h + 1u) {
-            if (h < grp) {
-                // exp underflows to zero on the first tile, where m is -inf-like.
-                let rescale = exp(m[h] - mNew[h]);
-                l[h] = l[h] * rescale + red_h[h * 64u];
-                m[h] = mNew[h];
-                acc[h] = acc[h] * rescale;
-            }
-        }
+        // exp underflows to zero on the first tile, where m is -inf-like.
+        let r0 = exp(m0 - n0); let r1 = exp(m1 - n1); let r2 = exp(m2 - n2); let r3 = exp(m3 - n3);
+        let r4 = exp(m4 - n4); let r5 = exp(m5 - n5); let r6 = exp(m6 - n6); let r7 = exp(m7 - n7);
+        l0 = l0 * r0 + red_h[0];   l1 = l1 * r1 + red_h[64];
+        l2 = l2 * r2 + red_h[128]; l3 = l3 * r3 + red_h[192];
+        l4 = l4 * r4 + red_h[256]; l5 = l5 * r5 + red_h[320];
+        l6 = l6 * r6 + red_h[384]; l7 = l7 * r7 + red_h[448];
+        m0 = n0; m1 = n1; m2 = n2; m3 = n3;
+        m4 = n4; m5 = n5; m6 = n6; m7 = n7;
+        acc0 = acc0 * r0; acc1 = acc1 * r1; acc2 = acc2 * r2; acc3 = acc3 * r3;
+        acc4 = acc4 * r4; acc5 = acc5 * r5; acc6 = acc6 * r6; acc7 = acc7 * r7;
         let jEnd = min(limit, tt * AT + AT);
         for (var jj = max(start, tt * AT); jj < jEnd; jj = jj + 1u) {
             var vv = vec4<f32>(0.0, 0.0, 0.0, 0.0);
@@ -1365,28 +1374,42 @@ fn attn_causal_gh(@builtin(workgroup_id) wid: vec3<u32>,
             if (192u + t < ap.dh) {
                 vv.w = f32(avh[offKV + jj * ap.dkv + 192u + t]);
             }
-            for (var h = 0u; h < 8u; h = h + 1u) {
-                if (h < grp) {
-                    acc[h] = acc[h] + sc_h[h * 64u + jj - tt * AT] * vv;
-                }
-            }
+            let sj = jj - tt * AT;
+            acc0 = acc0 + sc_h[sj] * vv;
+            acc1 = acc1 + sc_h[64u + sj] * vv;
+            acc2 = acc2 + sc_h[128u + sj] * vv;
+            acc3 = acc3 + sc_h[192u + sj] * vv;
+            acc4 = acc4 + sc_h[256u + sj] * vv;
+            acc5 = acc5 + sc_h[320u + sj] * vv;
+            acc6 = acc6 + sc_h[384u + sj] * vv;
+            acc7 = acc7 + sc_h[448u + sj] * vv;
         }
         workgroupBarrier();
     }
     for (var h = 0u; h < 8u; h = h + 1u) {
         if (h < grp) {
+            var av = vec4<f32>();
+            var lh = 1.0;
+            if (h == 0u) { av = acc0; lh = l0; }
+            if (h == 1u) { av = acc1; lh = l1; }
+            if (h == 2u) { av = acc2; lh = l2; }
+            if (h == 3u) { av = acc3; lh = l3; }
+            if (h == 4u) { av = acc4; lh = l4; }
+            if (h == 5u) { av = acc5; lh = l5; }
+            if (h == 6u) { av = acc6; lh = l6; }
+            if (h == 7u) { av = acc7; lh = l7; }
             let o = offO + qi * ap.d + h * ap.dh;
             if (t < ap.dh) {
-                aout[o + t] = acc[h].x / l[h];
+                aout[o + t] = av.x / lh;
             }
             if (64u + t < ap.dh) {
-                aout[o + 64u + t] = acc[h].y / l[h];
+                aout[o + 64u + t] = av.y / lh;
             }
             if (128u + t < ap.dh) {
-                aout[o + 128u + t] = acc[h].z / l[h];
+                aout[o + 128u + t] = av.z / lh;
             }
             if (192u + t < ap.dh) {
-                aout[o + 192u + t] = acc[h].w / l[h];
+                aout[o + 192u + t] = av.w / lh;
             }
         }
     }
