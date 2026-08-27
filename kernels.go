@@ -125,6 +125,16 @@ func adamStepGeneric(w, g, m, v []Float, beta1, beta2, rc1, rc2, lr, eps, wd Flo
 	}
 }
 
+// sgdStepGeneric applies one momentum-SGD update over a parameter slice:
+// vel = momentum*vel - lr*g, w += vel.
+func sgdStepGeneric(w, g, vel []Float, momentum, lr Float) {
+	for i, wi := range w {
+		vi := momentum*vel[i] - lr*g[i]
+		vel[i] = vi
+		w[i] = wi + vi
+	}
+}
+
 // geluFwdGeneric computes dst = 0.5*src*(1+erf(src/sqrt(2))).
 func geluFwdGeneric(dst, src []Float) {
 	for i, v := range src {

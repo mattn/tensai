@@ -23,6 +23,9 @@ func softmaxBwdAdd(dst, grad, y []Float)     { softmaxBwdAddGeneric(dst, grad, y
 func adamStepSlice(w, g, m, v []Float, beta1, beta2, rc1, rc2, lr, eps, wd Float) {
 	adamStepGeneric(w, g, m, v, beta1, beta2, rc1, rc2, lr, eps, wd)
 }
+func sgdStepSlice(w, g, vel []Float, momentum, lr Float) {
+	sgdStepGeneric(w, g, vel, momentum, lr)
+}
 
 func geluFwd(dst, src []Float)       { geluFwdGeneric(dst, src) }
 func geluBwd(dst, grad, src []Float) { geluBwdGeneric(dst, grad, src) }

@@ -258,6 +258,27 @@ func adamStepSlice(w, g, m, v []Float, beta1, beta2, rc1, rc2, lr, eps, wd Float
 	archsimd.ClearAVXUpperBits()
 }
 
+func sgdStepSlice(w, g, vel []Float, momentum, lr Float) {
+	if !hasAVX2 {
+		sgdStepGeneric(w, g, vel, momentum, lr)
+		return
+	}
+	mo := archsimd.BroadcastFloat32x8(momentum)
+	nlr := archsimd.BroadcastFloat32x8(-lr)
+	for len(w) >= 8 {
+		vv := loadF32x8(g).MulAdd(nlr, loadF32x8(vel).Mul(mo))
+		storeF32x8(vv, vel)
+		storeF32x8(loadF32x8(w).Add(vv), w)
+		w, g, vel = w[8:], g[8:], vel[8:]
+	}
+	if len(w) > 0 {
+		vv := loadF32x8Part(g).MulAdd(nlr, loadF32x8Part(vel).Mul(mo))
+		storeF32x8Part(vv, vel)
+		storeF32x8Part(loadF32x8Part(w).Add(vv), w)
+	}
+	archsimd.ClearAVXUpperBits()
+}
+
 // verf computes erf(x) per lane with the Abramowitz-Stegun 7.1.26
 // polynomial (max absolute error ~1.5e-7, below float32 resolution for this
 // use). Symmetry handles negative inputs via sign-bit restore.

@@ -20,6 +20,7 @@ Where the AVX2 kernels apply today, and where they still could:
 - [x] LayerNorm forward & backward (vector row reductions)
 - [x] Softmax / SoftmaxCrossEntropy exponentials and scaling
 - [x] Adam / AdamW parameter update
+- [x] SGD update (momentum form, same fused multiply-add loop as Adam)
 - [x] Slice add & scale primitives (bias add, `Embedding` gradient scatter-add)
 - [x] Transpose-free gradient matmul (`DotTAInto`) — `Dense`/`Conv2D` weight gradients no longer materialize `input^T` / `im2col^T`
 - [x] Remaining transposes (`T`/`TInto`) — cache-blocked 32x32 tiles
@@ -29,7 +30,6 @@ Where the AVX2 kernels apply today, and where they still could:
 - [ ] BatchNorm statistics (column-strided access needs a restructure)
 - [ ] MaxPool2D window scan
 - [ ] im2col / col2im gather-scatter (contiguous runs could use bulk copies)
-- [ ] SGD update
 
 The unchecked items are ordered roughly by expected impact; none of them show up prominently in training profiles today.
 

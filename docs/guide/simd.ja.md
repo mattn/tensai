@@ -20,6 +20,7 @@ AVX2 カーネルが今日適用されている場所と、まだ適用できる
 - [x] LayerNorm の順伝播と逆伝播 (行のベクトルリダクション)
 - [x] Softmax / SoftmaxCrossEntropy の指数計算とスケーリング
 - [x] Adam / AdamW のパラメータ更新
+- [x] SGD 更新 (モーメンタム形式、Adam と同じ融合積和ループ)
 - [x] スライスの加算/スケールプリミティブ (バイアス加算、`Embedding` 勾配の scatter-add)
 - [x] 転置不要の勾配 matmul (`DotTAInto`) — `Dense`/`Conv2D` の重み勾配は `input^T` / `im2col^T` を実体化しません
 - [x] 残りの転置 (`T`/`TInto`) — キャッシュブロッキングされた 32x32 タイル
@@ -29,7 +30,6 @@ AVX2 カーネルが今日適用されている場所と、まだ適用できる
 - [ ] BatchNorm の統計量 (列ストライドアクセスの再構成が必要)
 - [ ] MaxPool2D のウィンドウ走査
 - [ ] im2col / col2im の gather-scatter (連続区間はバルクコピーにできる)
-- [ ] SGD 更新
 
 未チェックの項目はおおよそ期待効果順ですが、どれも今の学習プロファイルでは目立ちません。
 
