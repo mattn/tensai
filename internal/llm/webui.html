@@ -6,33 +6,42 @@
 <title>tensai</title>
 <style>
 :root { color-scheme: light dark; }
-body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 2rem auto; padding: 0 1rem; }
-h1 { font-size: 1.2rem; } h1 small { font-weight: normal; opacity: .6; }
-textarea { width: 100%; box-sizing: border-box; min-height: 5rem; font: inherit; padding: .5rem; }
-#out { white-space: pre-wrap; border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
-       border-radius: 6px; padding: .75rem; min-height: 6rem; margin-top: 1rem; }
-.row { display: flex; gap: 1rem; align-items: center; margin: .5rem 0; flex-wrap: wrap; }
-#key-row { display: none; }
-button { font: inherit; padding: .3rem 1.2rem; }
-input[type=password] { font: inherit; }
+body { font-family: system-ui, sans-serif; max-width: 46rem; margin: 0 auto; padding: 1rem;
+       display: flex; flex-direction: column; height: 100vh; box-sizing: border-box; }
+h1 { font-size: 1.2rem; margin: 0 0 .5rem; } h1 small { font-weight: normal; opacity: .6; }
+#chat { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: .5rem; padding: .25rem 0; }
+.msg { white-space: pre-wrap; border-radius: 8px; padding: .5rem .75rem; max-width: 85%; }
+.user { align-self: flex-end; background: color-mix(in srgb, currentColor 12%, transparent); }
+.assistant { align-self: flex-start; border: 1px solid color-mix(in srgb, currentColor 25%, transparent); }
 .err { color: #c33; }
+form { display: flex; gap: .5rem; align-items: flex-end; margin-top: .5rem; }
+textarea { flex: 1; font: inherit; padding: .5rem; min-height: 2.5rem; max-height: 10rem; resize: vertical; }
+.row { display: flex; gap: 1rem; align-items: center; margin-top: .25rem; flex-wrap: wrap;
+       font-size: .85rem; opacity: .8; }
+#key-row { display: none; }
+button { font: inherit; padding: .3rem 1rem; }
+input[type=password] { font: inherit; }
 </style>
 </head>
 <body>
 <h1>tensai <small id="model"></small></h1>
-<textarea id="prompt" placeholder="Ask something..."></textarea>
+<div id="chat"></div>
+<form id="form">
+  <textarea id="prompt" placeholder="Message (Enter to send, Shift+Enter for a newline)"></textarea>
+  <button id="send" type="submit">Send</button>
+</form>
 <div class="row">
-  <button id="send">Send</button>
   <label>temp <input id="temp" type="range" min="0" max="1.5" step="0.1" value="0.7">
   <span id="tempv">0.7</span></label>
+  <button id="clear" type="button">Clear</button>
 </div>
 <div class="row" id="key-row">
   <label>API key <input id="key" type="password"></label>
-  <button id="savekey">Save</button>
+  <button id="savekey" type="button">Save</button>
 </div>
-<div id="out"></div>
 <script>
 const $ = id => document.getElementById(id);
+const messages = [];
 const headers = () => {
   const h = { "Content-Type": "application/json" };
   let k = "";
@@ -47,6 +56,18 @@ $("savekey").onclick = () => {
   load();
 };
 $("temp").oninput = () => $("tempv").textContent = $("temp").value;
+$("clear").onclick = () => {
+  messages.length = 0;
+  $("chat").replaceChildren();
+};
+
+function bubble(role) {
+  const d = document.createElement("div");
+  d.className = "msg " + role;
+  $("chat").appendChild(d);
+  return d;
+}
+const scroll = () => { $("chat").scrollTop = $("chat").scrollHeight; };
 
 async function load() {
   try {
@@ -58,25 +79,59 @@ async function load() {
 }
 load();
 
-$("send").onclick = async () => {
-  const out = $("out");
-  out.textContent = "";
-  out.classList.remove("err");
+// Enter sends; Shift+Enter and Ctrl+Enter insert a newline instead.
+$("prompt").addEventListener("keydown", e => {
+  if (e.key !== "Enter") return;
+  if (e.shiftKey || e.ctrlKey) {
+    if (e.ctrlKey) { // ctrl+enter inserts nothing by default
+      e.preventDefault();
+      const t = e.target, p = t.selectionStart;
+      t.value = t.value.slice(0, p) + "\n" + t.value.slice(t.selectionEnd);
+      t.selectionStart = t.selectionEnd = p + 1;
+    }
+    return;
+  }
+  e.preventDefault();
+  $("form").requestSubmit();
+});
+
+$("form").onsubmit = async e => {
+  e.preventDefault();
+  const text = $("prompt").value.trim();
+  if (!text || $("send").disabled) return;
+  $("prompt").value = "";
   $("send").disabled = true;
+  messages.push({ role: "user", content: text });
+  bubble("user").textContent = text;
+  const out = bubble("assistant");
+  scroll();
   try {
     const r = await fetch("v1/chat/completions", {
       method: "POST",
       headers: headers(),
       body: JSON.stringify({
         model: "tensai",
-        messages: [{ role: "user", content: $("prompt").value }],
+        messages: messages,
         temperature: parseFloat($("temp").value),
         max_tokens: 1024,
         stream: true,
       }),
     });
-    if (r.status === 401) { needKey(); out.textContent = "unauthorized: enter the API key"; out.classList.add("err"); return; }
-    if (!r.ok) { out.textContent = r.status + " " + await r.text(); out.classList.add("err"); return; }
+    if (r.status === 401) {
+      needKey();
+      messages.pop();
+      $("prompt").value = text;
+      out.textContent = "unauthorized: enter the API key";
+      out.classList.add("err");
+      return;
+    }
+    if (!r.ok) {
+      messages.pop();
+      $("prompt").value = text;
+      out.textContent = r.status + " " + await r.text();
+      out.classList.add("err");
+      return;
+    }
     const rd = r.body.getReader();
     const dec = new TextDecoder();
     let buf = "";
@@ -92,14 +147,19 @@ $("send").onclick = async () => {
         try {
           const c = JSON.parse(line.slice(6));
           out.textContent += c.choices?.[0]?.delta?.content || "";
+          scroll();
         } catch {}
       }
     }
-  } catch (e) {
-    out.textContent = String(e);
+    messages.push({ role: "assistant", content: out.textContent });
+  } catch (err) {
+    messages.pop();
+    $("prompt").value = text;
+    out.textContent = String(err);
     out.classList.add("err");
   } finally {
     $("send").disabled = false;
+    $("prompt").focus();
   }
 };
 </script>
