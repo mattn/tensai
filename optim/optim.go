@@ -7,25 +7,27 @@ import (
 	"github.com/mattn/tensai/internal/kernels"
 )
 
-// Optimizer updates a set of (weights, bias) parameter pairs using their
-// gradients. One Optimizer instance is shared by the model; each
-// parameterized layer gets its own state buffer inside the optimizer.
+// Optimizer is an update-rule configuration (learning rate, momentum, ...).
+// New hands out an Updater with fresh state for one parameter pair; the
+// model keeps one Updater per parameterized layer, so there is no index
+// bookkeeping between the model and the optimizer.
 type Optimizer interface {
-	// Step applies one update to the given parameters using their gradients.
-	// It is called once per parameterized layer.
-	Step(idx int, weights, gradW *tensai.Matrix, bias, gradB []tensai.Float)
-	// NewLayer registers a new parameterized layer and returns its index.
-	NewLayer() int
+	// New returns an Updater holding fresh per-parameter state.
+	New() Updater
 	// Name returns a short identifier.
 	Name() string
+}
+
+// Updater applies the optimizer rule to one (weights, bias) parameter pair,
+// carrying that pair's state (momentum buffers, Adam moments, step count).
+type Updater interface {
+	Step(weights, gradW *tensai.Matrix, bias, gradB []tensai.Float)
 }
 
 // SGD is stochastic gradient descent with optional momentum.
 type SGD struct {
 	LR       tensai.Float
 	Momentum tensai.Float
-	velW     []*tensai.Matrix
-	velB     [][]tensai.Float
 }
 
 // NewSGD returns an SGD optimizer. Momentum of 0 disables momentum.
@@ -36,24 +38,23 @@ func NewSGD(lr, momentum tensai.Float) *SGD {
 // Name returns "sgd".
 func (s *SGD) Name() string { return "sgd" }
 
-// NewLayer registers a layer and returns its index.
-func (s *SGD) NewLayer() int {
-	idx := len(s.velW)
-	s.velW = append(s.velW, nil)
-	s.velB = append(s.velB, nil)
-	return idx
+// New returns an updater with fresh velocity buffers.
+func (s *SGD) New() Updater { return &sgdUpdater{cfg: s} }
+
+type sgdUpdater struct {
+	cfg  *SGD
+	velW *tensai.Matrix
+	velB []tensai.Float
 }
 
 // Step updates parameters with standard (momentum) SGD.
-func (s *SGD) Step(idx int, weights, gradW *tensai.Matrix, bias, gradB []tensai.Float) {
-	if s.velW[idx] == nil {
-		s.velW[idx] = tensai.NewMatrix(weights.Rows, weights.Cols)
+func (u *sgdUpdater) Step(weights, gradW *tensai.Matrix, bias, gradB []tensai.Float) {
+	if u.velW == nil {
+		u.velW = tensai.NewMatrix(weights.Rows, weights.Cols)
+		u.velB = make([]tensai.Float, len(bias))
 	}
-	if s.velB[idx] == nil {
-		s.velB[idx] = make([]tensai.Float, len(bias))
-	}
-	kernels.SGDStep(weights.Data, gradW.Data, s.velW[idx].Data, s.Momentum, s.LR)
-	kernels.SGDStep(bias, gradB, s.velB[idx], s.Momentum, s.LR)
+	kernels.SGDStep(weights.Data, gradW.Data, u.velW.Data, u.cfg.Momentum, u.cfg.LR)
+	kernels.SGDStep(bias, gradB, u.velB, u.cfg.Momentum, u.cfg.LR)
 }
 
 // Adam optimizer. With WeightDecay > 0 it becomes AdamW: decay is decoupled
@@ -64,11 +65,6 @@ type Adam struct {
 	Beta2       tensai.Float
 	Eps         tensai.Float
 	WeightDecay tensai.Float
-	t           int
-	mW          []*tensai.Matrix
-	vW          []*tensai.Matrix
-	mB          [][]tensai.Float
-	vB          [][]tensai.Float
 }
 
 // NewAdam returns an Adam optimizer with standard defaults.
@@ -86,36 +82,39 @@ func NewAdamW(lr, weightDecay tensai.Float) *Adam {
 // Name returns "adam".
 func (a *Adam) Name() string { return "adam" }
 
-// NewLayer registers a layer and returns its index.
-func (a *Adam) NewLayer() int {
-	idx := len(a.mW)
-	a.mW = append(a.mW, nil)
-	a.vW = append(a.vW, nil)
-	a.mB = append(a.mB, nil)
-	a.vB = append(a.vB, nil)
-	return idx
+// New returns an updater with fresh moment buffers and step count.
+func (a *Adam) New() Updater { return &adamUpdater{cfg: a} }
+
+type adamUpdater struct {
+	cfg *Adam
+	t   int
+	mW  *tensai.Matrix
+	vW  *tensai.Matrix
+	mB  []tensai.Float
+	vB  []tensai.Float
 }
 
-// Step updates parameters with the Adam rule.
-func (a *Adam) Step(idx int, weights, gradW *tensai.Matrix, bias, gradB []tensai.Float) {
-	if a.mW[idx] == nil {
-		a.mW[idx] = tensai.NewMatrix(weights.Rows, weights.Cols)
-		a.vW[idx] = tensai.NewMatrix(weights.Rows, weights.Cols)
-		a.mB[idx] = make([]tensai.Float, len(bias))
-		a.vB[idx] = make([]tensai.Float, len(bias))
+// Step updates parameters with the Adam rule. The bias-correction step
+// count is per parameter, so a parameter that skips a step (an unused
+// autograd node) keeps its correction exact.
+func (u *adamUpdater) Step(weights, gradW *tensai.Matrix, bias, gradB []tensai.Float) {
+	if u.mW == nil {
+		u.mW = tensai.NewMatrix(weights.Rows, weights.Cols)
+		u.vW = tensai.NewMatrix(weights.Rows, weights.Cols)
+		u.mB = make([]tensai.Float, len(bias))
+		u.vB = make([]tensai.Float, len(bias))
 	}
-	a.t++
-	mW, vW := a.mW[idx], a.vW[idx]
-	mB, vB := a.mB[idx], a.vB[idx]
+	u.t++
+	a := u.cfg
 
 	// Bias corrections depend only on t, so hoist them out of the loops.
-	rc1 := 1 / (1 - kernels.PowF(a.Beta1, tensai.Float(a.t)))
-	rc2 := 1 / (1 - kernels.PowF(a.Beta2, tensai.Float(a.t)))
+	rc1 := 1 / (1 - kernels.PowF(a.Beta1, tensai.Float(u.t)))
+	rc2 := 1 / (1 - kernels.PowF(a.Beta2, tensai.Float(u.t)))
 
-	kernels.AdamStep(weights.Data, gradW.Data, mW.Data, vW.Data,
+	kernels.AdamStep(weights.Data, gradW.Data, u.mW.Data, u.vW.Data,
 		a.Beta1, a.Beta2, rc1, rc2, a.LR, a.Eps, a.WeightDecay)
 	// Decoupled weight decay is never applied to biases.
-	kernels.AdamStep(bias, gradB, mB, vB, a.Beta1, a.Beta2, rc1, rc2, a.LR, a.Eps, 0)
+	kernels.AdamStep(bias, gradB, u.mB, u.vB, a.Beta1, a.Beta2, rc1, rc2, a.LR, a.Eps, 0)
 }
 
 // Assert Optimizer implementations conform to the interface at compile time.

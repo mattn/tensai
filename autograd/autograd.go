@@ -369,17 +369,18 @@ func (n *Node) Scalar() tensai.Float {
 //		trainer.Step(loss)
 //	}
 type Trainer struct {
-	opt    optim.Optimizer
+	ups    []optim.Updater
 	params []*Node
 }
 
-// NewTrainer registers the parameters with the optimizer and returns a
+// NewTrainer gives each parameter its own optimizer state and returns a
 // Trainer that updates them.
 func NewTrainer(opt optim.Optimizer, params ...*Node) *Trainer {
-	for range params {
-		opt.NewLayer()
+	ups := make([]optim.Updater, len(params))
+	for i := range ups {
+		ups[i] = opt.New()
 	}
-	return &Trainer{opt: opt, params: params}
+	return &Trainer{ups: ups, params: params}
 }
 
 // Step runs backward from the scalar loss, applies one optimizer update to
@@ -388,10 +389,10 @@ func (t *Trainer) Step(loss *Node) tensai.Float {
 	loss.Backward()
 	for i, p := range t.params {
 		if p.Grad == nil {
-			// Parameter unused in this graph; keep its optimizer slot aligned.
+			// Parameter unused in this graph; its state simply sits out.
 			continue
 		}
-		t.opt.Step(i, p.Value, p.Grad, nil, nil)
+		t.ups[i].Step(p.Value, p.Grad, nil, nil)
 	}
 	ZeroGrads(t.params...)
 	return loss.Scalar()

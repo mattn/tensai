@@ -31,7 +31,7 @@ type Layer interface {
 
 `Conv2D` と `MaxPool2D` は各行をチャンネル優先の画像として扱います: `index = (channel*height + y)*width + x`。`Dropout` と `BatchNorm` は `Fit`/`FitStep` 内では学習時の挙動、`Predict` 内では推論時の挙動へ自動的に切り替わります。
 
-`Embedding` は行列のみの API を保っています。各入力行はトークン ID の列で、レイヤーは引いた埋め込みベクトルを列方向に連結します。たとえば `Compile(4, ...)` と `NewEmbedding(vocab, 8)` の組み合わせは、`Mx4` のトークン ID 行列を `LayerNorm`, `GELU`, `Dense` に食わせられる `Mx32` の密な特徴行列に変えます。
+`Embedding` は行列のみの API を保っています。各入力行はトークン ID の列で (`tensai.NewMatrixFromInts` を使うと各 ID が float32 変換で正確に保たれることを検証しながら安全に作れます)、レイヤーは引いた埋め込みベクトルを列方向に連結します。たとえば `Compile(4, ...)` と `NewEmbedding(vocab, 8)` の組み合わせは、`Mx4` のトークン ID 行列を `LayerNorm`, `GELU`, `Dense` に食わせられる `Mx32` の密な特徴行列に変えます。
 
 ## 活性化関数
 
@@ -64,7 +64,7 @@ softmax は `SoftmaxCrossEntropy` の*内部*で適用されます (数値安定
 | Adam | `optim.NewAdam(lr)` |
 | AdamW | `optim.NewAdamW(lr, weightDecay)` — decoupled weight decay |
 
-Adam/AdamW のパラメータ更新は SIMD ビルドで AVX2 ベクトル化されるカーネルの 1 つです。
+`Optimizer` は更新則の設定そのものです。モデルはパラメータ対ごとに `optim.Updater` を 1 つ受け取り、Updater がその対の状態 (モーメンタムバッファ、Adam のモーメント、ステップ数) を持ちます。カスタムオプティマイザは `New() Updater` と Updater の `Step` の 2 つを実装するだけです。Adam/AdamW と SGD の更新は SIMD ビルドで AVX2 ベクトル化されます。
 
 ## k-NN ベースライン
 
