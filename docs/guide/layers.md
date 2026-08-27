@@ -23,8 +23,8 @@ type Layer interface {
 |---|---|---|
 | Dense | `layer.NewDense(outCols)` | Fully connected; Glorot/He-style initialization |
 | Embedding | `layer.NewEmbedding(vocabSize, dim)` | Input rows are integer token ids stored in `Float`; looked-up vectors concatenate across the row |
-| Conv2D | `layer.NewConv2D(inH, inW, inC, outC, kernel, stride, pad)` | im2col + the `Dot` kernel |
-| MaxPool2D | `layer.NewMaxPool2D(inH, inW, channels, size)` | |
+| Conv2D | `layer.NewConv2D(outC, kernel, stride, pad)` | im2col + the `Dot` kernel; input shape comes from `CompileImage` |
+| MaxPool2D | `layer.NewMaxPool2D(size)` | Input shape comes from `CompileImage` |
 | BatchNorm | `layer.NewBatchNorm()` | Running statistics are saved with the model |
 | LayerNorm | `layer.NewLayerNorm()` | Per-row normalization |
 | Dropout | `layer.NewDropout(rate)` | Active only during training |

@@ -227,11 +227,11 @@ func TestConvNetLearnsLineOrientation(t *testing.T) {
 	}
 
 	model := NewSequential()
-	model.Add(layer.NewConv2D(size, size, 1, 4, 3, 1, 1))
+	model.Add(layer.NewConv2D(4, 3, 1, 1))
 	model.Add(&layer.ReLU{})
-	model.Add(layer.NewMaxPool2D(size, size, 4, 2))
+	model.Add(layer.NewMaxPool2D(2))
 	model.Add(layer.NewDense(2))
-	if err := model.Compile(size*size, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.05)); err != nil {
+	if err := model.CompileImage(layer.Image{H: size, W: size, C: 1}, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.05)); err != nil {
 		t.Fatal(err)
 	}
 	var lossVal tensai.Float

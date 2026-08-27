@@ -44,16 +44,18 @@ for epoch := 0; epoch < epochs; epoch++ {
 
 ```go
 net := model.NewSequential()
-net.Add(layer.NewConv2D(28, 28, 1, 8, 3, 1, 1)) // inH, inW, inC, outC, kernel, stride, pad
+net.Add(layer.NewConv2D(8, 3, 1, 1)) // outC, kernel, stride, pad
 net.Add(&layer.ReLU{})
-net.Add(layer.NewMaxPool2D(28, 28, 8, 2))
+net.Add(layer.NewMaxPool2D(2))
 net.Add(layer.NewDense(64))
 net.Add(layer.NewBatchNorm())
 net.Add(layer.NewLeakyReLU(0.01))
 net.Add(layer.NewDropout(0.3))
 net.Add(layer.NewDense(10))
 
-net.Compile(28*28, loss.SoftmaxCrossEntropy{}, optim.NewAdamW(0.001, 0.01))
+// 入力の形状は一度だけ書く。空間形状がスタックを流れるので
+// conv / pool レイヤーは自分の入力サイズをそこから受け取る
+net.CompileImage(layer.Image{H: 28, W: 28, C: 1}, loss.SoftmaxCrossEntropy{}, optim.NewAdamW(0.001, 0.01))
 net.Fit(inputs, targets, 10)
 ```
 

@@ -276,12 +276,12 @@ func buildModel(kind string) (*model.Sequential, error) {
 		model.Add(&layer.ReLU{})
 		model.Add(layer.NewDense(classCount))
 	case "cnn":
-		model.Add(layer.NewConv2D(28, 28, 1, 8, 3, 1, 1)) // 28x28x1 -> 28x28x8
+		model.Add(layer.NewConv2D(8, 3, 1, 1)) // 28x28x1 -> 28x28x8
 		model.Add(&layer.ReLU{})
-		model.Add(layer.NewMaxPool2D(28, 28, 8, 2)) // -> 14x14x8
-		model.Add(layer.NewConv2D(14, 14, 8, 16, 3, 1, 1))
+		model.Add(layer.NewMaxPool2D(2)) // -> 14x14x8
+		model.Add(layer.NewConv2D(16, 3, 1, 1))
 		model.Add(&layer.ReLU{})
-		model.Add(layer.NewMaxPool2D(14, 14, 16, 2)) // -> 7x7x16
+		model.Add(layer.NewMaxPool2D(2)) // -> 7x7x16
 		model.Add(layer.NewDense(64))
 		model.Add(&layer.ReLU{})
 		model.Add(layer.NewDropout(0.25))
@@ -289,7 +289,15 @@ func buildModel(kind string) (*model.Sequential, error) {
 	default:
 		return nil, fmt.Errorf("unknown model kind %q (want dense or cnn)", kind)
 	}
-	if err := model.Compile(imageSize, loss.SoftmaxCrossEntropy{}, optim.NewAdamW(0.001, 0.01)); err != nil {
+	var err error
+	if kind == "cnn" {
+		// The input geometry is stated once; Conv2D and MaxPool2D pick their
+		// dimensions up from the threaded shape.
+		err = model.CompileImage(layer.Image{H: 28, W: 28, C: 1}, loss.SoftmaxCrossEntropy{}, optim.NewAdamW(0.001, 0.01))
+	} else {
+		err = model.Compile(imageSize, loss.SoftmaxCrossEntropy{}, optim.NewAdamW(0.001, 0.01))
+	}
+	if err != nil {
 		return nil, err
 	}
 	return model, nil

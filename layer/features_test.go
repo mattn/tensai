@@ -197,13 +197,13 @@ func TestBatchNormEvalUsesRunningStats(t *testing.T) {
 
 func TestConv2DGradient(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
-	conv := NewConv2D(5, 5, 2, 3, 3, 1, 1)
-	outCols, err := conv.Init(5*5*2, rng)
+	conv := NewConv2D(3, 3, 1, 1)
+	outImg, err := conv.InitImage(Image{H: 5, W: 5, C: 2}, rng)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if outCols != 5*5*3 {
-		t.Fatalf("expected out cols %d, got %d", 5*5*3, outCols)
+	if outImg.Cols() != 5*5*3 {
+		t.Fatalf("expected out cols %d, got %d", 5*5*3, outImg.Cols())
 	}
 	checkLayerGrad(t, conv, randomInput(2, 5*5*2, 8), 1e-2)
 
@@ -242,13 +242,13 @@ func TestConv2DGradient(t *testing.T) {
 }
 
 func TestMaxPool2DGradient(t *testing.T) {
-	pool := NewMaxPool2D(4, 4, 2, 2)
-	outCols, err := pool.Init(4*4*2, nil)
+	pool := NewMaxPool2D(2)
+	outImg, err := pool.InitImage(Image{H: 4, W: 4, C: 2}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if outCols != 2*2*2 {
-		t.Fatalf("expected out cols %d, got %d", 2*2*2, outCols)
+	if outImg.Cols() != 2*2*2 {
+		t.Fatalf("expected out cols %d, got %d", 2*2*2, outImg.Cols())
 	}
 	// Distinct values avoid ties, where max is not differentiable.
 	in := tensai.NewMatrix(2, 4*4*2)
