@@ -30,7 +30,7 @@ err = tensai.DotInto(out, a, b)   // 事前確保した結果へ
 err = tensai.DotTAInto(out, a, b) // a^T を実体化せずに a^T @ b
 ```
 
-`Dot` はすべてが乗るカーネルです。`Dense` の順伝播、`Conv2D` の im2col 積、`KNN` の距離計算、自動微分の `MatMul`、さらに LLM サンプルの attention まで、最後はここに行き着きます。`GOEXPERIMENT=simd` でビルドすると AVX2 のレジスタタイリングカーネルになります — [SIMD アクセラレーション](simd.md)参照。
+`Dot` はすべてが乗るカーネルです。`Dense` の順伝播、`Conv2D` の im2col 積、`knn.Classifier` の距離計算、自動微分の `MatMul`、さらに LLM サンプルの attention まで、最後はここに行き着きます。`GOEXPERIMENT=simd` でビルドすると AVX2 のレジスタタイリングカーネルになります — [SIMD アクセラレーション](simd.md)参照。
 
 ## N 次元 Tensor
 

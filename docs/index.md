@@ -5,16 +5,16 @@
 **tensai** is a small machine-learning framework for learning and experiments, written in pure Go. It implements forward passes, backpropagation, and optimization with no external dependencies in the default build — no cgo, no assembly files, no C compiler.
 
 ```go
-model := tensai.NewSequential()
-model.Add(tensai.NewDense(8))
-model.Add(&tensai.Tanh{})
-model.Add(tensai.NewDense(1))
-model.Add(&tensai.Sigmoid{})
+net := model.NewSequential()
+net.Add(layer.NewDense(8))
+net.Add(&layer.Tanh{})
+net.Add(layer.NewDense(1))
+net.Add(&layer.Sigmoid{})
 
-model.Compile(2, tensai.MeanSquaredError{}, tensai.NewAdam(0.05))
-model.Fit(inputs, targets, 5000)
+net.Compile(2, loss.MeanSquaredError{}, optim.NewAdam(0.05))
+net.Fit(inputs, targets, 5000)
 
-pred, _ := model.Predict(inputs)
+pred, _ := net.Predict(inputs)
 ```
 
 Despite its size, tensai reaches surprisingly far: the same kernels that train a XOR network run the published GPT-2 checkpoint, chat with Qwen2.5 and Gemma 3, decode llama.cpp GGUF quantizations block-exactly, and serve an OpenAI-compatible API — all in pure Go.
@@ -24,7 +24,7 @@ Despite its size, tensai reaches surprisingly far: the same kernels that train a
 - **Matrices and N-d tensors** — float32 `Matrix` and rank-N `Tensor` with NumPy-style broadcasting, batched `MatMul`, zero-copy `Reshape` and views
 - **Layers** — `Embedding`, `Dense`, `Conv2D`, `MaxPool2D`, `BatchNorm`, `LayerNorm`, `Dropout`, plus `ReLU`, `LeakyReLU`, `GELU`, `Sigmoid`, `Tanh`, and `Softmax`
 - **Training** — `Sequential` models with `Compile` → `Fit` / `FitStep` → `Predict`, three loss functions, momentum `SGD` / `Adam` / `AdamW`, and dataset utilities; a full MLP step runs in ~29 allocations
-- **Autograd** — a micrograd-style reverse-mode engine over matrices, with `RNNCell`, `LSTMCell`, and `SelfAttention` built on top; backpropagation through time is a plain Go loop
+- **Autograd** — a micrograd-style reverse-mode engine over matrices, with `rnn.Cell`, `rnn.LSTMCell`, and `rnn.SelfAttention` built on top; backpropagation through time is a plain Go loop
 - **SIMD acceleration** — AVX2 kernels written with Go's experimental `simd/archsimd` package; build with `GOEXPERIMENT=simd`, and every other build uses the portable fallbacks automatically
 - **WebGPU backend** — `-tags wgpu` runs batched `MatMul`, attention, and a full quantized transformer decode step on any GPU wgpu-native reaches, through `purego` with no cgo
 - **int8 / int4 quantization** — weight-only quantized matmuls that reach memory bandwidth, plus MXFP4 for gpt-oss

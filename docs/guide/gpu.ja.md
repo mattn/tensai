@@ -19,28 +19,28 @@ $env:TENSAI_WGPU_LIB="$PWD\wgpu\lib\wgpu_native.dll"
 go run -tags wgpu ./_example/wgpu
 ```
 
-ビルドタグなしでは `OpenGPU` がエラーを返すだけで、他には何も変わりません。
+ビルドタグなしでは `gpu.Open` がエラーを返すだけで、他には何も変わりません。
 
 ## 基本的な使い方
 
 ```go
-gpu, err := tensai.OpenGPU() // GPU やライブラリがなければきれいに失敗する
+dev, err := gpu.Open() // GPU やライブラリがなければきれいに失敗する
 if err != nil { /* tensai.MatMul にフォールバック */ }
-defer gpu.Close()
-fmt.Println(gpu.Name()) // 例: "AMD Radeon 780M (integrated)"
-out, err := gpu.MatMul(a, b)
+defer dev.Close()
+fmt.Println(dev.Name()) // 例: "AMD Radeon 780M (integrated)"
+out, err := dev.MatMul(a, b)
 ```
 
-iGPU と dGPU の両方があるマシンでは希望を渡せます: `tensai.OpenGPU(tensai.GPULowPower)` は iGPU へ、`tensai.GPUHighPerformance` は dGPU へ寄せます (ヒントです — アダプタが 1 つならそれが返ります)。
+iGPU と dGPU の両方があるマシンでは希望を渡せます: `gpu.Open(gpu.LowPower)` は iGPU へ、`gpu.HighPerformance` は dGPU へ寄せます (ヒントです — アダプタが 1 つならそれが返ります)。
 
 ## 常駐バッファ
 
-`gpu.MatMul(a, b)` は Upload → MatMul → Download → Free の省略形です。バッファを GPU に常駐させれば、重みはバスを 1 回しか渡らず、中間結果はデバイスを離れません:
+`dev.MatMul(a, b)` は Upload → MatMul → Download → Free の省略形です。バッファを GPU に常駐させれば、重みはバスを 1 回しか渡らず、中間結果はデバイスを離れません:
 
 ```go
-gw, _ := gpu.Upload(w)              // 重みは 1 回だけアップロード
+gw, _ := dev.Upload(w)              // 重みは 1 回だけアップロード
 defer gw.Free()                     // GPU メモリは GC されない
-gx, _ := gpu.Upload(x)
+gx, _ := dev.Upload(x)
 h, _ := gx.MatMul(gw)               // 自由にチェーン。ホストには触れない
 out, _ := h.MatMul(gw2)
 result, _ := out.Download()         // 最後に 1 回だけ読み戻す
@@ -61,7 +61,7 @@ out, _ = gq.MultiHeadAttention(gk, gv, heads)  // パックされた (batch, seq
 
 ## デバイス上の量子化重み
 
-`UploadQ8` は `QMatrix` を u32 あたり int8 重み 4 つでパックし、`GPUQMatrix.MatMul` がレジスタ内で逆量子化するので、デコード matvec の転送は f32 の 1/4 バイトになります。`UploadQ4` は int4 の双子に同じことをするので、`-q4 -gpu` は int8 では収まらないモデルを動かせます。
+`UploadQ8` は `QMatrix` を u32 あたり int8 重み 4 つでパックし、`gpu.QMatrix.MatMul` がレジスタ内で逆量子化するので、デコード matvec の転送は f32 の 1/4 バイトになります。`UploadQ4` は int4 の双子に同じことをするので、`-q4 -gpu` は int8 では収まらないモデルを動かせます。
 
 トランスフォーマーのデコード 1 ステップの残りも揃っています — `RMSNorm`、インプレース `RoPE`、`Add`、`SiluMul`、`GroupedCausalAttention` (クエリよりヘッド数の少ない KV キャッシュ)、常駐キャッシュに新しい k/v 行を追記する `CopyRowsInto` — なので `_example/qwen -q8 -gpu` は全ブロックをデバイス上で実行し、トークンごとに戻ってくるのは隠れ状態だけです。`BeginBatch`/`Flush` は 1 トークン分のディスパッチを 1 回のサブミッションに記録し、解放された中間バッファはバッファプールで再利用されます。
 
@@ -92,7 +92,7 @@ huge         64x512x512@512x512    17179.9  116.374ms   62.128ms  566.726ms     
 
 ## `-tags wgpu24`: 新しい wgpu-native API と、WSL2 の中の本物の GPU
 
-`-tags wgpu24` は同じ `OpenGPU` API を刷新された wgpu-native C API に対してビルドします — **v29 系**のリリースバイナリと組み合わせてください。新 API の収穫は `WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter` で、非準拠の Vulkan ドライバを見えるようにします。具体的には: Mesa の dozen (Vulkan-on-D3D12) は WSL2 内で本物のホスト GPU を公開しますが、v22 API はそれを非準拠として隠して lavapipe にフォールバックします。wgpu24 ビルドなら届きます:
+`-tags wgpu24` は同じ `gpu.Open` API を刷新された wgpu-native C API に対してビルドします — **v29 系**のリリースバイナリと組み合わせてください。新 API の収穫は `WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter` で、非準拠の Vulkan ドライバを見えるようにします。具体的には: Mesa の dozen (Vulkan-on-D3D12) は WSL2 内で本物のホスト GPU を公開しますが、v22 API はそれを非準拠として隠して lavapipe にフォールバックします。wgpu24 ビルドなら届きます:
 
 ```bash
 VK_DRIVER_FILES=/path/to/dzn_icd.json \

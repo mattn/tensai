@@ -5,16 +5,16 @@
 Stack layers, then `Compile` → `Fit` (or `FitStep`) → `Predict`:
 
 ```go
-model := tensai.NewSequential()
-model.Add(tensai.NewDense(8))
-model.Add(&tensai.Tanh{})
-model.Add(tensai.NewDense(1))
-model.Add(&tensai.Sigmoid{})
+net := model.NewSequential()
+net.Add(layer.NewDense(8))
+net.Add(&layer.Tanh{})
+net.Add(layer.NewDense(1))
+net.Add(&layer.Sigmoid{})
 
-model.Compile(2, tensai.MeanSquaredError{}, tensai.NewAdam(0.05))
-model.Fit(inputs, targets, 5000)   // 5000 epochs over the full batch
+net.Compile(2, loss.MeanSquaredError{}, optim.NewAdam(0.05))
+net.Fit(inputs, targets, 5000)   // 5000 epochs over the full batch
 
-pred, _ := model.Predict(inputs)
+pred, _ := net.Predict(inputs)
 ```
 
 `Compile(inputCols, loss, optimizer)` initializes every layer, threading the column count through the stack. `Fit` runs full-batch epochs; `FitStep(input, target)` runs exactly one forward/backward/update step and returns the loss, which is the building block for mini-batch training.
@@ -24,7 +24,7 @@ pred, _ := model.Predict(inputs)
 `Dataset` pairs inputs with targets and provides shuffling, splitting, standardization, and buffer-reusing mini-batch iteration:
 
 ```go
-ds, _ := tensai.NewDataset(inputs, targets)
+ds, _ := dataset.New(inputs, targets)
 ds.Shuffle(rng)
 train, test, _ := ds.Split(0.2)          // views, no copying
 mean, std := train.Standardize()         // fit on train...
@@ -32,7 +32,7 @@ test.StandardizeWith(mean, std)          // ...apply to test
 
 for epoch := 0; epoch < epochs; epoch++ {
 	train.Batches(32, rng, func(in, tgt *tensai.Matrix) error {
-		_, err := model.FitStep(in, tgt)
+		_, err := net.FitStep(in, tgt)
 		return err
 	})
 }
@@ -43,18 +43,18 @@ for epoch := 0; epoch < epochs; epoch++ {
 ## A convolutional model
 
 ```go
-model := tensai.NewSequential()
-model.Add(tensai.NewConv2D(28, 28, 1, 8, 3, 1, 1)) // inH, inW, inC, outC, kernel, stride, pad
-model.Add(&tensai.ReLU{})
-model.Add(tensai.NewMaxPool2D(28, 28, 8, 2))
-model.Add(tensai.NewDense(64))
-model.Add(tensai.NewBatchNorm())
-model.Add(tensai.NewLeakyReLU(0.01))
-model.Add(tensai.NewDropout(0.3))
-model.Add(tensai.NewDense(10))
+net := model.NewSequential()
+net.Add(layer.NewConv2D(28, 28, 1, 8, 3, 1, 1)) // inH, inW, inC, outC, kernel, stride, pad
+net.Add(&layer.ReLU{})
+net.Add(layer.NewMaxPool2D(28, 28, 8, 2))
+net.Add(layer.NewDense(64))
+net.Add(layer.NewBatchNorm())
+net.Add(layer.NewLeakyReLU(0.01))
+net.Add(layer.NewDropout(0.3))
+net.Add(layer.NewDense(10))
 
-model.Compile(28*28, tensai.SoftmaxCrossEntropy{}, tensai.NewAdamW(0.001, 0.01))
-model.Fit(inputs, targets, 10)
+net.Compile(28*28, loss.SoftmaxCrossEntropy{}, optim.NewAdamW(0.001, 0.01))
+net.Fit(inputs, targets, 10)
 ```
 
 Each input row is a flattened channel-major image (`index = (channel*height + y)*width + x`). `Dropout` and `BatchNorm` are automatically in training mode inside `Fit`/`FitStep` and in inference mode inside `Predict`.
@@ -64,10 +64,10 @@ Each input row is a flattened channel-major image (`index = (channel*height + y)
 `Save`/`Load` (and the `SaveFile`/`LoadFile` convenience wrappers) round-trip trained Sequential parameters as JSON, including BatchNorm running statistics:
 
 ```go
-model.SaveFile("model.json")
+net.SaveFile("model.json")
 
 // Later: build + Compile the same architecture, then
-model.LoadFile("model.json")
+net.LoadFile("model.json")
 ```
 
 The architecture itself is not serialized — reconstruct the same layer stack and `Compile` before loading. Autograd parameters (RNN/LSTM/attention cells) are saved positionally with `SaveParams`/`LoadParams` — see [Automatic Differentiation](autograd.md).

@@ -2,20 +2,20 @@
 
 言語モデルのデコードはトークンごとに全重みを 1 回ストリームするので、デコード速度はメモリ帯域そのものです。weight-only 量子化は同じ matmul をより少ないバイト数で済ませます: int8 は float32 の 1/4、int4 は 1/8。tensai は `Matrix` の量子化された*双子*を作ります — float32 の元はそのまま、量子化コピーが float32 の入出力で `MatVec`/`MatMul` に答えます。
 
-## int8: `QuantizeMatrix`
+## int8: `quant.Quantize`
 
 ```go
-q := tensai.QuantizeMatrix(w)     // *QMatrix、列ごとのスケール
+q := quant.Quantize(w)     // *QMatrix、列ごとのスケール
 q.MatVec(x, out)                  // デコード: ベクトル 1 本
 q.MatMul(x, out)                  // プレフィル: バッチ行
 ```
 
 int8 パスは完全な整数パイプラインです。重みはインターリーブされた 4 行組で格納され、活性値は呼び出しごとに 7 ビットへ動的量子化され、内積全体が 256 ビットの u8 x s8 ペア積和 + 拡張ペア加算で回ります — 列あたり 2 命令、4 行同時。これでメモリ帯域 (16 コアで重み約 31GB/s) に到達します。デコード matvec の実質的な上限です。
 
-## int4: `QuantizeMatrix4`
+## int4: `quant.Quantize4`
 
 ```go
-q4, err := tensai.QuantizeMatrix4(w)  // *Q4Matrix、グループ単位のスケール
+q4, err := quant.Quantize4(w)  // *Q4Matrix、グループ単位のスケール
 ```
 
 int4 はグループ単位 (列内の行グループごとにスケール、またはスケール/最小値ペア) に量子化し、グループ境界で float32 に累積します。int8 からさらに重みを半分にします — 7B モデルが RAM に収まるかどうかの分かれ目です。
