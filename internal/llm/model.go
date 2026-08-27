@@ -21,6 +21,7 @@ import (
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
+	"github.com/mattn/tensai/internal/kernels"
 	"github.com/mattn/tensai/quant"
 )
 
@@ -684,8 +685,8 @@ func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, sco
 // (Axpys). Per head the arithmetic order matches the old one-head-at-
 // a-time path exactly, so the output is bit-identical; KV heads touch
 // disjoint output ranges, so callers fan them out across goroutines.
-// scores needs group*steps float64s, ws group*steps float32s.
-func (m *qwen) attendGroup(b *qblock, q, attn []float32, kh, group, steps int, scores []float64, ws []float32) {
+// scores and ws each need group*steps float32s.
+func (m *qwen) attendGroup(b *qblock, q, attn []float32, kh, group, steps int, scores, ws []float32) {
 	// Sliding-window layers (Gemma, gpt-oss) see only the last window
 	// positions.
 	start := 0
@@ -700,32 +701,40 @@ func (m *qwen) attendGroup(b *qblock, q, attn []float32, kh, group, steps int, s
 	for t := start; t < steps; t++ {
 		tensai.DotVecs(qg, b.kc[t][kvOff:kvOff+d], ws[t*group:(t+1)*group])
 	}
+	fscale := float32(scale)
 	for i := 0; i < group; i++ {
-		si := scores[i*steps : (i+1)*steps]
-		maxs := math.Inf(-1)
+		// The scores gather into a contiguous row so the exponentials run
+		// on the vector kernel: scalar exp and a per-position divide each
+		// cost about as much as this head's whole share of the dot
+		// products, and together they dominated the attention time.
+		si := scores[i*steps : (i+1)*steps][start:steps]
+		maxs := float32(math.Inf(-1))
 		for t := start; t < steps; t++ {
-			s := float64(ws[t*group+i]) * scale
-			si[t] = s
+			s := ws[t*group+i] * fscale
+			si[t-start] = s
 			if s > maxs {
 				maxs = s
 			}
 		}
 		h := kh*group + i
-		if b.sinks != nil && float64(b.sinks[h]) > maxs {
-			maxs = float64(b.sinks[h])
+		if b.sinks != nil && b.sinks[h] > maxs {
+			maxs = b.sinks[h]
 		}
-		var sum float64
-		for t := start; t < steps; t++ {
-			si[t] = math.Exp(si[t] - maxs)
-			sum += si[t]
+		kernels.ExpShift(si, si, maxs)
+		var sum float32
+		for _, v := range si {
+			sum += v
 		}
 		if b.sinks != nil {
 			// The sink is an extra softmax slot with no value: it only
 			// absorbs probability mass.
-			sum += math.Exp(float64(b.sinks[h]) - maxs)
+			sum += kernels.ExpF(b.sinks[h] - maxs)
 		}
+		// One reciprocal for the row: a divide per position costs about
+		// as much as the exponential next to it.
+		inv := 1 / sum
 		for t := start; t < steps; t++ {
-			ws[t*group+i] = float32(si[t] / sum)
+			ws[t*group+i] = si[t-start] * inv
 		}
 	}
 	og := attn[qOff : qOff+group*d]
@@ -891,7 +900,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				scores := make([]float64, group*(startPos+n))
+				scores := make([]float32, group*(startPos+n))
 				ws := make([]float32, group*(startPos+n))
 				for t := range rowCh {
 					steps := startPos + t + 1
