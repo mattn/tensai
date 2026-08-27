@@ -22,3 +22,4 @@ tokenizer/testdata/
 /goxz/
 *.gguf
 *.gguf.tensai-*.cache
+run-codeserver.sh
