@@ -23,6 +23,7 @@ import (
 
 	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/internal/llm"
+	"github.com/mattn/tensai/internal/simd"
 )
 
 const version = "0.0.10"
@@ -249,6 +250,14 @@ func benchCmd(o *llm.Options, p, n int) {
 	dev, gpuErr := run("gpu")
 
 	fmt.Printf("prefill %d tokens, decode %d tokens, int%d weights\n", cpu.Tokens, n, o.Bits)
+	// A binary built without GOEXPERIMENT=simd runs the portable kernels
+	// and measures an order of magnitude slower, which is easy to mistake
+	// for a slow machine.
+	if simd.HasAVX2 {
+		fmt.Println("cpu: AVX2 kernels")
+	} else {
+		fmt.Println("cpu: portable kernels (rebuild with GOEXPERIMENT=simd on amd64 for AVX2)")
+	}
 	// The two binding generations reach different adapters and differ in
 	// speed on the same one, so the table names which build measured.
 	tag := gpu.Backend()
@@ -291,7 +300,9 @@ func benchChild(side string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	cfg.Opts.Log = os.Stderr
+	// The engine's progress lines would interleave with the parent's
+	// table; the measurement is the output here.
+	cfg.Opts.Log = io.Discard
 	cfg.Opts.GPU = side == "gpu"
 	var r benchResult
 	e, err := llm.Open(cfg.Opts)

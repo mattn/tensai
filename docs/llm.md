@@ -86,14 +86,18 @@ tensai bench -q8                                 # CPU vs GPU, prefill and decod
 `bench` prefills a synthetic prompt and decodes a few tokens twice — once on
 the CPU, once on the GPU — and prints both with the ratio. Each side runs in
 its own child process, so a freed model's pages never distort the other
-measurement. The header names the adapter and the build tag, which matters:
+measurement. The header names the kernels and the adapter each side is using, which
+matters:
 the two binding generations reach different adapters (only `wgpu24` sees
 non-conformant drivers such as Mesa's dozen inside WSL2), so a build without
-that tag may silently fall back to a CPU Vulkan implementation.
+that tag may silently fall back to a CPU Vulkan implementation, and a binary
+built without `GOEXPERIMENT=simd` measures the portable kernels, an order of
+magnitude below the AVX2 ones.
 
 ```
 $ GOEXPERIMENT=simd go run -tags wgpu24 ./cmd/tensai bench -q8
 prefill 401 tokens, decode 32 tokens, int8 weights
+cpu: AVX2 kernels
 gpu: Microsoft Direct3D12 (AMD Radeon(TM) Graphics) (integrated) via -tags wgpu24
 
                prefill       decode

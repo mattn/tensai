@@ -359,9 +359,11 @@ func loadWGPU() error {
 	loadOnce.Do(func() {
 		var lib uintptr
 		var err error
+		var loaded string
 		for _, name := range libCandidates() {
 			lib, err = dlopenWGPU(name)
 			if err == nil {
+				loaded = name
 				break
 			}
 		}
@@ -371,10 +373,12 @@ func loadWGPU() error {
 		}
 		// Same symbol names, different ABI: calling a v22 library through
 		// these bindings crashes, so gate on the packed version number.
+		// Name the file that was loaded: with several versions installed
+		// the mismatch is usually TENSAI_WGPU_LIB pointing at the wrong one.
 		var fnGetVersion func() uint32
 		purego.RegisterLibFunc(&fnGetVersion, lib, "wgpuGetVersion")
 		if major := fnGetVersion() >> 24; major < 24 {
-			loadErr = fmt.Errorf("tensai: wgpu-native v%d is too old for -tags wgpu24 (needs v24+); use -tags wgpu with it", major)
+			loadErr = fmt.Errorf("tensai: %s is wgpu-native v%d, too old for -tags wgpu24 (needs v24+): point TENSAI_WGPU_LIB at a v24+ library, or build with -tags wgpu instead", loaded, major)
 			return
 		}
 		for _, f := range []struct {

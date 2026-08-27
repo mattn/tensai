@@ -85,14 +85,17 @@ tensai bench -q8                                 # CPU vs GPU のプレフィル
 
 `bench` は合成プロンプトのプレフィルと数トークンのデコードを CPU と GPU で 1
 回ずつ実行し、両方と倍率を表示します。各側は別プロセスで走るので、解放済み
-モデルのページがもう一方の測定を汚しません。ヘッダにはアダプタ名とビルドタグ
-が出ます — これが重要で、2 つのバインディング世代は届くアダプタが異なり
-(WSL2 の Mesa dozen のような非準拠ドライバが見えるのは `wgpu24` だけ)、
-タグを間違えると気付かないまま CPU Vulkan 実装にフォールバックします。
+モデルのページがもう一方の測定を汚しません。ヘッダには両側が使っているカーネルと
+アダプタが出ます — これが重要で、2 つのバインディング世代は届くアダプタが
+異なり (WSL2 の Mesa dozen のような非準拠ドライバが見えるのは `wgpu24`
+だけ)、タグを間違えると気付かないまま CPU Vulkan 実装にフォールバックします。
+また `GOEXPERIMENT=simd` なしでビルドするとポータブルカーネルを測ることに
+なり、AVX2 版より一桁遅い数値が出ます。
 
 ```
 $ GOEXPERIMENT=simd go run -tags wgpu24 ./cmd/tensai bench -q8
 prefill 401 tokens, decode 32 tokens, int8 weights
+cpu: AVX2 kernels
 gpu: Microsoft Direct3D12 (AMD Radeon(TM) Graphics) (integrated) via -tags wgpu24
 
                prefill       decode
