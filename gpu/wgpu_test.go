@@ -849,6 +849,40 @@ func TestGPUWindowedAttention(t *testing.T) {
 	}
 }
 
+// BenchmarkGPUQ8GEMM measures the batched integer-dot GEMM at a prefill
+// shape (512 activation rows against a 4864x896 down projection).
+func BenchmarkGPUQ8GEMM(b *testing.B) {
+	g, err := Open()
+	if err != nil {
+		b.Skipf("wgpu unavailable: %v", err)
+	}
+	defer g.Close()
+	if !g.IntDot() {
+		b.Skip("no integer dot")
+	}
+	rng := rand.New(rand.NewSource(63))
+	w := tensai.RandomMatrix(4864, 896, rng)
+	gq, err := g.UploadQ8(quant.Quantize(w))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer gq.Free()
+	gx, err := g.Upload(randTensor(rng, 512, 4864))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer gx.Free()
+	b.SetBytes(2 * 512 * 4864 * 896) // int8 multiply-adds as "bytes": TOPS = GB/s / 1000
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		out, err := gq.MatMul(gx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		out.Free()
+	}
+}
+
 func BenchmarkGPUQ8MatVec(b *testing.B) {
 	g, err := Open()
 	if err != nil {
