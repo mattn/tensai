@@ -1,0 +1,91 @@
+# LLM Inference
+
+The same kernels that train a XOR network run real language models. `_example/gpt2` and `_example/qwen` are complete inference engines in pure Go, and the `tensai` command wraps the same engine as installable subcommands.
+
+## GPT-2
+
+`_example/gpt2` downloads the published GPT-2 small (124M) checkpoint from Hugging Face, loads the weights through `encoding/safetensors`, tokenizes with a from-scratch byte-level BPE, and decodes with a KV cache — every matvec running on the same `Dot` kernel as the rest of tensai, at ~30 tok/s with the AVX2 build:
+
+```
+$ GOEXPERIMENT=simd go run ./_example/gpt2 -n 20
+Hello, I'm a language model, not a programming language. I'm a language model. ...
+```
+
+The greedy continuation matches GPT-2's well-known reference output token for token, which pins the whole pipeline — reader, tokenizer, and forward pass — in one check.
+
+- `-q8` quantizes the decode-path weights to int8 and doubles generation (23 → 46 tok/s on the same machine), because decode streams the whole checkpoint per token
+- `-gpu` (built with `-tags wgpu` or `wgpu24`) runs every block's causal multi-head attention as a single masked dispatch on the GPU
+
+## Qwen and friends: nine model families
+
+`_example/qwen` runs modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file. One runtime speaks nine architectures:
+
+| family | models | what it adds |
+|---|---|---|
+| qwen2 | Qwen 1.5/2/2.5, Qwen2.5-Coder, the R1-Distill-Qwen line | attention biases |
+| qwen3 | Qwen3 dense | per-head QK-norm, explicit head_dim, `-think` |
+| llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | the block everyone forked |
+| smollm3 | SmolLM3-3B | RoPE skipped every fourth layer |
+| gemma3 | Gemma 3 | sliding windows on 5/6 layers, sandwich norms, gelu-tanh gate, SentencePiece |
+| phi3 | Phi-3/3.5-mini | q/k/v and gate/up shipped pre-fused |
+| qwen2moe / qwen3moe | Qwen1.5-MoE-A2.7B, Qwen3-30B-A3B | top-k routed experts, a shared expert on qwen2moe |
+| gpt-oss | gpt-oss-20b | MXFP4 experts, attention sinks, YaRN rope, harmony channels |
+
+The DeepSeek-R1 distills are stock qwen2/llama blocks wearing DeepSeek's turn markers, which the loader spots in the embedded chat template and switches automatically, `<think>` reasoning included.
+
+```
+$ GOEXPERIMENT=simd go run ./_example/qwen -q8 -prompt "What is the capital of France?"
+The capital of France is Paris.
+43 tokens in 1.3s (33.1 tok/s)
+```
+
+## Quantized loading
+
+With `-q8`/`-q4` each weight quantizes as it loads and its float32 copy dies immediately, so the full-precision model never has to fit in memory. Quantized GGUF checkpoints skip the float32 detour entirely: Q8_0, Q4_0, Q5_0, the Q4_K/Q5_K/Q6_K K-quant family, and MXFP4 repack straight from the memory-mapped file, keeping llama.cpp's own quantization intact. A 1.5B Q4_K_M loads in about 3 seconds instead of 8; a 3B Q8_0 opens in 5 seconds instead of 32 (`-requant` restores the float detour, trading a much slower load for about 10% more decode speed).
+
+The first `-gguf` load also writes the repacked weights to a cache file next to the model (`-nocache` opts out), and every later load just memory-maps it: the 1.5B Q4_K_M reopens in ~0.3 seconds, a Mistral 7B in well under a second, and gpt-oss-20b in under two. Mapped weights are clean file-backed pages the kernel can drop and re-read at will — on a machine where the model barely fits, that replaces swap thrashing with ordinary page cache behavior.
+
+On a 15GB machine the ladder looks like: a 0.5B at ~40 tok/s with `-q8`, a 1.5B Q4_K_M at ~25 tok/s with `-q4` (tiled integer kernels, native Windows), and Qwen2.5-**7B**-Instruct — 15GB of BF16 shards, int4-quantized on the fly during a two-minute load into ~6GB resident — answering correctly at 3.5 tok/s.
+
+## Prefill, speculative decoding, sampling
+
+- **Batched prefill** — prompts feed through the model in blocks of eight token rows, streaming the weights once per block instead of once per token, cutting time-to-first-token by around 6x
+- **Speculative decoding** — `-draft` points at a smaller same-family model (greedy only): the draft proposes a few tokens, one batched pass of the big model verifies them, and rejections roll the caches back, so the output is exactly what the big model alone would produce
+- **Sampling** — `-temp` above 0 samples from the nucleus: `-topp 0.9` keeps the smallest probability-sorted set of tokens holding 90% of the mass, so the long tail where repetition loops live never gets a lottery ticket
+
+## The `tensai` command
+
+```bash
+GOEXPERIMENT=simd go install github.com/mattn/tensai/cmd/tensai@latest
+```
+
+```
+usage: tensai <command> [flags]
+
+commands:
+  run      generate a completion for a prompt
+  chat     interactive multi-turn chat on stdin
+  serve    OpenAI-compatible /v1/chat/completions server
+  models   list cached models; "models rm <name>" deletes one
+  version  print the version
+```
+
+All model commands share the same flags: `-repo` (Hugging Face repo to download from), `-gguf` (load everything from one .gguf file), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
+
+```bash
+tensai run -q8 "What is the capital of France?"
+tensai run -q8 -json "Explain RoPE briefly"      # one JSON object with usage counts
+tensai chat -q8 -gguf model.gguf                 # multi-turn; the KV cache carries the dialogue
+tensai models                                    # list the cache; "models rm <name>" deletes
+```
+
+### Serving an OpenAI-compatible API
+
+```bash
+tensai serve -q8 -addr 127.0.0.1:8080
+```
+
+`serve` exposes `/v1/chat/completions` (messages array, SSE streaming, usage counts), so any OpenAI client pointed at it chats with a pure-Go model. A built-in chat demo page is served on `GET /`.
+
+- The default bind is loopback only (`127.0.0.1:8080`, or `$TENSAI_ADDR`); widen it explicitly if you mean to
+- `-api-key` (or `$TENSAI_API_KEY`) requires a bearer token on the `/v1` routes; the demo page stays open
