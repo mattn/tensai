@@ -14,7 +14,13 @@ import (
 	"time"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/dataset"
 	tensaitflite "github.com/mattn/tensai/encoding/tflite"
+	"github.com/mattn/tensai/knn"
+	"github.com/mattn/tensai/layer"
+	"github.com/mattn/tensai/loss"
+	"github.com/mattn/tensai/model"
+	"github.com/mattn/tensai/optim"
 )
 
 const (
@@ -234,7 +240,7 @@ func argmaxRow(m *tensai.Matrix, row int) int {
 	return best
 }
 
-func evaluate(model tensai.Model, inputs, targets *tensai.Matrix) (int, [classCount][classCount]int, error) {
+func evaluate(model model.Model, inputs, targets *tensai.Matrix) (int, [classCount][classCount]int, error) {
 	var confusion [classCount][classCount]int
 	correct := 0
 	// Predict in chunks: the CNN's im2col expansion over a whole split at
@@ -260,30 +266,30 @@ func evaluate(model tensai.Model, inputs, targets *tensai.Matrix) (int, [classCo
 }
 
 // buildModel constructs either the plain MLP or a small CNN and compiles it.
-func buildModel(kind string) (*tensai.Sequential, error) {
-	model := tensai.NewSequential()
+func buildModel(kind string) (*model.Sequential, error) {
+	model := model.NewSequential()
 	switch kind {
 	case "dense":
-		model.Add(tensai.NewDense(128))
-		model.Add(&tensai.ReLU{})
-		model.Add(tensai.NewDense(64))
-		model.Add(&tensai.ReLU{})
-		model.Add(tensai.NewDense(classCount))
+		model.Add(layer.NewDense(128))
+		model.Add(&layer.ReLU{})
+		model.Add(layer.NewDense(64))
+		model.Add(&layer.ReLU{})
+		model.Add(layer.NewDense(classCount))
 	case "cnn":
-		model.Add(tensai.NewConv2D(28, 28, 1, 8, 3, 1, 1)) // 28x28x1 -> 28x28x8
-		model.Add(&tensai.ReLU{})
-		model.Add(tensai.NewMaxPool2D(28, 28, 8, 2)) // -> 14x14x8
-		model.Add(tensai.NewConv2D(14, 14, 8, 16, 3, 1, 1))
-		model.Add(&tensai.ReLU{})
-		model.Add(tensai.NewMaxPool2D(14, 14, 16, 2)) // -> 7x7x16
-		model.Add(tensai.NewDense(64))
-		model.Add(&tensai.ReLU{})
-		model.Add(tensai.NewDropout(0.25))
-		model.Add(tensai.NewDense(classCount))
+		model.Add(layer.NewConv2D(28, 28, 1, 8, 3, 1, 1)) // 28x28x1 -> 28x28x8
+		model.Add(&layer.ReLU{})
+		model.Add(layer.NewMaxPool2D(28, 28, 8, 2)) // -> 14x14x8
+		model.Add(layer.NewConv2D(14, 14, 8, 16, 3, 1, 1))
+		model.Add(&layer.ReLU{})
+		model.Add(layer.NewMaxPool2D(14, 14, 16, 2)) // -> 7x7x16
+		model.Add(layer.NewDense(64))
+		model.Add(&layer.ReLU{})
+		model.Add(layer.NewDropout(0.25))
+		model.Add(layer.NewDense(classCount))
 	default:
 		return nil, fmt.Errorf("unknown model kind %q (want dense or cnn)", kind)
 	}
-	if err := model.Compile(imageSize, tensai.SoftmaxCrossEntropy{}, tensai.NewAdamW(0.001, 0.01)); err != nil {
+	if err := model.Compile(imageSize, loss.SoftmaxCrossEntropy{}, optim.NewAdamW(0.001, 0.01)); err != nil {
 		return nil, err
 	}
 	return model, nil
@@ -315,7 +321,7 @@ func main() {
 		}
 		// A lazy baseline: no training at all, just neighbor votes. The
 		// distance matrix runs on the same Dot kernel as the networks.
-		knn := tensai.NewKNN(3)
+		knn := knn.New(3)
 		if err := knn.Fit(trainInputs, trainTargets); err != nil {
 			panic(err)
 		}
@@ -334,7 +340,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	ds, err := tensai.NewDataset(trainInputs, trainTargets)
+	ds, err := dataset.New(trainInputs, trainTargets)
 	if err != nil {
 		panic(err)
 	}

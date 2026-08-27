@@ -25,7 +25,7 @@ import (
 	"sort"
 	"time"
 
-	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/tokenizer"
 )
 
@@ -169,19 +169,19 @@ func main() {
 	temp := flag.Float64("temp", 0, "sampling temperature; 0 = greedy")
 	topP := flag.Float64("topp", 0.9, "nucleus sampling: keep the smallest set of tokens with this much probability mass (1 disables)")
 	seed := flag.Int64("seed", 1, "sampling seed for -temp > 0")
-	useGPU := flag.Bool("gpu", false, "run prompt-prefill attention on the GPU (build with -tags wgpu or wgpu24)")
+	useGPU := flag.Bool("dev", false, "run prompt-prefill attention on the GPU (build with -tags wgpu or wgpu24)")
 	q8 := flag.Bool("q8", false, "decode against int8-quantized weights (weight-only, per-column scales)")
 	flag.Parse()
 
-	var gpu *tensai.GPU
+	var dev *gpu.Device
 	if *useGPU {
-		g, err := tensai.OpenGPU()
+		g, err := gpu.Open()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gpu unavailable, using cpu: %v\n", err)
+			fmt.Fprintf(os.Stderr, "dev unavailable, using cpu: %v\n", err)
 		} else {
 			defer g.Close()
-			fmt.Fprintf(os.Stderr, "gpu: %s\n", g.Name())
-			gpu = g
+			fmt.Fprintf(os.Stderr, "dev: %s\n", g.Name())
+			dev = g
 		}
 	}
 
@@ -223,7 +223,7 @@ func main() {
 
 	fmt.Print(*prompt)
 	start = time.Now()
-	logits := model.prefill(ids, gpu)
+	logits := model.prefill(ids, dev)
 	fmt.Fprintf(os.Stderr, "prefill: %d tokens in %v\n", len(ids), time.Since(start).Round(time.Millisecond))
 	steps := len(ids)
 	for i := 0; i < *n && steps < nCtx; i++ {

@@ -13,11 +13,12 @@ import (
 	"fmt"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/autograd"
 )
 
 func main() {
-	x := tensai.Param(tensai.NewMatrix(1, 1)).Named("x")
-	y := tensai.Param(tensai.NewMatrix(1, 1)).Named("y")
+	x := autograd.Param(tensai.NewMatrix(1, 1)).Named("x")
+	y := autograd.Param(tensai.NewMatrix(1, 1)).Named("y")
 	z := x.Add(y).Named("z")
 
 	fmt.Print(z.ToDot())

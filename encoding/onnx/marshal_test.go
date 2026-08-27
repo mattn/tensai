@@ -6,9 +6,13 @@ import (
 	"testing"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/layer"
+	"github.com/mattn/tensai/loss"
+	"github.com/mattn/tensai/model"
+	"github.com/mattn/tensai/optim"
 )
 
-func trainStep(t *testing.T, m *tensai.Sequential, in, out int, classes bool, rng *rand.Rand) {
+func trainStep(t *testing.T, m *model.Sequential, in, out int, classes bool, rng *rand.Rand) {
 	t.Helper()
 	x := tensai.NewMatrix(8, in)
 	for i := range x.Data {
@@ -33,16 +37,16 @@ func trainStep(t *testing.T, m *tensai.Sequential, in, out int, classes bool, rn
 
 func TestMarshalMLP(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
-	m := tensai.NewSequential()
-	m.Add(tensai.NewDense(16))
-	m.Add(&tensai.Tanh{})
-	m.Add(tensai.NewBatchNorm())
-	m.Add(tensai.NewDropout(0.5))
-	m.Add(tensai.NewDense(8))
-	m.Add(&tensai.LeakyReLU{Alpha: 0.1})
-	m.Add(tensai.NewDense(3))
-	m.Add(&tensai.Softmax{})
-	if err := m.Compile(10, tensai.MeanSquaredError{}, tensai.NewAdam(0.01)); err != nil {
+	m := model.NewSequential()
+	m.Add(layer.NewDense(16))
+	m.Add(&layer.Tanh{})
+	m.Add(layer.NewBatchNorm())
+	m.Add(layer.NewDropout(0.5))
+	m.Add(layer.NewDense(8))
+	m.Add(&layer.LeakyReLU{Alpha: 0.1})
+	m.Add(layer.NewDense(3))
+	m.Add(&layer.Softmax{})
+	if err := m.Compile(10, loss.MeanSquaredError{}, optim.NewAdam(0.01)); err != nil {
 		t.Fatal(err)
 	}
 	trainStep(t, m, 10, 3, false, rng)
@@ -71,14 +75,14 @@ func TestMarshalMLP(t *testing.T) {
 
 func TestMarshalCNN(t *testing.T) {
 	rng := rand.New(rand.NewSource(2))
-	m := tensai.NewSequential()
-	m.Add(tensai.NewConv2D(8, 8, 2, 6, 3, 1, 1))
-	m.Add(&tensai.ReLU{})
-	m.Add(tensai.NewMaxPool2D(8, 8, 6, 2))
-	m.Add(tensai.NewConv2D(4, 4, 6, 4, 3, 1, 0))
-	m.Add(&tensai.Sigmoid{})
-	m.Add(tensai.NewDense(5))
-	if err := m.Compile(8*8*2, tensai.SoftmaxCrossEntropy{}, tensai.NewAdam(0.01)); err != nil {
+	m := model.NewSequential()
+	m.Add(layer.NewConv2D(8, 8, 2, 6, 3, 1, 1))
+	m.Add(&layer.ReLU{})
+	m.Add(layer.NewMaxPool2D(8, 8, 6, 2))
+	m.Add(layer.NewConv2D(4, 4, 6, 4, 3, 1, 0))
+	m.Add(&layer.Sigmoid{})
+	m.Add(layer.NewDense(5))
+	if err := m.Compile(8*8*2, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.01)); err != nil {
 		t.Fatal(err)
 	}
 	trainStep(t, m, 8*8*2, 5, true, rng)
@@ -95,13 +99,13 @@ func TestMarshalCNN(t *testing.T) {
 }
 
 func TestMarshalErrors(t *testing.T) {
-	if _, err := Marshal(tensai.NewSequential()); err == nil {
+	if _, err := Marshal(model.NewSequential()); err == nil {
 		t.Fatal("expected error for empty model")
 	}
 
-	m := tensai.NewSequential()
-	m.Add(&tensai.ReLU{})
-	if err := m.Compile(4, tensai.MeanSquaredError{}, tensai.NewSGD(0.1, 0)); err != nil {
+	m := model.NewSequential()
+	m.Add(&layer.ReLU{})
+	if err := m.Compile(4, loss.MeanSquaredError{}, optim.NewSGD(0.1, 0)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Marshal(m); err == nil {
@@ -109,10 +113,10 @@ func TestMarshalErrors(t *testing.T) {
 	}
 
 	rng := rand.New(rand.NewSource(3))
-	sm := tensai.NewSequential()
-	sm.Add(tensai.NewConv2D(4, 4, 1, 2, 3, 1, 1))
-	sm.Add(&tensai.Softmax{})
-	if err := sm.Compile(16, tensai.MeanSquaredError{}, tensai.NewAdam(0.01)); err != nil {
+	sm := model.NewSequential()
+	sm.Add(layer.NewConv2D(4, 4, 1, 2, 3, 1, 1))
+	sm.Add(&layer.Softmax{})
+	if err := sm.Compile(16, loss.MeanSquaredError{}, optim.NewAdam(0.01)); err != nil {
 		t.Fatal(err)
 	}
 	trainStep(t, sm, 16, 32, false, rng)

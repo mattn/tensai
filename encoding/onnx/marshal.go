@@ -19,7 +19,8 @@ import (
 	"math"
 	"os"
 
-	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/layer"
+	"github.com/mattn/tensai/model"
 )
 
 const (
@@ -103,7 +104,7 @@ func attrs(fns ...func(*pbuf)) func(*pbuf) {
 }
 
 // Marshal encodes a trained Sequential model as an ONNX ModelProto.
-func Marshal(m *tensai.Sequential) ([]byte, error) {
+func Marshal(m *model.Sequential) ([]byte, error) {
 	layers := m.Layers()
 	if len(layers) == 0 {
 		return nil, fmt.Errorf("onnx: model has no layers")
@@ -115,11 +116,11 @@ func Marshal(m *tensai.Sequential) ([]byte, error) {
 	var h, w, c, features int
 	spatial := false
 	switch l := layers[0].(type) {
-	case *tensai.Conv2D:
+	case *layer.Conv2D:
 		h, w, c, _, _, _, _ = l.Shape()
 		spatial = true
 		inputDims = []int64{1, int64(c), int64(h), int64(w)}
-	case *tensai.Dense:
+	case *layer.Dense:
 		weights, _ := l.Params()
 		features = weights.Rows
 		inputDims = []int64{1, int64(features)}
@@ -128,10 +129,10 @@ func Marshal(m *tensai.Sequential) ([]byte, error) {
 	}
 	cur := "input"
 
-	for li, layer := range layers {
+	for li, lyr := range layers {
 		name := fmt.Sprintf("l%d", li)
-		switch l := layer.(type) {
-		case *tensai.Dense:
+		switch l := lyr.(type) {
+		case *layer.Dense:
 			weights, bias := l.Params()
 			if spatial {
 				if h*w*c != weights.Rows {
@@ -144,7 +145,7 @@ func Marshal(m *tensai.Sequential) ([]byte, error) {
 			bName := g.tensor(name+"_b", []int64{int64(len(bias))}, bias)
 			cur = g.add("Gemm", []string{cur, wName, bName}, nil)
 			features = weights.Cols
-		case *tensai.Conv2D:
+		case *layer.Conv2D:
 			inH, inW, inC, outC, k, stride, pad := l.Shape()
 			if li != 0 && (!spatial || inH != h || inW != w || inC != c) {
 				return nil, fmt.Errorf("onnx: %s: conv input mismatch", name)
@@ -168,7 +169,7 @@ func Marshal(m *tensai.Sequential) ([]byte, error) {
 			w = (inW+2*pad-k)/stride + 1
 			c = outC
 			spatial = true
-		case *tensai.MaxPool2D:
+		case *layer.MaxPool2D:
 			ph, pw, pc, size := l.Shape()
 			if !spatial || ph != h || pw != w || pc != c {
 				return nil, fmt.Errorf("onnx: %s: maxpool input mismatch", name)
@@ -178,7 +179,7 @@ func Marshal(m *tensai.Sequential) ([]byte, error) {
 				attrIntsv("strides", []int64{int64(size), int64(size)}),
 			))
 			h, w = h/size, w/size
-		case *tensai.BatchNorm:
+		case *layer.BatchNorm:
 			// tensai's BatchNorm normalizes every flattened column, so it
 			// folds into an element-wise scale and offset; in NCHW those
 			// constants carry shape [C, H, W] and broadcast over the batch.
@@ -203,23 +204,23 @@ func Marshal(m *tensai.Sequential) ([]byte, error) {
 			oName := g.tensor(name+"_offset", dims, offset)
 			cur = g.add("Mul", []string{cur, sName}, nil)
 			cur = g.add("Add", []string{cur, oName}, nil)
-		case *tensai.Dropout:
+		case *layer.Dropout:
 			// Identity at inference time.
-		case *tensai.ReLU:
+		case *layer.ReLU:
 			cur = g.add("Relu", []string{cur}, nil)
-		case *tensai.LeakyReLU:
+		case *layer.LeakyReLU:
 			cur = g.add("LeakyRelu", []string{cur}, attrFloatv("alpha", float32(l.Alpha)))
-		case *tensai.Sigmoid:
+		case *layer.Sigmoid:
 			cur = g.add("Sigmoid", []string{cur}, nil)
-		case *tensai.Tanh:
+		case *layer.Tanh:
 			cur = g.add("Tanh", []string{cur}, nil)
-		case *tensai.Softmax:
+		case *layer.Softmax:
 			if spatial {
 				return nil, fmt.Errorf("onnx: %s: softmax needs flattened features", name)
 			}
 			cur = g.add("Softmax", []string{cur}, nil) // axis defaults to -1
 		default:
-			return nil, fmt.Errorf("onnx: unsupported layer %T", layer)
+			return nil, fmt.Errorf("onnx: unsupported layer %T", lyr)
 		}
 	}
 
@@ -289,7 +290,7 @@ func encode(g *graph, inputDims []int64, output string, outputDims []int64) []by
 }
 
 // MarshalFile writes the marshaled model to a file.
-func MarshalFile(path string, m *tensai.Sequential) error {
+func MarshalFile(path string, m *model.Sequential) error {
 	data, err := Marshal(m)
 	if err != nil {
 		return err

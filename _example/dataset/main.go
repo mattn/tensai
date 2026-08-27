@@ -9,6 +9,11 @@ import (
 	"math/rand"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/dataset"
+	"github.com/mattn/tensai/layer"
+	"github.com/mattn/tensai/loss"
+	"github.com/mattn/tensai/model"
+	"github.com/mattn/tensai/optim"
 )
 
 const (
@@ -22,7 +27,7 @@ const (
 
 // synthesize builds a two-class dataset whose features live on wildly
 // different scales (~1, ~100, ~10000), which is what Standardize is for.
-func synthesize(rng *rand.Rand) *tensai.Dataset {
+func synthesize(rng *rand.Rand) *dataset.Dataset {
 	inputs := tensai.NewMatrix(samples, features)
 	targets := tensai.NewMatrix(samples, 1)
 	for i := 0; i < samples; i++ {
@@ -33,14 +38,14 @@ func synthesize(rng *rand.Rand) *tensai.Dataset {
 		inputs.Set(i, 2, float32(rng.NormFloat64())*5000+20000-shift*6000)
 		targets.Set(i, 0, float32(class))
 	}
-	ds, err := tensai.NewDataset(inputs, targets)
+	ds, err := dataset.New(inputs, targets)
 	if err != nil {
 		panic(err)
 	}
 	return ds
 }
 
-func accuracy(model *tensai.Sequential, ds *tensai.Dataset) float64 {
+func accuracy(model *model.Sequential, ds *dataset.Dataset) float64 {
 	pred, err := model.Predict(ds.Inputs)
 	if err != nil {
 		panic(err)
@@ -79,11 +84,11 @@ func main() {
 	fmt.Printf("train feature means: %.1f %.1f %.1f (std %.1f %.1f %.1f)\n",
 		mean[0], mean[1], mean[2], std[0], std[1], std[2])
 
-	model := tensai.NewSequential()
-	model.Add(tensai.NewDense(16))
-	model.Add(&tensai.ReLU{})
-	model.Add(tensai.NewDense(classes))
-	if err := model.Compile(features, tensai.SoftmaxCrossEntropy{}, tensai.NewAdam(0.01)); err != nil {
+	model := model.NewSequential()
+	model.Add(layer.NewDense(16))
+	model.Add(&layer.ReLU{})
+	model.Add(layer.NewDense(classes))
+	if err := model.Compile(features, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.01)); err != nil {
 		panic(err)
 	}
 
