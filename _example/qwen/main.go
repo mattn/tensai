@@ -62,7 +62,7 @@ func main() {
 	defer e.Close()
 
 	if *serveAddr != "" {
-		if err := e.Serve(*serveAddr); err != nil {
+		if err := e.Serve(*serveAddr, ""); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

@@ -153,11 +153,16 @@ func main() {
 	case "serve":
 		fs := flag.NewFlagSet("tensai serve", flag.ExitOnError)
 		o, finish := modelFlags(fs)
-		addr := fs.String("addr", ":8080", "address to listen on")
+		defAddr := os.Getenv("TENSAI_ADDR")
+		if defAddr == "" {
+			defAddr = "127.0.0.1:8080"
+		}
+		addr := fs.String("addr", defAddr, "address to listen on (or $TENSAI_ADDR); loopback only unless widened")
+		apiKey := fs.String("api-key", os.Getenv("TENSAI_API_KEY"), "require this bearer token on the /v1 API (or $TENSAI_API_KEY)")
 		fs.Parse(args)
 		e := openEngine(o, finish)
 		defer e.Close()
-		if err := e.Serve(*addr); err != nil {
+		if err := e.Serve(*addr, *apiKey); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
