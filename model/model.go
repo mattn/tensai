@@ -19,6 +19,7 @@ type Model interface {
 type Sequential struct {
 	layers    []layer.Layer
 	optimizer optim.Optimizer
+	updaters  []optim.Updater
 	loss      loss.Loss
 	lossName  string
 	rng       *rand.Rand
@@ -74,6 +75,7 @@ func (s *Sequential) compile(inputCols int, img layer.Image, loss loss.Loss, opt
 	s.loss = loss
 	s.lossName = loss.Name()
 	s.optimizer = optimizer
+	s.updaters = s.updaters[:0]
 
 	currentCols := inputCols
 	for i, l := range s.layers {
@@ -99,9 +101,9 @@ func (s *Sequential) compile(inputCols int, img layer.Image, loss loss.Loss, opt
 				img = layer.Image{}
 			}
 		}
-		// Layers that expose parameters register with the optimizer.
+		// Layers that expose parameters get their own optimizer state.
 		if w, _ := l.Params(); w != nil {
-			_ = optimizer.NewLayer()
+			s.updaters = append(s.updaters, optimizer.New())
 		}
 		if out <= 0 {
 			return fmt.Errorf("tensai: layer %d produced non-positive output cols: %d", i, out)
@@ -137,7 +139,7 @@ func (s *Sequential) backward(grad *tensai.Matrix) error {
 	return nil
 }
 
-// applyGrads updates each parameterized layer via the optimizer.
+// applyGrads updates each parameterized layer via its optimizer state.
 func (s *Sequential) applyGrads() {
 	idx := 0
 	for _, l := range s.layers {
@@ -146,7 +148,7 @@ func (s *Sequential) applyGrads() {
 			continue
 		}
 		gradW, gradB := l.Grads()
-		s.optimizer.Step(idx, weights, gradW, bias, gradB)
+		s.updaters[idx].Step(weights, gradW, bias, gradB)
 		idx++
 	}
 }

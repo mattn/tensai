@@ -36,6 +36,24 @@ func NewMatrixFromSlice(rows, cols int, data []Float) (*Matrix, error) {
 	return m, nil
 }
 
+// NewMatrixFromInts builds a matrix from integer values, verifying each one
+// survives the float32 conversion exactly. This is the safe way to build
+// token-id inputs for an Embedding layer, whose ids travel as Float.
+func NewMatrixFromInts(rows, cols int, data []int) (*Matrix, error) {
+	if len(data) != rows*cols {
+		return nil, fmt.Errorf("tensai: data length %d != %dx%d", len(data), rows, cols)
+	}
+	m := NewMatrix(rows, cols)
+	for i, v := range data {
+		f := Float(v)
+		if int(f) != v {
+			return nil, fmt.Errorf("tensai: value %d at index %d does not fit float32 exactly", v, i)
+		}
+		m.Data[i] = f
+	}
+	return m, nil
+}
+
 // At returns the element at (r, c).
 func (m *Matrix) At(r, c int) Float {
 	return m.Data[r*m.Cols+c]

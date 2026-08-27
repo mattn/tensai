@@ -104,3 +104,20 @@ func TestDotVecAxpy(t *testing.T) {
 	}()
 	DotVec(make([]Float, 3), make([]Float, 4))
 }
+
+func TestNewMatrixFromInts(t *testing.T) {
+	m, err := NewMatrixFromInts(2, 2, []int{0, 1, 65535, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.At(1, 0) != 65535 {
+		t.Fatalf("got %g", m.At(1, 0))
+	}
+	// 1<<25 + 1 is the first odd integer float32 cannot represent.
+	if _, err := NewMatrixFromInts(1, 1, []int{1<<25 + 1}); err == nil {
+		t.Fatal("expected exactness error")
+	}
+	if _, err := NewMatrixFromInts(2, 2, []int{1}); err == nil {
+		t.Fatal("expected length error")
+	}
+}

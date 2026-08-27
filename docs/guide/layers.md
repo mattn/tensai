@@ -31,7 +31,7 @@ type Layer interface {
 
 `Conv2D` and `MaxPool2D` treat each row as a channel-major image: `index = (channel*height + y)*width + x`. `Dropout` and `BatchNorm` switch automatically between training behavior (inside `Fit`/`FitStep`) and inference behavior (inside `Predict`).
 
-`Embedding` keeps the matrix-only API: each input row is a token-id sequence, and the layer concatenates the looked-up embedding vectors across columns. For example, `Compile(4, ...)` plus `NewEmbedding(vocab, 8)` turns an `Mx4` token-id matrix into an `Mx32` dense feature matrix that can feed `LayerNorm`, `GELU`, and `Dense`.
+`Embedding` keeps the matrix-only API: each input row is a token-id sequence (build it safely with `tensai.NewMatrixFromInts`, which verifies every id survives the float32 conversion exactly), and the layer concatenates the looked-up embedding vectors across columns. For example, `Compile(4, ...)` plus `NewEmbedding(vocab, 8)` turns an `Mx4` token-id matrix into an `Mx32` dense feature matrix that can feed `LayerNorm`, `GELU`, and `Dense`.
 
 ## Activations
 
@@ -64,7 +64,7 @@ Softmax is applied *inside* `SoftmaxCrossEntropy` (with the row maximum subtract
 | Adam | `optim.NewAdam(lr)` |
 | AdamW | `optim.NewAdamW(lr, weightDecay)` — decoupled weight decay |
 
-The Adam/AdamW parameter update is one of the AVX2-vectorized kernels in the SIMD build.
+An `Optimizer` is just the rule's configuration: the model asks it for one `optim.Updater` per parameter pair, and the updater carries that pair's state (momentum buffers, Adam moments, step count). A custom optimizer therefore implements two small methods, `New() Updater` and the updater's `Step`. The Adam/AdamW and SGD parameter updates are AVX2-vectorized kernels in the SIMD build.
 
 ## k-NN baseline
 

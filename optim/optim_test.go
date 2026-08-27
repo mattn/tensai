@@ -7,15 +7,14 @@ import (
 )
 
 func TestAdamWDecaysWeights(t *testing.T) {
-	adam := NewAdamW(0.1, 0.5)
-	adam.NewLayer()
+	adam := NewAdamW(0.1, 0.5).New()
 	weights := tensai.NewMatrix(1, 2)
 	weights.Data[0] = 1
 	weights.Data[1] = -2
 	bias := []tensai.Float{3}
 	// Zero gradients: plain Adam would leave parameters unchanged; AdamW
 	// must still shrink weights (but never biases).
-	adam.Step(0, weights, tensai.NewMatrix(1, 2), bias, []tensai.Float{0})
+	adam.Step(weights, tensai.NewMatrix(1, 2), bias, []tensai.Float{0})
 	if weights.Data[0] >= 1 || weights.Data[1] <= -2 {
 		t.Errorf("weights not decayed: %v", weights.Data)
 	}
