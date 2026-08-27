@@ -18,6 +18,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime/pprof"
+	"sort"
 	"strings"
 	"time"
 
@@ -177,6 +178,7 @@ func main() {
 		o, finish := modelFlags(fs)
 		p := fs.Int("p", 512, "approximate prompt tokens to prefill")
 		n := fs.Int("n", 32, "tokens to decode")
+		reps := fs.Int("r", 5, "timed repetitions per side, after one warm-up")
 		fs.Parse(args)
 		finish()
 		if o.Bits == 0 {
@@ -184,7 +186,7 @@ func main() {
 			// the same way.
 			o.Bits = 8
 		}
-		benchCmd(o, *p, *n)
+		benchCmd(o, *p, *n, *reps)
 	case "models":
 		if err := modelsCmd(args); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -204,7 +206,7 @@ func main() {
 // Each side runs in its own child process so the second measurement never
 // pays for the first one's heap: a freed model keeps its pages resident
 // long enough to distort a back-to-back run in one process.
-func benchCmd(o *llm.Options, p, n int) {
+func benchCmd(o *llm.Options, p, n, reps int) {
 	if side := os.Getenv("TENSAI_BENCH_CHILD"); side != "" {
 		benchChild(side)
 		return
@@ -213,7 +215,7 @@ func benchCmd(o *llm.Options, p, n int) {
 	for sb.Len() < p*4 {
 		sb.WriteString("The quick brown fox jumps over the lazy dog while considering cache coherency protocols and memory hierarchies in modern processors. ")
 	}
-	cfg := benchConfig{Opts: *o, Prompt: sb.String(), N: n}
+	cfg := benchConfig{Opts: *o, Prompt: sb.String(), N: n, Reps: reps}
 	cfg.Opts.Log = nil
 	blob, err := json.Marshal(&cfg)
 	if err != nil {
@@ -269,28 +271,54 @@ func benchCmd(o *llm.Options, p, n int) {
 	} else {
 		fmt.Printf("gpu build: %s\n", tag)
 	}
-	fmt.Printf("\n%-9s %12s %12s\n", "", "prefill", "decode")
-	fmt.Printf("%-9s %10.1f %s %10.1f %s\n", "cpu", cpu.Prefill, "t/s", cpu.Decode, "t/s")
+	row := func(name string, r benchResult) {
+		fmt.Printf("%-8s %9.1f %-14s %8.1f %s\n", name,
+			median(r.Prefill), spread(r.Prefill),
+			median(r.Decode), spread(r.Decode))
+	}
+	fmt.Printf("\nmedian of %d runs after one warm-up, tokens/sec\n\n", reps)
+	fmt.Printf("%-8s %9s %-14s %8s\n", "", "prefill", "", "decode")
+	row("cpu", cpu)
 	if gpuErr != nil {
-		fmt.Printf("%-9s unavailable: %v\n", "gpu", gpuErr)
+		fmt.Printf("%-8s unavailable: %v\n", "gpu", gpuErr)
 		return
 	}
-	fmt.Printf("%-9s %10.1f %s %10.1f %s\n", "gpu", dev.Prefill, "t/s", dev.Decode, "t/s")
-	fmt.Printf("%-9s %11.2fx %12.2fx\n", "gpu/cpu", dev.Prefill/cpu.Prefill, dev.Decode/cpu.Decode)
+	row("gpu", dev)
+	fmt.Printf("%-8s %8.2fx %-14s %7.2fx\n", "gpu/cpu",
+		median(dev.Prefill)/median(cpu.Prefill), "", median(dev.Decode)/median(cpu.Decode))
 }
 
 type benchConfig struct {
 	Opts   llm.Options
 	Prompt string
 	N      int
+	Reps   int
 }
 
 type benchResult struct {
 	Tokens  int
-	Prefill float64
-	Decode  float64
+	Prefill []float64 // one sample per repetition
+	Decode  []float64
 	Adapter string `json:",omitempty"`
 	Err     string `json:",omitempty"`
+}
+
+// median returns the middle sample; samples are sorted in place.
+func median(v []float64) float64 {
+	if len(v) == 0 {
+		return 0
+	}
+	sort.Float64s(v)
+	return v[len(v)/2]
+}
+
+// spread renders the low-high range of the samples.
+func spread(v []float64) string {
+	if len(v) < 2 {
+		return ""
+	}
+	sort.Float64s(v)
+	return fmt.Sprintf("(%.0f-%.0f)", v[0], v[len(v)-1])
 }
 
 // benchChild measures one side and prints the result as one JSON line.
@@ -310,12 +338,20 @@ func benchChild(side string) {
 		r.Err = err.Error()
 	} else {
 		defer e.Close()
-		res := e.Generate(io.Discard, cfg.Prompt, true, cfg.N)
-		r = benchResult{
-			Tokens:  res.PromptTokens,
-			Prefill: float64(res.PromptTokens) / res.Prefill.Seconds(),
-			Decode:  float64(res.CompletionTokens) / (res.Total - res.Prefill).Seconds(),
-			Adapter: e.GPUName(),
+		r.Adapter = e.GPUName()
+		// The model stays loaded across repetitions and the first pass is
+		// discarded, so the samples describe steady state rather than a
+		// cold cache and a ramping clock — the same thing llama-bench
+		// reports.
+		for i := 0; i <= cfg.Reps; i++ {
+			e.Reset()
+			res := e.Generate(io.Discard, cfg.Prompt, true, cfg.N)
+			if i == 0 {
+				r.Tokens = res.PromptTokens
+				continue
+			}
+			r.Prefill = append(r.Prefill, float64(res.PromptTokens)/res.Prefill.Seconds())
+			r.Decode = append(r.Decode, float64(res.CompletionTokens)/(res.Total-res.Prefill).Seconds())
 		}
 	}
 	out, _ := json.Marshal(&r)

@@ -245,6 +245,18 @@ func Open(o Options) (*Engine, error) {
 	return e, nil
 }
 
+// Reset drops the KV cache and rewinds the position counter, so the next
+// Generate starts from an empty context instead of continuing the last
+// one. Benchmarks use it to repeat the same prompt.
+func (e *Engine) Reset() {
+	e.reset()
+	if e.draft != nil {
+		e.draft.reset()
+	}
+	e.steps = 0
+	e.logits = nil
+}
+
 // GPUName reports the adapter the engine is running on, empty when
 // decoding on the CPU. Backend names the binding generation the binary
 // was built with.

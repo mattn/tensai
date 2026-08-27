@@ -100,17 +100,21 @@ prefill 401 tokens, decode 32 tokens, int8 weights
 cpu: AVX2 kernels
 gpu: Microsoft Direct3D12 (AMD Radeon(TM) Graphics) (integrated) via -tags wgpu24
 
-               prefill       decode
-cpu            398.2 t/s       39.4 t/s
-gpu           2020.9 t/s       29.7 t/s
-gpu/cpu          5.08x         0.75x
+median of 5 runs after one warm-up, tokens/sec
+
+           prefill                  decode
+cpu          430.7 (357-446)          38.3 (38-39)
+gpu         2241.5 (1663-2295)        28.7 (25-29)
+gpu/cpu      5.20x                   0.75x
 ```
 
-`-p` sets the approximate prompt length and `-n` the tokens to decode. Without
-a GPU build tag the GPU row reports why it is unavailable. Prefill throughput falls as the prompt
-grows (attention is quadratic) and varies a few percent run to run through a
-translation layer, so compare medians of a few runs at one length rather than
-single numbers across lengths.
+`-p` sets the approximate prompt length, `-n` the tokens to decode, and `-r`
+the timed repetitions. Without a GPU build tag the GPU row reports why it is
+unavailable. The model stays loaded across repetitions and the first pass is
+discarded, so the samples describe steady state — a cold prefill on this path
+can read 30% low, which is what makes an unwarmed number unfair to compare
+against a tool that reports steady state. Prefill throughput still falls as
+the prompt grows, since attention is quadratic, so compare at one length.
 
 ### Serving an OpenAI-compatible API
 
