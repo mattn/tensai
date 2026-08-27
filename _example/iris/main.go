@@ -7,7 +7,6 @@ import (
 	"math/rand"
 
 	tensai "github.com/mattn/tensai"
-	"github.com/mattn/tensai/dataset"
 	"github.com/mattn/tensai/dataset/iris"
 	"github.com/mattn/tensai/layer"
 	"github.com/mattn/tensai/loss"
@@ -22,22 +21,6 @@ const (
 	batchSize    = 32
 	seed         = 3
 )
-
-func evaluate(net *model.Sequential, ds *dataset.Dataset) (int, [][]int, error) {
-	pred, err := net.Predict(ds.Inputs)
-	if err != nil {
-		return 0, nil, err
-	}
-	correct, err := metrics.Correct(pred, ds.Targets)
-	if err != nil {
-		return 0, nil, err
-	}
-	confusion, err := metrics.Confusion(pred, ds.Targets)
-	if err != nil {
-		return 0, nil, err
-	}
-	return correct, confusion, nil
-}
 
 func main() {
 	ds, err := iris.Load(nil)
@@ -79,20 +62,20 @@ func main() {
 		}
 	}
 
-	trainCorrect, _, err := evaluate(net, train)
+	trainRes, err := metrics.Evaluate(net, train.Inputs, train.Targets)
 	if err != nil {
 		panic(err)
 	}
-	testCorrect, confusion, err := evaluate(net, test)
+	testRes, err := metrics.Evaluate(net, test.Inputs, test.Targets)
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("\ntrain accuracy: %d/%d\n", trainCorrect, train.Len())
-	fmt.Printf("test accuracy:  %d/%d\n", testCorrect, test.Len())
+	fmt.Printf("\ntrain accuracy: %d/%d\n", trainRes.Correct, trainRes.Total)
+	fmt.Printf("test accuracy:  %d/%d\n", testRes.Correct, testRes.Total)
 	fmt.Println("\nconfusion matrix (rows = actual, columns = predicted):")
-	for r := range confusion {
+	for r := range testRes.Confusion {
 		fmt.Printf("  %-10s:", iris.ClassNames[r])
-		for _, n := range confusion[r] {
+		for _, n := range testRes.Confusion[r] {
 			fmt.Printf(" %3d", n)
 		}
 		fmt.Println()

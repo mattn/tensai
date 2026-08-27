@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -60,6 +61,36 @@ func TestConfusion(t *testing.T) {
 				t.Fatalf("confusion[%d][%d] = %d, want %d", r, c, confusion[r][c], want[r][c])
 			}
 		}
+	}
+}
+
+type fakePredictor struct {
+	pred *tensai.Matrix
+	err  error
+}
+
+func (f fakePredictor) Predict(*tensai.Matrix) (*tensai.Matrix, error) {
+	return f.pred, f.err
+}
+
+func TestReportAndEvaluate(t *testing.T) {
+	pred, targets := fixtures(t)
+	res, err := Evaluate(fakePredictor{pred: pred}, nil, targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Correct != 3 || res.Total != 4 {
+		t.Fatalf("Correct/Total = %d/%d, want 3/4", res.Correct, res.Total)
+	}
+	if res.Accuracy() != 0.75 {
+		t.Fatalf("Accuracy = %g, want 0.75", res.Accuracy())
+	}
+	if res.Confusion[1][2] != 1 {
+		t.Fatalf("Confusion[1][2] = %d, want 1", res.Confusion[1][2])
+	}
+	wantErr := fmt.Errorf("predict failed")
+	if _, err := Evaluate(fakePredictor{err: wantErr}, nil, targets); err != wantErr {
+		t.Fatalf("err = %v, want %v", err, wantErr)
 	}
 }
 
