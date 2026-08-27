@@ -30,7 +30,7 @@ err = tensai.DotInto(out, a, b) // into a preallocated result
 err = tensai.DotTAInto(out, a, b) // a^T @ b without materializing a^T
 ```
 
-`Dot` is the kernel everything else rides on: `Dense` forward passes, `Conv2D`'s im2col product, `KNN` distances, autograd `MatMul`, and even the LLM examples' attention all end up here. Build with `GOEXPERIMENT=simd` and it becomes an AVX2 register-tiled kernel — see [SIMD Acceleration](simd.md).
+`Dot` is the kernel everything else rides on: `Dense` forward passes, `Conv2D`'s im2col product, `knn.Classifier` distances, autograd `MatMul`, and even the LLM examples' attention all end up here. Build with `GOEXPERIMENT=simd` and it becomes an AVX2 register-tiled kernel — see [SIMD Acceleration](simd.md).
 
 ## N-d Tensor
 

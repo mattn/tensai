@@ -19,28 +19,28 @@ $env:TENSAI_WGPU_LIB="$PWD\wgpu\lib\wgpu_native.dll"
 go run -tags wgpu ./_example/wgpu
 ```
 
-Without the build tag, `OpenGPU` returns an error and nothing else changes.
+Without the build tag, `gpu.Open` returns an error and nothing else changes.
 
 ## Basic usage
 
 ```go
-gpu, err := tensai.OpenGPU() // fails cleanly when no GPU / library is present
+dev, err := gpu.Open() // fails cleanly when no GPU / library is present
 if err != nil { /* fall back to tensai.MatMul */ }
-defer gpu.Close()
-fmt.Println(gpu.Name()) // e.g. "AMD Radeon 780M (integrated)"
-out, err := gpu.MatMul(a, b)
+defer dev.Close()
+fmt.Println(dev.Name()) // e.g. "AMD Radeon 780M (integrated)"
+out, err := dev.MatMul(a, b)
 ```
 
-On machines with both an integrated and a discrete GPU, pass a preference: `tensai.OpenGPU(tensai.GPULowPower)` steers to the iGPU, `tensai.GPUHighPerformance` to the dGPU (it is a hint — with a single adapter you always get that one).
+On machines with both an integrated and a discrete GPU, pass a preference: `gpu.Open(gpu.LowPower)` steers to the iGPU, `gpu.HighPerformance` to the dGPU (it is a hint — with a single adapter you always get that one).
 
 ## Resident buffers
 
-`gpu.MatMul(a, b)` is shorthand for Upload → MatMul → Download → Free. Buffers can instead stay resident on the GPU, so a weight rides the bus once instead of on every call and intermediates never leave the device:
+`dev.MatMul(a, b)` is shorthand for Upload → MatMul → Download → Free. Buffers can instead stay resident on the GPU, so a weight rides the bus once instead of on every call and intermediates never leave the device:
 
 ```go
-gw, _ := gpu.Upload(w)              // weight uploaded once
+gw, _ := dev.Upload(w)              // weight uploaded once
 defer gw.Free()                     // GPU memory is not garbage collected
-gx, _ := gpu.Upload(x)
+gx, _ := dev.Upload(x)
 h, _ := gx.MatMul(gw)               // chain freely; nothing touches the host
 out, _ := h.MatMul(gw2)
 result, _ := out.Download()         // one readback at the end
@@ -61,7 +61,7 @@ Multi-head attention carves each head out of the packed layout with strided kern
 
 ## Quantized weights on the device
 
-`UploadQ8` packs a `QMatrix` four int8 weights per u32, and `GPUQMatrix.MatMul` dequantizes them in registers, so a decode matvec moves a quarter of the f32 bytes. `UploadQ4` does the same for the int4 twin, so `-q4 -gpu` runs models whose int8 weights would not fit.
+`UploadQ8` packs a `QMatrix` four int8 weights per u32, and `gpu.QMatrix.MatMul` dequantizes them in registers, so a decode matvec moves a quarter of the f32 bytes. `UploadQ4` does the same for the int4 twin, so `-q4 -gpu` runs models whose int8 weights would not fit.
 
 The rest of a transformer decode step is there as well — `RMSNorm`, in-place `RoPE`, `Add`, `SiluMul`, `GroupedCausalAttention` (a KV cache packing fewer heads than the queries), and `CopyRowsInto` to append fresh k/v rows to a resident cache — so `_example/qwen -q8 -gpu` runs every block on the device and only the hidden state comes back per token. `BeginBatch`/`Flush` record a whole token's dispatches into one submission, and freed intermediates recycle through a buffer pool.
 
@@ -92,7 +92,7 @@ The crossover moves with the CPU kernel, GPU driver, and transfer pattern — th
 
 ## `-tags wgpu24`: the new wgpu-native API, and the real GPU inside WSL2
 
-`-tags wgpu24` builds the same `OpenGPU` API against the reworked wgpu-native C API — pair it with a **v29-series** release binary. The new API's payoff is `WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter`, which un-hides non-conformant Vulkan drivers. Concretely: Mesa's dozen (Vulkan-on-D3D12) exposes the real host GPU inside WSL2, but the v22 API hides it as non-conformant and falls back to lavapipe; the wgpu24 build reaches it:
+`-tags wgpu24` builds the same `gpu.Open` API against the reworked wgpu-native C API — pair it with a **v29-series** release binary. The new API's payoff is `WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter`, which un-hides non-conformant Vulkan drivers. Concretely: Mesa's dozen (Vulkan-on-D3D12) exposes the real host GPU inside WSL2, but the v22 API hides it as non-conformant and falls back to lavapipe; the wgpu24 build reaches it:
 
 ```bash
 VK_DRIVER_FILES=/path/to/dzn_icd.json \
