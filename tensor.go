@@ -80,6 +80,19 @@ func (m *Matrix) Row(r int) []Float {
 	return out
 }
 
+// ArgmaxRow returns the column index of the largest value in row r; ties
+// go to the lowest index. Classification models emit one column per class,
+// so this maps a row of scores to its predicted class.
+func (m *Matrix) ArgmaxRow(r int) int {
+	best := 0
+	for c := 1; c < m.Cols; c++ {
+		if m.At(r, c) > m.At(r, best) {
+			best = c
+		}
+	}
+	return best
+}
+
 // T returns the transpose of the matrix.
 func (m *Matrix) T() *Matrix {
 	out := NewMatrix(m.Cols, m.Rows)

@@ -16,6 +16,7 @@ import (
 	"github.com/mattn/tensai/knn"
 	"github.com/mattn/tensai/layer"
 	"github.com/mattn/tensai/loss"
+	"github.com/mattn/tensai/metrics"
 	"github.com/mattn/tensai/model"
 	"github.com/mattn/tensai/optim"
 )
@@ -30,37 +31,35 @@ const (
 	seed       = 5
 )
 
-func argmaxRow(m *tensai.Matrix, row int) int {
-	best := 0
-	for c := 1; c < m.Cols; c++ {
-		if m.At(row, c) > m.At(row, best) {
-			best = c
-		}
-	}
-	return best
-}
-
-func evaluate(model model.Model, inputs, targets *tensai.Matrix) (int, [classCount][classCount]int, error) {
-	var confusion [classCount][classCount]int
-	correct := 0
-	// Predict in chunks: the CNN's im2col expansion over a whole split at
-	// once would be needlessly large.
+// predictChunked runs Predict over the split in chunks: the CNN's im2col
+// expansion over a whole split at once would be needlessly large.
+func predictChunked(model model.Model, inputs *tensai.Matrix) (*tensai.Matrix, error) {
+	out := tensai.NewMatrix(inputs.Rows, classCount)
 	const chunk = 500
 	for off := 0; off < inputs.Rows; off += chunk {
 		n := min(chunk, inputs.Rows-off)
 		view := &tensai.Matrix{Rows: n, Cols: imageSize, Data: inputs.Data[off*imageSize : (off+n)*imageSize]}
 		pred, err := model.Predict(view)
 		if err != nil {
-			return 0, confusion, err
+			return nil, err
 		}
-		for r := 0; r < n; r++ {
-			got := argmaxRow(pred, r)
-			want := int(targets.At(off+r, 0))
-			confusion[want][got]++
-			if got == want {
-				correct++
-			}
-		}
+		copy(out.Data[off*classCount:(off+n)*classCount], pred.Data)
+	}
+	return out, nil
+}
+
+func evaluate(model model.Model, inputs, targets *tensai.Matrix) (int, [][]int, error) {
+	pred, err := predictChunked(model, inputs)
+	if err != nil {
+		return 0, nil, err
+	}
+	correct, err := metrics.Correct(pred, targets)
+	if err != nil {
+		return 0, nil, err
+	}
+	confusion, err := metrics.Confusion(pred, targets)
+	if err != nil {
+		return 0, nil, err
 	}
 	return correct, confusion, nil
 }
@@ -211,12 +210,12 @@ func main() {
 	printConfusion(confusion)
 }
 
-func printConfusion(confusion [classCount][classCount]int) {
+func printConfusion(confusion [][]int) {
 	fmt.Println("\nconfusion matrix (rows = actual, columns = predicted):")
-	for r := 0; r < classCount; r++ {
+	for r := range confusion {
 		fmt.Printf("  %d:", r)
-		for c := 0; c < classCount; c++ {
-			fmt.Printf(" %4d", confusion[r][c])
+		for _, n := range confusion[r] {
+			fmt.Printf(" %4d", n)
 		}
 		fmt.Println()
 	}

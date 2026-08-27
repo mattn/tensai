@@ -3,6 +3,7 @@ package dataset
 import (
 	"fmt"
 	"math/rand"
+	"sort"
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/internal/kernels"
@@ -77,6 +78,71 @@ func (d *Dataset) Split(testFraction float64) (train, test *Dataset, err error) 
 	}
 	train = &Dataset{Inputs: view(d.Inputs, 0, trainRows), Targets: view(d.Targets, 0, trainRows)}
 	test = &Dataset{Inputs: view(d.Inputs, trainRows, testRows), Targets: view(d.Targets, trainRows, testRows)}
+	return train, test, nil
+}
+
+// Subset returns a new dataset holding copies of the given rows, in order.
+func (d *Dataset) Subset(rows []int) (*Dataset, error) {
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("tensai: subset of zero rows")
+	}
+	inCols, tgtCols := d.Inputs.Cols, d.Targets.Cols
+	inputs := tensai.NewMatrix(len(rows), inCols)
+	targets := tensai.NewMatrix(len(rows), tgtCols)
+	for i, r := range rows {
+		if r < 0 || r >= d.Len() {
+			return nil, fmt.Errorf("tensai: subset row %d out of range [0,%d)", r, d.Len())
+		}
+		copy(inputs.Data[i*inCols:(i+1)*inCols], d.Inputs.Data[r*inCols:(r+1)*inCols])
+		copy(targets.Data[i*tgtCols:(i+1)*tgtCols], d.Targets.Data[r*tgtCols:(r+1)*tgtCols])
+	}
+	return New(inputs, targets)
+}
+
+// SplitStratified divides the dataset like Split, but keeps the class
+// balance of both halves equal to the whole by splitting every class
+// separately. Targets must be a single column of class indices, the
+// convention the classification losses use. A non-nil rng shuffles each
+// class before the cut; nil keeps the original row order. Unlike Split,
+// the returned datasets copy their rows.
+func (d *Dataset) SplitStratified(testFraction float64, rng *rand.Rand) (train, test *Dataset, err error) {
+	if d.Targets.Cols != 1 {
+		return nil, nil, fmt.Errorf("tensai: stratified split needs single-column class targets, got %d columns", d.Targets.Cols)
+	}
+	if testFraction <= 0 || testFraction >= 1 {
+		return nil, nil, fmt.Errorf("tensai: split fraction must be in (0,1): %g", testFraction)
+	}
+	byClass := map[int][]int{}
+	var classes []int
+	for r := 0; r < d.Len(); r++ {
+		cls := int(d.Targets.At(r, 0))
+		if _, seen := byClass[cls]; !seen {
+			classes = append(classes, cls)
+		}
+		byClass[cls] = append(byClass[cls], r)
+	}
+	sort.Ints(classes)
+	var trainIdx, testIdx []int
+	for _, cls := range classes {
+		rows := byClass[cls]
+		if rng != nil {
+			rng.Shuffle(len(rows), func(i, j int) {
+				rows[i], rows[j] = rows[j], rows[i]
+			})
+		}
+		testRows := int(float64(len(rows))*testFraction + 0.5)
+		trainIdx = append(trainIdx, rows[:len(rows)-testRows]...)
+		testIdx = append(testIdx, rows[len(rows)-testRows:]...)
+	}
+	if len(trainIdx) == 0 || len(testIdx) == 0 {
+		return nil, nil, fmt.Errorf("tensai: split of %d samples at %g leaves an empty side", d.Len(), testFraction)
+	}
+	if train, err = d.Subset(trainIdx); err != nil {
+		return nil, nil, err
+	}
+	if test, err = d.Subset(testIdx); err != nil {
+		return nil, nil, err
+	}
 	return train, test, nil
 }
 
