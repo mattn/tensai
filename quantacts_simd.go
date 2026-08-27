@@ -2,7 +2,11 @@
 
 package tensai
 
-import "simd/archsimd"
+import (
+	"simd/archsimd"
+
+	"github.com/mattn/tensai/internal/simd"
+)
 
 // quantizeActsInto vectorizes the 7-bit activation quantizer with the
 // scalar path's exact rounding: |v|*inv + 0.5 truncates (Go's float to
@@ -11,7 +15,7 @@ import "simd/archsimd"
 // max-abs scan and the quantizing pass each run eight lanes wide; only
 // the byte narrowing stays scalar (the API has no saturating pack).
 func quantizeActsInto(x []Float, xu []uint8) Float {
-	if !hasAVX2 || len(x) < 16 {
+	if !simd.HasAVX2 || len(x) < 16 {
 		return quantizeActsScalar(x, xu)
 	}
 	vecEnd := len(x) &^ 7
@@ -19,10 +23,10 @@ func quantizeActsInto(x []Float, xu []uint8) Float {
 	mSign := archsimd.BroadcastInt32x8(0x7fffffff)
 	m := archsimd.BroadcastFloat32x8(0)
 	for i := 0; i < vecEnd; i += 8 {
-		m = m.Max(loadF32x8(x[i:]).AsInt32x8().And(mSign).AsFloat32x8())
+		m = m.Max(simd.LoadF32x8(x[i:]).AsInt32x8().And(mSign).AsFloat32x8())
 	}
 	var mb [8]Float
-	storeF32x8(m, mb[:])
+	simd.StoreF32x8(m, mb[:])
 	var maxAbs Float
 	for _, v := range mb {
 		if v > maxAbs {
@@ -51,10 +55,10 @@ func quantizeActsInto(x []Float, xu []uint8) Float {
 	c64 := archsimd.BroadcastInt32x8(64)
 	var buf [8]int32
 	for i := 0; i < vecEnd; i += 8 {
-		f := loadF32x8(x[i:])
+		f := simd.LoadF32x8(x[i:])
 		iv := f.AsInt32x8().And(mSign).AsFloat32x8().Mul(inv).Add(half).ConvertToInt32().Min(c63)
 		s := f.AsInt32x8().ShiftAllRight(31)
-		storeI32x8(iv.Xor(s).Sub(s).Add(c64), buf[:])
+		simd.StoreI32x8(iv.Xor(s).Sub(s).Add(c64), buf[:])
 		xu[i] = uint8(buf[0])
 		xu[i+1] = uint8(buf[1])
 		xu[i+2] = uint8(buf[2])

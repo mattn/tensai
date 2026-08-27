@@ -36,9 +36,9 @@ ndtensor.go         N-d Tensor: broadcasting element-wise ops, batched MatMul
 wgpu.go             WebGPU MatMul backend via purego + wgpu-native (build tag wgpu)
 dot_simd.go         AVX2 matmul kernel (GOEXPERIMENT=simd, amd64)
 dot_generic.go      Portable matmul kernel (all other builds)
-kernels.go          Scalar bodies of the element-wise kernels
-mathvec_simd.go     AVX2 element-wise kernels incl. vectorized exp
-mathvec_generic.go  Portable element-wise kernel dispatchers
+internal/kernels    Element-wise kernels: scalar bodies plus the AVX2 versions incl. vectorized exp
+internal/simd       Load/store shims over both simd/archsimd API generations
+internal/dims       Shape arithmetic shared with the GPU backend
 layer.go            Layer interface plus Dense and activations
 conv.go             Conv2D and MaxPool2D layers
 batchnorm.go        BatchNorm layer

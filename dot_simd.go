@@ -6,10 +6,9 @@ import (
 	"runtime"
 	"simd/archsimd"
 	"unsafe"
-)
 
-// hasAVX2 gates the vector kernel on the CPU actually supporting AVX2+FMA.
-var hasAVX2 = archsimd.X86.AVX2() && archsimd.X86.FMA()
+	"github.com/mattn/tensai/internal/simd"
+)
 
 // dotRows computes rows lo..hi of out = a * b with 8-lane float32 fused
 // multiply-adds, unrolled 4x.
@@ -21,7 +20,7 @@ var hasAVX2 = archsimd.X86.AVX2() && archsimd.X86.FMA()
 // (VPBROADCASTD) with a free bit-cast, and the column tail uses masked
 // part-loads instead of a scalar loop.
 func dotRows(out, a, b *Matrix, lo, hi int) {
-	if !hasAVX2 {
+	if !simd.HasAVX2 {
 		dotRowsGeneric(out, a, b, lo, hi)
 		return
 	}
@@ -45,31 +44,31 @@ func dotRows(out, a, b *Matrix, lo, hi int) {
 			var c int
 			if !initialized {
 				for ; c < wide; c += 32 {
-					storeF32x8(loadF32x8(bRow[c:]).Mul(vv), outRow[c:])
-					storeF32x8(loadF32x8(bRow[c+8:]).Mul(vv), outRow[c+8:])
-					storeF32x8(loadF32x8(bRow[c+16:]).Mul(vv), outRow[c+16:])
-					storeF32x8(loadF32x8(bRow[c+24:]).Mul(vv), outRow[c+24:])
+					simd.StoreF32x8(simd.LoadF32x8(bRow[c:]).Mul(vv), outRow[c:])
+					simd.StoreF32x8(simd.LoadF32x8(bRow[c+8:]).Mul(vv), outRow[c+8:])
+					simd.StoreF32x8(simd.LoadF32x8(bRow[c+16:]).Mul(vv), outRow[c+16:])
+					simd.StoreF32x8(simd.LoadF32x8(bRow[c+24:]).Mul(vv), outRow[c+24:])
 				}
 				for ; c < vecs; c += 8 {
-					storeF32x8(loadF32x8(bRow[c:]).Mul(vv), outRow[c:])
+					simd.StoreF32x8(simd.LoadF32x8(bRow[c:]).Mul(vv), outRow[c:])
 				}
 				if c < cols {
-					storeF32x8Part(loadF32x8Part(bRow[c:]).Mul(vv), outRow[c:])
+					simd.StoreF32x8Part(simd.LoadF32x8Part(bRow[c:]).Mul(vv), outRow[c:])
 				}
 				initialized = true
 				continue
 			}
 			for ; c < wide; c += 32 {
-				storeF32x8(loadF32x8(bRow[c:]).MulAdd(vv, loadF32x8(outRow[c:])), outRow[c:])
-				storeF32x8(loadF32x8(bRow[c+8:]).MulAdd(vv, loadF32x8(outRow[c+8:])), outRow[c+8:])
-				storeF32x8(loadF32x8(bRow[c+16:]).MulAdd(vv, loadF32x8(outRow[c+16:])), outRow[c+16:])
-				storeF32x8(loadF32x8(bRow[c+24:]).MulAdd(vv, loadF32x8(outRow[c+24:])), outRow[c+24:])
+				simd.StoreF32x8(simd.LoadF32x8(bRow[c:]).MulAdd(vv, simd.LoadF32x8(outRow[c:])), outRow[c:])
+				simd.StoreF32x8(simd.LoadF32x8(bRow[c+8:]).MulAdd(vv, simd.LoadF32x8(outRow[c+8:])), outRow[c+8:])
+				simd.StoreF32x8(simd.LoadF32x8(bRow[c+16:]).MulAdd(vv, simd.LoadF32x8(outRow[c+16:])), outRow[c+16:])
+				simd.StoreF32x8(simd.LoadF32x8(bRow[c+24:]).MulAdd(vv, simd.LoadF32x8(outRow[c+24:])), outRow[c+24:])
 			}
 			for ; c < vecs; c += 8 {
-				storeF32x8(loadF32x8(bRow[c:]).MulAdd(vv, loadF32x8(outRow[c:])), outRow[c:])
+				simd.StoreF32x8(simd.LoadF32x8(bRow[c:]).MulAdd(vv, simd.LoadF32x8(outRow[c:])), outRow[c:])
 			}
 			if c < cols {
-				storeF32x8Part(loadF32x8Part(bRow[c:]).MulAdd(vv, loadF32x8Part(outRow[c:])), outRow[c:])
+				simd.StoreF32x8Part(simd.LoadF32x8Part(bRow[c:]).MulAdd(vv, simd.LoadF32x8Part(outRow[c:])), outRow[c:])
 			}
 		}
 		if !initialized {
@@ -93,7 +92,7 @@ func dotWorkerCount(rows, inner, cols int) int {
 // SSE-free 8-lane FMA pattern as dotRows: a's element is fetched as integer
 // bits for the zero test and broadcast through an integer register.
 func dotTARows(out, a, b *Matrix, lo, hi int) {
-	if !hasAVX2 {
+	if !simd.HasAVX2 {
 		dotTARowsGeneric(out, a, b, lo, hi)
 		return
 	}
@@ -114,16 +113,16 @@ func dotTARows(out, a, b *Matrix, lo, hi int) {
 			vv := archsimd.BroadcastUint32x8(aBits[i]).AsFloat32x8()
 			var c int
 			for ; c < wide; c += 32 {
-				storeF32x8(loadF32x8(bRow[c:]).MulAdd(vv, loadF32x8(outRow[c:])), outRow[c:])
-				storeF32x8(loadF32x8(bRow[c+8:]).MulAdd(vv, loadF32x8(outRow[c+8:])), outRow[c+8:])
-				storeF32x8(loadF32x8(bRow[c+16:]).MulAdd(vv, loadF32x8(outRow[c+16:])), outRow[c+16:])
-				storeF32x8(loadF32x8(bRow[c+24:]).MulAdd(vv, loadF32x8(outRow[c+24:])), outRow[c+24:])
+				simd.StoreF32x8(simd.LoadF32x8(bRow[c:]).MulAdd(vv, simd.LoadF32x8(outRow[c:])), outRow[c:])
+				simd.StoreF32x8(simd.LoadF32x8(bRow[c+8:]).MulAdd(vv, simd.LoadF32x8(outRow[c+8:])), outRow[c+8:])
+				simd.StoreF32x8(simd.LoadF32x8(bRow[c+16:]).MulAdd(vv, simd.LoadF32x8(outRow[c+16:])), outRow[c+16:])
+				simd.StoreF32x8(simd.LoadF32x8(bRow[c+24:]).MulAdd(vv, simd.LoadF32x8(outRow[c+24:])), outRow[c+24:])
 			}
 			for ; c < vecs; c += 8 {
-				storeF32x8(loadF32x8(bRow[c:]).MulAdd(vv, loadF32x8(outRow[c:])), outRow[c:])
+				simd.StoreF32x8(simd.LoadF32x8(bRow[c:]).MulAdd(vv, simd.LoadF32x8(outRow[c:])), outRow[c:])
 			}
 			if c < cols {
-				storeF32x8Part(loadF32x8Part(bRow[c:]).MulAdd(vv, loadF32x8Part(outRow[c:])), outRow[c:])
+				simd.StoreF32x8Part(simd.LoadF32x8Part(bRow[c:]).MulAdd(vv, simd.LoadF32x8Part(outRow[c:])), outRow[c:])
 			}
 		}
 	}

@@ -3,6 +3,8 @@ package tensai
 import (
 	"errors"
 	"fmt"
+
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 // Loss is a differentiable loss function operating on a prediction batch
@@ -93,17 +95,17 @@ func (SoftmaxCrossEntropy) LossInto(pred, target, grad *Matrix) (Float, error) {
 				maxVal = v
 			}
 		}
-		expShift(probs, row, maxVal)
+		kernels.ExpShift(probs, row, maxVal)
 		var denom Float
 		for _, e := range probs {
 			denom += e
 		}
-		scaleSlice(probs, 1/denom)
+		kernels.ScaleSlice(probs, 1/denom)
 
-		loss -= logF(probs[cls] + 1e-12)
+		loss -= kernels.LogF(probs[cls] + 1e-12)
 
 		// Gradient of softmax+CE is (p - onehot) / batch.
-		scaleSlice(probs, invRows)
+		kernels.ScaleSlice(probs, invRows)
 		probs[cls] -= invRows
 	}
 	return loss * invRows, nil
@@ -143,7 +145,7 @@ func (BinaryCrossEntropy) LossInto(pred, target, grad *Matrix) (Float, error) {
 			p = 1 - eps
 		}
 		t := target.Data[i]
-		sum -= t*logF(p) + (1-t)*logF(1-p)
+		sum -= t*kernels.LogF(p) + (1-t)*kernels.LogF(1-p)
 		grad.Data[i] = (p - t) / (p * (1 - p) * n)
 	}
 	return sum / n, nil

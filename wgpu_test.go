@@ -6,6 +6,9 @@ import (
 	"math"
 	"math/rand"
 	"testing"
+
+	"github.com/mattn/tensai/internal/dims"
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 func openTestGPU(t *testing.T) *GPU {
@@ -40,7 +43,7 @@ func TestGPUMatMul(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cpu matmul: %v", err)
 		}
-		if !sameDims(got.Shape, want.Shape) {
+		if !dims.Same(got.Shape, want.Shape) {
 			t.Fatalf("shape: got %v want %v", got.Shape, want.Shape)
 		}
 		for i := range want.Data {
@@ -99,7 +102,7 @@ func TestGPUTensorResident(t *testing.T) {
 		t.Fatalf("upload: %v", err)
 	}
 	defer gw.Free()
-	if !sameDims(gw.Shape(), []int{64, 32}) || gw.Size() != 64*32 {
+	if !dims.Same(gw.Shape(), []int{64, 32}) || gw.Size() != 64*32 {
 		t.Fatalf("shape/size: %v %d", gw.Shape(), gw.Size())
 	}
 	for i := 0; i < 3; i++ {
@@ -120,7 +123,7 @@ func TestGPUTensorResident(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cpu matmul: %v", err)
 		}
-		if !sameDims(got.Shape, want.Shape) {
+		if !dims.Same(got.Shape, want.Shape) {
 			t.Fatalf("shape: got %v want %v", got.Shape, want.Shape)
 		}
 		for j := range want.Data {
@@ -210,7 +213,7 @@ func cpuSoftmaxLast(x *Tensor) {
 		}
 		var sum Float
 		for i, v := range row {
-			row[i] = expF(v - maxv)
+			row[i] = kernels.ExpF(v - maxv)
 			sum += row[i]
 		}
 		for i := range row {
@@ -247,7 +250,7 @@ func TestGPUKernels(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sameDims(got.Shape, want.Shape) {
+	if !dims.Same(got.Shape, want.Shape) {
 		t.Fatalf("matmul-t shape: got %v want %v", got.Shape, want.Shape)
 	}
 	for i := range want.Data {
@@ -333,13 +336,13 @@ func TestGPUAttention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scores.Scale(1 / sqrtF(8))
+	scores.Scale(1 / kernels.SqrtF(8))
 	cpuSoftmaxLast(scores)
 	want, err := MatMul(scores, v)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sameDims(got.Shape, want.Shape) {
+	if !dims.Same(got.Shape, want.Shape) {
 		t.Fatalf("shape: got %v want %v", got.Shape, want.Shape)
 	}
 	for i := range want.Data {
@@ -360,7 +363,7 @@ func cpuAttention(t *testing.T, q, k, v *Tensor) *Tensor {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.Scale(1 / sqrtF(Float(q.Shape[len(q.Shape)-1])))
+	s.Scale(1 / kernels.SqrtF(Float(q.Shape[len(q.Shape)-1])))
 	cpuSoftmaxLast(s)
 	out, err := MatMul(s, v)
 	if err != nil {
@@ -395,7 +398,7 @@ func TestGPUMultiHeadAttention(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !sameDims(got.Shape, []int{batch, seq, d}) {
+	if !dims.Same(got.Shape, []int{batch, seq, d}) {
 		t.Fatalf("shape: got %v", got.Shape)
 	}
 

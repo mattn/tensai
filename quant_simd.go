@@ -2,7 +2,11 @@
 
 package tensai
 
-import "simd/archsimd"
+import (
+	"simd/archsimd"
+
+	"github.com/mattn/tensai/internal/simd"
+)
 
 // 256-bit AVX2 kernels for the int8 matvec and matmul over the quad-row
 // layout: a 32-byte weight load holds eight columns four rows deep, the
@@ -24,7 +28,7 @@ func qxQuad(xu []uint8, i4 int) uint32 {
 }
 
 func qmatvecCols(out []Float, xu []uint8, sx Float, qw []int8, scale []Float, colSum64 []int32, cols, lo, hi int) {
-	if !hasAVX2 {
+	if !simd.HasAVX2 {
 		qmatvecColsGeneric(out, xu, sx, qw, scale, colSum64, cols, lo, hi)
 		return
 	}
@@ -37,16 +41,16 @@ func qmatvecCols(out []Float, xu []uint8, sx Float, qw []int8, scale []Float, co
 		for i4 := 0; i4 < quads; i4++ {
 			xp := archsimd.BroadcastUint32x8(qxQuad(xu, i4)).AsUint8x32()
 			row := tile[i4*4*q4Tile:]
-			a0 = a0.Add(xp.DotProductPairsSaturated(loadI8x32(row)).DotProductPairs(ones))
-			a1 = a1.Add(xp.DotProductPairsSaturated(loadI8x32(row[32:])).DotProductPairs(ones))
-			a2 = a2.Add(xp.DotProductPairsSaturated(loadI8x32(row[64:])).DotProductPairs(ones))
-			a3 = a3.Add(xp.DotProductPairsSaturated(loadI8x32(row[96:])).DotProductPairs(ones))
+			a0 = a0.Add(xp.DotProductPairsSaturated(simd.LoadI8x32(row)).DotProductPairs(ones))
+			a1 = a1.Add(xp.DotProductPairsSaturated(simd.LoadI8x32(row[32:])).DotProductPairs(ones))
+			a2 = a2.Add(xp.DotProductPairsSaturated(simd.LoadI8x32(row[64:])).DotProductPairs(ones))
+			a3 = a3.Add(xp.DotProductPairsSaturated(simd.LoadI8x32(row[96:])).DotProductPairs(ones))
 		}
 		sxv := archsimd.BroadcastFloat32x8(sx)
 		for k, a := range [4]archsimd.Int32x8{a0, a1, a2, a3} {
 			j := jt + 8*k
-			f := a.Sub(loadI32x8(colSum64[j:])).ConvertToFloat32().Mul(loadF32x8(scale[j:])).Mul(sxv)
-			storeF32x8(f, out[j:])
+			f := a.Sub(simd.LoadI32x8(colSum64[j:])).ConvertToFloat32().Mul(simd.LoadF32x8(scale[j:])).Mul(sxv)
+			simd.StoreF32x8(f, out[j:])
 		}
 	}
 	archsimd.ClearAVXUpperBits()
@@ -60,7 +64,7 @@ func qmatvecCols(out []Float, xu []uint8, sx Float, qw []int8, scale []Float, co
 // weight stream that dominates a single matvec amortizes eightfold while
 // every row still costs just the two multiplies per load.
 func qmatmulRows8(out *Matrix, xus [][]uint8, xq []uint32, sxs []Float, r0 int, qw []int8, scale []Float, colSum64 []int32, cols, lo, hi int) {
-	if !hasAVX2 {
+	if !simd.HasAVX2 {
 		qmatmulRows8Generic(out, xus, sxs, r0, qw, scale, colSum64, cols, lo, hi)
 		return
 	}
@@ -75,7 +79,7 @@ func qmatmulRows8(out *Matrix, xus [][]uint8, xq []uint32, sxs []Float, r0 int, 
 		tile := qw[(jt/q4Tile)*quads*4*q4Tile+(jt%q4Tile)*4:]
 		var a0, a1, a2, a3, a4, a5, a6, a7 archsimd.Int32x8
 		for i4 := 0; i4 < quads; i4++ {
-			w := loadI8x32(tile[i4*4*q4Tile:])
+			w := simd.LoadI8x32(tile[i4*4*q4Tile:])
 			xf := xq[i4*8 : i4*8+8]
 			a0 = a0.Add(archsimd.BroadcastUint32x8(xf[0]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))
 			a1 = a1.Add(archsimd.BroadcastUint32x8(xf[1]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))
@@ -86,11 +90,11 @@ func qmatmulRows8(out *Matrix, xus [][]uint8, xq []uint32, sxs []Float, r0 int, 
 			a6 = a6.Add(archsimd.BroadcastUint32x8(xf[6]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))
 			a7 = a7.Add(archsimd.BroadcastUint32x8(xf[7]).AsUint8x32().DotProductPairsSaturated(w).DotProductPairs(ones))
 		}
-		cs := loadI32x8(colSum64[jt:])
-		sc := loadF32x8(scale[jt:])
+		cs := simd.LoadI32x8(colSum64[jt:])
+		sc := simd.LoadF32x8(scale[jt:])
 		for r, a := range [8]archsimd.Int32x8{a0, a1, a2, a3, a4, a5, a6, a7} {
 			f := a.Sub(cs).ConvertToFloat32().Mul(sc).Mul(archsimd.BroadcastFloat32x8(sxs[r]))
-			storeF32x8(f, out.Data[(r0+r)*cols+jt:])
+			simd.StoreF32x8(f, out.Data[(r0+r)*cols+jt:])
 		}
 	}
 	archsimd.ClearAVXUpperBits()

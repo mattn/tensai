@@ -47,3 +47,15 @@ func BenchmarkFitStepMLP(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkTranspose1024(b *testing.B) {
+	src := NewMatrix(1024, 1024)
+	dst := NewMatrix(1024, 1024)
+	b.SetBytes(int64(len(src.Data) * 4))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := TInto(dst, src); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -3,22 +3,16 @@ package tensai
 import (
 	"errors"
 	"fmt"
-	"math"
 	"math/rand"
 	"sync"
+
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 // Float is the element type of every tensor. float32 halves memory traffic
 // versus float64 and enables the 8-lane AVX2 kernel (see dot_simd.go); its
 // ~7 decimal digits are plenty for neural-network training.
 type Float = float32
-
-// float32 wrappers for the float64-only math package.
-func expF(x Float) Float    { return Float(math.Exp(float64(x))) }
-func logF(x Float) Float    { return Float(math.Log(float64(x))) }
-func tanhF(x Float) Float   { return Float(math.Tanh(float64(x))) }
-func sqrtF(x Float) Float   { return Float(math.Sqrt(float64(x))) }
-func powF(x, y Float) Float { return Float(math.Pow(float64(x), float64(y))) }
 
 // Matrix is a row-major 2D tensor of Float.
 type Matrix struct {
@@ -280,7 +274,7 @@ func (m *Matrix) Scale(s Float) {
 func RandomMatrix(rows, cols int, rng *rand.Rand) *Matrix {
 	m := NewMatrix(rows, cols)
 	// He / Glorot-style scaling keeps early training stable.
-	scale := sqrtF(2.0 / Float(rows+cols))
+	scale := kernels.SqrtF(2.0 / Float(rows+cols))
 	for i := range m.Data {
 		m.Data[i] = Float(rng.NormFloat64()) * scale
 	}
@@ -305,7 +299,7 @@ func DotVec(a, b []Float) Float {
 	if len(a) != len(b) {
 		panic("tensai: DotVec length mismatch")
 	}
-	return dotVec(a, b)
+	return kernels.DotVec(a, b)
 }
 
 // Axpy computes y += a*x elementwise over equally long vectors — the
@@ -314,7 +308,7 @@ func Axpy(a Float, x, y []Float) {
 	if len(x) != len(y) {
 		panic("tensai: Axpy length mismatch")
 	}
-	axpy(a, x, y)
+	kernels.Axpy(a, x, y)
 }
 
 // SiluMul computes gate[i] = silu(gate[i]) * up[i] in place — the SwiGLU
@@ -326,7 +320,7 @@ func SiluMul(gate, up []Float) {
 	if len(gate) != len(up) {
 		panic("tensai: SiluMul length mismatch")
 	}
-	siluMul(gate, up)
+	kernels.SiluMul(gate, up)
 }
 
 // DotVecs is the grouped-query form of DotVec: out[i] gets the dot of k
@@ -338,7 +332,7 @@ func DotVecs(qs, k []Float, out []Float) {
 	if len(qs) != len(out)*len(k) {
 		panic("tensai: DotVecs length mismatch")
 	}
-	dotVecs(qs, k, out)
+	kernels.DotVecs(qs, k, out)
 }
 
 // Axpys is the grouped form of Axpy: the i-th of len(ws) rows packed
@@ -349,5 +343,5 @@ func Axpys(ws []Float, v, outs []Float) {
 	if len(outs) != len(ws)*len(v) {
 		panic("tensai: Axpys length mismatch")
 	}
-	axpys(ws, v, outs)
+	kernels.Axpys(ws, v, outs)
 }

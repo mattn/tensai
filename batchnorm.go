@@ -3,6 +3,8 @@ package tensai
 import (
 	"fmt"
 	"math/rand"
+
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 // BatchNorm normalizes each feature column over the batch, then applies a
@@ -71,7 +73,7 @@ func (b *BatchNorm) Forward(input *Matrix) (*Matrix, error) {
 		for r := 0; r < input.Rows; r++ {
 			for c := 0; c < cols; c++ {
 				x := input.Data[r*cols+c]
-				xn := (x - b.runMean[c]) / sqrtF(b.runVar[c]+b.Eps)
+				xn := (x - b.runMean[c]) / kernels.SqrtF(b.runVar[c]+b.Eps)
 				out.Data[r*cols+c] = b.gamma.Data[c]*xn + b.beta[c]
 			}
 		}
@@ -97,7 +99,7 @@ func (b *BatchNorm) Forward(input *Matrix) (*Matrix, error) {
 			variance += d * d
 		}
 		variance /= m
-		b.invStd[c] = 1 / sqrtF(variance+b.Eps)
+		b.invStd[c] = 1 / kernels.SqrtF(variance+b.Eps)
 		for r := 0; r < input.Rows; r++ {
 			xn := (input.Data[r*cols+c] - mean) * b.invStd[c]
 			b.xhat.Data[r*cols+c] = xn
