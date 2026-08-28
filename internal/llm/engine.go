@@ -106,6 +106,11 @@ type Engine struct {
 // model, and the GPU residency, returning an Engine positioned at an
 // empty context.
 func Open(o Options) (*Engine, error) {
+	// An empty Repo means the caller named a model already on disk, so
+	// nothing here may reach the network: the default repo that fills in
+	// below addresses a different checkpoint, and a file fetched from it
+	// would be another model's.
+	local := o.Repo == ""
 	if o.Repo == "" {
 		o.Repo = DefaultRepo
 	}
@@ -140,6 +145,7 @@ func Open(o Options) (*Engine, error) {
 		if model, err = loadQwen(paths[1], weights, o.Bits); err != nil {
 			return nil, err
 		}
+		model.cfg.ChatTemplate = chatTemplate(base, o.Data, local)
 	}
 	how := "float32"
 	if o.Bits != 0 {
@@ -192,6 +198,15 @@ func Open(o Options) (*Engine, error) {
 		}
 	}
 	tm := templateFor(style, o.Think)
+	// The family table says which markers the model speaks, and only a
+	// convention tensai renders can be offered at all -- so the
+	// checkpoint's own template only ever takes the capability away,
+	// never grants one the server could not write. A template that never
+	// branches on tools is the checkpoint saying it was not prepared for
+	// them, whatever its family does.
+	if tpl := model.cfg.ChatTemplate; tpl != "" && !templateTakesTools(tpl) {
+		tm.toolCalls = ""
+	}
 	stopID := func(i int) int {
 		if i < len(tm.stops) {
 			if id, ok := tok.ID(tm.stops[i]); ok {
@@ -690,6 +705,68 @@ func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 		}
 	}
 	return cands[0].id
+}
+
+// chatTemplate returns the model's own Jinja chat template, or "" when
+// the checkpoint does not ship one. Older checkpoints keep it in
+// tokenizer_config.json; newer ones moved it to a file of its own and
+// leave the JSON field empty. Neither file is needed to run the model,
+// so a miss costs nothing but the answer -- and for a model the caller
+// named on disk the files are read where they are, never downloaded,
+// since the repo in hand is not the one they came from.
+func chatTemplate(base, dir string, local bool) string {
+	get := func(name string) (string, bool) {
+		if local {
+			p := filepath.Join(dir, name)
+			if _, err := os.Stat(p); err != nil {
+				return "", false
+			}
+			raw, err := os.ReadFile(p)
+			return string(raw), err == nil
+		}
+		p, err := fetch(base, dir, name)
+		if err != nil {
+			return "", false
+		}
+		raw, err := os.ReadFile(p)
+		return string(raw), err == nil
+	}
+	if raw, ok := get("tokenizer_config.json"); ok {
+		var cfg struct {
+			ChatTemplate string `json:"chat_template"`
+		}
+		if json.Unmarshal([]byte(raw), &cfg) == nil && cfg.ChatTemplate != "" {
+			return cfg.ChatTemplate
+		}
+	}
+	if raw, ok := get("chat_template.jinja"); ok {
+		return raw
+	}
+	return ""
+}
+
+// templateTakesTools reports whether a chat template branches on the
+// tool definitions it may be handed. A template prepared for calling has
+// to name that variable to render the signatures at all, so its absence
+// is the checkpoint saying it was never prepared for this. The match is
+// on the Jinja idioms that read the variable rather than the bare word,
+// which also appears in templates that only mention tools in prose.
+func templateTakesTools(tpl string) bool {
+	flat := strings.ToLower(strings.Join(strings.Fields(tpl), " "))
+	for _, idiom := range []string{
+		"if tools",         // Qwen, Hermes, Mistral
+		"if tools is",      // Llama 3.1 ("is not none")
+		"in tools",         // "for tool in tools"
+		"tools is defined", // Gemma-style guards
+		"tools %}",         // bare interpolation of the list
+		"tools|",           // filtered, e.g. "tools|tojson"
+		"tools |",
+	} {
+		if strings.Contains(flat, idiom) {
+			return true
+		}
+	}
+	return false
 }
 
 // tmpl is the chat template family a model speaks: ChatML for the Qwen

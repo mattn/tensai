@@ -45,6 +45,12 @@ type config struct {
 	// architecture — DeepSeek's R1 distills are qwen2/llama blocks that
 	// speak DeepSeek's turn markers. Set by the GGUF loader, never JSON.
 	ChatStyle string `json:"-"`
+	// ChatTemplate is the model's own Jinja template when the checkpoint
+	// carries one. It is not rendered -- the turn markers come from the
+	// family table -- but it is the only honest answer to whether this
+	// checkpoint was prepared for tool calling, which its own template
+	// either branches on or does not. Empty when the files hold none.
+	ChatTemplate string `json:"-"`
 	// MoE dimensions (qwen2moe/qwen3moe/gpt-oss), from GGUF metadata.
 	NExpert     int `json:"-"`
 	NExpertUsed int `json:"-"`

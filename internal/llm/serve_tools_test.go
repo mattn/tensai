@@ -151,3 +151,41 @@ func TestFamiliesWithoutToolConvention(t *testing.T) {
 		}
 	}
 }
+
+// Excerpts of the real templates these checkpoints ship, which is the
+// only thing that says whether they were prepared to be offered tools.
+const (
+	qwenTemplate = `{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- for tool in tools %}
+        {{- "\n" }}{{- tool | tojson }}
+    {%- endfor %}`
+	llamaTemplate = `{%- if tools is not none %}
+    {{- "Environment: ipython\n" }}
+{%- endif %}`
+	// SmolLM2 ships 368 characters that never mention the variable.
+	smolTemplate = `{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}` +
+		`{{ '<|im_start|>system\nYou are a helpful AI assistant named SmolLM<|im_end|>\n' }}{% endif %}` +
+		`{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}`
+	// Prose about tools is not a branch on them.
+	proseTemplate = `{% for m in messages %}{{ "You have no tools available." + m['content'] }}{% endfor %}`
+)
+
+func TestTemplateTakesTools(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		tpl  string
+		want bool
+	}{
+		{"qwen", qwenTemplate, true},
+		{"llama 3.1", llamaTemplate, true},
+		{"smollm2", smolTemplate, false},
+		{"prose only", proseTemplate, false},
+		{"empty", "", false},
+		{"odd spacing", "{%-   if   tools   %}", true},
+	} {
+		if got := templateTakesTools(tt.tpl); got != tt.want {
+			t.Errorf("templateTakesTools(%s) = %v, want %v", tt.name, got, tt.want)
+		}
+	}
+}
