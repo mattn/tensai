@@ -145,6 +145,20 @@ the same place, and those are counted separately rather than listed as models;
 
 `serve` exposes `/v1/chat/completions` (messages array, SSE streaming, usage counts), so any OpenAI client pointed at it chats with a pure-Go model. A built-in chat demo page is served on `GET /`.
 
+### Thinking
+
+With `-think`, a model that reasons before it answers keeps the two apart on the wire: the block it writes first arrives as `reasoning_content` and only the reply is `content`, streaming as its own deltas, so a client can show the thinking as thinking or drop it. Reasoning never goes back into the prompt — replayed history keeps the answer and loses the thinking, as the model's own template does.
+
+```json
+"message": {
+  "role": "assistant",
+  "reasoning_content": "Okay, the user is asking for 17 multiplied by 3...",
+  "content": "17 multiplied by 3 is 51."
+}
+```
+
+Without `-think` the qwen3 and smollm3 families open the turn with an empty block, so there is nothing to separate. gpt-oss reasons in harmony channels instead, which this does not cover.
+
 ### Tool calling
 
 Pass `tools` and the model can answer with `tool_calls` instead of prose, which is what an agent needs to drive a loop:
