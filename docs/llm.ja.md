@@ -43,7 +43,7 @@ The capital of France is Paris.
 
 `-q8`/`-q4` では各重みがロードと同時に量子化され、float32 コピーは即座に破棄されます。フル精度のモデルがメモリに収まる必要はありません。量子化済み GGUF チェックポイントは float32 の回り道を完全にスキップします: Q8_0, Q4_0, Q5_0, Q4_K/Q5_K/Q6_K の K-quant 系、MXFP4 がメモリマップしたファイルから直接リパックされ、llama.cpp 自身の量子化がそのまま保たれます。1.5B の Q4_K_M は約 8 秒が約 3 秒に、3B の Q8_0 は 32 秒が 5 秒で開きます (`-requant` は float 経由に戻し、ずっと遅いロードと引き換えにデコードが約 10% 速くなります)。
 
-最初の `-gguf` ロードはリパック済みの重みをモデルの隣のキャッシュファイルに書き (`-nocache` でオプトアウト)、以後のロードはそれをメモリマップするだけです: 1.5B Q4_K_M は約 0.3 秒で、Mistral 7B は 1 秒未満で、gpt-oss-20b は 2 秒未満で再オープンします。マップされた重みはカーネルがいつでも破棄・再読込できるクリーンなファイルバックのページなので、モデルがぎりぎり収まるマシンではスワップのスラッシングが普通のページキャッシュの挙動に置き換わります。
+最初の `.gguf` ロードはリパック済みの重みをモデルの隣のキャッシュファイルに書き (`-nocache` でオプトアウト)、以後のロードはそれをメモリマップするだけです: 1.5B Q4_K_M は約 0.3 秒で、Mistral 7B は 1 秒未満で、gpt-oss-20b は 2 秒未満で再オープンします。マップされた重みはカーネルがいつでも破棄・再読込できるクリーンなファイルバックのページなので、モデルがぎりぎり収まるマシンではスワップのスラッシングが普通のページキャッシュの挙動に置き換わります。
 
 15GB のマシンでの階段はこうなります: 0.5B が `-q8` で約 40 tok/s、1.5B Q4_K_M が `-q4` で約 25 tok/s (タイル化整数カーネル、ネイティブ Windows)、そして Qwen2.5-**7B**-Instruct — 15GB の BF16 シャードを 2 分のロード中にオンザフライで int4 量子化して常駐約 6GB に — が 3.5 tok/s で正しく答えます。
 
@@ -71,12 +71,26 @@ commands:
   version  print the version
 ```
 
-モデルを使うコマンドは同じフラグを共有します: `-repo` (ダウンロード元の Hugging Face リポジトリ)、`-gguf` (1 つの .gguf からすべてロード)、`-q8`/`-q4`、`-gpu`、`-draft`、`-think`、`-system`、`-temp`、`-topp`、`-seed` など — 完全なリストは `tensai <command> -h` で。
+モデルを使うコマンドは同じフラグを共有します: `-model` (どのモデルを実行するか)、`-data` (ダウンロードのキャッシュ先)、`-q8`/`-q4`、`-gpu`、`-draft`、`-think`、`-system`、`-temp`、`-topp`、`-seed` など — 完全なリストは `tensai <command> -h` で。
+
+どのモデルを実行するかを言うのは `-model` だけで、次の順に解釈します:
+
+| 形式 | 例 |
+|---|---|
+| `tensai models` が出す名前 | `-model Qwen3-0.6B`、`-model qwen2.5-0.5b-instruct-q8_0` |
+| ディレクトリまたは `.gguf` のパス | `-model ./model.gguf`、`-model /srv/checkpoints/qwen` |
+| Hugging Face リポジトリ (初回にダウンロード) | `-model Qwen/Qwen3-4B-Instruct-2507` |
+
+省略すると既定のチェックポイントです。ローカル指定が勝手にダウンロードすることは
+ありません — キャッシュに無く、取得元の組織名も無い名前はエラーになり、一覧を案内
+します。`-data` はダウンロードのキャッシュ先を上書きするもので、モデルが既にローカル
+にある場合は黙って無視せずその旨を伝えます。`-draft` も同じ形式を受けます (`.gguf` を除く)。
 
 ```bash
 tensai run -q8 "What is the capital of France?"
+tensai run -q8 -model Qwen3-0.6B "Explain RoPE briefly"   # "tensai models" の名前をそのまま
 tensai run -q8 -json "Explain RoPE briefly"      # 補完と使用量を 1 つの JSON で
-tensai chat -q8 -gguf model.gguf                 # マルチターン。KV キャッシュが対話全体を運ぶ
+tensai chat -q8 -model ./model.gguf              # マルチターン。KV キャッシュが対話全体を運ぶ
 tensai models                                    # キャッシュ一覧。"models rm <name>" で削除
 tensai bench -q8                                 # CPU vs GPU のプレフィル/デコード比較
 ```

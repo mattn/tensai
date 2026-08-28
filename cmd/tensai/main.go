@@ -48,22 +48,21 @@ Run "tensai <command> -h" for the command's flags.`
 // Options they fill.
 func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 	o := &llm.Options{Log: os.Stderr}
-	fs.StringVar(&o.Data, "data", "", "directory for the downloaded model files (default: a per-repo directory under the user cache)")
-	fs.StringVar(&o.Repo, "repo", llm.DefaultRepo, "Hugging Face repo to download missing model files from")
-	fs.StringVar(&o.GGUF, "gguf", "", "load model and tokenizer from a single .gguf file instead of -data/-repo")
+	model := fs.String("model", "", `which model to run: a name from "tensai models", a path to a directory or .gguf, or a Hugging Face repo to download`)
+	data := fs.String("data", "", "directory to cache a downloaded model in (default: a per-repo directory under the user cache)")
 	q8 := fs.Bool("q8", false, "decode against int8-quantized weights")
 	q4 := fs.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
 	fs.BoolVar(&o.GPU, "gpu", false, "decode on the GPU (requires -q8 or -q4 and a wgpu build tag)")
 	fs.BoolVar(&o.Requant, "requant", false, "requantize gguf weights through float32 instead of repacking their stored blocks")
-	fs.BoolVar(&o.NoCache, "nocache", false, "neither write nor reuse the repack cache file the first -gguf load leaves next to the model")
-	fs.StringVar(&o.Draft, "draft", "", "data directory of a smaller draft model for speculative decoding")
+	fs.BoolVar(&o.NoCache, "nocache", false, "neither write nor reuse the repack cache file the first .gguf load leaves next to the model")
+	draft := fs.String("draft", "", "a smaller same-family model for speculative decoding, named the way -model is")
 	fs.IntVar(&o.SpecK, "spec", 3, "draft tokens proposed per speculative step")
 	fs.BoolVar(&o.Think, "think", false, "let Qwen3 models reason in a <think> block before answering")
 	fs.StringVar(&o.System, "system", llm.DefaultSystem, "system message for the chat template")
 	fs.Float64Var(&o.Temp, "temp", 0, "sampling temperature; 0 = greedy")
 	fs.Float64Var(&o.TopP, "topp", 0.9, "nucleus sampling: keep the smallest set of tokens with this much probability mass (1 disables)")
 	fs.Int64Var(&o.Seed, "seed", 1, "sampling seed for -temp > 0")
-	// Bits and the default data directory resolve only after Parse.
+	// Bits and the model reference resolve only after Parse.
 	finish := func() {
 		if *q8 {
 			o.Bits = 8
@@ -71,11 +70,103 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 		if *q4 {
 			o.Bits = 4
 		}
-		if o.Data == "" && o.GGUF == "" {
-			o.Data = llm.DefaultDataDir(o.Repo)
+		if err := resolveModel(o, *model, *data); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		if *draft != "" {
+			d := &llm.Options{}
+			if err := resolveModel(d, *draft, ""); err != nil || d.GGUF != "" {
+				fmt.Fprintf(os.Stderr, "-draft wants a model directory or a cached name, not %q\n", *draft)
+				os.Exit(2)
+			}
+			o.Draft = d.Data
 		}
 	}
 	return o, finish
+}
+
+// resolveModel turns the one thing a caller says about a model into the
+// three the loader wants. A reference is, in order: empty for the default
+// checkpoint; an existing path, to a .gguf or to a directory; a bare name
+// in the cache, exactly as "tensai models" prints it; or, failing all of
+// those, a Hugging Face repo to download. dataDir overrides where a
+// download is cached and is meaningless for the local forms.
+func resolveModel(o *llm.Options, ref, dataDir string) error {
+	if ref == "" {
+		o.Repo = llm.DefaultRepo
+		o.Data = dataDir
+		if o.Data == "" {
+			o.Data = llm.DefaultDataDir(o.Repo)
+		}
+		return nil
+	}
+	local := func(p string) error {
+		info, err := os.Stat(p)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			// The same test the listing uses: a model directory is one
+			// the loader can read a config.json out of, which keeps a
+			// dataset directory from being mistaken for a checkpoint.
+			if _, err := os.Stat(filepath.Join(p, "config.json")); err != nil {
+				return fmt.Errorf("%s has no config.json, so it is not a model directory", p)
+			}
+			o.Data = p
+			return nil
+		}
+		if !strings.HasSuffix(p, ".gguf") {
+			return fmt.Errorf("%s is not a model directory or a .gguf file", p)
+		}
+		o.GGUF = p
+		return nil
+	}
+	// A path the user spelled out wins, so a directory named like a repo
+	// still resolves to the directory in front of them. Something that
+	// exists but is not a model is an error: falling through would send
+	// a typo to the network as if it were a repo.
+	if strings.ContainsAny(ref, `/\`) || ref == "." || ref == ".." {
+		if _, err := os.Stat(ref); err == nil {
+			if err := local(ref); err != nil {
+				return err
+			}
+			return dataUnused(dataDir, ref)
+		}
+	}
+	root := llm.CacheRoot()
+	if ref == filepath.Base(ref) {
+		for _, cand := range []string{ref, ref + ".gguf"} {
+			p := filepath.Join(root, cand)
+			if _, err := os.Stat(p); err != nil {
+				continue
+			}
+			if err := local(p); err != nil {
+				return err
+			}
+			return dataUnused(dataDir, ref)
+		}
+	}
+	// Nothing local: the last reading that can still work is a repo, and
+	// a repo has an org, so a bare name here is simply not found.
+	if !strings.Contains(ref, "/") {
+		return fmt.Errorf("no cached model %q under %s (see \"tensai models\", or give an org/name to download)", ref, root)
+	}
+	o.Repo = ref
+	o.Data = dataDir
+	if o.Data == "" {
+		o.Data = llm.DefaultDataDir(ref)
+	}
+	return nil
+}
+
+// dataUnused rejects -data alongside a model that is already on disk,
+// where there is no download for it to place.
+func dataUnused(dataDir, ref string) error {
+	if dataDir != "" {
+		return fmt.Errorf("-data says where to cache a download, but %q is already local", ref)
+	}
+	return nil
 }
 
 func openEngine(o *llm.Options, finish func()) *llm.Engine {
