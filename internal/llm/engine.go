@@ -702,6 +702,12 @@ type tmpl struct {
 	asstOpen, asstClose string
 	foldSystem          bool
 	stops               []string
+	// toolCalls names the function-calling convention the family was
+	// trained on, empty when it has none. "hermes" is the one the ChatML
+	// families speak: tool signatures inside a <tools> block appended to
+	// the system turn, calls emitted as <tool_call> JSON, and results fed
+	// back as <tool_response> inside a user turn.
+	toolCalls string
 }
 
 func templateFor(modelType string, think bool) tmpl {
@@ -764,7 +770,8 @@ func templateFor(modelType string, think bool) tmpl {
 		sysOpen: "<|im_start|>system\n", sysClose: "<|im_end|>\n",
 		userOpen: "<|im_start|>user\n", userClose: "<|im_end|>\n",
 		asstOpen: "<|im_start|>assistant\n", asstClose: "<|im_end|>\n",
-		stops: []string{"<|im_end|>", "<|endoftext|>"},
+		stops:     []string{"<|im_end|>", "<|endoftext|>"},
+		toolCalls: "hermes",
 	}
 	// Qwen3 and SmolLM3 disable their thinking mode by opening the
 	// assistant turn with an empty think block; -think leaves it open.

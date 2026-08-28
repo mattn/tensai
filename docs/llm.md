@@ -145,5 +145,28 @@ the same place, and those are counted separately rather than listed as models;
 
 `serve` exposes `/v1/chat/completions` (messages array, SSE streaming, usage counts), so any OpenAI client pointed at it chats with a pure-Go model. A built-in chat demo page is served on `GET /`.
 
+### Tool calling
+
+Pass `tools` and the model can answer with `tool_calls` instead of prose, which is what an agent needs to drive a loop:
+
+```bash
+curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
+  "tools": [{"type": "function", "function": {
+    "name": "get_weather",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]}'
+```
+
+```json
+"finish_reason": "tool_calls",
+"message": {"role": "assistant", "content": "", "tool_calls": [
+  {"index": 0, "id": "call_0", "type": "function",
+   "function": {"name": "get_weather", "arguments": "{\"city\": \"Tokyo\"}"}}]}
+```
+
+Send the result back as a `tool` message naming the call it answers, alongside the assistant turn that made it, and the model writes the reply. Streaming works the same way: text streams as usual, the calls arrive as `tool_calls` deltas indexed from zero, and the turn ends with `finish_reason: "tool_calls"`.
+
+The signatures are handed to the model in the convention the ChatML families were trained on — a `<tools>` block on the system turn, calls as `<tool_call>` JSON — so qwen2, qwen3, their MoE variants, llama, and SmolLM speak it. Families with no such convention (gemma3, phi3, mistral, deepseek, gpt-oss) answer a request carrying `tools` with 400 rather than dropping them silently. Nothing constrains the sampler, so a call is the model's choice: `tool_choice: "none"` withholds the signatures, but `"required"` cannot force what only a grammar could, and it reads as `"auto"`. Bigger models call far more reliably than the 0.5B default.
+
 - The default bind is loopback only (`127.0.0.1:8080`, or `$TENSAI_ADDR`); widen it explicitly if you mean to
 - `-api-key` (or `$TENSAI_API_KEY`) requires a bearer token on the `/v1` routes; the demo page stays open

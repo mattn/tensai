@@ -6,7 +6,9 @@ package llm
 // the prompt through the batched path, and decodes with the same
 // sampling as the CLI. One request holds the model at a time — the KV
 // cache is rebuilt per request — so any OpenAI client pointed at the
-// address works against a pure-Go model.
+// address works against a pure-Go model. Offered tools reach families
+// trained on the ChatML calling convention, and the calls they emit come
+// back as tool_calls, which is enough for an agent to drive a loop.
 
 import (
 	"crypto/subtle"
@@ -15,6 +17,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +26,41 @@ import (
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// An assistant turn replayed from history carries the calls it made,
+	// and each result comes back as its own "tool" message naming the
+	// call it answers.
+	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Name       string     `json:"name,omitempty"`
+}
+
+// toolFunc is one function signature: the JSON Schema in Parameters is
+// passed to the model verbatim, which is what the families trained on
+// this convention expect to read.
+type toolFunc struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description,omitempty"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+type toolDef struct {
+	Type     string   `json:"type"`
+	Function toolFunc `json:"function"`
+}
+
+type callFunc struct {
+	Name string `json:"name"`
+	// Arguments is a JSON object encoded as a string, as the API defines
+	// it -- not an object -- so a caller can hand it to a decoder of its
+	// own without a second round trip.
+	Arguments string `json:"arguments"`
+}
+
+type toolCall struct {
+	Index    *int     `json:"index,omitempty"`
+	ID       string   `json:"id"`
+	Type     string   `json:"type"`
+	Function callFunc `json:"function"`
 }
 
 type chatRequest struct {
@@ -33,6 +71,12 @@ type chatRequest struct {
 	TopP        *float64      `json:"top_p"`
 	MaxTokens   int           `json:"max_tokens"`
 	Seed        *int64        `json:"seed"`
+	Tools       []toolDef     `json:"tools,omitempty"`
+	// ToolChoice is "none", "auto", "required", or an object naming one
+	// function. Only "none" changes what the model sees here: without a
+	// constrained sampler nothing can force a call, so the rest read as
+	// "auto".
+	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
 }
 
 // reset drops the KV cache so the next request starts a fresh context.
@@ -43,10 +87,38 @@ func (m *qwen) reset() {
 	}
 }
 
+// toolPreamble is the block the ChatML families were trained to read:
+// the signatures they may call, and the shape a call takes. It is
+// appended to the system turn, which is where their own template puts it.
+func toolPreamble(tools []toolDef) string {
+	var b strings.Builder
+	b.WriteString("\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n" +
+		"You are provided with function signatures within <tools></tools> XML tags:\n<tools>")
+	for _, t := range tools {
+		if t.Type == "" {
+			t.Type = "function"
+		}
+		raw, err := json.Marshal(t)
+		if err != nil {
+			continue
+		}
+		b.WriteString("\n")
+		b.Write(raw)
+	}
+	b.WriteString("\n</tools>\n\nFor each function call, return a json object with function name and " +
+		"arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n" +
+		`{"name": <function-name>, "arguments": <args-json-object>}` + "\n</tool_call>")
+	return b.String()
+}
+
 // render walks the messages through the model's template, ending with an
 // open assistant turn. Models without a system role (Gemma) get the
-// system text folded into the first user message.
-func render(tm tmpl, msgs []chatMessage, defaultSystem string) string {
+// system text folded into the first user message. When tools are offered
+// and the family speaks a calling convention, the signatures join the
+// system turn, past calls replay as <tool_call> blocks, and each result
+// goes back as a <tool_response> in a user turn -- consecutive results
+// share one turn, as the trained template does.
+func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) string {
 	var b strings.Builder
 	b.WriteString(tm.bos)
 	system := defaultSystem
@@ -55,14 +127,48 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string) string {
 		system = msgs[0].Content
 		rest = msgs[1:]
 	}
+	hermes := tm.toolCalls == "hermes" && len(tools) > 0
+	if hermes {
+		system += toolPreamble(tools)
+	}
 	if !tm.foldSystem {
 		b.WriteString(tm.sysOpen + system + tm.sysClose)
 	}
 	first := true
-	for _, m := range rest {
-		switch m.Role {
-		case "assistant":
-			b.WriteString(tm.asstOpen + m.Content + tm.asstClose)
+	inTools := false
+	for i, m := range rest {
+		// A run of tool results is one user turn, so close the open one
+		// only when the next message leaves the run.
+		if inTools && m.Role != "tool" {
+			b.WriteString(tm.userClose)
+			inTools = false
+		}
+		switch {
+		case m.Role == "tool" && hermes:
+			if !inTools {
+				b.WriteString(tm.userOpen)
+				inTools = true
+			}
+			b.WriteString("<tool_response>\n" + m.Content + "\n</tool_response>")
+			if i == len(rest)-1 {
+				b.WriteString(tm.userClose)
+				inTools = false
+			}
+			first = false
+		case m.Role == "assistant":
+			b.WriteString(tm.asstOpen + m.Content)
+			if hermes {
+				for _, c := range m.ToolCalls {
+					args := strings.TrimSpace(c.Function.Arguments)
+					if args == "" {
+						args = "{}"
+					}
+					b.WriteString("\n<tool_call>\n" +
+						`{"name": ` + strconv.Quote(c.Function.Name) + `, "arguments": ` + args + "}" +
+						"\n</tool_call>")
+				}
+			}
+			b.WriteString(tm.asstClose)
 		default:
 			text := m.Content
 			if tm.foldSystem && first {
@@ -72,8 +178,77 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string) string {
 			b.WriteString(tm.userOpen + text + tm.userClose)
 		}
 	}
+	if inTools {
+		b.WriteString(tm.userClose)
+	}
 	b.WriteString(tm.asstOpen)
 	return b.String()
+}
+
+// partialMarker returns how many trailing bytes of s could still grow
+// into marker, so a stream can hold exactly that much back instead of
+// printing half of an opening tag.
+func partialMarker(s, marker string) int {
+	n := len(marker) - 1
+	if n > len(s) {
+		n = len(s)
+	}
+	for ; n > 0; n-- {
+		if strings.HasPrefix(marker, s[len(s)-n:]) {
+			return n
+		}
+	}
+	return 0
+}
+
+// parseToolCalls splits a finished assistant turn into the text it meant
+// to say and the calls it emitted. A model that runs out of tokens mid
+// block leaves the closing tag off, so an unterminated one takes the
+// rest of the turn rather than being dropped.
+func parseToolCalls(s string) (string, []toolCall) {
+	const openTag, closeTag = "<tool_call>", "</tool_call>"
+	if !strings.Contains(s, openTag) {
+		return s, nil
+	}
+	var text strings.Builder
+	var calls []toolCall
+	for {
+		i := strings.Index(s, openTag)
+		if i < 0 {
+			text.WriteString(s)
+			break
+		}
+		text.WriteString(s[:i])
+		s = s[i+len(openTag):]
+		body := s
+		if j := strings.Index(s, closeTag); j >= 0 {
+			body, s = s[:j], s[j+len(closeTag):]
+		} else {
+			s = ""
+		}
+		var call struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &call); err != nil || call.Name == "" {
+			// Not a call after all: keep the text so a reply that merely
+			// talks about the tag is not silently swallowed.
+			text.WriteString(openTag + body)
+			continue
+		}
+		args := strings.TrimSpace(string(call.Arguments))
+		if args == "" || args == "null" {
+			args = "{}"
+		}
+		idx := len(calls)
+		calls = append(calls, toolCall{
+			Index:    &idx,
+			ID:       fmt.Sprintf("call_%d", idx),
+			Type:     "function",
+			Function: callFunc{Name: call.Name, Arguments: args},
+		})
+	}
+	return strings.TrimSpace(text.String()), calls
 }
 
 type server struct {
@@ -195,7 +370,19 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	rng := rand.New(rand.NewSource(seed))
 
-	ids := s.tok.Encode(render(s.tm, req.Messages, s.system))
+	tools := req.Tools
+	// "none" is the one choice that changes the prompt: with no
+	// constrained sampler the others cannot be enforced, so offering the
+	// signatures and letting the model decide is all "auto" and
+	// "required" can mean here.
+	if choice := strings.Trim(string(req.ToolChoice), `"`); choice == "none" {
+		tools = nil
+	}
+	if len(tools) > 0 && s.tm.toolCalls == "" {
+		httpError(w, http.StatusBadRequest, "this model's chat template has no tool-calling convention, so tools cannot be offered to it")
+		return
+	}
+	ids := s.tok.Encode(render(s.tm, req.Messages, s.system, tools))
 	if len(ids) >= s.nCtx-1 {
 		httpError(w, http.StatusBadRequest, fmt.Sprintf("prompt of %d tokens exceeds the %d-token context", len(ids), s.nCtx))
 		return
@@ -211,6 +398,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	created := time.Now().Unix()
 
+	// With tools in play the turn may open a <tool_call> block, which is
+	// not content for the client to print. Text streams as usual until
+	// the marker appears; any tail that could still grow into it is held
+	// back, and once a call has started nothing more is streamed.
+	sawCall := false
 	var flush func(string)
 	if req.Stream {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -231,6 +423,38 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	// held is the text accepted but not yet streamed, kept only long
+	// enough to rule out the start of a call marker.
+	var held strings.Builder
+	emit := func(piece string, final bool) {
+		if len(tools) == 0 {
+			flush(piece)
+			return
+		}
+		if sawCall {
+			return
+		}
+		held.WriteString(piece)
+		text := held.String()
+		if i := strings.Index(text, "<tool_call>"); i >= 0 {
+			sawCall = true
+			held.Reset()
+			if i > 0 {
+				flush(text[:i])
+			}
+			return
+		}
+		keep := 0
+		if !final {
+			keep = partialMarker(text, "<tool_call>")
+		}
+		held.Reset()
+		held.WriteString(text[len(text)-keep:])
+		if len(text) > keep {
+			flush(text[:len(text)-keep])
+		}
+	}
+
 	// Byte-fallback BPE tokens can split a multi-byte character, so a
 	// chunk holds back an incomplete trailing rune until the next token
 	// completes it; deliberately invalid bytes still flush once older
@@ -265,7 +489,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if cut > 0 {
-			flush(string(pend[:cut]))
+			emit(string(pend[:cut]), final)
 			pend = append(pend[:0], pend[cut:]...)
 		}
 	}
@@ -323,9 +547,33 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	content := s.tok.Decode(out)
+	var calls []toolCall
+	if len(tools) > 0 {
+		content, calls = parseToolCalls(content)
+		if len(calls) > 0 {
+			finish = "tool_calls"
+		}
+	}
+
 	if req.Stream {
 		if len(pend) > 0 {
 			push("", true)
+		}
+		// The calls go out as deltas of their own, one chunk each and
+		// complete, so a client accumulating fragments by index ends up
+		// with the same thing either way.
+		for _, c := range calls {
+			chunk := map[string]any{
+				"id": id, "object": "chat.completion.chunk", "created": created,
+				"model": "tensai",
+				"choices": []map[string]any{{
+					"index": 0,
+					"delta": map[string]any{"tool_calls": []toolCall{c}},
+				}},
+			}
+			raw, _ := json.Marshal(chunk)
+			fmt.Fprintf(w, "data: %s\n\n", raw)
 		}
 		final := map[string]any{
 			"id": id, "object": "chat.completion.chunk", "created": created,
@@ -341,14 +589,16 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	msg := map[string]any{"role": "assistant", "content": content}
+	if len(calls) > 0 {
+		msg["tool_calls"] = calls
+	}
 	writeJSON(w, map[string]any{
 		"id": id, "object": "chat.completion", "created": created,
 		"model": "tensai",
 		"choices": []map[string]any{{
-			"index": 0,
-			"message": map[string]any{
-				"role": "assistant", "content": s.tok.Decode(out),
-			},
+			"index":         0,
+			"message":       msg,
 			"finish_reason": finish,
 		}},
 		"usage": map[string]any{

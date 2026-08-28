@@ -142,5 +142,28 @@ tensai serve -q8 -addr 127.0.0.1:8080
 
 `serve` は `/v1/chat/completions` (messages 配列、SSE ストリーミング、使用量カウント) を公開するので、OpenAI クライアントを向ければ何でも純 Go のモデルとチャットできます。組み込みのチャットデモページが `GET /` で提供されます。
 
+### ツール呼び出し
+
+`tools` を渡すと、モデルは散文の代わりに `tool_calls` で答えられます。エージェントがループを回すのに必要なものです:
+
+```bash
+curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],
+  "tools": [{"type": "function", "function": {
+    "name": "get_weather",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]}'
+```
+
+```json
+"finish_reason": "tool_calls",
+"message": {"role": "assistant", "content": "", "tool_calls": [
+  {"index": 0, "id": "call_0", "type": "function",
+   "function": {"name": "get_weather", "arguments": "{\"city\": \"Tokyo\"}"}}]}
+```
+
+結果は、呼び出した assistant ターンと一緒に、対応する呼び出しを名指しした `tool` メッセージとして返します。するとモデルが返答を書きます。ストリーミングでも同じで、テキストは通常どおり流れ、呼び出しは 0 始まりの index を持つ `tool_calls` デルタとして届き、ターンは `finish_reason: "tool_calls"` で終わります。
+
+シグネチャは ChatML 系が訓練された形式 — システムターンの `<tools>` ブロックと、`<tool_call>` JSON による呼び出し — でモデルに渡されるので、qwen2、qwen3、それぞれの MoE、llama、SmolLM が話せます。その慣習を持たないファミリー (gemma3、phi3、mistral、deepseek、gpt-oss) は、`tools` 付きのリクエストを黙って無視せず 400 で返します。サンプラーは拘束されないので、呼ぶかどうかはモデル次第です。`tool_choice: "none"` はシグネチャを渡しませんが、`"required"` は文法拘束でしか実現できないため `"auto"` として扱われます。既定の 0.5B より大きいモデルのほうが、はるかに確実に呼び出します。
+
 - デフォルトのバインドはループバックのみです (`127.0.0.1:8080`、または `$TENSAI_ADDR`)。広げるときは明示的にどうぞ
 - `-api-key` (または `$TENSAI_API_KEY`) は `/v1` ルートに bearer トークンを要求します。デモページは開いたままです
