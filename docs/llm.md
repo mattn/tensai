@@ -71,10 +71,11 @@ commands:
   version  print the version
 ```
 
-All model commands share the same flags: `-repo` (Hugging Face repo to download from), `-gguf` (load everything from one .gguf file), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
+All model commands share the same flags: `-model` (a model already cached, named as `tensai models` prints it), `-repo` (Hugging Face repo to download from), `-gguf` (load everything from one .gguf file), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
 
 ```bash
 tensai run -q8 "What is the capital of France?"
+tensai run -q8 -model Qwen3-0.6B "Explain RoPE briefly"   # a name from "tensai models"
 tensai run -q8 -json "Explain RoPE briefly"      # one JSON object with usage counts
 tensai chat -q8 -gguf model.gguf                 # multi-turn; the KV cache carries the dialogue
 tensai models                                    # list the cache; "models rm <name>" deletes
@@ -121,6 +122,10 @@ the prompt grows, since attention is quadratic, so compare at one length.
 ```bash
 tensai serve -q8 -addr 127.0.0.1:8080
 ```
+
+`-model` takes a name straight from the listing — a directory or a `.gguf`,
+with or without the extension — and never downloads: an uncached name is an
+error rather than a fetch. Use `-repo` when you do want tensai to go get it.
 
 `models` lists only what `run`, `chat`, and `serve` can load — a directory
 with a `config.json`, or a `.gguf` file. The examples cache their datasets in

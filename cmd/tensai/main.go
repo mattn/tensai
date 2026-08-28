@@ -51,6 +51,7 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 	fs.StringVar(&o.Data, "data", "", "directory for the downloaded model files (default: a per-repo directory under the user cache)")
 	fs.StringVar(&o.Repo, "repo", llm.DefaultRepo, "Hugging Face repo to download missing model files from")
 	fs.StringVar(&o.GGUF, "gguf", "", "load model and tokenizer from a single .gguf file instead of -data/-repo")
+	model := fs.String("model", "", `cached model to run, named as "tensai models" prints it`)
 	q8 := fs.Bool("q8", false, "decode against int8-quantized weights")
 	q4 := fs.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
 	fs.BoolVar(&o.GPU, "gpu", false, "decode on the GPU (requires -q8 or -q4 and a wgpu build tag)")
@@ -71,11 +72,49 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 		if *q4 {
 			o.Bits = 4
 		}
+		if *model != "" {
+			if err := useCached(o, *model); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(2)
+			}
+		}
 		if o.Data == "" && o.GGUF == "" {
 			o.Data = llm.DefaultDataDir(o.Repo)
 		}
 	}
 	return o, finish
+}
+
+// useCached points the options at a model already in the cache, named the
+// way "tensai models" prints it, so a listing can be pasted into a run
+// without spelling out a path or remembering the Hugging Face org. It
+// never downloads: a name that is not cached is an error, not a fetch.
+func useCached(o *llm.Options, name string) error {
+	if o.Data != "" || o.GGUF != "" {
+		return fmt.Errorf("-model already says which model to run; drop -data and -gguf")
+	}
+	if name != filepath.Base(name) || name == "." || name == ".." {
+		return fmt.Errorf("invalid model name %q: use the name \"tensai models\" prints, not a path", name)
+	}
+	root := llm.CacheRoot()
+	// A .gguf carries everything in one file; a directory needs the
+	// config.json that run, chat, and serve load first.
+	for _, gguf := range []string{name, name + ".gguf"} {
+		if !strings.HasSuffix(gguf, ".gguf") {
+			continue
+		}
+		p := filepath.Join(root, gguf)
+		if _, err := os.Stat(p); err == nil {
+			o.GGUF = p
+			return nil
+		}
+	}
+	dir := filepath.Join(root, name)
+	if _, err := os.Stat(filepath.Join(dir, "config.json")); err == nil {
+		o.Data = dir
+		return nil
+	}
+	return fmt.Errorf("no cached model %q under %s (see \"tensai models\")", name, root)
 }
 
 func openEngine(o *llm.Options, finish func()) *llm.Engine {

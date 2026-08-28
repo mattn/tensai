@@ -71,10 +71,11 @@ commands:
   version  print the version
 ```
 
-モデルを使うコマンドは同じフラグを共有します: `-repo` (ダウンロード元の Hugging Face リポジトリ)、`-gguf` (1 つの .gguf からすべてロード)、`-q8`/`-q4`、`-gpu`、`-draft`、`-think`、`-system`、`-temp`、`-topp`、`-seed` など — 完全なリストは `tensai <command> -h` で。
+モデルを使うコマンドは同じフラグを共有します: `-model` (キャッシュ済みモデルを `tensai models` が出す名前で指定)、`-repo` (ダウンロード元の Hugging Face リポジトリ)、`-gguf` (1 つの .gguf からすべてロード)、`-q8`/`-q4`、`-gpu`、`-draft`、`-think`、`-system`、`-temp`、`-topp`、`-seed` など — 完全なリストは `tensai <command> -h` で。
 
 ```bash
 tensai run -q8 "What is the capital of France?"
+tensai run -q8 -model Qwen3-0.6B "Explain RoPE briefly"   # "tensai models" の名前をそのまま
 tensai run -q8 -json "Explain RoPE briefly"      # 補完と使用量を 1 つの JSON で
 tensai chat -q8 -gguf model.gguf                 # マルチターン。KV キャッシュが対話全体を運ぶ
 tensai models                                    # キャッシュ一覧。"models rm <name>" で削除
@@ -119,6 +120,10 @@ gpu/cpu      5.20x                   0.75x
 ```bash
 tensai serve -q8 -addr 127.0.0.1:8080
 ```
+
+`-model` には一覧の名前をそのまま渡せます — ディレクトリでも `.gguf` でも、拡張子は
+あってもなくても構いません。ダウンロードはしないので、キャッシュに無い名前はエラーに
+なります。取ってきてほしいときは `-repo` を使ってください。
 
 `models` が一覧するのは `run` / `chat` / `serve` が読めるものだけです —
 `config.json` を持つディレクトリか、`.gguf` ファイル。example はデータセットを
