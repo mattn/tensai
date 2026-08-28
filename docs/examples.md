@@ -17,9 +17,8 @@ Every example is runnable from the repository root with `go run`:
 | tensor | `go run ./_example/tensor` | Tour of the n-d Tensor: broadcasting, batched MatMul, attention |
 | wgpu | `go run -tags wgpu ./_example/wgpu` | WebGPU MatMul: adapter info, CPU cross-check, GPU vs CPU sweep |
 | gpt2 | `GOEXPERIMENT=simd go run ./_example/gpt2` | The published GPT-2 (124M) checkpoint generating text in pure Go |
-| qwen | `GOEXPERIMENT=simd go run ./_example/qwen -q8` | Qwen2.5-0.5B-Instruct (and eight other families) chatting in pure Go |
 
-The gpt2 example downloads the GPT-2 checkpoint (~550MB) on first run; qwen downloads Qwen2.5-0.5B-Instruct (~1GB).
+The gpt2 example downloads the GPT-2 checkpoint (~550MB) on first run. For instruction-tuned models — nine families, from Qwen2.5-0.5B up to 7B — use the `tensai` command: see [LLM Inference](llm.md).
 
 ## MNIST
 

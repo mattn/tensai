@@ -1,7 +1,7 @@
 // Package llm wires tensai's kernels into a runnable language model:
 // checkpoint download and loading, chat templates, sampling, generation
 // (plain and speculative), the GPU decode path, and the OpenAI-compatible
-// server. cmd/tensai and _example/qwen are thin flag parsers over Engine.
+// server. cmd/tensai is a thin flag parser over Engine.
 package llm
 
 import (
@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/user"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -38,6 +39,13 @@ const DefaultSystem = "You are Qwen, created by Alibaba Cloud. You are a helpful
 func CacheRoot() string {
 	if dir, err := os.UserCacheDir(); err == nil {
 		return filepath.Join(dir, "tensai")
+	}
+	// UserCacheDir only fails when the environment does not say where
+	// the home directory is. The account itself still knows, and a
+	// multi-gigabyte download belongs there rather than in whatever
+	// directory the command happened to start in.
+	if u, err := user.Current(); err == nil && u.HomeDir != "" {
+		return filepath.Join(u.HomeDir, ".cache", "tensai")
 	}
 	return "tensai-data"
 }

@@ -1,6 +1,6 @@
 # LLM Inference
 
-The same kernels that train a XOR network run real language models. `_example/gpt2` and `_example/qwen` are complete inference engines in pure Go, and the `tensai` command wraps the same engine as installable subcommands.
+The same kernels that train a XOR network run real language models. `_example/gpt2` is a complete inference engine in pure Go, and the `tensai` command runs nine model families over the same kernels.
 
 ## GPT-2
 
@@ -18,7 +18,7 @@ The greedy continuation matches GPT-2's well-known reference output token for to
 
 ## Qwen and friends: nine model families
 
-`_example/qwen` runs modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file. One runtime speaks nine architectures:
+The `tensai` command runs modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file. One runtime speaks nine architectures:
 
 | family | models | what it adds |
 |---|---|---|
@@ -34,7 +34,7 @@ The greedy continuation matches GPT-2's well-known reference output token for to
 The DeepSeek-R1 distills are stock qwen2/llama blocks wearing DeepSeek's turn markers, which the loader spots in the embedded chat template and switches automatically, `<think>` reasoning included.
 
 ```
-$ GOEXPERIMENT=simd go run ./_example/qwen -q8 -prompt "What is the capital of France?"
+$ tensai run -q8 "What is the capital of France?"
 The capital of France is Paris.
 43 tokens in 1.3s (33.1 tok/s)
 ```
@@ -71,7 +71,7 @@ commands:
   version  print the version
 ```
 
-All model commands share the same flags: `-model` (which model to run), `-data` (where to cache a download), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
+All model commands share the same flags: `-model` (which model to run), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
 
 `-model` is the only thing that says which model to run, and it reads whichever
 form you hand it, in this order:
@@ -84,9 +84,9 @@ form you hand it, in this order:
 
 Omit it for the default checkpoint. A local reference never downloads: a name
 that is not cached, and carries no org to fetch it from, is an error pointing
-back at the listing. `-data` overrides where a download is cached, and says so
-rather than being ignored when the model is already local. `-draft` takes the
-same forms, minus `.gguf`.
+back at the listing. A download lands in the user cache directory
+(`~/.cache/tensai` on Linux); to keep a model anywhere else, fetch it there and
+name its path. `-draft` takes the same forms, minus `.gguf`.
 
 ```bash
 tensai run -q8 "What is the capital of France?"

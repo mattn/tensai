@@ -2,8 +2,8 @@ package llm
 
 // GGUF loading: one downloaded .gguf file carries the config (typed
 // metadata), the tokenizer (embedded vocab, merges, and pre-tokenizer
-// tag), and the weights, so -gguf runs a llama.cpp checkpoint with no
-// other files. Weights dequantize to float32 on the way out of the
+// tag), and the weights, so -model pointed at one runs a llama.cpp
+// checkpoint with no other files. Weights dequantize to float32 on the way out of the
 // container and then requantize through the same -q8/-q4 path as the
 // safetensors loader. llama.cpp's converter permutes the attention q/k
 // projections into interleaved rope order for the llama architecture

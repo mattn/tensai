@@ -62,7 +62,6 @@ _example/dot        Graphviz DOT export of the z = x + y graph
 _example/tensor     Tour of the n-d Tensor: broadcasting, batched MatMul, attention
 _example/wgpu       WebGPU MatMul: adapter info, CPU cross-check, GPU vs CPU sweep
 _example/gpt2       The published GPT-2 (124M) checkpoint generating text in pure Go
-_example/qwen       Qwen2.5-0.5B-Instruct chatting in pure Go: RoPE, GQA, SwiGLU
 cmd/tensai          The tensai command: run, chat, and serve subcommands over internal/llm
 ```
 
@@ -203,7 +202,7 @@ The prompt runs through the model as one batched pass; with `-gpu` (built with `
 
 `-q8` quantizes the decode-path weights to int8 (weight-only, per-column scales) and doubles generation — 23 to 46 tok/s on the same machine — because decode streams the whole checkpoint per token and int8 pulls a quarter of the bytes. The text stays coherent but greedy decoding no longer reproduces the float32 reference tokens exactly; use the default float32 path for the reference check.
 
-`_example/qwen` does the same for modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file — `-gguf qwen2.5-0.5b-instruct-q8_0.gguf -q8` chats with nothing else on disk. One runtime speaks nine architectures, each contributing its own twist:
+The `tensai` command does the same for modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file — `-model ./qwen2.5-0.5b-instruct-q8_0.gguf -q8` chats with nothing else on disk. One runtime speaks nine architectures, each contributing its own twist:
 
 | family | models | what it adds |
 |---|---|---|
@@ -227,7 +226,7 @@ On a 15GB machine the ladder looks like: 0.5B at ~40 tok/s with `-q8` and a 1.5B
 `-draft` points at a smaller same-family model for speculative decoding (greedy only): the draft proposes a few tokens, one batched pass of the big model verifies them, and rejections roll the caches back, so the output is exactly what the big model alone would produce — Qwen2.5-**7B** with the 0.5B drafting goes from 1.2 to 1.6 tok/s; the draft only pays off when the target is much larger than it. Sampling (`-temp` above 0) restricts itself to the nucleus: `-topp 0.9` keeps the smallest probability-sorted set of tokens holding 90% of the mass, so the long tail where repetition loops live never gets a lottery ticket. `-chat` turns it into a multi-turn conversation on stdin — the KV cache carries the whole dialogue, so each turn only processes its own tokens — and `-serve :8080` exposes the same model as an OpenAI-compatible `/v1/chat/completions` endpoint (messages array, SSE streaming, usage counts), so any OpenAI client pointed at it chats with a pure-Go model:
 
 ```
-$ GOEXPERIMENT=simd go run ./_example/qwen -q8 -prompt "What is the capital of France?"
+$ tensai run -q8 "What is the capital of France?"
 The capital of France is Paris.
 43 tokens in 1.3s (33.1 tok/s)
 ```
@@ -372,7 +371,7 @@ Arithmetic no longer dominates the convenient path — `gpu+xfer` at `large` spe
 
 Quantized weights stay quantized on the device too: `UploadQ8` packs a `QMatrix` four int8 weights per u32, and `gpu.QMatrix.MatMul` dequantizes them in registers, so a decode matvec — whose cost is streaming the weights — moves a quarter of the f32 bytes. On the same iGPU through dozen it runs the matvec 2.2x faster than the resident f32 kernel.
 
-`UploadQ4` does the same for the int4 twin — nibbles packed four row-pair bytes per u32, group scales folded at group boundaries in registers — so `-q4 -gpu` runs models whose int8 weights would not fit. The rest of a transformer decode step is there as well — `RMSNorm`, in-place `RoPE`, `Add`, `SiluMul`, `GroupedCausalAttention` (a KV cache packing fewer heads than the queries, read up to a valid length), and `CopyRowsInto` to append fresh k/v rows to a resident cache — so `_example/qwen -q8 -gpu` runs every block on the device and only the hidden state comes back per token. `BeginBatch`/`Flush` record a whole token's dispatches into one submission, and freed intermediates recycle through a buffer pool, which together took a dozen-translated decode from 1.2 to ~17 tok/s steady state on the machine above. The vec4-staged integer GEMM and the scalar-state attention kernel then lifted the same path's prefill from ~840 to ~1800 t/s on a 625-token prompt — about 87% of llama.cpp's Vulkan backend on the same GPU — with decode at ~20 tok/s. On native Windows the same iGPU speaks D3D12 directly, and `-q8 -gpu` held the 0.5B decode crown for a while — 29.7 tok/s against 23.2 on the AVX2 path — until the tiled integer kernels took it back: the CPU now decodes the same model at ~42 tok/s against ~30 on the GPU, which stays useful for keeping the cores free.
+`UploadQ4` does the same for the int4 twin — nibbles packed four row-pair bytes per u32, group scales folded at group boundaries in registers — so `-q4 -gpu` runs models whose int8 weights would not fit. The rest of a transformer decode step is there as well — `RMSNorm`, in-place `RoPE`, `Add`, `SiluMul`, `GroupedCausalAttention` (a KV cache packing fewer heads than the queries, read up to a valid length), and `CopyRowsInto` to append fresh k/v rows to a resident cache — so `tensai run -q8 -gpu` runs every block on the device and only the hidden state comes back per token. `BeginBatch`/`Flush` record a whole token's dispatches into one submission, and freed intermediates recycle through a buffer pool, which together took a dozen-translated decode from 1.2 to ~17 tok/s steady state on the machine above. The vec4-staged integer GEMM and the scalar-state attention kernel then lifted the same path's prefill from ~840 to ~1800 t/s on a 625-token prompt — about 87% of llama.cpp's Vulkan backend on the same GPU — with decode at ~20 tok/s. On native Windows the same iGPU speaks D3D12 directly, and `-q8 -gpu` held the 0.5B decode crown for a while — 29.7 tok/s against 23.2 on the AVX2 path — until the tiled integer kernels took it back: the CPU now decodes the same model at ~42 tok/s against ~30 on the GPU, which stays useful for keeping the cores free.
 
 wgpu-native picks Vulkan on Linux, Vulkan or D3D12 on Windows, and Metal on macOS, so AMD, Intel, Apple, and NVIDIA GPUs all work — as do CPU Vulkan implementations like lavapipe, which is how the tests run on machines without a GPU. `gpu.MatMul` uploads the operands and reads the product back on every call; `Upload` plus `gpu.Tensor.MatMul` keeps inputs and intermediates resident, so only the final result needs to cross the bus. Without the build tag `gpu.Open` returns an error and nothing else changes.
 
@@ -410,9 +409,8 @@ go run ./_example/charrnn
 go run ./_example/plasma
 go run ./_example/tensor
 GOEXPERIMENT=simd go run ./_example/gpt2          # downloads the GPT-2 checkpoint (~550MB) on first run
-GOEXPERIMENT=simd go run ./_example/qwen -q8      # downloads Qwen2.5-0.5B-Instruct (~1GB) on first run
 
-# The tensai command wraps the same engine as subcommands:
+# The tensai command runs instruction-tuned models (~1GB downloaded on first run):
 GOEXPERIMENT=simd go install ./cmd/tensai
 tensai run -q8 "What is the capital of France?"
 tensai chat -q8 -model ./model.gguf

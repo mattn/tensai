@@ -3,7 +3,7 @@
 // the GPU path):
 //
 //	tensai run -q8 "What is the capital of France?"
-//	tensai chat -q8 -gguf model.gguf
+//	tensai chat -q8 -model ./model.gguf
 //	tensai serve -q8 -addr :8080
 package main
 
@@ -49,7 +49,6 @@ Run "tensai <command> -h" for the command's flags.`
 func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 	o := &llm.Options{Log: os.Stderr}
 	model := fs.String("model", "", `which model to run: a name from "tensai models", a path to a directory or .gguf, or a Hugging Face repo to download`)
-	data := fs.String("data", "", "directory to cache a downloaded model in (default: a per-repo directory under the user cache)")
 	q8 := fs.Bool("q8", false, "decode against int8-quantized weights")
 	q4 := fs.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
 	fs.BoolVar(&o.GPU, "gpu", false, "decode on the GPU (requires -q8 or -q4 and a wgpu build tag)")
@@ -70,13 +69,13 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 		if *q4 {
 			o.Bits = 4
 		}
-		if err := resolveModel(o, *model, *data); err != nil {
+		if err := resolveModel(o, *model); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
 		if *draft != "" {
 			d := &llm.Options{}
-			if err := resolveModel(d, *draft, ""); err != nil || d.GGUF != "" {
+			if err := resolveModel(d, *draft); err != nil || d.GGUF != "" {
 				fmt.Fprintf(os.Stderr, "-draft wants a model directory or a cached name, not %q\n", *draft)
 				os.Exit(2)
 			}
@@ -90,15 +89,12 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 // three the loader wants. A reference is, in order: empty for the default
 // checkpoint; an existing path, to a .gguf or to a directory; a bare name
 // in the cache, exactly as "tensai models" prints it; or, failing all of
-// those, a Hugging Face repo to download. dataDir overrides where a
-// download is cached and is meaningless for the local forms.
-func resolveModel(o *llm.Options, ref, dataDir string) error {
+// those, a Hugging Face repo to download. A download lands in the cache
+// under CacheRoot; to put a model elsewhere, fetch it and name its path.
+func resolveModel(o *llm.Options, ref string) error {
 	if ref == "" {
 		o.Repo = llm.DefaultRepo
-		o.Data = dataDir
-		if o.Data == "" {
-			o.Data = llm.DefaultDataDir(o.Repo)
-		}
+		o.Data = llm.DefaultDataDir(o.Repo)
 		return nil
 	}
 	local := func(p string) error {
@@ -128,10 +124,7 @@ func resolveModel(o *llm.Options, ref, dataDir string) error {
 	// a typo to the network as if it were a repo.
 	if strings.ContainsAny(ref, `/\`) || ref == "." || ref == ".." {
 		if _, err := os.Stat(ref); err == nil {
-			if err := local(ref); err != nil {
-				return err
-			}
-			return dataUnused(dataDir, ref)
+			return local(ref)
 		}
 	}
 	root := llm.CacheRoot()
@@ -141,10 +134,7 @@ func resolveModel(o *llm.Options, ref, dataDir string) error {
 			if _, err := os.Stat(p); err != nil {
 				continue
 			}
-			if err := local(p); err != nil {
-				return err
-			}
-			return dataUnused(dataDir, ref)
+			return local(p)
 		}
 	}
 	// Nothing local: the last reading that can still work is a repo, and
@@ -153,19 +143,7 @@ func resolveModel(o *llm.Options, ref, dataDir string) error {
 		return fmt.Errorf("no cached model %q under %s (see \"tensai models\", or give an org/name to download)", ref, root)
 	}
 	o.Repo = ref
-	o.Data = dataDir
-	if o.Data == "" {
-		o.Data = llm.DefaultDataDir(ref)
-	}
-	return nil
-}
-
-// dataUnused rejects -data alongside a model that is already on disk,
-// where there is no download for it to place.
-func dataUnused(dataDir, ref string) error {
-	if dataDir != "" {
-		return fmt.Errorf("-data says where to cache a download, but %q is already local", ref)
-	}
+	o.Data = llm.DefaultDataDir(ref)
 	return nil
 }
 

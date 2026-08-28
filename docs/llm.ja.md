@@ -1,6 +1,6 @@
 # LLM 推論
 
-XOR を学習するのと同じカーネルが本物の言語モデルを動かします。`_example/gpt2` と `_example/qwen` は純 Go の完全な推論エンジンで、`tensai` コマンドは同じエンジンをインストール可能なサブコマンドとして包みます。
+XOR を学習するのと同じカーネルが本物の言語モデルを動かします。`_example/gpt2` は純 Go の完全な推論エンジンで、`tensai` コマンドは同じカーネルの上で 9 つのモデルファミリーを動かします。
 
 ## GPT-2
 
@@ -18,7 +18,7 @@ greedy の続きは GPT-2 のよく知られたリファレンス出力とトー
 
 ## Qwen とその仲間たち: 9 つのモデルファミリー
 
-`_example/qwen` は現代の instruction-tuned モデルを動かします: RMSNorm、RoPE、grouped-query attention、SwiGLU MLP。safetensors から (config.json が次元を決め、シャーディングされたチェックポイントは index.json 経由) でも、config・トークナイザ・重みを 1 ファイルに収めた llama.cpp の GGUF からでもロードできます。1 つのランタイムが 9 つのアーキテクチャを話します:
+`tensai` コマンドは現代の instruction-tuned モデルを動かします: RMSNorm、RoPE、grouped-query attention、SwiGLU MLP。safetensors から (config.json が次元を決め、シャーディングされたチェックポイントは index.json 経由) でも、config・トークナイザ・重みを 1 ファイルに収めた llama.cpp の GGUF からでもロードできます。1 つのランタイムが 9 つのアーキテクチャを話します:
 
 | ファミリー | モデル | 何が加わるか |
 |---|---|---|
@@ -34,7 +34,7 @@ greedy の続きは GPT-2 のよく知られたリファレンス出力とトー
 DeepSeek-R1 の蒸留モデルに専用ファミリーは要りません — DeepSeek のターンマーカーをまとった素の qwen2/llama ブロックで、ローダーが埋め込みのチャットテンプレートからそれを見つけて自動で切り替えます。`<think>` の推論込みです。
 
 ```
-$ GOEXPERIMENT=simd go run ./_example/qwen -q8 -prompt "What is the capital of France?"
+$ tensai run -q8 "What is the capital of France?"
 The capital of France is Paris.
 43 tokens in 1.3s (33.1 tok/s)
 ```
@@ -71,7 +71,7 @@ commands:
   version  print the version
 ```
 
-モデルを使うコマンドは同じフラグを共有します: `-model` (どのモデルを実行するか)、`-data` (ダウンロードのキャッシュ先)、`-q8`/`-q4`、`-gpu`、`-draft`、`-think`、`-system`、`-temp`、`-topp`、`-seed` など — 完全なリストは `tensai <command> -h` で。
+モデルを使うコマンドは同じフラグを共有します: `-model` (どのモデルを実行するか)、`-q8`/`-q4`、`-gpu`、`-draft`、`-think`、`-system`、`-temp`、`-topp`、`-seed` など — 完全なリストは `tensai <command> -h` で。
 
 どのモデルを実行するかを言うのは `-model` だけで、次の順に解釈します:
 
@@ -83,8 +83,9 @@ commands:
 
 省略すると既定のチェックポイントです。ローカル指定が勝手にダウンロードすることは
 ありません — キャッシュに無く、取得元の組織名も無い名前はエラーになり、一覧を案内
-します。`-data` はダウンロードのキャッシュ先を上書きするもので、モデルが既にローカル
-にある場合は黙って無視せずその旨を伝えます。`-draft` も同じ形式を受けます (`.gguf` を除く)。
+します。ダウンロードはユーザーキャッシュディレクトリ (Linux なら `~/.cache/tensai`)
+に置かれます。それ以外の場所に置きたいなら、そこへ取得してからパスで指定してください。
+`-draft` も同じ形式を受けます (`.gguf` を除く)。
 
 ```bash
 tensai run -q8 "What is the capital of France?"

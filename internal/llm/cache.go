@@ -1,6 +1,6 @@
 package llm
 
-// Repack caching: the first -gguf load repacks the stored blocks into
+// Repack caching: the first .gguf load repacks the stored blocks into
 // tensai's tile layouts and then writes every weight the model holds
 // into one flat file next to the source; later loads mmap that file
 // and point the matrices straight into it, skipping the repack. More

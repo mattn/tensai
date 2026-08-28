@@ -97,13 +97,13 @@ net.Compile(2, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.05))
 
 ## Run the examples
 
-The repository ships fifteen runnable examples, from a two-line autograd hello-world up to real LLM inference:
+The repository ships thirteen runnable examples, from a two-line autograd hello-world up to real LLM inference:
 
 ```bash
 go run ./_example/xor
 go run ./_example/mnist -model cnn
 GOEXPERIMENT=simd go run ./_example/gpt2      # downloads GPT-2 (~550MB) on first run
-GOEXPERIMENT=simd go run ./_example/qwen -q8  # downloads Qwen2.5-0.5B (~1GB) on first run
+GOEXPERIMENT=simd go run ./cmd/tensai run -q8  # downloads Qwen2.5-0.5B (~1GB) on first run
 ```
 
 See [Examples](examples.md) for the full list.
