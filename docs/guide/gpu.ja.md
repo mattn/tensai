@@ -100,4 +100,12 @@ TENSAI_WGPU_LIB=$PWD/wgpu29/lib/libwgpu_native.so \
     go run -tags wgpu24 ./_example/wgpu   # adapter: Microsoft Direct3D12 (AMD Radeon(TM) Graphics)
 ```
 
-両方のタグを付けると `wgpu24` が勝ちます。新しい方が速いわけではないことに注意: Radeon 780M の `32x512x512@512x512` で、同じシェーダが v22 ライブラリでは 85ms、v29 では 165ms です。`wgpu24` は速度のためではなく、届くアダプタのために使ってください。
+両方のタグを付けると `wgpu24` が勝ちます。そしてこのような環境では、その選択がすべてを決めます — どのアダプタに届くかが決まるからです。WSL2 内の dozen 越しに Radeon 780M で測ると、v22 ビルドは llvmpipe に落ちます:
+
+| | `-tags wgpu` (v22) | `-tags wgpu24` (v29) |
+|---|---|---|
+| 到達したアダプタ | llvmpipe (ソフトウェア) | Microsoft Direct3D12 (Radeon 780M) |
+| f32 `32x512x512@512x512`、入力常駐 | 461.7ms | 69.5ms |
+| int8 プレフィル / デコード | 27.0 / 6.0 t/s | 1801 / 27.1 t/s |
+
+`Makefile` が `wgpu24` でビルドするのはこのためです。この差はどちらのビルドがどのハードウェアに届くかであって、同じアダプタ上で 2 つのライブラリを比較した結果ではありません — 準拠ドライバが両方から見える環境なら、どちらでも構いません。

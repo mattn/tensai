@@ -100,4 +100,12 @@ TENSAI_WGPU_LIB=$PWD/wgpu29/lib/libwgpu_native.so \
     go run -tags wgpu24 ./_example/wgpu   # adapter: Microsoft Direct3D12 (AMD Radeon(TM) Graphics)
 ```
 
-When both tags are set, `wgpu24` wins. Note that new does not mean faster: on a Radeon 780M at `32x512x512@512x512` the v22 library runs the same shader in 85ms and the v29 one in 165ms. Use `wgpu24` for the adapters it reaches, not for speed.
+When both tags are set, `wgpu24` wins, and on a machine like this one that choice decides everything, because it decides which adapter you get. Measured on the Radeon 780M through dozen inside WSL2, where the v22 build falls back to llvmpipe:
+
+| | `-tags wgpu` (v22) | `-tags wgpu24` (v29) |
+|---|---|---|
+| adapter reached | llvmpipe (software) | Microsoft Direct3D12 (Radeon 780M) |
+| f32 `32x512x512@512x512`, resident inputs | 461.7ms | 69.5ms |
+| int8 prefill / decode | 27.0 / 6.0 t/s | 1801 / 27.1 t/s |
+
+This is why the `Makefile` builds with `wgpu24`. The gap is which hardware each build reaches, not a comparison of the two libraries on the same adapter — where a conformant driver is visible to both, pick either.
