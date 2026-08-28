@@ -785,6 +785,11 @@ type tmpl struct {
 	// the system turn, calls emitted as <tool_call> JSON, and results fed
 	// back as <tool_response> inside a user turn.
 	toolCalls string
+	// reasonOpen and reasonClose bracket the block a thinking model fills
+	// before it answers, empty for families that do not think out loud.
+	// What is between them is the model reasoning, not its reply, and the
+	// API keeps the two apart.
+	reasonOpen, reasonClose string
 }
 
 func templateFor(modelType string, think bool) tmpl {
@@ -820,7 +825,9 @@ func templateFor(modelType string, think bool) tmpl {
 			bos:      "<｜begin▁of▁sentence｜>",
 			userOpen: "<｜User｜>",
 			asstOpen: "<｜Assistant｜>", asstClose: "<｜end▁of▁sentence｜>",
-			stops: []string{"<｜end▁of▁sentence｜>"},
+			stops:       []string{"<｜end▁of▁sentence｜>"},
+			reasonOpen:  "<think>",
+			reasonClose: "</think>",
 		}
 	}
 	if modelType == "phi3" {
@@ -852,8 +859,12 @@ func templateFor(modelType string, think bool) tmpl {
 	}
 	// Qwen3 and SmolLM3 disable their thinking mode by opening the
 	// assistant turn with an empty think block; -think leaves it open.
-	if (modelType == "qwen3" || modelType == "smollm3") && !think {
-		t.asstOpen += "<think>\n\n</think>\n\n"
+	if modelType == "qwen3" || modelType == "smollm3" {
+		if think {
+			t.reasonOpen, t.reasonClose = "<think>", "</think>"
+		} else {
+			t.asstOpen += "<think>\n\n</think>\n\n"
+		}
 	}
 	return t
 }

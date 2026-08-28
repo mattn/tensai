@@ -156,7 +156,14 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 			}
 			first = false
 		case m.Role == "assistant":
-			b.WriteString(tm.asstOpen + m.Content)
+			// The model's own template drops reasoning from history, so a
+			// client that echoes a whole turn back does not get to teach
+			// it that thinking belongs in the answer.
+			text := m.Content
+			if tm.reasonOpen != "" {
+				_, text = splitReasoning(text, tm.reasonOpen, tm.reasonClose)
+			}
+			b.WriteString(tm.asstOpen + text)
 			if hermes {
 				for _, c := range m.ToolCalls {
 					args := strings.TrimSpace(c.Function.Arguments)
@@ -183,6 +190,21 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 	}
 	b.WriteString(tm.asstOpen)
 	return b.String()
+}
+
+// splitReasoning takes the block a thinking model writes before its
+// answer off the front of a finished turn. A turn cut short mid-block
+// is all reasoning and no answer, which is what it is.
+func splitReasoning(s, open, close string) (reason, rest string) {
+	i := strings.Index(s, open)
+	if i < 0 {
+		return "", s
+	}
+	head, body := s[:i], s[i+len(open):]
+	if j := strings.Index(body, close); j >= 0 {
+		return strings.TrimSpace(body[:j]), strings.TrimSpace(head + body[j+len(close):])
+	}
+	return strings.TrimSpace(body), strings.TrimSpace(head)
 }
 
 // partialMarker returns how many trailing bytes of s could still grow
@@ -403,17 +425,30 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// the marker appears; any tail that could still grow into it is held
 	// back, and once a call has started nothing more is streamed.
 	sawCall := false
-	var flush func(string)
+	// send names the field a piece belongs in: what a thinking model
+	// writes before it answers is reasoning, not content, and clients
+	// that show the two differently need them apart.
+	var send func(field, piece string)
+	flush := func(piece string) {
+		if send != nil && piece != "" {
+			send("content", piece)
+		}
+	}
+	flushReason := func(piece string) {
+		if send != nil && piece != "" {
+			send("reasoning_content", piece)
+		}
+	}
 	if req.Stream {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		flusher, _ := w.(http.Flusher)
-		flush = func(piece string) {
+		send = func(field, piece string) {
 			chunk := map[string]any{
 				"id": id, "object": "chat.completion.chunk", "created": created,
 				"model": "tensai",
 				"choices": []map[string]any{{
-					"index": 0, "delta": map[string]any{"content": piece},
+					"index": 0, "delta": map[string]any{field: piece},
 				}},
 			}
 			raw, _ := json.Marshal(chunk)
@@ -426,7 +461,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// held is the text accepted but not yet streamed, kept only long
 	// enough to rule out the start of a call marker.
 	var held strings.Builder
-	emit := func(piece string, final bool) {
+	answer := func(piece string, final bool) {
 		if len(tools) == 0 {
 			flush(piece)
 			return
@@ -452,6 +487,54 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		held.WriteString(text[len(text)-keep:])
 		if len(text) > keep {
 			flush(text[:len(text)-keep])
+		}
+	}
+
+	// A thinking model opens its turn with a reasoning block; what is
+	// inside goes out as reasoning and what follows is the answer. The
+	// two markers are looked for one at a time, holding back only a tail
+	// that could still grow into the one being awaited.
+	var reasonHeld strings.Builder
+	reasonState := 0 // 0 before the block, 1 inside it, 2 past it
+	emit := func(piece string, final bool) {
+		if s.tm.reasonOpen == "" || reasonState == 2 {
+			answer(piece, final)
+			return
+		}
+		reasonHeld.WriteString(piece)
+		for {
+			text := reasonHeld.String()
+			marker := s.tm.reasonOpen
+			if reasonState == 1 {
+				marker = s.tm.reasonClose
+			}
+			if i := strings.Index(text, marker); i >= 0 {
+				reasonHeld.Reset()
+				reasonHeld.WriteString(text[i+len(marker):])
+				if reasonState == 0 {
+					answer(text[:i], false)
+					reasonState = 1
+					continue
+				}
+				flushReason(text[:i])
+				reasonState = 2
+				answer(reasonHeld.String(), final)
+				reasonHeld.Reset()
+				return
+			}
+			keep := 0
+			if !final {
+				keep = partialMarker(text, marker)
+			}
+			out := text[:len(text)-keep]
+			reasonHeld.Reset()
+			reasonHeld.WriteString(text[len(text)-keep:])
+			if reasonState == 0 {
+				answer(out, final)
+			} else {
+				flushReason(out)
+			}
+			return
 		}
 	}
 
@@ -548,6 +631,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	content := s.tok.Decode(out)
+	reasoning := ""
+	if s.tm.reasonOpen != "" {
+		reasoning, content = splitReasoning(content, s.tm.reasonOpen, s.tm.reasonClose)
+	}
 	var calls []toolCall
 	if len(tools) > 0 {
 		content, calls = parseToolCalls(content)
@@ -590,6 +677,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	msg := map[string]any{"role": "assistant", "content": content}
+	if reasoning != "" {
+		msg["reasoning_content"] = reasoning
+	}
 	if len(calls) > 0 {
 		msg["tool_calls"] = calls
 	}

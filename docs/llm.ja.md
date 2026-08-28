@@ -142,6 +142,20 @@ tensai serve -q8 -addr 127.0.0.1:8080
 
 `serve` は `/v1/chat/completions` (messages 配列、SSE ストリーミング、使用量カウント) を公開するので、OpenAI クライアントを向ければ何でも純 Go のモデルとチャットできます。組み込みのチャットデモページが `GET /` で提供されます。
 
+### 思考の分離
+
+`-think` を付けると、答える前に考えるモデルの出力は 2 つに分かれて届きます — 最初に書く思考ブロックが `reasoning_content`、返答だけが `content` で、ストリーミングでもそれぞれのデルタになります。クライアントは思考を思考として表示することも、捨てることもできます。思考がプロンプトに戻ることはありません — 履歴を再生するときは返答だけを残し、思考は落とします。モデル自身のテンプレートと同じ扱いです。
+
+```json
+"message": {
+  "role": "assistant",
+  "reasoning_content": "Okay, the user is asking for 17 multiplied by 3...",
+  "content": "17 multiplied by 3 is 51."
+}
+```
+
+`-think` なしの場合、qwen3 と smollm3 は空の思考ブロックでターンを開くので、分離するものがありません。gpt-oss は harmony チャンネルで推論する別機構で、これは対象外です。
+
 ### ツール呼び出し
 
 `tools` を渡すと、モデルは散文の代わりに `tool_calls` で答えられます。エージェントがループを回すのに必要なものです:
