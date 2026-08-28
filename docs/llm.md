@@ -143,6 +143,21 @@ with a `config.json`, or a `.gguf` file. The examples cache their datasets in
 the same place, and those are counted separately rather than listed as models;
 `models rm` still removes them by name.
 
+```
+Qwen3-4B-Instruct-2507                      7.5GB  qwen3    tools think 2026-08-27
+Qwen2.5-1.5B-Instruct                       2.9GB  qwen2    tools       2026-08-23
+SmolLM2-360M-Instruct                       692MB  llama    -           2026-08-24
+qwen2.5-0.5b-instruct-q8_0.gguf             531MB  gguf     tools       2026-08-25
+```
+
+The fourth column says what `serve` will do with the model — accept a request
+offering `tools`, and give `-think` a block to reason in — not how well it will
+do it: a 0.5B checkpoint is listed as taking tools because it will be offered
+them, not because its calls are reliable. The answers follow the loader exactly,
+family fallback included, so a checkpoint whose own template is not on disk is
+listed the way it will be treated. Reading it costs a `.gguf` about 80ms of
+metadata parsing; directories are free.
+
 `serve` exposes `/v1/chat/completions` (messages array, SSE streaming, usage counts), so any OpenAI client pointed at it chats with a pure-Go model. A built-in chat demo page is served on `GET /`.
 
 ### Thinking
