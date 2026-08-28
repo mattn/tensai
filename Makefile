@@ -61,7 +61,7 @@ endif
 
 .PHONY: bump-force
 bump-force: $(GOBIN)/gobump
-	@gobump patch -w .
+	@gobump patch -w ./cmd/tensai
 	git commit -am "Bump up version to $(VERSION)"
 	git tag "v$(VERSION)"
 	git push origin main
