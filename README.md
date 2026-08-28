@@ -220,7 +220,7 @@ The DeepSeek-R1 distills need no family of their own — they are stock qwen2/ll
 
 With `-q8`/`-q4` each weight quantizes as it loads and its float32 copy dies immediately, so the full-precision model never has to fit in memory, and the layers load in parallel with the quantizer splitting columns across CPUs. Quantized GGUF checkpoints skip the float32 detour entirely: Q8_0, Q4_0, Q5_0, the whole Q4_K/Q5_K/Q6_K K-quant family, and MXFP4 repack straight from the memory-mapped file — nibbles copy raw where the grids line up, five- and six-bit spans renormalize with integer rounding under `-q4`, everything widens onto a finer int8 grid under `-q8` — keeping llama.cpp's own quantization intact. A 1.5B Q4_K_M loads in about 3 seconds instead of 8 (`-requant` restores the float detour, trading the much slower load for about 10% more decode speed from its coarser symmetric tables); a 3B Q8_0 opens in 5 seconds instead of 32.
 
-The first `-gguf` load also writes the repacked weights to a cache file next to the model (`-nocache` opts out), and every later load just memory-maps it: the 1.5B Q4_K_M reopens in ~0.3 seconds, a Mistral 7B in well under a second, and gpt-oss-20b in under two. Beyond the instant reopen, mapped weights are clean file-backed pages the kernel can drop and re-read at will — on a machine where the model barely fits, that replaces swap thrashing with ordinary page cache behavior, which is the same structural advantage llama.cpp gets from decoding straight out of its mmap'd file.
+The first `.gguf` load also writes the repacked weights to a cache file next to the model (`-nocache` opts out), and every later load just memory-maps it: the 1.5B Q4_K_M reopens in ~0.3 seconds, a Mistral 7B in well under a second, and gpt-oss-20b in under two. Beyond the instant reopen, mapped weights are clean file-backed pages the kernel can drop and re-read at will — on a machine where the model barely fits, that replaces swap thrashing with ordinary page cache behavior, which is the same structural advantage llama.cpp gets from decoding straight out of its mmap'd file.
 
 On a 15GB machine the ladder looks like: 0.5B at ~40 tok/s with `-q8` and a 1.5B Q4_K_M at ~25 with `-q4` (the tiled integer kernels, measured on native Windows), and Qwen2.5-**7B**-Instruct — 15GB of BF16 shards, int4-quantized on the fly during a two-minute load into ~6GB resident — answering correctly at 3.5 tok/s. Prompts feed through a batched prefill: `QMatrix.MatMul` streams the weights once per block of eight token rows instead of once per token, cutting the wait before the first generated token by around 6x.
 
@@ -415,7 +415,7 @@ GOEXPERIMENT=simd go run ./_example/qwen -q8      # downloads Qwen2.5-0.5B-Instr
 # The tensai command wraps the same engine as subcommands:
 GOEXPERIMENT=simd go install ./cmd/tensai
 tensai run -q8 "What is the capital of France?"
-tensai chat -q8 -gguf model.gguf
+tensai chat -q8 -model ./model.gguf
 tensai serve -q8 -addr :8080                      # OpenAI-compatible API
 GOEXPERIMENT=simd go run -tags wgpu24 ./cmd/tensai bench -q8   # CPU vs GPU
 go run -tags wgpu ./_example/wgpu          # needs wgpu-native, see above

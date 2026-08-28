@@ -43,7 +43,7 @@ The capital of France is Paris.
 
 With `-q8`/`-q4` each weight quantizes as it loads and its float32 copy dies immediately, so the full-precision model never has to fit in memory. Quantized GGUF checkpoints skip the float32 detour entirely: Q8_0, Q4_0, Q5_0, the Q4_K/Q5_K/Q6_K K-quant family, and MXFP4 repack straight from the memory-mapped file, keeping llama.cpp's own quantization intact. A 1.5B Q4_K_M loads in about 3 seconds instead of 8; a 3B Q8_0 opens in 5 seconds instead of 32 (`-requant` restores the float detour, trading a much slower load for about 10% more decode speed).
 
-The first `-gguf` load also writes the repacked weights to a cache file next to the model (`-nocache` opts out), and every later load just memory-maps it: the 1.5B Q4_K_M reopens in ~0.3 seconds, a Mistral 7B in well under a second, and gpt-oss-20b in under two. Mapped weights are clean file-backed pages the kernel can drop and re-read at will — on a machine where the model barely fits, that replaces swap thrashing with ordinary page cache behavior.
+The first `.gguf` load also writes the repacked weights to a cache file next to the model (`-nocache` opts out), and every later load just memory-maps it: the 1.5B Q4_K_M reopens in ~0.3 seconds, a Mistral 7B in well under a second, and gpt-oss-20b in under two. Mapped weights are clean file-backed pages the kernel can drop and re-read at will — on a machine where the model barely fits, that replaces swap thrashing with ordinary page cache behavior.
 
 On a 15GB machine the ladder looks like: a 0.5B at ~40 tok/s with `-q8`, a 1.5B Q4_K_M at ~25 tok/s with `-q4` (tiled integer kernels, native Windows), and Qwen2.5-**7B**-Instruct — 15GB of BF16 shards, int4-quantized on the fly during a two-minute load into ~6GB resident — answering correctly at 3.5 tok/s.
 
@@ -71,12 +71,28 @@ commands:
   version  print the version
 ```
 
-All model commands share the same flags: `-repo` (Hugging Face repo to download from), `-gguf` (load everything from one .gguf file), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
+All model commands share the same flags: `-model` (which model to run), `-data` (where to cache a download), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
+
+`-model` is the only thing that says which model to run, and it reads whichever
+form you hand it, in this order:
+
+| Form | Example |
+|---|---|
+| a name from `tensai models` | `-model Qwen3-0.6B`, `-model qwen2.5-0.5b-instruct-q8_0` |
+| a path to a directory or `.gguf` | `-model ./model.gguf`, `-model /srv/checkpoints/qwen` |
+| a Hugging Face repo, downloaded on first use | `-model Qwen/Qwen3-4B-Instruct-2507` |
+
+Omit it for the default checkpoint. A local reference never downloads: a name
+that is not cached, and carries no org to fetch it from, is an error pointing
+back at the listing. `-data` overrides where a download is cached, and says so
+rather than being ignored when the model is already local. `-draft` takes the
+same forms, minus `.gguf`.
 
 ```bash
 tensai run -q8 "What is the capital of France?"
+tensai run -q8 -model Qwen3-0.6B "Explain RoPE briefly"   # a name from "tensai models"
 tensai run -q8 -json "Explain RoPE briefly"      # one JSON object with usage counts
-tensai chat -q8 -gguf model.gguf                 # multi-turn; the KV cache carries the dialogue
+tensai chat -q8 -model ./model.gguf              # multi-turn; the KV cache carries the dialogue
 tensai models                                    # list the cache; "models rm <name>" deletes
 tensai bench -q8                                 # CPU vs GPU, prefill and decode
 ```
