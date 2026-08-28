@@ -122,6 +122,11 @@ the prompt grows, since attention is quadratic, so compare at one length.
 tensai serve -q8 -addr 127.0.0.1:8080
 ```
 
+`models` lists only what `run`, `chat`, and `serve` can load — a directory
+with a `config.json`, or a `.gguf` file. The examples cache their datasets in
+the same place, and those are counted separately rather than listed as models;
+`models rm` still removes them by name.
+
 `serve` exposes `/v1/chat/completions` (messages array, SSE streaming, usage counts), so any OpenAI client pointed at it chats with a pure-Go model. A built-in chat demo page is served on `GET /`.
 
 - The default bind is loopback only (`127.0.0.1:8080`, or `$TENSAI_ADDR`); widen it explicitly if you mean to

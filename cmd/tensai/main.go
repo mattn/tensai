@@ -403,6 +403,7 @@ func modelsCmd(args []string) error {
 	}
 	var total int64
 	found := false
+	others := 0
 	for _, ent := range entries {
 		if !ent.IsDir() {
 			if !strings.HasSuffix(ent.Name(), ".gguf") {
@@ -425,6 +426,23 @@ func modelsCmd(args []string) error {
 			continue
 		}
 		dir := filepath.Join(root, ent.Name())
+		// The cache root is shared with the examples, which park their
+		// datasets (iris, mnist) beside the checkpoints. What run, chat,
+		// and serve can load is a directory with a config.json, so
+		// anything without one is not a model and does not belong in a
+		// model listing.
+		raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
+		if err != nil {
+			others++
+			continue
+		}
+		kind := "?"
+		var cfg struct {
+			ModelType string `json:"model_type"`
+		}
+		if json.Unmarshal(raw, &cfg) == nil && cfg.ModelType != "" {
+			kind = cfg.ModelType
+		}
 		var size int64
 		newest := time.Time{}
 		filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
@@ -439,24 +457,24 @@ func modelsCmd(args []string) error {
 			}
 			return nil
 		})
-		kind := "?"
-		if raw, err := os.ReadFile(filepath.Join(dir, "config.json")); err == nil {
-			var cfg struct {
-				ModelType string `json:"model_type"`
-			}
-			if json.Unmarshal(raw, &cfg) == nil && cfg.ModelType != "" {
-				kind = cfg.ModelType
-			}
-		}
 		fmt.Printf("%-40s %8s  %-8s %s\n", ent.Name(), humanSize(size), kind, newest.Format("2006-01-02"))
 		total += size
 		found = true
 	}
-	if !found {
+	if found {
+		fmt.Printf("%-40s %8s  (%s)\n", "total", humanSize(total), root)
+	} else {
 		fmt.Fprintf(os.Stderr, "no cached models under %s\n", root)
-		return nil
 	}
-	fmt.Printf("%-40s %8s  (%s)\n", "total", humanSize(total), root)
+	if others > 0 {
+		// Said plainly so the count cannot be read as models that failed
+		// to list; "models rm" still accepts them by name.
+		what := fmt.Sprintf("%d other directories here hold example datasets, not models", others)
+		if others == 1 {
+			what = "1 other directory here holds an example dataset, not a model"
+		}
+		fmt.Fprintln(os.Stderr, what)
+	}
 	return nil
 }
 
