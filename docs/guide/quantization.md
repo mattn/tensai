@@ -27,7 +27,7 @@ int4 quantizes group-wise (a scale — or scale/min pair — per group of rows w
 ## Where quantization is used
 
 - `_example/gpt2 -q8` quantizes the decode-path weights and doubles generation speed (23 → 46 tok/s), because decode streams the whole checkpoint per token
-- `_example/qwen` / the `tensai` command accept `-q8` and `-q4`: each weight quantizes as it loads and its float32 copy dies immediately, so the full-precision model never has to fit in memory
+- The `tensai` command accepts `-q8` and `-q4`: each weight quantizes as it loads and its float32 copy dies immediately, so the full-precision model never has to fit in memory
 - Quantized GGUF checkpoints (Q8_0, Q4_0, Q5_0, the Q4_K/Q5_K/Q6_K family, MXFP4) repack **directly** into these layouts from the memory-mapped file, skipping the float32 detour entirely — llama.cpp's own quantization stays intact
 - On the GPU, `UploadQ8`/`UploadQ4` keep the weights quantized on the device and dequantize in registers — see [GPU (WebGPU)](gpu.md)
 

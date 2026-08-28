@@ -97,13 +97,13 @@ net.Compile(2, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.05))
 
 ## サンプルを動かす
 
-リポジトリには、2 行の自動微分 hello-world から本物の LLM 推論まで、15 個の実行可能サンプルが入っています:
+リポジトリには、2 行の自動微分 hello-world から本物の LLM 推論まで、13 個の実行可能サンプルが入っています:
 
 ```bash
 go run ./_example/xor
 go run ./_example/mnist -model cnn
 GOEXPERIMENT=simd go run ./_example/gpt2      # 初回に GPT-2 (~550MB) をダウンロード
-GOEXPERIMENT=simd go run ./_example/qwen -q8  # 初回に Qwen2.5-0.5B (~1GB) をダウンロード
+GOEXPERIMENT=simd go run ./cmd/tensai run -q8  # 初回に Qwen2.5-0.5B (~1GB) をダウンロード
 ```
 
 全リストは[サンプル](examples.md)を参照してください。

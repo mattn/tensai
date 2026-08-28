@@ -17,9 +17,8 @@
 | tensor | `go run ./_example/tensor` | N 次元 Tensor ツアー: ブロードキャスト、バッチ MatMul、attention |
 | wgpu | `go run -tags wgpu ./_example/wgpu` | WebGPU MatMul: アダプタ情報、CPU との照合、GPU vs CPU スイープ |
 | gpt2 | `GOEXPERIMENT=simd go run ./_example/gpt2` | 公開 GPT-2 (124M) チェックポイントが純 Go でテキスト生成 |
-| qwen | `GOEXPERIMENT=simd go run ./_example/qwen -q8` | Qwen2.5-0.5B-Instruct (ほか 8 ファミリー) が純 Go でチャット |
 
-gpt2 サンプルは初回に GPT-2 チェックポイント (~550MB) を、qwen は Qwen2.5-0.5B-Instruct (~1GB) をダウンロードします。
+gpt2 サンプルは初回に GPT-2 チェックポイント (~550MB) をダウンロードします。instruction-tuned モデル (Qwen2.5-0.5B から 7B まで 9 ファミリー) は `tensai` コマンドを使ってください: [LLM 推論](llm.md)を参照。
 
 ## MNIST
 

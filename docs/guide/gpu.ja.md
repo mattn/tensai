@@ -63,7 +63,7 @@ out, _ = gq.MultiHeadAttention(gk, gv, heads)  // パックされた (batch, seq
 
 `UploadQ8` は `QMatrix` を u32 あたり int8 重み 4 つでパックし、`gpu.QMatrix.MatMul` がレジスタ内で逆量子化するので、デコード matvec の転送は f32 の 1/4 バイトになります。`UploadQ4` は int4 の双子に同じことをするので、`-q4 -gpu` は int8 では収まらないモデルを動かせます。
 
-トランスフォーマーのデコード 1 ステップの残りも揃っています — `RMSNorm`、インプレース `RoPE`、`Add`、`SiluMul`、`GroupedCausalAttention` (クエリよりヘッド数の少ない KV キャッシュ)、常駐キャッシュに新しい k/v 行を追記する `CopyRowsInto` — なので `_example/qwen -q8 -gpu` は全ブロックをデバイス上で実行し、トークンごとに戻ってくるのは隠れ状態だけです。`BeginBatch`/`Flush` は 1 トークン分のディスパッチを 1 回のサブミッションに記録し、解放された中間バッファはバッファプールで再利用されます。
+トランスフォーマーのデコード 1 ステップの残りも揃っています — `RMSNorm`、インプレース `RoPE`、`Add`、`SiluMul`、`GroupedCausalAttention` (クエリよりヘッド数の少ない KV キャッシュ)、常駐キャッシュに新しい k/v 行を追記する `CopyRowsInto` — なので `tensai run -q8 -gpu` は全ブロックをデバイス上で実行し、トークンごとに戻ってくるのは隠れ状態だけです。`BeginBatch`/`Flush` は 1 トークン分のディスパッチを 1 回のサブミッションに記録し、解放された中間バッファはバッファプールで再利用されます。
 
 ## クロスオーバーの測定
 
