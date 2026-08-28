@@ -1,3 +1,7 @@
+# wgpu24 binds the v29 wgpu-native C API, which can see non-conformant
+# Vulkan drivers. That is what reaches the real GPU through dozen inside
+# WSL2; a plain wgpu build falls back to a software rasterizer there.
+# See docs/guide/gpu.md.
 BIN := tensai
 VERSION := $$(make -s show-version)
 CURRENT_REVISION := $(shell git rev-parse --short HEAD)
