@@ -780,7 +780,9 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 	// Some models are stock blocks speaking their own turn markers; the
 	// embedded chat template gives them away — DeepSeek's R1 distills
 	// (qwen2/llama) and the Mistral instruct line (llama).
-	if tpl, _ := g.String("tokenizer.chat_template"); strings.Contains(tpl, "<｜User｜>") {
+	tpl, _ := g.String("tokenizer.chat_template")
+	cfg.ChatTemplate = tpl
+	if strings.Contains(tpl, "<｜User｜>") {
 		cfg.ChatStyle = "deepseek"
 	} else if strings.Contains(tpl, "[INST]") {
 		cfg.ChatStyle = "mistral"
