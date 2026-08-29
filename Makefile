@@ -11,12 +11,8 @@ BIN := tensai
 # archives, which are cross-built from Linux.
 ifeq ($(OS),Windows_NT)
 EXE := .exe
-RM_F := del /q
-RM_RF := rmdir /s /q
 else
 EXE :=
-RM_F := rm -f
-RM_RF := rm -rf
 endif
 VERSION := $$(make -s show-version)
 CURRENT_REVISION := $(shell git rev-parse --short HEAD)
@@ -66,8 +62,8 @@ test:
 
 .PHONY: clean
 clean:
-	-$(RM_F) $(BIN)$(EXE)
-	-$(RM_RF) goxz
+	-rm -f $(BIN)$(EXE)
+	-rm -rf goxz
 	go clean
 
 .PHONY: bump
