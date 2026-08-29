@@ -177,6 +177,8 @@ func dtypeSize(dtype string) (int64, error) {
 		return 2, nil
 	case "F64":
 		return 8, nil
+	case "U8", "I8":
+		return 1, nil
 	default:
 		return 0, fmt.Errorf("safetensors: unsupported dtype %q", dtype)
 	}
@@ -191,6 +193,13 @@ func (f *File) Tensor(name string) (*tensai.Tensor, error) {
 	}
 	if _, err := dtypeSize(e.Dtype); err != nil {
 		return nil, fmt.Errorf("%w (tensor %q)", err, name)
+	}
+	if e.Dtype == "U8" || e.Dtype == "I8" {
+		// These carry packed payloads -- MXFP4 nibbles and their e8m0
+		// exponents -- whose meaning lives in the format that wrote them,
+		// and widening a quarter of a gigabyte of nibbles to float32 is
+		// not what any caller wants. Raw hands back the bytes instead.
+		return nil, fmt.Errorf("safetensors: tensor %q is %s; use Raw (tensor %q)", name, e.Dtype, name)
 	}
 	var buf []byte
 	if f.data != nil {
@@ -229,6 +238,32 @@ func (f *File) Tensor(name string) (*tensai.Tensor, error) {
 		}
 	}
 	return out, nil
+}
+
+// Raw returns a tensor's bytes as they sit in the file, for dtypes whose
+// payload is packed rather than numeric -- MXFP4 weights arrive as U8
+// blocks of nibbles beside U8 e8m0 scales, and expanding those to float32
+// would cost a couple of gigabytes a layer. The slice aliases the mapped
+// file when there is one, so treat it as read-only and do not retain it
+// past Close.
+func (f *File) Raw(name string) (data []byte, shape []int, err error) {
+	e, ok := f.entries[name]
+	if !ok {
+		return nil, nil, fmt.Errorf("safetensors: no tensor %q", name)
+	}
+	if f.data != nil {
+		lo, hi := f.dataOff+e.DataOffsets[0], f.dataOff+e.DataOffsets[1]
+		if hi > int64(len(f.data)) || lo < 0 || lo > hi {
+			return nil, nil, fmt.Errorf("safetensors: tensor %q extends past the file", name)
+		}
+		data = f.data[lo:hi]
+	} else {
+		data = make([]byte, e.DataOffsets[1]-e.DataOffsets[0])
+		if _, err := f.r.ReadAt(data, f.dataOff+e.DataOffsets[0]); err != nil {
+			return nil, nil, fmt.Errorf("safetensors: reading tensor %q: %w", name, err)
+		}
+	}
+	return data, append([]int(nil), e.Shape...), nil
 }
 
 // f16to32 widens an IEEE 754 binary16 value, including subnormals,
@@ -411,6 +446,15 @@ func (s *Shards) Tensor(name string) (*tensai.Tensor, error) {
 		return nil, fmt.Errorf("safetensors: no tensor %q", name)
 	}
 	return f.Tensor(name)
+}
+
+// Raw returns one tensor's packed bytes from its shard.
+func (s *Shards) Raw(name string) ([]byte, []int, error) {
+	f, ok := s.byName[name]
+	if !ok {
+		return nil, nil, fmt.Errorf("safetensors: no tensor %q", name)
+	}
+	return f.Raw(name)
 }
 
 // SaveFile writes tensors to path via Save.
