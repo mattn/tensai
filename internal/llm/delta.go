@@ -280,12 +280,37 @@ func (d *deltaWeights) head(st *deltaState, scratch *deltaScratch, res, out, z, 
 	}
 }
 
-// deltaScratch is one token's working set, reused across layers.
+// deltaScratch is one token's working set, reused across layers. The
+// per-head copies exist because a prefill batch runs the heads at once,
+// and each wants its own mem and delta; decode reuses the first.
 type deltaScratch struct {
 	qkv, conv, z, a, b, mem, delta, out, proj []float32
+	perHead                                   []*deltaScratch
+	batch                                     []float32
+}
+
+// batchConv hands back a [rows, cols] buffer for a prefill batch's
+// convolution output, growing the one it keeps rather than allocating a
+// fresh twenty megabytes per layer.
+func (s *deltaScratch) batchConv(rows, cols int) []float32 {
+	if n := rows * cols; cap(s.batch) < n {
+		s.batch = make([]float32, n)
+	} else {
+		s.batch = s.batch[:n]
+	}
+	return s.batch
 }
 
 func newDeltaScratch(d *deltaWeights, hidden int) *deltaScratch {
+	s := newDeltaScratchOne(d, hidden)
+	s.perHead = make([]*deltaScratch, d.heads)
+	for i := range s.perHead {
+		s.perHead[i] = newDeltaScratchOne(d, hidden)
+	}
+	return s
+}
+
+func newDeltaScratchOne(d *deltaWeights, hidden int) *deltaScratch {
 	return &deltaScratch{
 		qkv:   make([]float32, d.convDim),
 		conv:  make([]float32, d.convDim),
@@ -308,4 +333,80 @@ func (m *qwen) hasDelta() bool {
 		}
 	}
 	return false
+}
+
+// mixBatch is mix over a whole prefill batch. The convolution is a
+// sequence-wide pass, and after it every head walks the batch on its own
+// state, so the recurrence -- which is sequential in tokens but not in
+// heads -- runs on as many cores as there are heads instead of one.
+// That is the difference between prefill using four of sixteen and most
+// of them.
+func (d *deltaWeights) mixBatch(st *deltaState, qz *tensai.Matrix, ab *tensai.Matrix,
+	mixed *tensai.Matrix, scratch *deltaScratch) {
+	n := mixed.Rows
+	kd, vd, h := d.kDim, d.vDim, d.heads
+	keyDim := kd * h
+	kw := d.convK
+	// The convolution first, for every token: each channel mixes with its
+	// three predecessors, which for the first tokens are the window the
+	// previous batch left.
+	conv := scratch.batchConv(n, d.convDim)
+	prev := st.conv
+	for t := 0; t < n; t++ {
+		src := qz.Data[t*qz.Cols : t*qz.Cols+d.convDim]
+		out := conv[t*d.convDim : (t+1)*d.convDim]
+		for c := 0; c < d.convDim; c++ {
+			acc := src[c] * d.conv[c*kw+kw-1]
+			for i := 0; i < kw-1; i++ {
+				j := t - (kw - 1) + i
+				if j < 0 {
+					acc += prev[(kw-1+j)*d.convDim+c] * d.conv[c*kw+i]
+				} else {
+					acc += qz.Data[j*qz.Cols+c] * d.conv[c*kw+i]
+				}
+			}
+			out[c] = acc
+		}
+	}
+	kernels.Silu(conv)
+	// Carry the window forward by the last kw-1 tokens of the batch.
+	for i := 0; i < kw-1; i++ {
+		j := n - (kw - 1) + i
+		dst := prev[i*d.convDim : (i+1)*d.convDim]
+		if j < 0 {
+			copy(dst, prev[(kw-1+j)*d.convDim:])
+			continue
+		}
+		copy(dst, qz.Data[j*qz.Cols:j*qz.Cols+d.convDim])
+	}
+
+	qScale := float32(1 / math.Sqrt(float64(kd)))
+	work := func(hi int) {
+		sc := scratch.perHead[hi]
+		for t := 0; t < n; t++ {
+			d.head(st, sc, mixed.Data[t*mixed.Cols:(t+1)*mixed.Cols],
+				conv[t*d.convDim:(t+1)*d.convDim],
+				qz.Data[t*qz.Cols+d.convDim:(t+1)*qz.Cols],
+				ab.Data[t*ab.Cols:t*ab.Cols+h],
+				ab.Data[t*ab.Cols+h:(t+1)*ab.Cols],
+				hi, kd, vd, keyDim, qScale)
+		}
+	}
+	if workers := min(runtime.NumCPU(), h); workers > 1 {
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for hi := w; hi < h; hi += workers {
+					work(hi)
+				}
+			}(w)
+		}
+		wg.Wait()
+		return
+	}
+	for hi := 0; hi < h; hi++ {
+		work(hi)
+	}
 }

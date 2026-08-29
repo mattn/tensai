@@ -1125,18 +1125,8 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			// quantized weight, a and b the float one.
 			qzB := mmb(a, d.wQZ, d.qQZ, nil)
 			abB := mmb(a, d.wAB, nil, nil)
-			// Only the state carries between tokens, and it is not worth
-			// a goroutine per token here.
-			b.dstate.parallel = false
 			mixed := tensai.NewMatrix(n, d.vDim*d.heads)
-			for t := 0; t < n; t++ {
-				qz := qzB.Data[t*qzB.Cols : (t+1)*qzB.Cols]
-				ab := abB.Data[t*abB.Cols : (t+1)*abB.Cols]
-				res := d.mix(b.dstate, qz[:d.convDim], qz[d.convDim:],
-					ab[:d.heads], ab[d.heads:], m.dscratch)
-				copy(mixed.Data[t*mixed.Cols:(t+1)*mixed.Cols], res)
-			}
-			b.dstate.parallel = true
+			d.mixBatch(b.dstate, qzB, abB, mixed, m.dscratch)
 			outB := mmb(mixed, d.wOut, d.qOut, nil)
 			for i := range x.Data {
 				x.Data[i] += outB.Data[i]
