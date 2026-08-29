@@ -436,6 +436,15 @@ func modelsCmd(args []string) error {
 			return fmt.Errorf("usage: tensai models rm <name>...")
 		}
 		for _, name := range args[1:] {
+			// The listing may print an org/name, which is what a user
+			// copies; the cache directory is only ever the last element.
+			if org, base, ok := strings.Cut(name, "/"); ok {
+				if org == "" || org != filepath.Base(org) || org == "." || org == ".." ||
+					strings.Contains(base, "/") {
+					return fmt.Errorf("invalid model name %q", name)
+				}
+				name = base
+			}
 			if name != filepath.Base(name) || name == "." || name == ".." {
 				return fmt.Errorf("invalid model name %q", name)
 			}
@@ -473,6 +482,14 @@ func modelsCmd(args []string) error {
 	var total int64
 	found := false
 	others := 0
+	// Rows are collected before printing: naming a model by the repo it
+	// came from moves it out of directory order, and a listing that
+	// looks unsorted is harder to read than one that is.
+	type row struct{ name, line string }
+	var rows []row
+	emit := func(name, line string) {
+		rows = append(rows, row{name, line})
+	}
 	for _, ent := range entries {
 		if !ent.IsDir() {
 			if !strings.HasSuffix(ent.Name(), ".gguf") {
@@ -489,8 +506,8 @@ func modelsCmd(args []string) error {
 					}
 				}
 			}
-			fmt.Printf("%-40s %8s  %-8s %-11s %s\n", ent.Name(), humanSize(size), "gguf",
-				llm.Inspect(filepath.Join(root, ent.Name())), newest.Format("2006-01-02"))
+			emit(ent.Name(), fmt.Sprintf("%-40s %8s  %-8s %-11s %s", ent.Name(), humanSize(size), "gguf",
+				llm.Inspect(filepath.Join(root, ent.Name())), newest.Format("2006-01-02")))
 			total += size
 			found = true
 			continue
@@ -527,10 +544,27 @@ func modelsCmd(args []string) error {
 			}
 			return nil
 		})
-		fmt.Printf("%-40s %8s  %-8s %-11s %s\n", ent.Name(), humanSize(size), kind,
-			llm.Inspect(dir), newest.Format("2006-01-02"))
+		// Naming the repo rather than the directory keeps the listing
+		// usable on another machine, where the model is not cached yet;
+		// -model takes either form against a cache that already has it.
+		name := ent.Name()
+		if repo := llm.Origin(dir); repo != "" {
+			name = repo
+		}
+		emit(name, fmt.Sprintf("%-40s %8s  %-8s %-11s %s", name, humanSize(size), kind,
+			llm.Inspect(dir), newest.Format("2006-01-02")))
 		total += size
 		found = true
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		a, b := strings.ToLower(rows[i].name), strings.ToLower(rows[j].name)
+		if a != b {
+			return a < b
+		}
+		return rows[i].name < rows[j].name
+	})
+	for _, r := range rows {
+		fmt.Println(r.line)
 	}
 	if found {
 		fmt.Printf("%-40s %8s  (%s)\n", "total", humanSize(total), root)
