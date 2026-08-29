@@ -11,6 +11,8 @@ package llm
 import (
 	"fmt"
 	"math"
+	"runtime"
+	"sync"
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/internal/kernels"
@@ -139,15 +141,22 @@ func silu(x float32) float32 {
 // step advances one token through the layer, in place on x. conv holds the
 // previous convK-1 rows; the state absorbs the token and answers the query.
 func (d *deltaWeights) step(st *deltaState, x []float32, scratch *deltaScratch) []float32 {
-	qkv := scratch.qkv
-	mvInto(qkv, x, d.wQKV, d.qQKV, nil)
-	z := scratch.z
-	mvInto(z, x, d.wZ, d.qZ, nil)
-	a := scratch.a
-	mvInto(a, x, d.wA, nil, nil)
-	b := scratch.b
-	mvInto(b, x, d.wB, nil, nil)
+	mvInto(scratch.qkv, x, d.wQKV, d.qQKV, nil)
+	mvInto(scratch.z, x, d.wZ, d.qZ, nil)
+	mvInto(scratch.a, x, d.wA, nil, nil)
+	mvInto(scratch.b, x, d.wB, nil, nil)
+	res := d.mix(st, scratch.qkv, scratch.z, scratch.a, scratch.b, scratch)
+	y := scratch.proj
+	mvInto(y, res, d.wOut, d.qOut, nil)
+	return y
+}
 
+// mix is the half of the layer that cannot be batched: the convolution
+// reads the window the previous tokens left, and the state each token
+// writes is what the next one reads. Everything around it -- the four
+// projections in and the one out -- is an ordinary matmul, which is why
+// prefill does those over the whole batch and calls only this per token.
+func (d *deltaWeights) mix(st *deltaState, qkv, z, a, b []float32, scratch *deltaScratch) []float32 {
 	// Causal depthwise convolution over the qkv channels, then silu. The
 	// window is the state's convK-1 rows followed by this token.
 	kw := d.convK
@@ -167,10 +176,38 @@ func (d *deltaWeights) step(st *deltaState, x []float32, scratch *deltaScratch) 
 
 	kd, vd, h := d.kDim, d.vDim, d.heads
 	keyDim := kd * h
-	qs, ks, vs := out[:keyDim], out[keyDim:2*keyDim], out[2*keyDim:]
 	res := scratch.out
 	qScale := float32(1 / math.Sqrt(float64(kd)))
+	// Heads share nothing: each owns its slice of the state and of every
+	// scratch buffer, so they run wherever there is a core. The state is
+	// a megabyte a layer, which is what makes this worth the dispatch.
+	if workers := min(runtime.NumCPU(), h); workers > 1 {
+		var wg sync.WaitGroup
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func(w int) {
+				defer wg.Done()
+				for hi := w; hi < h; hi += workers {
+					d.head(st, scratch, res, out, z, a, b, hi, kd, vd, keyDim, qScale)
+				}
+			}(w)
+		}
+		wg.Wait()
+		return res
+	}
 	for hi := 0; hi < h; hi++ {
+		d.head(st, scratch, res, out, z, a, b, hi, kd, vd, keyDim, qScale)
+	}
+	return res
+}
+
+// head advances one head of the delta rule. It is its own function so the
+// loop above can hand a head to a goroutine without capturing anything the
+// others touch.
+func (d *deltaWeights) head(st *deltaState, scratch *deltaScratch, res, out, z, a, b []float32,
+	hi, kd, vd, keyDim int, qScale float32) {
+	qs, ks, vs := out[:keyDim], out[keyDim:2*keyDim], out[2*keyDim:]
+	{
 		q := qs[hi*kd : (hi+1)*kd]
 		k := ks[hi*kd : (hi+1)*kd]
 		v := vs[hi*vd : (hi+1)*vd]
@@ -183,7 +220,7 @@ func (d *deltaWeights) step(st *deltaState, x []float32, scratch *deltaScratch) 
 		decay := float32(math.Exp(float64(-float32(math.Exp(float64(d.aLog[hi]))) * softplus(a[hi]+d.dtBias[hi]))))
 
 		s := st.s[hi*kd*vd : (hi+1)*kd*vd]
-		mem := scratch.mem[:vd]
+		mem := scratch.mem[hi*vd : (hi+1)*vd]
 		for j := range mem {
 			mem[j] = 0
 		}
@@ -195,17 +232,21 @@ func (d *deltaWeights) step(st *deltaState, x []float32, scratch *deltaScratch) 
 				tensai.Axpy(k[i], row, mem)
 			}
 		}
-		// Write the difference back along the key, then answer the query.
+		// The correction the key writes is the same vector for every row
+		// of the state, so it is computed once and each row takes a
+		// multiple of it -- which is an axpy, not a scalar loop.
+		delta := scratch.delta[hi*vd : (hi+1)*vd]
+		for j := range delta {
+			delta[j] = (v[j] - mem[j]) * beta
+		}
 		o := res[hi*vd : (hi+1)*vd]
 		for j := range o {
 			o[j] = 0
 		}
 		for i := 0; i < kd; i++ {
 			row := s[i*vd : (i+1)*vd]
-			if ki := k[i]; ki != 0 {
-				for j := 0; j < vd; j++ {
-					row[j] += ki * (v[j] - mem[j]) * beta
-				}
+			if k[i] != 0 {
+				tensai.Axpy(k[i], delta, row)
 			}
 			if q[i] != 0 {
 				tensai.Axpy(q[i], row, o)
@@ -222,26 +263,24 @@ func (d *deltaWeights) step(st *deltaState, x []float32, scratch *deltaScratch) 
 			o[j] = d.norm[j] * (o[j] * inv) * silu(zg[j])
 		}
 	}
-	y := scratch.proj
-	mvInto(y, res, d.wOut, d.qOut, nil)
-	return y
 }
 
 // deltaScratch is one token's working set, reused across layers.
 type deltaScratch struct {
-	qkv, conv, z, a, b, mem, out, proj []float32
+	qkv, conv, z, a, b, mem, delta, out, proj []float32
 }
 
 func newDeltaScratch(d *deltaWeights, hidden int) *deltaScratch {
 	return &deltaScratch{
-		qkv:  make([]float32, d.convDim),
-		conv: make([]float32, d.convDim),
-		z:    make([]float32, d.vDim*d.heads),
-		a:    make([]float32, d.heads),
-		b:    make([]float32, d.heads),
-		mem:  make([]float32, d.vDim),
-		out:  make([]float32, d.vDim*d.heads),
-		proj: make([]float32, hidden),
+		qkv:   make([]float32, d.convDim),
+		conv:  make([]float32, d.convDim),
+		z:     make([]float32, d.vDim*d.heads),
+		a:     make([]float32, d.heads),
+		b:     make([]float32, d.heads),
+		mem:   make([]float32, d.vDim*d.heads),
+		delta: make([]float32, d.vDim*d.heads),
+		out:   make([]float32, d.vDim*d.heads),
+		proj:  make([]float32, hidden),
 	}
 }
 

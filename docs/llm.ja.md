@@ -25,6 +25,13 @@ greedy の続きは GPT-2 のよく知られたリファレンス出力とトー
 | qwen2 | Qwen 1.5/2/2.5, Qwen2.5-Coder, R1-Distill-Qwen 系 | attention バイアス |
 | qwen3 | Qwen3 dense | ヘッドごとの QK-norm、明示的 head_dim、`-think` |
 | qwen3_5 | Qwen3.5 / 3.6 / 3.8 | 4 層に 3 層が gated delta rule、残り 1 層が通常の attention。正規化は 1 + w、RoPE はヘッドの 1/4 だけ回し、クエリが attention 出力のゲートを連れる。CPU のみ、`-draft` 不可 |
+
+`qwen3_5` のプレフィルは、モデルの大きさから想像するより高くつきます。delta 層は
+状態をトークンごとに引き継ぐので、バッチが効くのは再帰の周りの射影だけで、長い
+プロンプトはプレフィルというよりデコードに近くなります。0.8B で AVX2 マシンなら
+1 トークンあたり約 10 ミリ秒 — 同規模の qwen3 が 4 ミリ秒なので、システムプロンプトが
+数千トークンあると待たされます。アーキテクチャが許すチャンク化を実装すれば大半は
+縮みますが、まだ入っていません。
 | llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | みんながフォークしたブロック |
 | smollm3 | SmolLM3-3B | 4 層ごとに RoPE をスキップ |
 | gemma3 | Gemma 3 | 5/6 層のスライディングウィンドウ、サンドイッチ norm、gelu-tanh ゲート、SentencePiece |
