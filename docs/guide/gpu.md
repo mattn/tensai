@@ -92,7 +92,10 @@ The crossover moves with the CPU kernel, GPU driver, and transfer pattern — th
 
 ## `-tags wgpu24`: the new wgpu-native API, and the real GPU inside WSL2
 
-`-tags wgpu24` builds the same `gpu.Open` API against the reworked wgpu-native C API — pair it with a **v29-series** release binary. The new API's payoff is `WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter`, which un-hides non-conformant Vulkan drivers. Concretely: Mesa's dozen (Vulkan-on-D3D12) exposes the real host GPU inside WSL2, but the v22 API hides it as non-conformant and falls back to lavapipe; the wgpu24 build reaches it:
+`-tags wgpu24` builds the same `gpu.Open` API against the reworked wgpu-native C API — pair it with a **v29-series** release binary. Releases carry both, so a driver that disagrees with one of them
+does not also require a Go toolchain: `tensai_*` is the `wgpu24` build and
+`tensai-wgpu22_*` the other, and the binary inside is called `tensai` either
+way. The new API's payoff is `WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter`, which un-hides non-conformant Vulkan drivers. Concretely: Mesa's dozen (Vulkan-on-D3D12) exposes the real host GPU inside WSL2, but the v22 API hides it as non-conformant and falls back to lavapipe; the wgpu24 build reaches it:
 
 ```bash
 VK_DRIVER_FILES=/path/to/dzn_icd.json \
