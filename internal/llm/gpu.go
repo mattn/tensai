@@ -3,13 +3,16 @@ package llm
 // GPU decode: every transformer block runs on the device — int8 weights
 // resident via GPUQMatrix, the KV cache resident in two preallocated
 // buffers per layer — so one token costs a handful of dispatches and a
-// single download of the hidden state. The final norm, the lm_head matvec
-// (whose weight would exceed modest per-buffer storage limits), and
-// sampling stay on the CPU. The prompt still prefills through the batched
-// CPU path; syncCache then copies the caches up once before decoding.
+// single download. The final norm and the lm_head join them when the
+// device's storage limit has room for the vocabulary projection, which
+// leaves only sampling on the CPU; where it does not fit, the hidden
+// state comes back and the CPU finishes the token. The prompt still
+// prefills through the batched CPU path; syncCache then copies the caches
+// up once before decoding.
 
 import (
 	"fmt"
+	"io"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/gpu"
@@ -43,6 +46,12 @@ type gpuQwen struct {
 	layers []gpuLayer
 	nCtx   int
 	gpuLen int // cache positions currently valid on the GPU
+	// The final norm and lm_head, resident when the device's storage
+	// limit has room for the whole vocabulary projection. Both nil on a
+	// device that cannot hold it, and decode falls back to reading the
+	// hidden state back and finishing on the CPU.
+	gNorm  *gpu.Tensor
+	lmHead gpuMat
 }
 
 // sliceQ4 copies a column range out of a fused 4-bit quantized matrix;
@@ -121,10 +130,20 @@ func must[T any](v T, err error) T {
 	return v
 }
 
+// tryUp uploads a whole quantized weight, reporting the error instead of
+// panicking: the lm_head is the one weight big enough to be turned away by
+// a device's storage limit, and that has to stay recoverable.
+func tryUp(g *gpu.Device, q *qmat) (gpuMat, error) {
+	if q.q8 != nil {
+		return g.UploadQ8(q.q8)
+	}
+	return g.UploadQ4(q.q4)
+}
+
 // newGPUQwen uploads the model's transformer blocks to the GPU: the int8
 // weight twins, the norm weights and biases, and zeroed KV caches sized
 // for nCtx positions.
-func newGPUQwen(m *qwen, g *gpu.Device, nCtx int) (*gpuQwen, error) {
+func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw io.Writer) (*gpuQwen, error) {
 	kvDim := m.cfg.KVHeads * m.headSz
 	vec := func(v []float32) *gpu.Tensor {
 		if v == nil { // llama: no attention biases
@@ -182,6 +201,20 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int) (*gpuQwen, error) {
 		} else {
 			l.kc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
 			l.vc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
+		}
+	}
+	// The lm_head is the single biggest weight in a small model — for
+	// Qwen3-0.6B its 1024x151936 is a quarter of everything decode
+	// streams — so leaving it on the CPU caps what moving the blocks can
+	// buy. Upload it when it fits, and keep the final norm next to it so
+	// the whole token, logits included, stays one submission. Devices
+	// with a smaller storage limit just miss out and keep the CPU path.
+	if q := m.qLmT; q != nil {
+		if lm, err := tryUp(g, q); err != nil {
+			fmt.Fprintf(logw, "lm_head stays on the cpu: %v\n", err)
+		} else {
+			gq.lmHead = lm
+			gq.gNorm = vec(m.normW)
 		}
 	}
 	// Warm every kernel the decode and both prefill batch sizes touch:
@@ -434,6 +467,16 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 			}
 			down.Free()
 		}
+	}
+	// With the lm_head resident the norm and the vocabulary projection
+	// ride the same submission, and the one readback is the logits
+	// themselves — the hidden state never crosses back.
+	if gq.lmHead != nil {
+		a := must(x.RMSNorm(gq.gNorm, cfg.RMSEps))
+		logits := must(gq.lmHead.MatMul(a))
+		a.Free()
+		defer logits.Free()
+		return must(logits.Download()).Data
 	}
 	xt := must(x.Download())
 	a := make([]float32, hs)

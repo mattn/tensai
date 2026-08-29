@@ -255,7 +255,7 @@ func Open(o Options) (*Engine, error) {
 			e.nCtx = maxCtx
 		}
 		start := time.Now()
-		gq, err := newGPUQwen(model, g, e.nCtx)
+		gq, err := newGPUQwen(model, g, e.nCtx, o.Log)
 		if err != nil {
 			g.Close()
 			return nil, err
