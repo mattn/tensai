@@ -489,7 +489,8 @@ func modelsCmd(args []string) error {
 					}
 				}
 			}
-			fmt.Printf("%-40s %8s  %-8s %s\n", ent.Name(), humanSize(size), "gguf", newest.Format("2006-01-02"))
+			fmt.Printf("%-40s %8s  %-8s %-11s %s\n", ent.Name(), humanSize(size), "gguf",
+				llm.Inspect(filepath.Join(root, ent.Name())), newest.Format("2006-01-02"))
 			total += size
 			found = true
 			continue
@@ -526,7 +527,8 @@ func modelsCmd(args []string) error {
 			}
 			return nil
 		})
-		fmt.Printf("%-40s %8s  %-8s %s\n", ent.Name(), humanSize(size), kind, newest.Format("2006-01-02"))
+		fmt.Printf("%-40s %8s  %-8s %-11s %s\n", ent.Name(), humanSize(size), kind,
+			llm.Inspect(dir), newest.Format("2006-01-02"))
 		total += size
 		found = true
 	}
