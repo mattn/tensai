@@ -144,11 +144,18 @@ the same place, and those are counted separately rather than listed as models;
 `models rm` still removes them by name.
 
 ```
-Qwen3-4B-Instruct-2507                      7.5GB  qwen3    tools think 2026-08-27
+Qwen/Qwen3-4B-Instruct-2507                 7.5GB  qwen3    tools think 2026-08-27
 Qwen2.5-1.5B-Instruct                       2.9GB  qwen2    tools       2026-08-23
 SmolLM2-360M-Instruct                       692MB  llama    -           2026-08-24
 qwen2.5-0.5b-instruct-q8_0.gguf             531MB  gguf     tools       2026-08-25
 ```
+
+A model downloaded from a repo is named by that repo, organization included,
+because the cache directory drops it — and without it the listing cannot say
+what to type on a machine that does not have the model yet. Either form works
+against a cache that already holds it, and `models rm` takes either as well.
+Checkpoints cached before this, or placed by hand, keep their bare directory
+name until something downloads them again.
 
 The fourth column says what `serve` will do with the model — accept a request
 offering `tools`, and give `-think` a block to reason in — not how well it will

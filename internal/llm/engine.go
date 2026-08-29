@@ -146,6 +146,9 @@ func Open(o Options) (*Engine, error) {
 			return nil, err
 		}
 		model.cfg.ChatTemplate = chatTemplate(base, o.Data, local)
+		if !local {
+			recordOrigin(o.Data, o.Repo)
+		}
 	}
 	how := "float32"
 	if o.Bits != 0 {
@@ -705,6 +708,45 @@ func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 		}
 	}
 	return cands[0].id
+}
+
+// originFile names the repo a cached model was downloaded from. The
+// cache directory is named after the repo's last element, which is what
+// makes a listed name typeable, but that drops the organization -- and
+// with it the only way to fetch the same checkpoint on another machine.
+const originFile = ".tensai-origin"
+
+// recordOrigin remembers where a download came from, so a listing can
+// name something the user can act on somewhere else. Failing to write it
+// costs the listing an organization, not the model, so the error is not
+// worth failing a load over.
+func recordOrigin(dir, repo string) {
+	if dir == "" || !strings.Contains(repo, "/") {
+		return
+	}
+	p := filepath.Join(dir, originFile)
+	if b, err := os.ReadFile(p); err == nil && string(b) == repo {
+		return
+	}
+	os.WriteFile(p, []byte(repo), 0o644)
+}
+
+// Origin returns the repo a cached model was downloaded from, or "" for
+// one that predates the record or was never downloaded at all.
+func Origin(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, originFile))
+	if err != nil {
+		return ""
+	}
+	repo := strings.TrimSpace(string(b))
+	// Only a plain org/name is worth handing back: it is going to be
+	// printed and then typed at -model.
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" ||
+		strings.ContainsAny(repo, `\`) || strings.Contains(repo, "..") {
+		return ""
+	}
+	return repo
 }
 
 // chatTemplate returns the model's own Jinja chat template, or "" when
