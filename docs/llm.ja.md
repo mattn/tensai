@@ -1,6 +1,6 @@
 # LLM 推論
 
-XOR を学習するのと同じカーネルが本物の言語モデルを動かします。`_example/gpt2` は純 Go の完全な推論エンジンで、`tensai` コマンドは同じカーネルの上で 9 つのモデルファミリーを動かします。
+XOR を学習するのと同じカーネルが本物の言語モデルを動かします。`_example/gpt2` は純 Go の完全な推論エンジンで、`tensai` コマンドは同じカーネルの上で 10 のモデルファミリーを動かします。
 
 ## GPT-2
 
@@ -16,14 +16,15 @@ greedy の続きは GPT-2 のよく知られたリファレンス出力とトー
 - `-q8` はデコードパスの重みを int8 に量子化して生成を 2 倍にします (同一マシンで 23 → 46 tok/s)。デコードはトークンごとにチェックポイント全体をストリームするからです
 - `-gpu` (`-tags wgpu` または `wgpu24` でビルド) は各ブロックの causal マルチヘッド attention を GPU 上の 1 回のマスク付きディスパッチとして実行します
 
-## Qwen とその仲間たち: 9 つのモデルファミリー
+## Qwen とその仲間たち: 10 のモデルファミリー
 
-`tensai` コマンドは現代の instruction-tuned モデルを動かします: RMSNorm、RoPE、grouped-query attention、SwiGLU MLP。safetensors から (config.json が次元を決め、シャーディングされたチェックポイントは index.json 経由) でも、config・トークナイザ・重みを 1 ファイルに収めた llama.cpp の GGUF からでもロードできます。1 つのランタイムが 9 つのアーキテクチャを話します:
+`tensai` コマンドは現代の instruction-tuned モデルを動かします: RMSNorm、RoPE、grouped-query attention、SwiGLU MLP。safetensors から (config.json が次元を決め、シャーディングされたチェックポイントは index.json 経由) でも、config・トークナイザ・重みを 1 ファイルに収めた llama.cpp の GGUF からでもロードできます。1 つのランタイムが 10 のアーキテクチャを話します:
 
 | ファミリー | モデル | 何が加わるか |
 |---|---|---|
 | qwen2 | Qwen 1.5/2/2.5, Qwen2.5-Coder, R1-Distill-Qwen 系 | attention バイアス |
 | qwen3 | Qwen3 dense | ヘッドごとの QK-norm、明示的 head_dim、`-think` |
+| qwen3_5 | Qwen3.5 / 3.6 / 3.8 | 4 層に 3 層が gated delta rule、残り 1 層が通常の attention。正規化は 1 + w、RoPE はヘッドの 1/4 だけ回し、クエリが attention 出力のゲートを連れる。CPU のみ、`-draft` 不可 |
 | llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | みんながフォークしたブロック |
 | smollm3 | SmolLM3-3B | 4 層ごとに RoPE をスキップ |
 | gemma3 | Gemma 3 | 5/6 層のスライディングウィンドウ、サンドイッチ norm、gelu-tanh ゲート、SentencePiece |

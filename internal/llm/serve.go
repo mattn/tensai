@@ -84,6 +84,9 @@ func (m *qwen) reset() {
 	for i := range m.blocks {
 		m.blocks[i].kc = nil
 		m.blocks[i].vc = nil
+		// A delta layer's state is not indexed by position, so there is
+		// nothing to truncate: a fresh context starts from a zeroed one.
+		m.blocks[i].dstate = nil
 	}
 }
 

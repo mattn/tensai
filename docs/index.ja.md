@@ -30,7 +30,7 @@ pred, _ := net.Predict(inputs)
 - **int8 / int4 量子化** — メモリ帯域に到達する weight-only 量子化 matmul、gpt-oss 用の MXFP4 も
 - **モデルフォーマット** — TFLite / ONNX エクスポート、safetensors の読み書き、K-quants まで揃った GGUF リーダー — エンコーダはすべてツリー内実装で、依存はゼロのまま
 - **トークナイザ** — Hugging Face `tokenizer.json` のバイトレベル BPE (GPT-2, cl100k, o200k 系) と SentencePiece。リファレンス実装と完全一致することを検証済み
-- **LLM 推論** — `_example/gpt2`、そして 9 つのモデルファミリーを `run` / `chat` / `serve` サブコマンドで動かす `tensai` コマンド
+- **LLM 推論** — `_example/gpt2`、そして 10 のモデルファミリーを `run` / `chat` / `serve` サブコマンドで動かす `tensai` コマンド
 
 ## 次に読むページ
 

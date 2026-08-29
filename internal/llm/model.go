@@ -41,6 +41,28 @@ type config struct {
 	TieEmbedding bool    `json:"tie_word_embeddings"`
 	EOS          int     `json:"eos_token_id"`
 	ModelType    string  `json:"model_type"`
+	// qwen3_5 (Qwen3.5 and up) interleaves two kinds of layer: most run a
+	// gated delta rule over a fixed-size recurrent state, and every
+	// FullAttnInterval-th runs ordinary attention over a KV cache.
+	// LayerTypes names them one by one, as the checkpoint does.
+	LayerTypes       []string `json:"layer_types"`
+	FullAttnInterval int      `json:"full_attention_interval"`
+	// AttnOutputGate: q_proj is twice as wide as the queries, the second
+	// half gating the attention output.
+	AttnOutputGate bool `json:"attn_output_gate"`
+	// PartialRotary is the fraction of each head's dimensions RoPE turns,
+	// 0 meaning all of them.
+	PartialRotary float64 `json:"-"`
+	// Gated delta-rule dimensions.
+	LinearKeyHeads   int `json:"linear_num_key_heads"`
+	LinearValueHeads int `json:"linear_num_value_heads"`
+	LinearKeyDim     int `json:"linear_key_head_dim"`
+	LinearValueDim   int `json:"linear_value_head_dim"`
+	LinearConvK      int `json:"linear_conv_kernel_dim"`
+	// Prefix is what the checkpoint calls the language model, empty for
+	// the families that put it at the top level. qwen3_5 ships a vision
+	// tower beside it, so its text weights sit under language_model.
+	Prefix string `json:"-"`
 	// ChatStyle overrides the template family when it differs from the
 	// architecture — DeepSeek's R1 distills are qwen2/llama blocks that
 	// speak DeepSeek's turn markers. Set by the GGUF loader, never JSON.
@@ -144,6 +166,11 @@ type qblock struct {
 	sharedDown *qmat
 	sharedGate []float32   // [hidden]; sigmoid(dot) scales the shared expert
 	kc, vc     [][]float32 // KV cache, kvHeads*headDim per position
+	dstate     *deltaState // recurrent state for a delta layer; nil until first use
+	// delta holds a qwen3_5 linear-attention layer, which has no KV cache:
+	// it carries a fixed-size recurrent state instead, so its cost per
+	// token does not grow with the context. nil on a full-attention layer.
+	delta *deltaWeights
 }
 
 // expertFFN is one expert's SwiGLU: fused gate|up and down projections,
@@ -161,6 +188,9 @@ type qwen struct {
 	qLmT   *qmat
 	normW  []float32
 	blocks []qblock
+	// dscratch is one token's working set for the delta layers, which all
+	// share the same shapes; nil until a delta layer runs.
+	dscratch *deltaScratch
 }
 
 func loadConfig(path string) (config, error) {
@@ -172,8 +202,46 @@ func loadConfig(path string) (config, error) {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return c, err
 	}
+	// qwen3_5 nests everything the text model needs under text_config and
+	// keeps a vision tower beside it; the fields the loader reads are the
+	// same ones, one level down.
+	var outer struct {
+		Text     json.RawMessage `json:"text_config"`
+		RopeArgs struct {
+			Theta   float64 `json:"rope_theta"`
+			Partial float64 `json:"partial_rotary_factor"`
+		} `json:"rope_parameters"`
+	}
+	if json.Unmarshal(raw, &outer) == nil && len(outer.Text) > 0 {
+		modelType, tied := c.ModelType, c.TieEmbedding
+		if err := json.Unmarshal(outer.Text, &c); err != nil {
+			return c, fmt.Errorf("parsing text_config: %w", err)
+		}
+		if c.ModelType == "" || strings.HasSuffix(c.ModelType, "_text") {
+			c.ModelType = modelType
+		}
+		c.TieEmbedding = c.TieEmbedding || tied
+		c.Prefix = "language_model."
+		var inner struct {
+			RopeArgs struct {
+				Theta   float64 `json:"rope_theta"`
+				Partial float64 `json:"partial_rotary_factor"`
+			} `json:"rope_parameters"`
+		}
+		if json.Unmarshal(outer.Text, &inner) == nil {
+			outer.RopeArgs = inner.RopeArgs
+		}
+	}
+	if outer.RopeArgs.Theta != 0 {
+		c.RopeTheta = outer.RopeArgs.Theta
+	}
+	c.PartialRotary = outer.RopeArgs.Partial
 	switch c.ModelType {
 	case "qwen2", "qwen3", "llama", "smollm3":
+	case "qwen3_5":
+		if len(c.LayerTypes) != c.Layers {
+			return c, fmt.Errorf("qwen3_5 config lists %d layer types for %d layers", len(c.LayerTypes), c.Layers)
+		}
 	case "gpt_oss":
 		var hf gptOssConfig
 		if err := json.Unmarshal(raw, &hf); err != nil {
@@ -186,7 +254,7 @@ func loadConfig(path string) (config, error) {
 		// without this the harmony channels leak into the answer.
 		c.ChatStyle = "gpt-oss"
 	default:
-		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2, qwen3, llama, smollm3, and gpt_oss)", c.ModelType)
+		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2, qwen3, qwen3_5, llama, smollm3, and gpt_oss)", c.ModelType)
 	}
 	return c, nil
 }
@@ -228,6 +296,35 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 			panic(err)
 		}
 		return t.Data
+	}
+	// normVec reads an RMSNorm weight. qwen3_5 stores it Gemma-style, as
+	// the offset from one rather than the scale itself -- its weights
+	// initialize to zero, and the norm multiplies by (1 + w) -- so the
+	// one is folded in here and the kernel stays a plain multiply.
+	normVec := func(name string) []float32 {
+		v := vec(name)
+		if cfg.ModelType == "qwen3_5" {
+			w := make([]float32, len(v))
+			for i, x := range v {
+				w[i] = 1 + x
+			}
+			return w
+		}
+		return v
+	}
+	normVecOpt := func(name string) []float32 {
+		t, err := f.Tensor(name)
+		if err != nil {
+			return nil
+		}
+		if cfg.ModelType != "qwen3_5" {
+			return t.Data
+		}
+		w := make([]float32, len(t.Data))
+		for i, x := range t.Data {
+			w[i] = 1 + x
+		}
+		return w
 	}
 	// vecOpt returns nil for weights the architecture does not have —
 	// Llama-family checkpoints carry no attention biases.
@@ -307,11 +404,11 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 		headSz = cfg.HeadDim
 	}
 	m := &qwen{cfg: cfg, headSz: headSz}
-	m.embed, err = f.Tensor("model.embed_tokens.weight")
+	m.embed, err = f.Tensor("model." + cfg.Prefix + "embed_tokens.weight")
 	if err != nil {
 		return nil, err
 	}
-	m.normW = vec("model.norm.weight")
+	m.normW = normVec("model." + cfg.Prefix + "norm.weight")
 	m.blocks = make([]qblock, cfg.Layers)
 	// Layers load concurrently: reads are ReadAt against one descriptor
 	// and the convert/transpose/quantize chain per tensor is CPU-bound, so
@@ -353,11 +450,17 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 			defer loadGate.release(got)
 			b := &m.blocks[i]
 			b.noPE = i < len(cfg.NoRopeLayers) && cfg.NoRopeLayers[i] == 0
-			p := fmt.Sprintf("model.layers.%d.", i)
-			b.ln1 = vec(p + "input_layernorm.weight")
-			b.ln2 = vec(p + "post_attention_layernorm.weight")
-			b.qNorm = vecOpt(p + "self_attn.q_norm.weight")
-			b.kNorm = vecOpt(p + "self_attn.k_norm.weight")
+			p := fmt.Sprintf("model.%slayers.%d.", cfg.Prefix, i)
+			b.ln1 = normVec(p + "input_layernorm.weight")
+			b.ln2 = normVec(p + "post_attention_layernorm.weight")
+			b.qNorm = normVecOpt(p + "self_attn.q_norm.weight")
+			b.kNorm = normVecOpt(p + "self_attn.k_norm.weight")
+			if cfg.linearLayer(i) {
+				b.delta = loadDelta(cfg, p, vec, linq, linqRouter)
+				b.wGU, b.qGU = linqFused(p+"mlp.gate_proj.weight", p+"mlp.up_proj.weight")
+				b.wDown, b.qDown = linq(p + "mlp.down_proj.weight")
+				return
+			}
 			b.wQKV, b.qQKV = linqFused(p+"self_attn.q_proj.weight", p+"self_attn.k_proj.weight", p+"self_attn.v_proj.weight")
 			b.bQKV = catVec(vecOpt(p+"self_attn.q_proj.bias"), vecOpt(p+"self_attn.k_proj.bias"), vecOpt(p+"self_attn.v_proj.bias"))
 			b.wo, b.qo = linq(p + "self_attn.o_proj.weight")
@@ -383,7 +486,10 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 }
 
 func (m *qwen) initRopeFreqs() {
-	half := m.headSz / 2
+	// A partial rotary factor rotates only the first rotDim of each head,
+	// and the frequencies run over that width rather than the whole head.
+	rotDim := m.rotaryDim()
+	half := rotDim / 2
 	for i := range m.blocks {
 		b := &m.blocks[i]
 		if b.noPE || half == 0 {
@@ -395,7 +501,7 @@ func (m *qwen) initRopeFreqs() {
 		}
 		b.ropeFreq = make([]float64, half)
 		for j := range b.ropeFreq {
-			b.ropeFreq[j] = math.Pow(theta, -2*float64(j)/float64(m.headSz))
+			b.ropeFreq[j] = math.Pow(theta, -2*float64(j)/float64(rotDim))
 		}
 	}
 }
@@ -815,14 +921,62 @@ func (m *qwen) qkNorm(v, w []float32) {
 	}
 }
 
+// qProjWidth is how wide the query projection is. qwen3_5 makes it twice
+// the queries and spends the second half gating the attention output, so
+// the fused qkv row is wider than the queries suggest.
+func (m *qwen) qProjWidth() int {
+	w := m.cfg.Heads * m.headSz
+	if m.cfg.AttnOutputGate {
+		w *= 2
+	}
+	return w
+}
+
+// splitGate pulls the queries and their gate out of a q projection that
+// holds both. They alternate per head -- head 0's queries, head 0's gate,
+// head 1's -- so neither is a contiguous run of the row.
+func (m *qwen) splitGate(row, q, gate []float32) {
+	d := m.headSz
+	for h := 0; h < m.cfg.Heads; h++ {
+		copy(q[h*d:(h+1)*d], row[2*h*d:(2*h+1)*d])
+		copy(gate[h*d:(h+1)*d], row[(2*h+1)*d:(2*h+2)*d])
+	}
+}
+
+// applyGate is the gate's whole effect: it scales the attention output
+// just before the output projection.
+func applyGate(attn, gate []float32) {
+	for i := range attn {
+		attn[i] *= 1 / (1 + float32(math.Exp(float64(-gate[i]))))
+	}
+}
+
+// rotaryDim is how much of each head RoPE turns: the whole thing unless
+// the config asks for a fraction of it.
+func (m *qwen) rotaryDim() int {
+	if f := m.cfg.PartialRotary; f > 0 && f < 1 {
+		return int(float64(m.headSz)*f) / 2 * 2
+	}
+	return m.headSz
+}
+
 // rope rotates one head in place, half-split style: pair (i, i+dh/2).
+// A partial rotary factor turns only the first fraction of the head and
+// leaves the rest as it is, which qwen3_5 uses to spend a 256-wide head
+// on content while rotating 64 of it for position.
 func (m *qwen) rope(h []float32, pos int, b *qblock) {
+	if n := m.rotaryDim(); n < len(h) {
+		if n < 2 {
+			return
+		}
+		h = h[:n]
+	}
 	theta := b.ropeTheta
 	if theta == 0 {
 		theta = m.cfg.RopeTheta
 	}
 	freqs := b.ropeFreq
-	half := m.headSz / 2
+	half := len(h) / 2
 	yarn := m.cfg.YarnFactor > 1
 	var low, high, mscale float64
 	if yarn {
@@ -916,73 +1070,107 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		}
 	}
 	qDim := cfg.Heads * m.headSz
-	qkvW := qDim + 2*kvDim
+	qProjW := m.qProjWidth()
+	qkvW := qProjW + 2*kvDim
+	var qbuf, gbuf []float32
+	if cfg.AttnOutputGate {
+		qbuf, gbuf = make([]float32, n*qDim), make([]float32, n*qDim)
+	}
 	for li := range m.blocks {
 		b := &m.blocks[li]
 		norm(b.ln1)
-		qkv := mmb(a, b.wQKV, b.qQKV, b.bQKV)
-		// Two batch-wide backings detach the cache rows from the wide
-		// fused buffer instead of 2n little allocations per layer.
-		kb := make([]float32, n*kvDim)
-		vb := make([]float32, n*kvDim)
-		for t := 0; t < n; t++ {
-			pos := startPos + t
-			row := qkv.Data[t*qkvW : (t+1)*qkvW]
-			qr := row[:qDim]
-			kr := row[qDim : qDim+kvDim]
-			m.qkNorm(qr, b.qNorm)
-			m.qkNorm(kr, b.kNorm)
-			if !b.noPE {
-				for h := 0; h < cfg.Heads; h++ {
-					m.rope(qr[h*m.headSz:(h+1)*m.headSz], pos, b)
-				}
-				for h := 0; h < cfg.KVHeads; h++ {
-					m.rope(kr[h*m.headSz:(h+1)*m.headSz], pos, b)
+		if b.delta != nil {
+			// The recurrence carries token to token, so the batch buys
+			// nothing here: each row advances the state in turn. A
+			// chunked formulation exists and is the next thing to do.
+			if b.dstate == nil {
+				b.dstate = b.delta.newState()
+			}
+			if m.dscratch == nil {
+				m.dscratch = newDeltaScratch(b.delta, hs)
+			}
+			for t := 0; t < n; t++ {
+				y := b.delta.step(b.dstate, a.Data[t*hs:(t+1)*hs], m.dscratch)
+				row := x.Data[t*hs : (t+1)*hs]
+				for i := range row {
+					row[i] += y[i]
 				}
 			}
-			kt := kb[t*kvDim : (t+1)*kvDim : (t+1)*kvDim]
-			vt := vb[t*kvDim : (t+1)*kvDim : (t+1)*kvDim]
-			copy(kt, kr)
-			copy(vt, row[qDim+kvDim:])
-			b.kc = append(b.kc, kt)
-			b.vc = append(b.vc, vt)
-		}
-
-		// Causal attention: row t sees cache positions [0, startPos+t].
-		// Rows are independent, so they fan out across CPUs.
-		attn := tensai.NewMatrix(n, qDim)
-		var wg sync.WaitGroup
-		rowCh := make(chan int, n)
-		for t := 0; t < n; t++ {
-			rowCh <- t
-		}
-		close(rowCh)
-		for w := min(runtime.NumCPU(), n); w > 0; w-- {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				scores := make([]float32, group*(startPos+n))
-				ws := make([]float32, group*(startPos+n))
-				for t := range rowCh {
-					steps := startPos + t + 1
-					qr := qkv.Data[t*qkvW : t*qkvW+qDim]
-					ar := attn.Data[t*qDim : (t+1)*qDim]
-					for kh := 0; kh < cfg.KVHeads; kh++ {
-						m.attendGroup(b, qr, ar, kh, group, steps, scores, ws)
+		} else {
+			qkv := mmb(a, b.wQKV, b.qQKV, b.bQKV)
+			// Two batch-wide backings detach the cache rows from the wide
+			// fused buffer instead of 2n little allocations per layer.
+			kb := make([]float32, n*kvDim)
+			vb := make([]float32, n*kvDim)
+			for t := 0; t < n; t++ {
+				pos := startPos + t
+				row := qkv.Data[t*qkvW : (t+1)*qkvW]
+				qr := row[:qDim]
+				if cfg.AttnOutputGate {
+					m.splitGate(row[:qProjW], qbuf[t*qDim:(t+1)*qDim], gbuf[t*qDim:(t+1)*qDim])
+					qr = qbuf[t*qDim : (t+1)*qDim]
+				}
+				kr := row[qProjW : qProjW+kvDim]
+				m.qkNorm(qr, b.qNorm)
+				m.qkNorm(kr, b.kNorm)
+				if !b.noPE {
+					for h := 0; h < cfg.Heads; h++ {
+						m.rope(qr[h*m.headSz:(h+1)*m.headSz], pos, b)
+					}
+					for h := 0; h < cfg.KVHeads; h++ {
+						m.rope(kr[h*m.headSz:(h+1)*m.headSz], pos, b)
 					}
 				}
-			}()
-		}
-		wg.Wait()
-
-		proj := mmb(attn, b.wo, b.qo, b.bo)
-		if b.postAttn != nil {
-			for t := 0; t < n; t++ {
-				rmsnormInto(proj.Data[t*hs:(t+1)*hs], proj.Data[t*hs:(t+1)*hs], b.postAttn, cfg.RMSEps)
+				kt := kb[t*kvDim : (t+1)*kvDim : (t+1)*kvDim]
+				vt := vb[t*kvDim : (t+1)*kvDim : (t+1)*kvDim]
+				copy(kt, kr)
+				copy(vt, row[qProjW+kvDim:])
+				b.kc = append(b.kc, kt)
+				b.vc = append(b.vc, vt)
 			}
-		}
-		for i := range x.Data {
-			x.Data[i] += proj.Data[i]
+
+			// Causal attention: row t sees cache positions [0, startPos+t].
+			// Rows are independent, so they fan out across CPUs.
+			attn := tensai.NewMatrix(n, qDim)
+			var wg sync.WaitGroup
+			rowCh := make(chan int, n)
+			for t := 0; t < n; t++ {
+				rowCh <- t
+			}
+			close(rowCh)
+			for w := min(runtime.NumCPU(), n); w > 0; w-- {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					scores := make([]float32, group*(startPos+n))
+					ws := make([]float32, group*(startPos+n))
+					for t := range rowCh {
+						steps := startPos + t + 1
+						qr := qkv.Data[t*qkvW : t*qkvW+qDim]
+						if cfg.AttnOutputGate {
+							qr = qbuf[t*qDim : (t+1)*qDim]
+						}
+						ar := attn.Data[t*qDim : (t+1)*qDim]
+						for kh := 0; kh < cfg.KVHeads; kh++ {
+							m.attendGroup(b, qr, ar, kh, group, steps, scores, ws)
+						}
+					}
+				}()
+			}
+			wg.Wait()
+
+			if cfg.AttnOutputGate {
+				applyGate(attn.Data, gbuf)
+			}
+			proj := mmb(attn, b.wo, b.qo, b.bo)
+			if b.postAttn != nil {
+				for t := 0; t < n; t++ {
+					rmsnormInto(proj.Data[t*hs:(t+1)*hs], proj.Data[t*hs:(t+1)*hs], b.postAttn, cfg.RMSEps)
+				}
+			}
+			for i := range x.Data {
+				x.Data[i] += proj.Data[i]
+			}
 		}
 
 		norm(b.ln2)
@@ -1046,19 +1234,42 @@ func (m *qwen) step(token, pos int) []float32 {
 
 	kvDim := cfg.KVHeads * m.headSz
 	qDim := cfg.Heads * m.headSz
-	qkvW := qDim + 2*kvDim
+	qProjW := m.qProjWidth()
+	qkvW := qProjW + 2*kvDim
 	qkv := make([]float32, qkvW)
 	attn := make([]float32, qDim)
+	var qbuf, gbuf []float32
+	if cfg.AttnOutputGate {
+		qbuf, gbuf = make([]float32, qDim), make([]float32, qDim)
+	}
 	proj := make([]float32, hs)
 	gu := make([]float32, 2*cfg.Intermediate)
 	downBuf := make([]float32, hs)
 	for li := range m.blocks {
 		b := &m.blocks[li]
 		rmsnormInto(a, x, b.ln1, cfg.RMSEps)
+		if b.delta != nil {
+			if b.dstate == nil {
+				b.dstate = b.delta.newState()
+			}
+			if m.dscratch == nil {
+				m.dscratch = newDeltaScratch(b.delta, hs)
+			}
+			y := b.delta.step(b.dstate, a, m.dscratch)
+			for i := range x {
+				x[i] += y[i]
+			}
+			m.blockFFN(b, x, a, gu, downBuf)
+			continue
+		}
 		mvInto(qkv, a, b.wQKV, b.qQKV, b.bQKV)
 		q := qkv[:qDim]
-		k := qkv[qDim : qDim+kvDim]
-		v := qkv[qDim+kvDim:]
+		if cfg.AttnOutputGate {
+			m.splitGate(qkv[:qProjW], qbuf, gbuf)
+			q = qbuf
+		}
+		k := qkv[qProjW : qProjW+kvDim]
+		v := qkv[qProjW+kvDim:]
 		m.qkNorm(q, b.qNorm)
 		m.qkNorm(k, b.kNorm)
 		if !b.noPE {
@@ -1097,6 +1308,9 @@ func (m *qwen) step(token, pos int) []float32 {
 				m.attendHead(b, q, attn, h, group, steps, scores)
 			}
 		}
+		if cfg.AttnOutputGate {
+			applyGate(attn, gbuf)
+		}
 		mvInto(proj, attn, b.wo, b.qo, b.bo)
 		if b.postAttn != nil {
 			rmsnormInto(proj, proj, b.postAttn, cfg.RMSEps)
@@ -1105,25 +1319,33 @@ func (m *qwen) step(token, pos int) []float32 {
 			x[i] += proj[i]
 		}
 
-		rmsnormInto(a, x, b.ln2, cfg.RMSEps)
-		var down []float32
-		if len(b.experts) > 0 {
-			down = m.moeFFN(b, a)
-		} else {
-			mvInto(gu, a, b.wGU, b.qGU, nil)
-			gate, up := gu[:cfg.Intermediate], gu[cfg.Intermediate:]
-			activate(gate, up, b.geglu)
-			mvInto(downBuf, gate, b.wDown, b.qDown, nil)
-			down = downBuf
-		}
-		if b.postFFN != nil {
-			rmsnormInto(down, down, b.postFFN, cfg.RMSEps)
-		}
-		for i := range x {
-			x[i] += down[i]
-		}
+		m.blockFFN(b, x, a, gu, downBuf)
 	}
 
 	rmsnormInto(a, x, m.normW, cfg.RMSEps)
 	return mv(a, m.lmT, m.qLmT, nil)
+}
+
+// blockFFN runs the second half of a block in place on x: normalize,
+// through the dense or routed feed-forward, and add the residual. Both
+// kinds of first half — attention and the delta rule — end here.
+func (m *qwen) blockFFN(b *qblock, x, a, gu, downBuf []float32) {
+	cfg := m.cfg
+	rmsnormInto(a, x, b.ln2, cfg.RMSEps)
+	var down []float32
+	if len(b.experts) > 0 {
+		down = m.moeFFN(b, a)
+	} else {
+		mvInto(gu, a, b.wGU, b.qGU, nil)
+		gate, up := gu[:cfg.Intermediate], gu[cfg.Intermediate:]
+		activate(gate, up, b.geglu)
+		mvInto(downBuf, gate, b.wDown, b.qDown, nil)
+		down = downBuf
+	}
+	if b.postFFN != nil {
+		rmsnormInto(down, down, b.postFFN, cfg.RMSEps)
+	}
+	for i := range x {
+		x[i] += down[i]
+	}
 }

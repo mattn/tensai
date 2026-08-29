@@ -1,6 +1,6 @@
 # LLM Inference
 
-The same kernels that train a XOR network run real language models. `_example/gpt2` is a complete inference engine in pure Go, and the `tensai` command runs nine model families over the same kernels.
+The same kernels that train a XOR network run real language models. `_example/gpt2` is a complete inference engine in pure Go, and the `tensai` command runs ten model families over the same kernels.
 
 ## GPT-2
 
@@ -16,14 +16,15 @@ The greedy continuation matches GPT-2's well-known reference output token for to
 - `-q8` quantizes the decode-path weights to int8 and doubles generation (23 → 46 tok/s on the same machine), because decode streams the whole checkpoint per token
 - `-gpu` (built with `-tags wgpu` or `wgpu24`) runs every block's causal multi-head attention as a single masked dispatch on the GPU
 
-## Qwen and friends: nine model families
+## Qwen and friends: ten model families
 
-The `tensai` command runs modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file. One runtime speaks nine architectures:
+The `tensai` command runs modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file. One runtime speaks ten architectures:
 
 | family | models | what it adds |
 |---|---|---|
 | qwen2 | Qwen 1.5/2/2.5, Qwen2.5-Coder, the R1-Distill-Qwen line | attention biases |
 | qwen3 | Qwen3 dense | per-head QK-norm, explicit head_dim, `-think` |
+| qwen3_5 | Qwen3.5, Qwen3.6, Qwen3.8 | a gated delta rule on three layers in four, ordinary attention on the fourth; norms scale by 1 + w, RoPE turns a quarter of each head, and the queries carry a gate for the attention output. CPU only, and no `-draft` |
 | llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | the block everyone forked |
 | smollm3 | SmolLM3-3B | RoPE skipped every fourth layer |
 | gemma3 | Gemma 3 | sliding windows on 5/6 layers, sandwich norms, gelu-tanh gate, SentencePiece |

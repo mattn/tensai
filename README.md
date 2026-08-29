@@ -202,12 +202,13 @@ The prompt runs through the model as one batched pass; with `-gpu` (built with `
 
 `-q8` quantizes the decode-path weights to int8 (weight-only, per-column scales) and doubles generation — 23 to 46 tok/s on the same machine — because decode streams the whole checkpoint per token and int8 pulls a quarter of the bytes. The text stays coherent but greedy decoding no longer reproduces the float32 reference tokens exactly; use the default float32 path for the reference check.
 
-The `tensai` command does the same for modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file — `-model ./qwen2.5-0.5b-instruct-q8_0.gguf -q8` chats with nothing else on disk. One runtime speaks nine architectures, each contributing its own twist:
+The `tensai` command does the same for modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file — `-model ./qwen2.5-0.5b-instruct-q8_0.gguf -q8` chats with nothing else on disk. One runtime speaks ten architectures, each contributing its own twist:
 
 | family | models | what it adds |
 |---|---|---|
 | qwen2 | Qwen 1.5/2/2.5, Qwen2.5-Coder, the R1-Distill-Qwen line | attention biases |
 | qwen3 | Qwen3 dense | per-head QK-norm, explicit head_dim, `-think` |
+| qwen3_5 | Qwen3.5, Qwen3.6, Qwen3.8 | a gated delta rule on three layers in four, ordinary attention on the fourth; norms scale by 1 + w, RoPE turns a quarter of each head, and the queries carry a gate for the attention output. CPU only, and no `-draft` |
 | llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | the block everyone forked |
 | smollm3 | SmolLM3-3B | RoPE skipped every fourth layer |
 | gemma3 | Gemma 3 | sliding windows on 5/6 layers, sandwich norms, gelu-tanh gate, SentencePiece |
