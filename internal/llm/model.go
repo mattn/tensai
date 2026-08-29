@@ -399,6 +399,34 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 		return mm.T()
 	}
 
+	linqF32Fused := func(names ...string) *tensai.Matrix {
+		parts := make([]*tensai.Matrix, len(names))
+		for i, name := range names {
+			t, err := f.Tensor(name)
+			if err != nil {
+				panic(err)
+			}
+			mm, err := t.Matrix()
+			if err != nil {
+				panic(err)
+			}
+			parts[i] = mm.T()
+		}
+		rows, cols := parts[0].Rows, 0
+		for _, m := range parts {
+			cols += m.Cols
+		}
+		out := tensai.NewMatrix(rows, cols)
+		off := 0
+		for _, m := range parts {
+			for r := 0; r < rows; r++ {
+				copy(out.Data[r*cols+off:], m.Data[r*m.Cols:(r+1)*m.Cols])
+			}
+			off += m.Cols
+		}
+		return out
+	}
+
 	headSz := cfg.HiddenSize / cfg.Heads
 	if cfg.HeadDim != 0 {
 		headSz = cfg.HeadDim
@@ -456,7 +484,7 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 			b.qNorm = normVecOpt(p + "self_attn.q_norm.weight")
 			b.kNorm = normVecOpt(p + "self_attn.k_norm.weight")
 			if cfg.linearLayer(i) {
-				b.delta = loadDelta(cfg, p, vec, linq, linqRouter)
+				b.delta = loadDelta(cfg, p, vec, linq, linqRouter, linqFused, linqF32Fused)
 				b.wGU, b.qGU = linqFused(p+"mlp.gate_proj.weight", p+"mlp.up_proj.weight")
 				b.wDown, b.qDown = linq(p + "mlp.down_proj.weight")
 				return
@@ -1092,20 +1120,23 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			if m.dscratch == nil {
 				m.dscratch = newDeltaScratch(d, hs)
 			}
-			qkvB := mmb(a, d.wQKV, d.qQKV, nil)
-			zB := mmb(a, d.wZ, d.qZ, nil)
-			aB := mmb(a, d.wA, nil, nil)
-			bB := mmb(a, d.wB, nil, nil)
+			// The four inputs come from one activation, so they come out
+			// of two matmuls rather than four: qkv and z share the
+			// quantized weight, a and b the float one.
+			qzB := mmb(a, d.wQZ, d.qQZ, nil)
+			abB := mmb(a, d.wAB, nil, nil)
+			// Only the state carries between tokens, and it is not worth
+			// a goroutine per token here.
+			b.dstate.parallel = false
 			mixed := tensai.NewMatrix(n, d.vDim*d.heads)
 			for t := 0; t < n; t++ {
-				res := d.mix(b.dstate,
-					qkvB.Data[t*qkvB.Cols:(t+1)*qkvB.Cols],
-					zB.Data[t*zB.Cols:(t+1)*zB.Cols],
-					aB.Data[t*aB.Cols:(t+1)*aB.Cols],
-					bB.Data[t*bB.Cols:(t+1)*bB.Cols],
-					m.dscratch)
+				qz := qzB.Data[t*qzB.Cols : (t+1)*qzB.Cols]
+				ab := abB.Data[t*abB.Cols : (t+1)*abB.Cols]
+				res := d.mix(b.dstate, qz[:d.convDim], qz[d.convDim:],
+					ab[:d.heads], ab[d.heads:], m.dscratch)
 				copy(mixed.Data[t*mixed.Cols:(t+1)*mixed.Cols], res)
 			}
+			b.dstate.parallel = true
 			outB := mmb(mixed, d.wOut, d.qOut, nil)
 			for i := range x.Data {
 				x.Data[i] += outB.Data[i]
