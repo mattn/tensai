@@ -1,7 +1,10 @@
-# wgpu24 binds the v29 wgpu-native C API, which can see non-conformant
-# Vulkan drivers. That is what reaches the real GPU through dozen inside
-# WSL2; a plain wgpu build falls back to a software rasterizer there.
-# See docs/guide/gpu.md.
+# WGPU picks the wgpu-native binding. wgpu24 binds the v29 C API, which
+# can see non-conformant Vulkan drivers -- that is what reaches the real
+# GPU through dozen inside WSL2, where a plain wgpu build falls back to a
+# software rasterizer. Build the other one with "make WGPU=wgpu" when a
+# driver disagrees with v29, and pair the binary with the matching
+# library. See docs/guide/gpu.md.
+WGPU ?= wgpu24
 BIN := tensai
 VERSION := $$(make -s show-version)
 CURRENT_REVISION := $(shell git rev-parse --short HEAD)
@@ -15,11 +18,11 @@ all: clean build
 
 .PHONY: build
 build:
-	go build -tags wgpu24 -ldflags=$(BUILD_LDFLAGS) -o $(BIN) ./cmd/tensai
+	go build -tags $(WGPU) -ldflags=$(BUILD_LDFLAGS) -o $(BIN) ./cmd/tensai
 
 .PHONY: install
 install:
-	go install -tags wgpu24 -ldflags=$(BUILD_LDFLAGS) ./cmd/tensai
+	go install -tags $(WGPU) -ldflags=$(BUILD_LDFLAGS) ./cmd/tensai
 
 .PHONY: show-version
 show-version: $(GOBIN)/gobump
@@ -31,7 +34,7 @@ $(GOBIN)/gobump:
 .PHONY: cross
 cross: $(GOBIN)/goxz
 	goxz -n $(BIN) -pv=v$(VERSION) -os linux,darwin,windows -arch amd64,arm64 \
-		-build-tags wgpu24 -build-ldflags=$(BUILD_LDFLAGS) ./cmd/tensai
+		-build-tags $(WGPU) -build-ldflags=$(BUILD_LDFLAGS) ./cmd/tensai
 
 $(GOBIN)/goxz:
 	go install github.com/Songmu/goxz/cmd/goxz@latest

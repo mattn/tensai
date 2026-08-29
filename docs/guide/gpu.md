@@ -109,3 +109,16 @@ When both tags are set, `wgpu24` wins, and on a machine like this one that choic
 | int8 prefill / decode | 27.0 / 6.0 t/s | 1801 / 27.1 t/s |
 
 This is why the `Makefile` builds with `wgpu24`. The gap is which hardware each build reaches, not a comparison of the two libraries on the same adapter — where a conformant driver is visible to both, pick either.
+
+Which binding it builds is a variable, so a driver that disagrees with one of
+them can be answered without editing anything:
+
+```bash
+make build              # wgpu24, the default
+make build WGPU=wgpu    # the v22 binding
+```
+
+`install` and `cross` take it too. Pair the binary with the matching library:
+a `wgpu24` build wants a v29-series `libwgpu_native`, a `wgpu` build wants v22,
+and `TENSAI_WGPU_LIB` names the file to load when it is not the one beside the
+binary.
