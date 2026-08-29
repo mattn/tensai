@@ -88,6 +88,14 @@ back at the listing. A download lands in the user cache directory
 (`~/.cache/tensai` on Linux); to keep a model anywhere else, fetch it there and
 name its path. `-draft` takes the same forms, minus `.gguf`.
 
+A download that dies partway is kept and resumed rather than started over,
+which matters when the file is fifteen gigabytes: the partial sits beside the
+model as `<name>.tmp` and the next attempt asks for the rest. The resume is
+guarded against the ETag recorded with it, so a checkpoint that changed
+upstream restarts instead of splicing two versions together. Transport errors
+and a server's 5xx are retried a few times with a widening pause; a 404 is
+not.
+
 ```bash
 tensai run -q8 "What is the capital of France?"
 tensai run -q8 -model Qwen3-0.6B "Explain RoPE briefly"   # a name from "tensai models"
