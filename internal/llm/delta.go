@@ -35,6 +35,10 @@ type deltaWeights struct {
 	qZ, qOut *qmat
 	// a and b are [hidden, heads], small enough to leave in float32.
 	wA, wB *tensai.Matrix
+	// wQZ fuses qkv with z and wAB a with b: both pairs read the same
+	// activation, so a batch pays for one pass over it instead of two.
+	wQZ, wAB *tensai.Matrix
+	qQZ      *qmat
 }
 
 // deltaState is what a linear-attention layer carries between tokens: the
@@ -42,12 +46,19 @@ type deltaWeights struct {
 type deltaState struct {
 	s    []float32 // [heads, kDim, vDim]
 	conv []float32 // [convK-1, convDim], oldest first
+	// parallel spreads the heads across cores. Decode calls the layer
+	// once per token and the state is a megabyte, so the dispatch pays
+	// for itself; prefill calls it once per token as well but with the
+	// projections already batched around it, where the goroutines cost
+	// more than the heads save.
+	parallel bool
 }
 
 func (d *deltaWeights) newState() *deltaState {
 	return &deltaState{
-		s:    make([]float32, d.heads*d.kDim*d.vDim),
-		conv: make([]float32, (d.convK-1)*d.convDim),
+		parallel: true,
+		s:        make([]float32, d.heads*d.kDim*d.vDim),
+		conv:     make([]float32, (d.convK-1)*d.convDim),
 	}
 }
 
@@ -66,7 +77,9 @@ func (c config) linearLayer(i int) bool {
 // loader's usual transpose-and-quantize path.
 func loadDelta(cfg config, p string, vec func(string) []float32,
 	linq func(string) (*tensai.Matrix, *qmat),
-	linqF32 func(string) *tensai.Matrix) *deltaWeights {
+	linqF32 func(string) *tensai.Matrix,
+	linqFused func(...string) (*tensai.Matrix, *qmat),
+	linqF32Fused func(...string) *tensai.Matrix) *deltaWeights {
 	d := &deltaWeights{
 		heads:  cfg.LinearValueHeads,
 		kDim:   cfg.LinearKeyDim,
@@ -85,6 +98,8 @@ func loadDelta(cfg config, p string, vec func(string) []float32,
 	// would save nothing and cost the precision the decay depends on.
 	d.wA = linqF32(p + "linear_attn.in_proj_a.weight")
 	d.wB = linqF32(p + "linear_attn.in_proj_b.weight")
+	d.wQZ, d.qQZ = linqFused(p+"linear_attn.in_proj_qkv.weight", p+"linear_attn.in_proj_z.weight")
+	d.wAB = linqF32Fused(p+"linear_attn.in_proj_a.weight", p+"linear_attn.in_proj_b.weight")
 	if err := d.check(); err != nil {
 		panic(err)
 	}
@@ -163,13 +178,13 @@ func (d *deltaWeights) mix(st *deltaState, qkv, z, a, b []float32, scratch *delt
 	prev := st.conv
 	out := scratch.conv
 	for c := 0; c < d.convDim; c++ {
-		var acc float32
+		acc := qkv[c] * d.conv[c*kw+kw-1]
 		for t := 0; t < kw-1; t++ {
 			acc += prev[t*d.convDim+c] * d.conv[c*kw+t]
 		}
-		acc += qkv[c] * d.conv[c*kw+kw-1]
-		out[c] = silu(acc)
+		out[c] = acc
 	}
+	kernels.Silu(out)
 	// Roll the window forward by one.
 	copy(prev, prev[d.convDim:])
 	copy(prev[(kw-2)*d.convDim:], qkv)
@@ -181,7 +196,7 @@ func (d *deltaWeights) mix(st *deltaState, qkv, z, a, b []float32, scratch *delt
 	// Heads share nothing: each owns its slice of the state and of every
 	// scratch buffer, so they run wherever there is a core. The state is
 	// a megabyte a layer, which is what makes this worth the dispatch.
-	if workers := min(runtime.NumCPU(), h); workers > 1 {
+	if workers := min(runtime.NumCPU(), h); workers > 1 && st.parallel {
 		var wg sync.WaitGroup
 		for w := 0; w < workers; w++ {
 			wg.Add(1)

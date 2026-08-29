@@ -77,6 +77,13 @@ func siluMulGeneric(gate, up []float32) {
 	}
 }
 
+// siluGeneric applies x * sigmoid(x) in place.
+func siluGeneric(v []float32) {
+	for i, x := range v {
+		v[i] = x / (1 + ExpF(-x))
+	}
+}
+
 // sigmoidBwdGeneric computes dst = grad * y * (1-y) from the forward output y.
 func sigmoidBwdGeneric(dst, grad, y []float32) {
 	for i, g := range grad {

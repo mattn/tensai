@@ -134,6 +134,21 @@ func SiluMul(gate, up []float32) {
 	})
 }
 
+// Silu applies x * sigmoid(x) in place. SiluMul is the same thing paired
+// with a gate; the delta rule wants it on its own, over a convolution's
+// output rather than a SwiGLU's.
+func Silu(v []float32) {
+	if !simd.HasAVX2 {
+		siluGeneric(v)
+		return
+	}
+	one := archsimd.BroadcastFloat32x8(1)
+	zero := archsimd.BroadcastFloat32x8(0)
+	mapSlices(v, v, func(x archsimd.Float32x8) archsimd.Float32x8 {
+		return x.Div(one.Add(vexpf(zero.Sub(x))))
+	})
+}
+
 func SigmoidBwd(dst, grad, y []float32) {
 	if !simd.HasAVX2 {
 		sigmoidBwdGeneric(dst, grad, y)
