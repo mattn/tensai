@@ -150,6 +150,18 @@ func Open(o Options) (*Engine, error) {
 			recordOrigin(o.Data, o.Repo)
 		}
 	}
+	// A delta layer's state is not a KV cache: nothing in it can be
+	// indexed by position, so speculative decoding cannot roll it back,
+	// and the GPU path has no kernel for it. Both say so rather than
+	// producing nonsense.
+	if model.hasDelta() {
+		if o.GPU {
+			return nil, fmt.Errorf("%s runs its linear-attention layers on the CPU only", model.cfg.ModelType)
+		}
+		if o.Draft != "" {
+			return nil, fmt.Errorf("%s keeps a recurrent state that cannot be rolled back, so -draft cannot verify against it", model.cfg.ModelType)
+		}
+	}
 	how := "float32"
 	if o.Bits != 0 {
 		how = fmt.Sprintf("int%d", o.Bits)
@@ -977,7 +989,7 @@ func templateFor(modelType string, think bool) tmpl {
 	}
 	// Qwen3 and SmolLM3 disable their thinking mode by opening the
 	// assistant turn with an empty think block; -think leaves it open.
-	if modelType == "qwen3" || modelType == "smollm3" {
+	if modelType == "qwen3" || modelType == "qwen3_5" || modelType == "smollm3" {
 		if think {
 			t.reasonOpen, t.reasonClose = "<think>", "</think>"
 		} else {

@@ -30,7 +30,7 @@ Despite its size, tensai reaches surprisingly far: the same kernels that train a
 - **int8 / int4 quantization** — weight-only quantized matmuls that reach memory bandwidth, plus MXFP4 for gpt-oss
 - **Model formats** — TFLite and ONNX export, safetensors read/write, and a GGUF reader covering the K-quants — all with in-tree encoders, still no dependencies
 - **Tokenizers** — Hugging Face `tokenizer.json` byte-level BPE (GPT-2, cl100k, o200k families) and SentencePiece, verified to match the reference implementations exactly
-- **LLM inference** — `_example/gpt2`, and the `tensai` command — nine model families with `run`, `chat`, and `serve` subcommands
+- **LLM inference** — `_example/gpt2`, and the `tensai` command — ten model families with `run`, `chat`, and `serve` subcommands
 
 ## Where to go next
 
