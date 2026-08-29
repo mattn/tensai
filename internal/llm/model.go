@@ -62,6 +62,9 @@ type config struct {
 	YarnOrigCtx  int     `json:"-"`
 	YarnBetaFast float64 `json:"-"`
 	YarnBetaSlow float64 `json:"-"`
+	// gptOss keeps the Hugging Face spelling of the fields above around
+	// for the loader, which needs its per-layer attention spans.
+	gptOss gptOssConfig `json:"-"`
 }
 
 // qmat abstracts the int8 and int4 twins behind one matvec call, plus the
@@ -171,8 +174,19 @@ func loadConfig(path string) (config, error) {
 	}
 	switch c.ModelType {
 	case "qwen2", "qwen3", "llama", "smollm3":
+	case "gpt_oss":
+		var hf gptOssConfig
+		if err := json.Unmarshal(raw, &hf); err != nil {
+			return c, fmt.Errorf("parsing gpt-oss config: %w", err)
+		}
+		applyGptOss(&c, hf)
+		c.gptOss = hf
+		// config.json spells it with an underscore and the GGUF metadata
+		// with a hyphen; the template family table knows the hyphen, and
+		// without this the harmony channels leak into the answer.
+		c.ChatStyle = "gpt-oss"
 	default:
-		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2, qwen3, llama, and smollm3)", c.ModelType)
+		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2, qwen3, llama, smollm3, and gpt_oss)", c.ModelType)
 	}
 	return c, nil
 }
@@ -181,6 +195,10 @@ func loadConfig(path string) (config, error) {
 // loader needs.
 type weightsFile interface {
 	Tensor(string) (*tensai.Tensor, error)
+	// Raw reads a packed tensor's bytes without widening them: gpt-oss's
+	// experts sit in the file as MXFP4 and only the loader knows how to
+	// read them.
+	Raw(string) ([]byte, []int, error)
 	Close() error
 }
 
@@ -259,6 +277,31 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 		return nil, quantizeMat(w, bits)
 	}
 
+	// raw hands back a packed U8 tensor's bytes; gpt-oss's experts are
+	// MXFP4 inside the file and expanding them to float32 would cost
+	// gigabytes a layer.
+	raw := func(name string) ([]byte, []int) {
+		data, shape, err := f.Raw(name)
+		if err != nil {
+			panic(err)
+		}
+		return data, shape
+	}
+	// linqRouter keeps the router in float32: it is [hidden, nExpert],
+	// far too small to be worth quantizing and too load-bearing to want
+	// the error.
+	linqRouter := func(name string) *tensai.Matrix {
+		t, err := f.Tensor(name)
+		if err != nil {
+			panic(err)
+		}
+		mm, err := t.Matrix()
+		if err != nil {
+			panic(err)
+		}
+		return mm.T()
+	}
+
 	headSz := cfg.HiddenSize / cfg.Heads
 	if cfg.HeadDim != 0 {
 		headSz = cfg.HeadDim
@@ -318,6 +361,18 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 			b.wQKV, b.qQKV = linqFused(p+"self_attn.q_proj.weight", p+"self_attn.k_proj.weight", p+"self_attn.v_proj.weight")
 			b.bQKV = catVec(vecOpt(p+"self_attn.q_proj.bias"), vecOpt(p+"self_attn.k_proj.bias"), vecOpt(p+"self_attn.v_proj.bias"))
 			b.wo, b.qo = linq(p + "self_attn.o_proj.weight")
+			if cfg.ModelType == "gpt_oss" {
+				// Sinks absorb the attention mass that the sliding
+				// layers would otherwise have given to positions outside
+				// their window.
+				b.sinks = vecOpt(p + "self_attn.sinks")
+				b.bo = vecOpt(p + "self_attn.o_proj.bias")
+				if gptOssSlides(cfg.gptOss, i) {
+					b.window = cfg.SlidingWin
+				}
+				loadGptOssExperts(b, cfg, p, bits, raw, vecOpt, linqRouter)
+				return
+			}
 			b.wGU, b.qGU = linqFused(p+"mlp.gate_proj.weight", p+"mlp.up_proj.weight")
 			b.wDown, b.qDown = linq(p + "mlp.down_proj.weight")
 		}(i)
