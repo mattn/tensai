@@ -200,8 +200,7 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw io.Writer) (*gpuQwen, err
 		if fuseQKV {
 			l.qQKV = up(b.qQKV)
 			l.bQKV = vec(b.bQKV)
-		}
-		{
+		} else {
 			l.bq = vec(vecRange(b.bQKV, 0, hs))
 			l.bk = vec(vecRange(b.bQKV, hs, hs+kvDim))
 			l.bv = vec(vecRange(b.bQKV, hs+kvDim, hs+2*kvDim))
@@ -267,6 +266,26 @@ func (gq *gpuQwen) qkv(l *gpuLayer, a *gpu.Tensor) (q, k, v, owner *gpu.Tensor) 
 		must(f.View(hs+kvDim, 1, kvDim)), f
 }
 
+// qkvRows is qkv for a batch of token rows. The fused result is
+// [rows, hs+2*kvDim] with q, k, and v side by side inside every row, so
+// no contiguous view covers one of them and each is copied out instead.
+// That copy is what lets the fused weight serve prefill as well, which
+// is what keeps the split weights off the device entirely.
+func (gq *gpuQwen) qkvRows(l *gpuLayer, a *gpu.Tensor) (q, k, v *gpu.Tensor) {
+	if l.qQKV == nil {
+		return must(l.qq.MatMulOpts(a, l.bq, nil)),
+			must(l.qk.MatMulOpts(a, l.bk, nil)),
+			must(l.qv.MatMulOpts(a, l.bv, nil))
+	}
+	hs := gq.m.cfg.Heads * gq.m.headSz
+	kvDim := gq.m.cfg.KVHeads * gq.m.headSz
+	f := must(l.qQKV.MatMulOpts(a, l.bQKV, nil))
+	defer f.Free()
+	return must(f.SliceCols(0, hs)),
+		must(f.SliceCols(hs, kvDim)),
+		must(f.SliceCols(hs+kvDim, kvDim))
+}
+
 // prefill feeds a batch of tokens through the GPU-resident blocks — the
 // batched twins of every decode op (row-batched RMSNorm and RoPE, the
 // multi-row quantized matmuls, causal attention with the queries aligned
@@ -319,9 +338,7 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 	for i := range gq.layers {
 		l := &gq.layers[i]
 		a := must(x.RMSNorm(l.ln1, cfg.RMSEps))
-		q := must(l.qq.MatMulOpts(a, l.bq, nil))
-		k := must(l.qk.MatMulOpts(a, l.bk, nil))
-		v := must(l.qv.MatMulOpts(a, l.bv, nil))
+		q, k, v := gq.qkvRows(l, a)
 		a.Free()
 		if l.qNorm != nil {
 			nq := must(q.RMSNormEach(l.qNorm, cfg.RMSEps))

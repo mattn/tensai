@@ -946,6 +946,27 @@ fn silu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
     }
 }
 
+// slice_cols lifts a column window out of every row. The fused QKV
+// projection lands in one buffer and prefill wants q, k, and v as
+// tensors of their own; a bind offset cannot express that, because the
+// window repeats once per row rather than sitting at one place in the
+// buffer.
+struct SliceParams { rows: u32, cols: u32, stride: u32, off: u32 }
+@group(0) @binding(36) var<uniform> slp: SliceParams;
+@group(0) @binding(37) var<storage, read> slsrc: array<f32>;
+@group(0) @binding(38) var<storage, read_write> sldst: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn slice_cols(@builtin(workgroup_id) wg: vec3<u32>,
+              @builtin(num_workgroups) nwg: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx < slp.rows * slp.cols) {
+        let r = idx / slp.cols;
+        sldst[idx] = slsrc[r * slp.stride + slp.off + (idx - r * slp.cols)];
+    }
+}
+
 // gelu_mul_ip: dst = gelu_tanh(dst) * src — Gemma's gate.
 @compute @workgroup_size(256, 1, 1)
 fn gelu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
@@ -1429,6 +1450,7 @@ type gpuPipelines struct {
 	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
 	geluMulIP, qmatmulB, attnG, qmatmulT           uintptr
 	qacts, qmatmulI, attnF16, rowsToF16            uintptr
+	sliceCols, laySliceCols                        uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
 	layScale, laySoftmax, layAttn, layQmatmul      uintptr
 	layRmsnorm, layRope, layAddIP, laySiluMulIP    uintptr
@@ -1461,6 +1483,7 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.qmatmulB, &g.pipes.layQmatmulB, "qmatmul_b"},
 		{&g.pipes.attnG, &g.pipes.layAttnG, "attn_causal_g"},
 		{&g.pipes.qmatmulT, &g.pipes.layQmatmulT, "qmatmul_t"},
+		{&g.pipes.sliceCols, &g.pipes.laySliceCols, "slice_cols"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -1540,7 +1563,7 @@ func (g *Device) releasePipelines() {
 		g.pipes.qmatmul, g.pipes.rmsnorm, g.pipes.rope,
 		g.pipes.addIP, g.pipes.siluMulIP, g.pipes.q4matmul,
 		g.pipes.geluMulIP, g.pipes.qmatmulB, g.pipes.attnG,
-		g.pipes.qmatmulT, g.pipes.qacts, g.pipes.qmatmulI,
+		g.pipes.qmatmulT, g.pipes.sliceCols, g.pipes.qacts, g.pipes.qmatmulI,
 		g.pipes.attnF16, g.pipes.rowsToF16,
 	} {
 		if h != 0 {
@@ -1906,6 +1929,64 @@ func (t *Tensor) View(off int, shape ...int) (*Tensor, error) {
 		off:   t.off + uint64(off)*4,
 		view:  true,
 	}, nil
+}
+
+// SliceCols lifts a column window out of every row into a tensor of its
+// own: t is [rows, stride] and the result [rows, cols] holding columns
+// [off, off+cols). View covers the case where the window is one
+// contiguous run of the buffer; this is the case where it repeats per
+// row, which no binding offset can describe, so it costs a copy.
+func (t *Tensor) SliceCols(off, cols int) (*Tensor, error) {
+	if t.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	n := len(t.shape)
+	if n < 2 {
+		return nil, errors.New("tensai: gpu slice needs at least 2 axes")
+	}
+	stride := t.shape[n-1]
+	if off < 0 || cols <= 0 || off+cols > stride {
+		return nil, fmt.Errorf("tensai: slice of %d columns at %d overflows %d", cols, off, stride)
+	}
+	if t.f16 {
+		return nil, errors.New("tensai: cannot slice a half-precision tensor")
+	}
+	rows := t.Size() / stride
+	g := t.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	outBytes := uint64(rows*cols) * 4
+	if err := g.checkSize(outBytes); err != nil {
+		return nil, err
+	}
+	params := [4]uint32{uint32(rows), uint32(cols), uint32(stride), uint32(off)}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+	bufOut := g.takeOutBuffer(outBytes)
+
+	entries := [3]wgpuBindGroupEntry{
+		{binding: 36, buffer: bufParams, size: 16},
+		bind(37, t),
+		{binding: 38, buffer: bufOut, size: outBytes},
+	}
+	bindGroup := g.cachedBindGroup(g.pipes.laySliceCols, entries[:])
+	runtime.KeepAlive(&entries)
+
+	x, y := split2D((rows*cols + 255) / 256)
+	if err := g.dispatch(g.pipes.sliceCols, bindGroup, x, y, 1); err != nil {
+		g.dropBuffer(bufOut)
+		return nil, err
+	}
+	shape := append(append([]int(nil), t.shape[:n-1]...), cols)
+	return &Tensor{g: g, buf: bufOut, shape: shape}, nil
 }
 
 // byteLen is the tensor's buffer size, which the pool keys on.
