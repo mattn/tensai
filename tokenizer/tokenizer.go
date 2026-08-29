@@ -53,10 +53,17 @@ type splitConfig struct {
 	// is its own pre-token, so a digit never absorbs a preceding space, and
 	// whitespace running into a digit behaves as if at end of text.
 	individualDigits bool
-	// caseWords selects o200k's case-aware word alternatives: a run of
-	// uppercase-ish letters (any letter but ASCII a-z) then a run of
-	// lowercase-ish ones (any letter but ASCII A-Z), with contractions
-	// attaching as a suffix instead of splitting on their own.
+	// caseWords selects o200k's case-aware word alternatives: a run from
+	// [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}] then one from
+	// [\p{Ll}\p{Lm}\p{Lo}\p{M}], with contractions attaching as a
+	// suffix instead of splitting on their own.
+	//
+	// llama.cpp spells these classes as "any letter but ASCII a-z" and
+	// "any letter but ASCII A-Z", which agrees for Latin and for the
+	// unicased scripts but drops \p{M}: a combining mark ends the run
+	// instead of continuing it, so "नमस्ते" splits mid-word. NFC keeps
+	// those marks in Devanagari, Thai, and Hebrew, so the categories are
+	// what the models were actually trained on and what this implements.
 	caseWords bool
 	// punctSlash admits '/' into the punctuation run's newline tail
 	// (o200k's "[\r\n/]*").
@@ -224,6 +231,11 @@ func classifyRegex(re string) (splitConfig, error) {
 		return gpt2Config, nil
 	case strings.HasPrefix(re, `[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))*`):
 		// o200k (gpt-4o and friends), in llama.cpp's lookahead spelling.
+		return o200kConfig, nil
+	case strings.HasPrefix(re, `[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+`):
+		// The same split in tiktoken's own spelling, which is what the
+		// Hugging Face tokenizer.json carries for o200k_base and for
+		// gpt-oss's o200k_harmony.
 		return o200kConfig, nil
 	case strings.HasPrefix(re, `(?i:'s|'t|'re|'ve|'m|'ll|'d)`):
 		cfg := cl100kConfig
@@ -400,10 +412,10 @@ func (t *Tokenizer) split(s string) []string {
 				// then a lowercase-ish one (letters except ASCII A-Z) —
 				// the backtracking-free reading of its two alternatives —
 				// plus an optional contraction suffix.
-				for j < len(rs) && unicode.IsLetter(rs[j]) && !(rs[j] >= 'a' && rs[j] <= 'z') {
+				for j < len(rs) && isUpperWord(rs[j]) {
 					j++
 				}
-				for j < len(rs) && unicode.IsLetter(rs[j]) && !(rs[j] >= 'A' && rs[j] <= 'Z') {
+				for j < len(rs) && isLowerWord(rs[j]) {
 					j++
 				}
 				if j < len(rs) && rs[j] == '\'' {
@@ -524,6 +536,24 @@ func matchContraction(rs []rune, ci bool) int {
 	}
 	return 0
 }
+
+// o200k's word classes. \p{Lm} and \p{Lo} sit in both, so a run of
+// unicased letters can be consumed by either -- the span works out the
+// same, which is all pre-tokenization needs.
+func isUpperWord(r rune) bool {
+	return unicode.Is(unicode.Lu, r) || unicode.Is(unicode.Lt, r) || isCaselessWord(r)
+}
+
+func isLowerWord(r rune) bool {
+	return unicode.Is(unicode.Ll, r) || isCaselessWord(r)
+}
+
+func isCaselessWord(r rune) bool {
+	return unicode.Is(unicode.Lm, r) || unicode.Is(unicode.Lo, r) || unicode.Is(unicode.M, r)
+}
+
+// isWordRune reports whether r can open either alternative.
+func isWordRune(r rune) bool { return isUpperWord(r) || isLowerWord(r) }
 
 func isPunct(r rune) bool {
 	return !unicode.IsSpace(r) && !unicode.IsLetter(r) && !unicode.IsNumber(r)
