@@ -946,6 +946,27 @@ fn silu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
     }
 }
 
+// slice_cols lifts a column window out of every row. The fused QKV
+// projection lands in one buffer and prefill wants q, k, and v as
+// tensors of their own; a bind offset cannot express that, because the
+// window repeats once per row rather than sitting at one place in the
+// buffer.
+struct SliceParams { rows: u32, cols: u32, stride: u32, off: u32 }
+@group(0) @binding(36) var<uniform> slp: SliceParams;
+@group(0) @binding(37) var<storage, read> slsrc: array<f32>;
+@group(0) @binding(38) var<storage, read_write> sldst: array<f32>;
+
+@compute @workgroup_size(256, 1, 1)
+fn slice_cols(@builtin(workgroup_id) wg: vec3<u32>,
+              @builtin(num_workgroups) nwg: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx < slp.rows * slp.cols) {
+        let r = idx / slp.cols;
+        sldst[idx] = slsrc[r * slp.stride + slp.off + (idx - r * slp.cols)];
+    }
+}
+
 // gelu_mul_ip: dst = gelu_tanh(dst) * src — Gemma's gate.
 @compute @workgroup_size(256, 1, 1)
 fn gelu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
@@ -1429,6 +1450,7 @@ type gpuPipelines struct {
 	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
 	geluMulIP, qmatmulB, attnG, qmatmulT           uintptr
 	qacts, qmatmulI, attnF16, rowsToF16            uintptr
+	sliceCols, laySliceCols                        uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
 	layScale, laySoftmax, layAttn, layQmatmul      uintptr
 	layRmsnorm, layRope, layAddIP, laySiluMulIP    uintptr
@@ -1461,6 +1483,7 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.qmatmulB, &g.pipes.layQmatmulB, "qmatmul_b"},
 		{&g.pipes.attnG, &g.pipes.layAttnG, "attn_causal_g"},
 		{&g.pipes.qmatmulT, &g.pipes.layQmatmulT, "qmatmul_t"},
+		{&g.pipes.sliceCols, &g.pipes.laySliceCols, "slice_cols"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -1540,7 +1563,7 @@ func (g *Device) releasePipelines() {
 		g.pipes.qmatmul, g.pipes.rmsnorm, g.pipes.rope,
 		g.pipes.addIP, g.pipes.siluMulIP, g.pipes.q4matmul,
 		g.pipes.geluMulIP, g.pipes.qmatmulB, g.pipes.attnG,
-		g.pipes.qmatmulT, g.pipes.qacts, g.pipes.qmatmulI,
+		g.pipes.qmatmulT, g.pipes.sliceCols, g.pipes.qacts, g.pipes.qmatmulI,
 		g.pipes.attnF16, g.pipes.rowsToF16,
 	} {
 		if h != 0 {
@@ -1795,6 +1818,7 @@ type bgKey struct {
 	e      [8]struct {
 		binding uint32
 		buf     uintptr
+		off     uint64
 		size    uint64
 	}
 }
@@ -1813,6 +1837,7 @@ func (g *Device) cachedBindGroup(layout uintptr, entries []wgpuBindGroupEntry) u
 	for i, e := range entries {
 		key.e[i].binding = e.binding
 		key.e[i].buf = e.buffer
+		key.e[i].off = e.offset
 		key.e[i].size = e.size
 	}
 	if bg, ok := g.bgCache[key]; ok {
@@ -1857,6 +1882,111 @@ type Tensor struct {
 	shape []int
 	freed bool
 	f16   bool // half-precision storage (KV caches); most kernels want f32
+	// off is a byte offset into buf. Non-zero only for a View, which
+	// borrows a window of another tensor's buffer rather than owning one;
+	// every kernel reaches its operand through bind/bindN, so the offset
+	// applies uniformly and no call site can forget it.
+	off  uint64
+	view bool
+}
+
+// bind builds a bind-group entry covering the whole of t, and bindN one
+// covering the first n bytes. Every kernel binds its tensor operands
+// through these two so a View's offset is applied in one place instead of
+// at two dozen call sites.
+func bind(binding uint32, t *Tensor) wgpuBindGroupEntry {
+	return bindN(binding, t, t.byteLen())
+}
+
+func bindN(binding uint32, t *Tensor, bytes uint64) wgpuBindGroupEntry {
+	return wgpuBindGroupEntry{binding: binding, buffer: t.buf, offset: t.off, size: bytes}
+}
+
+// View borrows a window of t's buffer as a tensor of its own: the fused
+// QKV projection lands in one buffer and q, k, and v are read back out of
+// it without a copy. The offset must be 256-byte aligned, which every
+// WebGPU device accepts as a storage-buffer binding offset. A view does
+// not own the buffer -- Free on it is a no-op, and it must not outlive
+// the tensor it borrows from.
+func (t *Tensor) View(off int, shape ...int) (*Tensor, error) {
+	if t.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if t.f16 {
+		return nil, errors.New("tensai: cannot view a half-precision tensor")
+	}
+	n := dims.Prod(shape)
+	if off < 0 || n <= 0 || off+n > t.Size() {
+		return nil, fmt.Errorf("tensai: view of %d elements at %d overflows %d", n, off, t.Size())
+	}
+	if (uint64(off)*4)%256 != 0 {
+		return nil, fmt.Errorf("tensai: view offset %d is not 256-byte aligned", off)
+	}
+	return &Tensor{
+		g:     t.g,
+		buf:   t.buf,
+		shape: append([]int(nil), shape...),
+		off:   t.off + uint64(off)*4,
+		view:  true,
+	}, nil
+}
+
+// SliceCols lifts a column window out of every row into a tensor of its
+// own: t is [rows, stride] and the result [rows, cols] holding columns
+// [off, off+cols). View covers the case where the window is one
+// contiguous run of the buffer; this is the case where it repeats per
+// row, which no binding offset can describe, so it costs a copy.
+func (t *Tensor) SliceCols(off, cols int) (*Tensor, error) {
+	if t.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	n := len(t.shape)
+	if n < 2 {
+		return nil, errors.New("tensai: gpu slice needs at least 2 axes")
+	}
+	stride := t.shape[n-1]
+	if off < 0 || cols <= 0 || off+cols > stride {
+		return nil, fmt.Errorf("tensai: slice of %d columns at %d overflows %d", cols, off, stride)
+	}
+	if t.f16 {
+		return nil, errors.New("tensai: cannot slice a half-precision tensor")
+	}
+	rows := t.Size() / stride
+	g := t.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	outBytes := uint64(rows*cols) * 4
+	if err := g.checkSize(outBytes); err != nil {
+		return nil, err
+	}
+	params := [4]uint32{uint32(rows), uint32(cols), uint32(stride), uint32(off)}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+	bufOut := g.takeOutBuffer(outBytes)
+
+	entries := [3]wgpuBindGroupEntry{
+		{binding: 36, buffer: bufParams, size: 16},
+		bind(37, t),
+		{binding: 38, buffer: bufOut, size: outBytes},
+	}
+	bindGroup := g.cachedBindGroup(g.pipes.laySliceCols, entries[:])
+	runtime.KeepAlive(&entries)
+
+	x, y := split2D((rows*cols + 255) / 256)
+	if err := g.dispatch(g.pipes.sliceCols, bindGroup, x, y, 1); err != nil {
+		g.dropBuffer(bufOut)
+		return nil, err
+	}
+	shape := append(append([]int(nil), t.shape[:n-1]...), cols)
+	return &Tensor{g: g, buf: bufOut, shape: shape}, nil
 }
 
 // byteLen is the tensor's buffer size, which the pool keys on.
@@ -2023,7 +2153,7 @@ func (t *Tensor) Download() (*tensai.Tensor, error) {
 	}()
 
 	encoder := fnDeviceCreateCmdEncoder(g.device, nil)
-	fnEncoderCopyBuffer(encoder, t.buf, 0, staging, 0, bytes)
+	fnEncoderCopyBuffer(encoder, t.buf, t.off, staging, 0, bytes)
 	cmd := fnEncoderFinish(encoder, nil)
 	fnCmdEncoderRelease(encoder)
 	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
@@ -2076,7 +2206,7 @@ func (t *Tensor) DownloadRange(off, n int) (*tensai.Tensor, error) {
 		}
 	}()
 	encoder := fnDeviceCreateCmdEncoder(g.device, nil)
-	fnEncoderCopyBuffer(encoder, t.buf, uint64(off)*4, staging, 0, bytes)
+	fnEncoderCopyBuffer(encoder, t.buf, t.off+uint64(off)*4, staging, 0, bytes)
 	cmd := fnEncoderFinish(encoder, nil)
 	fnCmdEncoderRelease(encoder)
 	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
@@ -2101,6 +2231,9 @@ func (t *Tensor) Free() {
 		return
 	}
 	t.freed = true
+	if t.view { // borrowed, not owned: the owner still holds the buffer
+		return
+	}
 	t.g.putBuffer(gpuTensorUsage, t.byteLen(), t.buf)
 }
 
@@ -2231,8 +2364,8 @@ func (g *Device) stridedMatMul(a, b *Tensor, outShape []int, transB bool, m, k, 
 	}
 	entries := [5]wgpuBindGroupEntry{
 		{binding: 0, buffer: bufParams, size: 32},
-		{binding: 1, buffer: a.buf, size: uint64(a.Size()) * 4},
-		{binding: 2, buffer: b.buf, size: uint64(b.Size()) * 4},
+		bind(1, a),
+		bind(2, b),
 		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
 		{binding: 4, buffer: bufOut, size: outBytes},
 	}
@@ -2281,7 +2414,7 @@ func (t *Tensor) Scale(s tensai.Float) error {
 
 	entries := [2]wgpuBindGroupEntry{
 		{binding: 5, buffer: bufParams, size: 16},
-		{binding: 6, buffer: t.buf, size: uint64(count) * 4},
+		bindN(6, t, uint64(count)*4),
 	}
 	bindGroup := g.cachedBindGroup(g.pipes.layScale, entries[:])
 	runtime.KeepAlive(&entries)
@@ -2327,7 +2460,7 @@ func (t *Tensor) softmax(qmod, off int) (*Tensor, error) {
 
 	entries := [3]wgpuBindGroupEntry{
 		{binding: 7, buffer: bufParams, size: 16},
-		{binding: 8, buffer: t.buf, size: bytes},
+		bindN(8, t, bytes),
 		{binding: 9, buffer: bufOut, size: bytes},
 	}
 	bindGroup := g.cachedBindGroup(g.pipes.laySoftmax, entries[:])
@@ -2528,9 +2661,9 @@ func (q *Tensor) fusedCausalMHA(k, v *Tensor, heads, batch, seq, seqKV, d, dh, b
 	entries := [6]wgpuBindGroupEntry{
 		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
 		{binding: 10, buffer: bufParams, size: 32},
-		{binding: 11, buffer: q.buf, size: uint64(q.Size()) * 4},
-		{binding: 12, buffer: k.buf, size: uint64(k.Size()) * 4},
-		{binding: 13, buffer: v.buf, size: uint64(v.Size()) * 4},
+		bind(11, q),
+		bind(12, k),
+		bind(13, v),
 		{binding: 14, buffer: bufOut, size: outBytes},
 	}
 	bindGroup := g.cachedBindGroup(g.pipes.layAttn, entries[:])
@@ -2718,7 +2851,7 @@ func (q *QMatrix) MatMulOpts(x, bias, dst *Tensor) (*Tensor, error) {
 		{binding: 15, buffer: bufParams, size: 32},
 		{binding: 16, buffer: q.buf, size: uint64(q.rows*q.words) * 4},
 		{binding: 17, buffer: q.scales, size: uint64(q.words*4) * 4},
-		{binding: 18, buffer: x.buf, size: uint64(x.Size()) * 4},
+		bind(18, x),
 		{binding: 19, buffer: bufOut, size: outBytes},
 		{binding: 34, buffer: biasBuf, size: biasSize},
 	}
@@ -2795,7 +2928,7 @@ func (q *QMatrix) matmulIntDot(x, bias, dst *Tensor, m int, outShape []int) (*Te
 
 	qe := [4]wgpuBindGroupEntry{
 		{binding: 0, buffer: bufParams, size: 32},
-		{binding: 1, buffer: x.buf, size: uint64(x.Size()) * 4},
+		bind(1, x),
 		{binding: 2, buffer: bufPA, size: paBytes},
 		{binding: 3, buffer: bufAS, size: uint64(m) * 4},
 	}
@@ -2864,8 +2997,8 @@ func (t *Tensor) RMSNorm(w *Tensor, eps float64) (*Tensor, error) {
 
 	entries := [4]wgpuBindGroupEntry{
 		{binding: 20, buffer: bufParams, size: 16},
-		{binding: 21, buffer: t.buf, size: uint64(t.Size()) * 4},
-		{binding: 22, buffer: w.buf, size: uint64(w.Size()) * 4},
+		bind(21, t),
+		bind(22, w),
 		{binding: 23, buffer: bufOut, size: uint64(t.Size()) * 4},
 	}
 	bindGroup := g.cachedBindGroup(g.pipes.layRmsnorm, entries[:])
@@ -2910,8 +3043,8 @@ func (t *Tensor) RMSNormEach(w *Tensor, eps float64) (*Tensor, error) {
 
 	entries := [4]wgpuBindGroupEntry{
 		{binding: 20, buffer: bufParams, size: 16},
-		{binding: 21, buffer: t.buf, size: uint64(t.Size()) * 4},
-		{binding: 22, buffer: w.buf, size: uint64(n) * 4},
+		bind(21, t),
+		bindN(22, w, uint64(n)*4),
 		{binding: 23, buffer: bufOut, size: uint64(t.Size()) * 4},
 	}
 	bindGroup := g.cachedBindGroup(g.pipes.layRmsnorm, entries[:])
@@ -2964,7 +3097,7 @@ func (t *Tensor) RoPE(headSz, pos0 int, theta float64) error {
 
 	entries := [2]wgpuBindGroupEntry{
 		{binding: 24, buffer: bufParams, size: 32},
-		{binding: 25, buffer: t.buf, size: uint64(t.Size()) * 4},
+		bind(25, t),
 	}
 	bindGroup := g.cachedBindGroup(g.pipes.layRope, entries[:])
 	runtime.KeepAlive(&entries)
@@ -3003,8 +3136,8 @@ func (t *Tensor) eltwiseIP(pipe, lay uintptr, o *Tensor) error {
 
 	entries := [3]wgpuBindGroupEntry{
 		{binding: 26, buffer: bufParams, size: 16},
-		{binding: 27, buffer: t.buf, size: uint64(t.Size()) * 4},
-		{binding: 28, buffer: o.buf, size: uint64(o.Size()) * 4},
+		bind(27, t),
+		bind(28, o),
 	}
 	bindGroup := g.cachedBindGroup(lay, entries[:])
 	runtime.KeepAlive(&entries)
@@ -3063,8 +3196,8 @@ func (t *Tensor) CopyRowsInto(dst *Tensor, off int) error {
 		fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
 		entries := [3]wgpuBindGroupEntry{
 			{binding: 20, buffer: bufParams, size: 16},
-			{binding: 21, buffer: t.buf, size: uint64(n) * 4},
-			{binding: 22, buffer: dst.buf, size: dst.byteLen()},
+			bindN(21, t, uint64(n)*4),
+			bind(22, dst),
 		}
 		bindGroup := g.cachedBindGroup(g.pipes.layRowsToF16, entries[:])
 		runtime.KeepAlive(&entries)
@@ -3078,11 +3211,11 @@ func (t *Tensor) CopyRowsInto(dst *Tensor, off int) error {
 	}
 	if g.batchEnc != 0 {
 		g.endBatchPass()
-		fnEncoderCopyBuffer(g.batchEnc, t.buf, 0, dst.buf, uint64(off)*4, uint64(t.Size())*4)
+		fnEncoderCopyBuffer(g.batchEnc, t.buf, t.off, dst.buf, dst.off+uint64(off)*4, uint64(t.Size())*4)
 		return nil
 	}
 	encoder := fnDeviceCreateCmdEncoder(g.device, nil)
-	fnEncoderCopyBuffer(encoder, t.buf, 0, dst.buf, uint64(off)*4, uint64(t.Size())*4)
+	fnEncoderCopyBuffer(encoder, t.buf, t.off, dst.buf, dst.off+uint64(off)*4, uint64(t.Size())*4)
 	cmd := fnEncoderFinish(encoder, nil)
 	fnCmdEncoderRelease(encoder)
 	fnQueueSubmit(g.queue, 1, unsafe.Pointer(&cmd))
@@ -3183,9 +3316,9 @@ func (q *Tensor) GroupedCausalAttention(k, v *Tensor, heads, kvHeads, seqKV, win
 	entries := [6]wgpuBindGroupEntry{
 		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
 		{binding: 10, buffer: bufParams, size: 32},
-		{binding: 11, buffer: q.buf, size: uint64(q.Size()) * 4},
-		{binding: 12, buffer: k.buf, size: k.byteLen()},
-		{binding: 13, buffer: v.buf, size: v.byteLen()},
+		bind(11, q),
+		bind(12, k),
+		bind(13, v),
 		{binding: 14, buffer: bufOut, size: outBytes},
 	}
 	pipe, lay := g.pipes.attn, g.pipes.layAttn
@@ -3372,7 +3505,7 @@ func (q *Q4Matrix) MatMulOpts(x, bias, dst *Tensor) (*Tensor, error) {
 		{binding: 29, buffer: bufParams, size: 32},
 		{binding: 30, buffer: q.buf, size: uint64(pairs*q.words) * 4},
 		{binding: 31, buffer: q.scales, size: uint64(groups*q.words*4) * 4},
-		{binding: 32, buffer: x.buf, size: uint64(x.Size()) * 4},
+		bind(32, x),
 		{binding: 33, buffer: bufOut, size: outBytes},
 		{binding: 35, buffer: biasBuf, size: biasSize},
 	}
