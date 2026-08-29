@@ -443,6 +443,17 @@ func (e *Engine) Serve(addr, apiKey string) error {
 	return s.listen(addr)
 }
 
+// fetchAttempts is how many times a download is tried before giving up.
+// The pause between them widens, so a server that is briefly unhappy gets
+// a little room without a wedged one holding the load up for long.
+const fetchAttempts = 5
+
+// fetch downloads name into dir unless it is already there. A partial
+// download stays on disk as name.tmp and the next attempt resumes it with
+// a Range request rather than starting a multi-gigabyte file over. The
+// resume is guarded by If-Range against the recorded ETag, so a file that
+// changed upstream restarts instead of splicing two versions together;
+// without a recorded tag the partial is discarded rather than trusted.
 func fetch(base, dir, name string) (string, error) {
 	path := filepath.Join(dir, name)
 	if _, err := os.Stat(path); err == nil {
@@ -451,29 +462,94 @@ func fetch(base, dir, name string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	resp, err := http.Get(base + name)
+	tmp := path + ".tmp"
+	var err error
+	for attempt := 0; attempt < fetchAttempts; attempt++ {
+		if attempt > 0 {
+			pause := time.Duration(1<<uint(attempt-1)) * time.Second
+			fmt.Fprintf(os.Stderr, "\n%s: %v; retrying in %v\n", name, err, pause)
+			time.Sleep(pause)
+		}
+		var retry bool
+		retry, err = fetchOnce(base, dir, name, tmp)
+		if err == nil {
+			fmt.Fprintln(os.Stderr)
+			os.Remove(tmp + ".etag")
+			return path, os.Rename(tmp, path)
+		}
+		if !retry {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("downloading %s: %w (after %d attempts)", name, err, fetchAttempts)
+}
+
+// fetchOnce makes one attempt at finishing tmp, reporting whether the
+// failure is the kind another attempt could get past. A partial file is
+// left where it is either way: it is what the next attempt resumes from.
+func fetchOnce(base, dir, name, tmp string) (retry bool, err error) {
+	req, err := http.NewRequest(http.MethodGet, base+name, nil)
 	if err != nil {
-		return "", err
+		return false, err
+	}
+	var off int64
+	tag, _ := os.ReadFile(tmp + ".etag")
+	if fi, err := os.Stat(tmp); err == nil && fi.Size() > 0 && len(tag) > 0 {
+		off = fi.Size()
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", off))
+		req.Header.Set("If-Range", string(tag))
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return true, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("downloading %s: %s", name, resp.Status)
-	}
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return "", err
-	}
-	if _, err := io.Copy(f, &progressReader{r: resp.Body, name: name, total: resp.ContentLength}); err != nil {
-		f.Close()
+
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		// The server kept our place; anything else means starting over.
+	case http.StatusOK:
+		off = 0
+	case http.StatusRequestedRangeNotSatisfiable:
+		// The partial is at least as long as the file: it is not a prefix
+		// of anything the server will send, so drop it and try again.
 		os.Remove(tmp)
-		return "", err
+		os.Remove(tmp + ".etag")
+		return true, fmt.Errorf("downloading %s: %s", name, resp.Status)
+	default:
+		// 5xx and 429 may pass; a 404 or a 403 will not.
+		retry = resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests
+		return retry, fmt.Errorf("downloading %s: %s", name, resp.Status)
 	}
-	fmt.Fprintln(os.Stderr)
-	if err := f.Close(); err != nil {
-		return "", err
+
+	flags := os.O_CREATE | os.O_WRONLY
+	if off > 0 {
+		flags |= os.O_APPEND
+	} else {
+		flags |= os.O_TRUNC
+		if etag := resp.Header.Get("ETag"); etag != "" {
+			os.WriteFile(tmp+".etag", []byte(etag), 0o644)
+		} else {
+			os.Remove(tmp + ".etag")
+		}
 	}
-	return path, os.Rename(tmp, path)
+	f, err := os.OpenFile(tmp, flags, 0o644)
+	if err != nil {
+		return false, err
+	}
+	total := resp.ContentLength
+	if total >= 0 {
+		total += off
+	}
+	_, err = io.Copy(f, &progressReader{r: resp.Body, name: name, total: total, done: off})
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		// Whatever landed stays: the next attempt picks up from there.
+		return true, err
+	}
+	return false, nil
 }
 
 // progressReader reports download progress on stderr, at most twice a
