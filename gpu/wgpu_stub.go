@@ -85,6 +85,9 @@ func (t *Tensor) Download() (*tensai.Tensor, error) { return nil, errNoWGPU }
 // Free is a no-op in builds without the wgpu tag.
 func (t *Tensor) Free() {}
 
+// View always fails in builds without the wgpu tag.
+func (t *Tensor) View(off int, shape ...int) (*Tensor, error) { return nil, errNoWGPU }
+
 // Shape returns nil in builds without the wgpu tag.
 func (t *Tensor) Shape() []int { return nil }
 
