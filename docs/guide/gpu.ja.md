@@ -121,3 +121,6 @@ make build WGPU=wgpu    # v22 の束縛
 `install` と `cross` も同じ変数を見ます。バイナリとライブラリは対にしてください —
 `wgpu24` ビルドには v29 系の `libwgpu_native`、`wgpu` ビルドには v22 が要ります。
 バイナリの隣にあるもの以外を読ませたいときは `TENSAI_WGPU_LIB` で指定します。
+リリースは両方を配っているので、片方と相性の悪いドライバに当たっても Go を
+入れ直す必要はありません — `tensai_*` が `wgpu24` ビルド、`tensai-wgpu22_*` が
+もう一方で、中のバイナリ名はどちらも `tensai` です。
