@@ -25,6 +25,14 @@ The `tensai` command runs modern instruction-tuned models: RMSNorm, rotary posit
 | qwen2 | Qwen 1.5/2/2.5, Qwen2.5-Coder, the R1-Distill-Qwen line | attention biases |
 | qwen3 | Qwen3 dense | per-head QK-norm, explicit head_dim, `-think` |
 | qwen3_5 | Qwen3.5, Qwen3.6, Qwen3.8 | a gated delta rule on three layers in four, ordinary attention on the fourth; norms scale by 1 + w, RoPE turns a quarter of each head, and the queries carry a gate for the attention output. CPU only, and no `-draft` |
+
+A `qwen3_5` prompt costs more to prefill than its size suggests: the delta
+layers carry state token by token, so only the projections around the
+recurrence batch, and a long prompt is closer to decoding it than to
+prefilling one. Roughly ten milliseconds a token on an AVX2 machine for the
+0.8B, against four for a qwen3 of the same size — enough that a couple of
+thousand tokens of system prompt is a wait. The chunked formulation the
+architecture allows would close most of that and is not implemented yet.
 | llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | the block everyone forked |
 | smollm3 | SmolLM3-3B | RoPE skipped every fourth layer |
 | gemma3 | Gemma 3 | sliding windows on 5/6 layers, sandwich norms, gelu-tanh gate, SentencePiece |

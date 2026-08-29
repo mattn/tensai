@@ -1080,21 +1080,35 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		b := &m.blocks[li]
 		norm(b.ln1)
 		if b.delta != nil {
-			// The recurrence carries token to token, so the batch buys
-			// nothing here: each row advances the state in turn. A
-			// chunked formulation exists and is the next thing to do.
+			// Only the convolution and the recurrence are sequential --
+			// each token reads what the last one left. The projections
+			// around them are ordinary matmuls, and they are most of the
+			// arithmetic, so they run over the whole batch and the loop
+			// carries just the state.
+			d := b.delta
 			if b.dstate == nil {
-				b.dstate = b.delta.newState()
+				b.dstate = d.newState()
 			}
 			if m.dscratch == nil {
-				m.dscratch = newDeltaScratch(b.delta, hs)
+				m.dscratch = newDeltaScratch(d, hs)
 			}
+			qkvB := mmb(a, d.wQKV, d.qQKV, nil)
+			zB := mmb(a, d.wZ, d.qZ, nil)
+			aB := mmb(a, d.wA, nil, nil)
+			bB := mmb(a, d.wB, nil, nil)
+			mixed := tensai.NewMatrix(n, d.vDim*d.heads)
 			for t := 0; t < n; t++ {
-				y := b.delta.step(b.dstate, a.Data[t*hs:(t+1)*hs], m.dscratch)
-				row := x.Data[t*hs : (t+1)*hs]
-				for i := range row {
-					row[i] += y[i]
-				}
+				res := d.mix(b.dstate,
+					qkvB.Data[t*qkvB.Cols:(t+1)*qkvB.Cols],
+					zB.Data[t*zB.Cols:(t+1)*zB.Cols],
+					aB.Data[t*aB.Cols:(t+1)*aB.Cols],
+					bB.Data[t*bB.Cols:(t+1)*bB.Cols],
+					m.dscratch)
+				copy(mixed.Data[t*mixed.Cols:(t+1)*mixed.Cols], res)
+			}
+			outB := mmb(mixed, d.wOut, d.qOut, nil)
+			for i := range x.Data {
+				x.Data[i] += outB.Data[i]
 			}
 		} else {
 			qkv := mmb(a, b.wQKV, b.qQKV, b.bQKV)
