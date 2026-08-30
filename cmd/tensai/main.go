@@ -127,6 +127,13 @@ func resolveModel(o *llm.Options, ref string) error {
 			return local(ref)
 		}
 	}
+	// A reference that can only be a filesystem path must exist: letting
+	// an absolute path or a .gguf name fall through would send it to the
+	// network as if it were a repo and leave a junk directory named after
+	// the typo in the cache.
+	if filepath.IsAbs(ref) || strings.HasSuffix(ref, ".gguf") {
+		return fmt.Errorf("no model at %s", ref)
+	}
 	root := llm.CacheRoot()
 	if ref == filepath.Base(ref) {
 		for _, cand := range []string{ref, ref + ".gguf"} {
