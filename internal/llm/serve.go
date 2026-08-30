@@ -290,6 +290,7 @@ type server struct {
 	imEnd   int
 	eot     int
 	tm      tmpl
+	cache   promptCache
 	prefill func([]int, int) []float32
 	step    func(int, int) []float32
 	reset   func()
@@ -415,9 +416,20 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.reset()
+	// A draft model verifies against a rebuilt context, so it starts over
+	// whatever the target does.
 	if s.draft != nil {
 		s.draft.reset()
+	}
+	start, restore := s.cache.plan(ids)
+	switch {
+	case restore:
+		s.model.truncate(len(s.cache.ckpt))
+		restoreDelta(s.model, s.cache.ckptDelta)
+	case start > 0:
+		s.model.truncate(start)
+	default:
+		s.reset()
 	}
 
 	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -580,12 +592,27 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	logits := s.prefill(ids, 0)
+	// Where two prompts part company is worth a checkpoint: the next one
+	// to share this opening starts from there instead of from nothing.
+	// The KV rows need no copy; only a recurrent state does.
+	if mark := commonPrefix(s.cache.live, ids); s.cache.enabled && start == 0 && mark > 0 && mark > len(s.cache.ckpt) {
+		s.prefill(ids[:mark], 0)
+		s.cache.ckpt = append(s.cache.ckpt[:0], ids[:mark]...)
+		if s.cache.hasDelta {
+			s.cache.ckptDelta = snapshotDelta(s.model)
+		}
+		start = mark
+	}
+	logits := s.prefill(ids[start:], start)
 	if s.draft != nil {
 		s.draft.prefill(ids, 0)
 	}
+	s.cache.live = append(s.cache.live[:0], ids...)
 	steps := len(ids)
 	var out []int
+	// What the model generates is part of the context a follow-up turn
+	// replays, so it belongs in the cache alongside the prompt.
+	defer func() { s.cache.live = append(s.cache.live, out...) }()
 	finish := "length"
 	ctx := r.Context()
 	if s.draft != nil {

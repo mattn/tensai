@@ -223,3 +223,10 @@ The signatures are handed to the model in the convention the ChatML families wer
 
 - The default bind is loopback only (`127.0.0.1:8080`, or `$TENSAI_ADDR`); widen it explicitly if you mean to
 - `-api-key` (or `$TENSAI_API_KEY`) requires a bearer token on the `/v1` routes; the demo page stays open
+- The prompt an agent resends every turn — its system message and its tool
+  definitions — is prefilled once and kept. A request that extends what came
+  before continues from it, and one that only shares the opening restarts from
+  the point the two parted, which the server checkpoints the first time it sees
+  them diverge. On a 744-token prompt that is 12s for the first question and
+  under 2s for the rest. The GPU path keeps its own resident cache and does not
+  take part
