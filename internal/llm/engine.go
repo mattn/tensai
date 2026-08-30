@@ -452,6 +452,12 @@ func (e *Engine) Serve(addr, apiKey string) error {
 		tm: e.tm, prefill: e.prefill, step: e.step, reset: e.reset,
 		draft: e.draft, specK: e.opts.SpecK,
 	}
+	// An agent resends its system prompt and its tool definitions with
+	// every question; caching them is the difference between paying for
+	// thousands of tokens each time and paying once. The GPU path keeps
+	// its own resident cache, which this does not reach.
+	s.cache.enabled = !e.opts.GPU
+	s.cache.hasDelta = e.model.hasDelta()
 	return s.listen(addr)
 }
 
