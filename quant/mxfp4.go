@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/mattn/tensai"
+	"github.com/mattn/tensai/internal/workpool"
 )
 
 // MXFP4Matrix is a weight matrix in microscaling FP4: 32-row groups per
@@ -75,12 +76,11 @@ func (q *MXFP4Matrix) MatVec(x, out []tensai.Float) error {
 			len(x), len(out), q.Rows, q.Cols)
 	}
 	xu, sx := quantizeActs(x)
-	workers := matvecWorkerCount(q.Cols, q.Rows)
-	if workers == 1 {
+	if matvecWorkerCount(q.Cols, q.Rows) == 1 {
 		mxfp4MatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, q.Cols, 0, q.Cols)
 		return nil
 	}
-	parallelChunks(q.Cols, workers, q4Tile, func(lo, hi int) {
+	workpool.Run(q.Cols, q4Tile, func(lo, hi int) {
 		mxfp4MatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
 	})
 	return nil

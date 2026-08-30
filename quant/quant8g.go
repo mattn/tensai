@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/mattn/tensai"
+	"github.com/mattn/tensai/internal/workpool"
 )
 
 // q8Group is the number of input rows sharing one scale in a Q8GMatrix —
@@ -76,12 +77,11 @@ func (q *Q8GMatrix) MatVec(x, out []tensai.Float) error {
 	}
 	xu, sx := quantizeActs(x)
 	grp := q.group()
-	workers := matvecWorkerCount(q.Cols, q.Rows)
-	if workers == 1 {
+	if matvecWorkerCount(q.Cols, q.Rows) == 1 {
 		q8gMatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, grp, q.Cols, 0, q.Cols)
 		return nil
 	}
-	parallelChunks(q.Cols, workers, q4Tile, func(lo, hi int) {
+	workpool.Run(q.Cols, q4Tile, func(lo, hi int) {
 		q8gMatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, grp, q.Cols, lo, hi)
 	})
 	return nil

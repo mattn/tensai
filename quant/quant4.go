@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/mattn/tensai"
+	"github.com/mattn/tensai/internal/workpool"
 )
 
 // q4Group is the number of input rows sharing one scale. 64 keeps
@@ -195,14 +196,13 @@ func (q *Q4Matrix) MatVec(x, out []tensai.Float) error {
 	for i, u := range xu {
 		gsum[min(i/grp, len(gsum)-1)] += int32(u) - 64
 	}
-	workers := matvecWorkerCount(q.Cols, q.Rows)
-	if workers == 1 {
+	if matvecWorkerCount(q.Cols, q.Rows) == 1 {
 		q4matvecCols(out, xu, xq, sx, gsum, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, 0, q.Cols)
 		return nil
 	}
 	// Tile-aligned chunks keep every worker's vector span inside whole
 	// layout tiles, and its memory walk sequential.
-	parallelChunks(q.Cols, workers, q4Tile, func(lo, hi int) {
+	workpool.Run(q.Cols, q4Tile, func(lo, hi int) {
 		q4matvecCols(out, xu, xq, sx, gsum, q.Q, q.Scale, q.ScaleMin, grp, q.Cols, lo, hi)
 	})
 	return nil

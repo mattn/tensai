@@ -6,14 +6,17 @@ import (
 	"sync"
 
 	"github.com/mattn/tensai"
+	"github.com/mattn/tensai/internal/workpool"
 )
 
 // matvecWorkerCount sizes the worker pool for quantized matvecs. Unlike
 // dotWorkerCount's cap of 8 (tuned for training matmuls that share the
 // machine with other layers), a decode matvec is the only thing running,
-// so it may use every CPU.
+// so it may use every CPU. The threshold sat at 1<<20 when splitting
+// meant spawning goroutines; on the resident workpool dispatch is cheap
+// enough that the sub-megabyte o-projection pays for itself too.
 func matvecWorkerCount(cols, rows int) int {
-	if cols*rows < 1<<20 {
+	if cols*rows < 1<<18 {
 		return 1
 	}
 	workers := runtime.GOMAXPROCS(0)
@@ -247,13 +250,12 @@ func (q *QMatrix) MatVec(x, out []tensai.Float) error {
 			len(x), len(out), q.Rows, q.Cols)
 	}
 	xu, sx := quantizeActs(x)
-	workers := matvecWorkerCount(q.Cols, q.Rows)
-	if workers == 1 {
+	if matvecWorkerCount(q.Cols, q.Rows) == 1 {
 		qmatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, q.Cols, 0, q.Cols)
 		return nil
 	}
 	// Chunks stay multiples of 8 so only the last one has a scalar tail.
-	parallelChunks(q.Cols, workers, q4Tile, func(lo, hi int) {
+	workpool.Run(q.Cols, q4Tile, func(lo, hi int) {
 		qmatvecCols(out, xu, sx, q.Q, q.Scale, q.ColSum64, q.Cols, lo, hi)
 	})
 	return nil
