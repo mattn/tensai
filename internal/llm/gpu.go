@@ -510,37 +510,48 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 			k.Free()
 			k = nk
 		}
-		if !l.noPE {
-			theta := l.ropeTheta
-			if theta == 0 {
-				theta = cfg.RopeTheta
+		theta := l.ropeTheta
+		if theta == 0 {
+			theta = cfg.RopeTheta
+		}
+		if !l.noPE && qkvOwner != nil && l.qNorm == nil && l.kc.IsF16() {
+			// One dispatch rotates q and k on the fused row and appends
+			// the rotated k and the v straight into the caches. Every
+			// small dispatch in this chain costs ~40us of dependent-
+			// dispatch latency on dozen, so the three-in-one matters
+			// more than any of the work inside.
+			if err := qkvOwner.RopeCacheF16(l.kc, l.vc, m.headSz, cfg.Heads*m.headSz, kvDim, pos, theta, pos*kvDim); err != nil {
+				panic(err)
 			}
-			if qkvOwner != nil && l.qNorm == nil {
-				// q and k sit side by side in the fused row and the heads
-				// are uniform, so one dispatch rotates both. Every small
-				// dispatch in this chain costs ~40us of dependent-dispatch
-				// latency on dozen, which is worth more than the rotation.
-				qk := must(qkvOwner.View(0, 1, cfg.Heads*m.headSz+kvDim))
-				if err := qk.RoPE(m.headSz, pos, theta); err != nil {
-					panic(err)
-				}
-			} else {
-				if err := q.RoPE(m.headSz, pos, theta); err != nil {
-					panic(err)
-				}
-				if err := k.RoPE(m.headSz, pos, theta); err != nil {
-					panic(err)
+			k.Free()
+			v.Free()
+		} else {
+			if !l.noPE {
+				if qkvOwner != nil && l.qNorm == nil {
+					// q and k sit side by side in the fused row and the
+					// heads are uniform, so one dispatch rotates both.
+					qk := must(qkvOwner.View(0, 1, cfg.Heads*m.headSz+kvDim))
+					if err := qk.RoPE(m.headSz, pos, theta); err != nil {
+						panic(err)
+					}
+				} else {
+					if err := q.RoPE(m.headSz, pos, theta); err != nil {
+						panic(err)
+					}
+					if err := k.RoPE(m.headSz, pos, theta); err != nil {
+						panic(err)
+					}
 				}
 			}
+			if err := k.CopyRowsInto(l.kc, pos*kvDim); err != nil {
+				panic(err)
+			}
+			if err := v.CopyRowsInto(l.vc, pos*kvDim); err != nil {
+				panic(err)
+			}
+			k.Free()
+			v.Free()
 		}
-		if err := k.CopyRowsInto(l.kc, pos*kvDim); err != nil {
-			panic(err)
-		}
-		if err := v.CopyRowsInto(l.vc, pos*kvDim); err != nil {
-			panic(err)
-		}
-		k.Free()
-		v.Free()
 		if pos+1 > gq.gpuLen {
 			gq.gpuLen = pos + 1
 		}

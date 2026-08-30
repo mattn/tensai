@@ -269,3 +269,93 @@ func BenchmarkGPUGroupedAttnPrefill(b *testing.B) {
 		out.Free()
 	}
 }
+
+// TestGPUGroupedCausalAttentionF16Split covers the split decode path: one
+// query row over a context long enough (>= 256) to take attn_split_gh +
+// attn_reduce_g, checked against the f64 reference over f16-rounded K/V.
+func TestGPUGroupedCausalAttentionF16Split(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	if !g.HasF16() {
+		t.Skip("device has no shader-f16")
+	}
+	rng := rand.New(rand.NewSource(17))
+
+	const heads, kvHeads, dh = 14, 2, 64
+	const d, kvDim = heads * dh, kvHeads * dh
+	group := heads / kvHeads
+	// 400 is the decode-bench context; 257 exercises a ragged final tile
+	// right past the split threshold.
+	for _, seqKV := range []int{257, 400} {
+		k := randTensor(rng, seqKV, kvDim)
+		v := randTensor(rng, seqKV, kvDim)
+		upload16 := func(src *tensai.Tensor) *Tensor {
+			t.Helper()
+			f32, err := g.Upload(src)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f32.Free()
+			c, err := g.NewF16Tensor(seqKV, kvDim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := f32.CopyRowsInto(c, 0); err != nil {
+				t.Fatal(err)
+			}
+			return c
+		}
+		gk := upload16(k)
+		defer gk.Free()
+		gv := upload16(v)
+		defer gv.Free()
+		q := randTensor(rng, 1, d)
+		gq, err := g.Upload(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer gq.Free()
+		got, err := gq.GroupedCausalAttention(gk, gv, heads, kvHeads, seqKV, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer got.Free()
+		out, err := got.Download()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		h16 := func(x float32) float64 {
+			return float64(float16round(x))
+		}
+		scale := 1 / math.Sqrt(dh)
+		for h := 0; h < heads; h++ {
+			kvOff := (h / group) * dh
+			scores := make([]float64, seqKV)
+			maxs := math.Inf(-1)
+			for j := 0; j < seqKV; j++ {
+				var s float64
+				for c := 0; c < dh; c++ {
+					s += float64(q.Data[h*dh+c]) * h16(k.Data[j*kvDim+kvOff+c])
+				}
+				scores[j] = s * scale
+				maxs = math.Max(maxs, scores[j])
+			}
+			var sum float64
+			for j := range scores {
+				scores[j] = math.Exp(scores[j] - maxs)
+				sum += scores[j]
+			}
+			for c := 0; c < dh; c++ {
+				var want float64
+				for j := 0; j < seqKV; j++ {
+					want += scores[j] / sum * h16(v.Data[j*kvDim+kvOff+c])
+				}
+				gotv := float64(out.Data[h*dh+c])
+				if diff := math.Abs(gotv - want); diff > 2e-3*(1+math.Abs(want)) {
+					t.Fatalf("seqKV %d head %d chan %d: got %v want %v", seqKV, h, c, gotv, want)
+				}
+			}
+		}
+	}
+}

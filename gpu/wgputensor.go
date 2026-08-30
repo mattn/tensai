@@ -1477,6 +1477,256 @@ fn attn_causal_gh(@builtin(workgroup_id) wid: vec3<u32>,
         }
     }
 }
+
+struct RCParams { d: u32, headSz: u32, qw: u32, kvDim: u32, pos: u32, dstOff: u32, theta: f32, pad: u32 }
+@group(0) @binding(43) var<uniform> rcp: RCParams;
+@group(0) @binding(41) var<storage, read_write> rcx: array<f32>;
+@group(0) @binding(42) var<storage, read_write> rcv: array<f16>;
+
+// rope_cache fuses decode's rotation with the cache append: one dispatch
+// rotates the fused q|k row in place, writes the rotated k on into the
+// f16 K cache, and copies v into the V cache — three dependent ~40us
+// dispatches become one. The rotation matches rope_rows bit for bit and
+// the narrowing matches rows_to_f16, so nothing downstream changes.
+@compute @workgroup_size(64, 1, 1)
+fn rope_cache(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let half = rcp.headSz / 2u;
+    let pairs = (rcp.d / rcp.headSz) * half;
+    if (gid.x < pairs) {
+        let h = gid.x / half;
+        let c = gid.x % half;
+        let base = h * rcp.headSz + c;
+        let freq = pow(rcp.theta, -2.0 * f32(c) / f32(rcp.headSz));
+        let ang = f32(rcp.pos) * freq;
+        let sn = sin(ang);
+        let cs = cos(ang);
+        let a = rcx[base];
+        let b = rcx[base + half];
+        let na = a * cs - b * sn;
+        let nb = b * cs + a * sn;
+        rcx[base] = na;
+        rcx[base + half] = nb;
+        // A k head sits entirely past the query region, so both pair
+        // elements land in the cache together.
+        if (base >= rcp.qw) {
+            cvdst[rcp.dstOff + base - rcp.qw] = f16(na);
+            cvdst[rcp.dstOff + base + half - rcp.qw] = f16(nb);
+        }
+        return;
+    }
+    let i = gid.x - pairs;
+    if (i < rcp.kvDim) {
+        rcv[rcp.dstOff + i] = f16(rcx[rcp.qw + rcp.kvDim + i]);
+    }
+}
+
+// attn_split_gh is attn_causal_gh's decode split: a single query row at
+// two KV heads leaves ten of twelve WGPs idle while one workgroup walks
+// the whole context (~680us a layer at 400 positions), so each workgroup
+// takes one slab of KV tiles instead and parks its unnormalized head
+// accumulators with the running (m, l) softmax state in ascr, which
+// attn_reduce_g folds. Fields are repurposed: seqQ carries the tiles per
+// slab and rows the slab count. Query row 0 only, no sliding window.
+@group(0) @binding(40) var<storage, read_write> ascr: array<f32>;
+
+@compute @workgroup_size(64, 1, 1)
+fn attn_split_gh(@builtin(workgroup_id) wid: vec3<u32>,
+                 @builtin(local_invocation_id) lid: vec3<u32>) {
+    let slab = wid.x;
+    let kvh = wid.y;
+    let grp = ap.d / ap.dkv;
+    let offQ = offs[kvh].x;
+    let offKV = offs[kvh].y;
+    let t = lid.x;
+    for (var c = t; c < grp * ap.dh; c = c + 64u) {
+        qrow_h[c] = aq[offQ + c];
+    }
+    workgroupBarrier();
+    let limit = ap.off + 1u;
+    let scale = inverseSqrt(f32(ap.dh));
+    var m0 = -3.40282e38; var m1 = -3.40282e38; var m2 = -3.40282e38; var m3 = -3.40282e38;
+    var m4 = -3.40282e38; var m5 = -3.40282e38; var m6 = -3.40282e38; var m7 = -3.40282e38;
+    var l0 = 0.0; var l1 = 0.0; var l2 = 0.0; var l3 = 0.0;
+    var l4 = 0.0; var l5 = 0.0; var l6 = 0.0; var l7 = 0.0;
+    var acc0 = vec4<f32>(); var acc1 = vec4<f32>(); var acc2 = vec4<f32>(); var acc3 = vec4<f32>();
+    var acc4 = vec4<f32>(); var acc5 = vec4<f32>(); var acc6 = vec4<f32>(); var acc7 = vec4<f32>();
+    let tiles = (limit + AT - 1u) / AT;
+    let tEnd = min(tiles, (slab + 1u) * ap.seqQ);
+    for (var tt = slab * ap.seqQ; tt < tEnd; tt = tt + 1u) {
+        let j = tt * AT + t;
+        let valid = j < limit;
+        var d0 = 0.0; var d1 = 0.0; var d2 = 0.0; var d3 = 0.0;
+        var d4 = 0.0; var d5 = 0.0; var d6 = 0.0; var d7 = 0.0;
+        if (valid) {
+            for (var c = 0u; c < ap.dh; c = c + 1u) {
+                let kv = f32(akh[offKV + j * ap.dkv + c]);
+                d0 = d0 + qrow_h[c] * kv;
+                d1 = d1 + qrow_h[ap.dh + c] * kv;
+                d2 = d2 + qrow_h[2u * ap.dh + c] * kv;
+                d3 = d3 + qrow_h[3u * ap.dh + c] * kv;
+                d4 = d4 + qrow_h[4u * ap.dh + c] * kv;
+                d5 = d5 + qrow_h[5u * ap.dh + c] * kv;
+                d6 = d6 + qrow_h[6u * ap.dh + c] * kv;
+                d7 = d7 + qrow_h[7u * ap.dh + c] * kv;
+            }
+            d0 = d0 * scale; d1 = d1 * scale; d2 = d2 * scale; d3 = d3 * scale;
+            d4 = d4 * scale; d5 = d5 * scale; d6 = d6 * scale; d7 = d7 * scale;
+        } else {
+            d0 = -3.40282e38; d1 = -3.40282e38; d2 = -3.40282e38; d3 = -3.40282e38;
+            d4 = -3.40282e38; d5 = -3.40282e38; d6 = -3.40282e38; d7 = -3.40282e38;
+        }
+        red_h[t] = d0;         red_h[64u + t] = d1;
+        red_h[128u + t] = d2;  red_h[192u + t] = d3;
+        red_h[256u + t] = d4;  red_h[320u + t] = d5;
+        red_h[384u + t] = d6;  red_h[448u + t] = d7;
+        workgroupBarrier();
+        for (var r = 32u; r > 0u; r = r >> 1u) {
+            if (t < r) {
+                for (var h = 0u; h < 8u; h = h + 1u) {
+                    if (h < grp) {
+                        red_h[h * 64u + t] = max(red_h[h * 64u + t], red_h[h * 64u + t + r]);
+                    }
+                }
+            }
+            workgroupBarrier();
+        }
+        let n0 = max(m0, red_h[0]);   let n1 = max(m1, red_h[64]);
+        let n2 = max(m2, red_h[128]); let n3 = max(m3, red_h[192]);
+        let n4 = max(m4, red_h[256]); let n5 = max(m5, red_h[320]);
+        let n6 = max(m6, red_h[384]); let n7 = max(m7, red_h[448]);
+        var p0 = 0.0; var p1 = 0.0; var p2 = 0.0; var p3 = 0.0;
+        var p4 = 0.0; var p5 = 0.0; var p6 = 0.0; var p7 = 0.0;
+        if (valid) {
+            p0 = exp(d0 - n0); p1 = exp(d1 - n1); p2 = exp(d2 - n2); p3 = exp(d3 - n3);
+            p4 = exp(d4 - n4); p5 = exp(d5 - n5); p6 = exp(d6 - n6); p7 = exp(d7 - n7);
+        }
+        workgroupBarrier();
+        sc_h[t] = p0;         sc_h[64u + t] = p1;
+        sc_h[128u + t] = p2;  sc_h[192u + t] = p3;
+        sc_h[256u + t] = p4;  sc_h[320u + t] = p5;
+        sc_h[384u + t] = p6;  sc_h[448u + t] = p7;
+        red_h[t] = p0;         red_h[64u + t] = p1;
+        red_h[128u + t] = p2;  red_h[192u + t] = p3;
+        red_h[256u + t] = p4;  red_h[320u + t] = p5;
+        red_h[384u + t] = p6;  red_h[448u + t] = p7;
+        workgroupBarrier();
+        for (var r = 32u; r > 0u; r = r >> 1u) {
+            if (t < r) {
+                for (var h = 0u; h < 8u; h = h + 1u) {
+                    if (h < grp) {
+                        red_h[h * 64u + t] = red_h[h * 64u + t] + red_h[h * 64u + t + r];
+                    }
+                }
+            }
+            workgroupBarrier();
+        }
+        let r0 = exp(m0 - n0); let r1 = exp(m1 - n1); let r2 = exp(m2 - n2); let r3 = exp(m3 - n3);
+        let r4 = exp(m4 - n4); let r5 = exp(m5 - n5); let r6 = exp(m6 - n6); let r7 = exp(m7 - n7);
+        l0 = l0 * r0 + red_h[0];   l1 = l1 * r1 + red_h[64];
+        l2 = l2 * r2 + red_h[128]; l3 = l3 * r3 + red_h[192];
+        l4 = l4 * r4 + red_h[256]; l5 = l5 * r5 + red_h[320];
+        l6 = l6 * r6 + red_h[384]; l7 = l7 * r7 + red_h[448];
+        m0 = n0; m1 = n1; m2 = n2; m3 = n3;
+        m4 = n4; m5 = n5; m6 = n6; m7 = n7;
+        acc0 = acc0 * r0; acc1 = acc1 * r1; acc2 = acc2 * r2; acc3 = acc3 * r3;
+        acc4 = acc4 * r4; acc5 = acc5 * r5; acc6 = acc6 * r6; acc7 = acc7 * r7;
+        let jEnd = min(limit, tt * AT + AT);
+        for (var jj = tt * AT; jj < jEnd; jj = jj + 1u) {
+            var vv = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            if (t < ap.dh) {
+                vv.x = f32(avh[offKV + jj * ap.dkv + t]);
+            }
+            if (64u + t < ap.dh) {
+                vv.y = f32(avh[offKV + jj * ap.dkv + 64u + t]);
+            }
+            if (128u + t < ap.dh) {
+                vv.z = f32(avh[offKV + jj * ap.dkv + 128u + t]);
+            }
+            if (192u + t < ap.dh) {
+                vv.w = f32(avh[offKV + jj * ap.dkv + 192u + t]);
+            }
+            let sj = jj - tt * AT;
+            acc0 = acc0 + sc_h[sj] * vv;
+            acc1 = acc1 + sc_h[64u + sj] * vv;
+            acc2 = acc2 + sc_h[128u + sj] * vv;
+            acc3 = acc3 + sc_h[192u + sj] * vv;
+            acc4 = acc4 + sc_h[256u + sj] * vv;
+            acc5 = acc5 + sc_h[320u + sj] * vv;
+            acc6 = acc6 + sc_h[384u + sj] * vv;
+            acc7 = acc7 + sc_h[448u + sj] * vv;
+        }
+        workgroupBarrier();
+    }
+    let stride = 8u * ap.dh + 16u;
+    let sbase = (kvh * ap.rows + slab) * stride;
+    for (var h = 0u; h < 8u; h = h + 1u) {
+        if (h < grp) {
+            var av = vec4<f32>();
+            var lh = 0.0;
+            var mh = -3.40282e38;
+            if (h == 0u) { av = acc0; lh = l0; mh = m0; }
+            if (h == 1u) { av = acc1; lh = l1; mh = m1; }
+            if (h == 2u) { av = acc2; lh = l2; mh = m2; }
+            if (h == 3u) { av = acc3; lh = l3; mh = m3; }
+            if (h == 4u) { av = acc4; lh = l4; mh = m4; }
+            if (h == 5u) { av = acc5; lh = l5; mh = m5; }
+            if (h == 6u) { av = acc6; lh = l6; mh = m6; }
+            if (h == 7u) { av = acc7; lh = l7; mh = m7; }
+            let o = sbase + h * ap.dh;
+            if (t < ap.dh) {
+                ascr[o + t] = av.x;
+            }
+            if (64u + t < ap.dh) {
+                ascr[o + 64u + t] = av.y;
+            }
+            if (128u + t < ap.dh) {
+                ascr[o + 128u + t] = av.z;
+            }
+            if (192u + t < ap.dh) {
+                ascr[o + 192u + t] = av.w;
+            }
+            if (t == 0u) {
+                ascr[sbase + 8u * ap.dh + h] = mh;
+                ascr[sbase + 8u * ap.dh + 8u + h] = lh;
+            }
+        }
+    }
+}
+
+// attn_reduce_g folds attn_split_gh's slabs: rebase every slab's l and
+// accumulators onto the global max and normalize once. One workgroup per
+// KV head; a slab that saw only masked positions carries l = 0 and an
+// m of -inf, and drops out through exp underflow.
+@compute @workgroup_size(64, 1, 1)
+fn attn_reduce_g(@builtin(workgroup_id) wid: vec3<u32>,
+                 @builtin(local_invocation_id) lid: vec3<u32>) {
+    let kvh = wid.x;
+    let grp = ap.d / ap.dkv;
+    let slabs = ap.rows;
+    let stride = 8u * ap.dh + 16u;
+    let base = kvh * slabs * stride;
+    let offO = offs[kvh].z;
+    let t = lid.x;
+    for (var h = 0u; h < grp; h = h + 1u) {
+        var mh = -3.40282e38;
+        for (var s = 0u; s < slabs; s = s + 1u) {
+            mh = max(mh, ascr[base + s * stride + 8u * ap.dh + h]);
+        }
+        var lh = 0.0;
+        for (var s = 0u; s < slabs; s = s + 1u) {
+            let ms = ascr[base + s * stride + 8u * ap.dh + h];
+            lh = lh + ascr[base + s * stride + 8u * ap.dh + 8u + h] * exp(ms - mh);
+        }
+        for (var c = t; c < ap.dh; c = c + 64u) {
+            var o = 0.0;
+            for (var s = 0u; s < slabs; s = s + 1u) {
+                let ms = ascr[base + s * stride + 8u * ap.dh + h];
+                o = o + ascr[base + s * stride + h * ap.dh + c] * exp(ms - mh);
+            }
+            aout[offO + h * ap.dh + c] = o / lh;
+        }
+    }
+}
 `
 
 // IntDot reports whether the optional integer-dot GEMM module compiled
@@ -1492,6 +1742,8 @@ type gpuPipelines struct {
 	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
 	geluMulIP, qmatmulB, attnG, qmatmulT           uintptr
 	qacts, qmatmulI, attnF16, rowsToF16            uintptr
+	attnSplit, attnReduce, ropeCache               uintptr
+	layAttnSplit, layAttnReduce, layRopeCache      uintptr
 	sliceCols, laySliceCols                        uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
 	layScale, laySoftmax, layAttn, layQmatmul      uintptr
@@ -1568,6 +1820,9 @@ func (g *Device) initPipelines() error {
 			}{
 				{&g.pipes.attnF16, &g.pipes.layAttnF16, "attn_causal_gh"},
 				{&g.pipes.rowsToF16, &g.pipes.layRowsToF16, "rows_to_f16"},
+				{&g.pipes.attnSplit, &g.pipes.layAttnSplit, "attn_split_gh"},
+				{&g.pipes.attnReduce, &g.pipes.layAttnReduce, "attn_reduce_g"},
+				{&g.pipes.ropeCache, &g.pipes.layRopeCache, "rope_cache"},
 			} {
 				*x.pipe = g.makePipelineIn(g.module3, x.entry)
 				if *x.pipe == 0 || uncapturedCB != "" {
@@ -3243,6 +3498,71 @@ func (t *Tensor) GeluMul(o *Tensor) error {
 // CopyRowsInto copies t's whole buffer into dst starting at element offset
 // off — appending freshly projected k/v rows to a preallocated cache
 // without leaving the device.
+// IsF16 reports whether the tensor stores half-precision elements.
+func (t *Tensor) IsF16() bool { return t.f16 }
+
+// RopeCacheF16 rotates the leading qw+kvDim elements of a fused single
+// qkv row in place — RoPE at position pos over headSz-wide heads — and
+// appends the rotated k and the trailing v into the half-precision kc
+// and vc caches at element offset dstOff, all in one dispatch. Decode
+// used to spend three dependent dispatches on this.
+func (t *Tensor) RopeCacheF16(kc, vc *Tensor, headSz, qw, kvDim, pos int, theta float64, dstOff int) error {
+	if t.freed || kc.freed || vc.freed {
+		return errors.New("tensai: gpu tensor already freed")
+	}
+	if t.g != kc.g || t.g != vc.g {
+		return errors.New("tensai: gpu tensors belong to different GPUs")
+	}
+	g := t.g
+	if g.pipes.ropeCache == 0 {
+		return errors.New("tensai: device has no rope_cache kernel")
+	}
+	if !kc.f16 || !vc.f16 {
+		return errors.New("tensai: rope_cache needs f16 caches")
+	}
+	d := qw + kvDim
+	if headSz <= 0 || d%headSz != 0 || qw%headSz != 0 || t.Size() < d+kvDim {
+		return fmt.Errorf("tensai: rope_cache shape mismatch: qw=%d kvDim=%d headSz=%d in %d", qw, kvDim, headSz, t.Size())
+	}
+	if dstOff < 0 || dstOff+kvDim > kc.Size() || dstOff+kvDim > vc.Size() {
+		return fmt.Errorf("tensai: rope_cache append of %d at %d overflows caches", kvDim, dstOff)
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	pairs := (d / headSz) * (headSz / 2)
+	total := pairs + kvDim
+	params := [8]uint32{
+		uint32(d), uint32(headSz), uint32(qw), uint32(kvDim),
+		uint32(pos), uint32(dstOff), math.Float32bits(float32(theta)),
+	}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
+	entries := [4]wgpuBindGroupEntry{
+		{binding: 43, buffer: bufParams, size: 32},
+		bind(41, t),
+		bind(22, kc),
+		bind(42, vc),
+	}
+	bindGroup := g.cachedBindGroup(g.pipes.layRopeCache, entries[:])
+	runtime.KeepAlive(&entries)
+	if err := g.dispatch(g.pipes.ropeCache, bindGroup, uint32((total+63)/64), 1, 1); err != nil {
+		return err
+	}
+	if uncapturedCB != "" {
+		return fmt.Errorf("tensai: gpu rope_cache failed: %s", uncapturedCB)
+	}
+	return nil
+}
+
 func (t *Tensor) CopyRowsInto(dst *Tensor, off int) error {
 	if t.freed || dst.freed {
 		return errors.New("tensai: gpu tensor already freed")
@@ -3364,6 +3684,13 @@ func (q *Tensor) GroupedCausalAttention(k, v *Tensor, heads, kvHeads, seqKV, win
 			offs[4*h+2] = uint32(h * dh)
 		}
 	}
+	// A one-row grouped decode leaves kvHeads workgroups walking the
+	// whole context serially — two workgroups on a twelve-WGP device —
+	// so a long context splits into KV slabs folded by a second, tiny
+	// dispatch. Short contexts stay serial: the fold costs a dispatch.
+	if grouped && k.f16 && seq == 1 && window == 0 && seqKV >= 256 && q.g.pipes.attnSplit != 0 {
+		return q.groupedDecodeSplit(k, v, kvHeads, dh, d, kvDim, seqKV, offs)
+	}
 	rows := nwg * seq
 	params := [8]uint32{
 		uint32(seq), uint32(seqKV), uint32(dh), uint32(d),
@@ -3412,6 +3739,75 @@ func (q *Tensor) GroupedCausalAttention(k, v *Tensor, heads, kvHeads, seqKV, win
 		g.dropBuffer(bufOut)
 		return nil, err
 	}
+	return &Tensor{g: g, buf: bufOut, shape: append([]int(nil), q.shape...)}, nil
+}
+
+// groupedDecodeSplit runs the split decode attention: attn_split_gh over
+// (slabs x kvHeads) workgroups into a scratch of per-slab softmax states,
+// then attn_reduce_g folds them into the output row. Both dispatches ride
+// whatever batch is open, like the single-kernel path.
+func (q *Tensor) groupedDecodeSplit(k, v *Tensor, kvHeads, dh, d, kvDim, seqKV int, offs []uint32) (*Tensor, error) {
+	g := q.g
+	tiles := (seqKV + 63) / 64
+	per := (tiles + 31) / 32 // tiles per slab: at most 32 slabs
+	slabs := (tiles + per - 1) / per
+	stride := 8*dh + 16
+	scrBytes := uint64(kvHeads*slabs*stride) * 4
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	outBytes := uint64(q.Size()) * 4
+	// seqQ carries the tiles per slab and rows the slab count; the split
+	// kernels read nothing else differently.
+	params := [8]uint32{
+		uint32(per), uint32(seqKV), uint32(dh), uint32(d),
+		uint32(slabs), uint32(seqKV - 1), uint32(kvDim), 0,
+	}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
+	bufOffs := g.takeBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
+	defer g.putBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4, bufOffs)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
+	fnQueueWriteBuffer(g.queue, bufOffs, 0, unsafe.Pointer(&offs[0]), uintptr(len(offs))*4)
+	scr := g.takeOutBuffer(scrBytes)
+	bufOut := g.takeOutBuffer(outBytes)
+
+	split := [6]wgpuBindGroupEntry{
+		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
+		{binding: 10, buffer: bufParams, size: 32},
+		bind(11, q),
+		bind(12, k),
+		bind(13, v),
+		{binding: 40, buffer: scr, size: scrBytes},
+	}
+	bg := g.cachedBindGroup(g.pipes.layAttnSplit, split[:])
+	runtime.KeepAlive(&split)
+	if err := g.dispatch(g.pipes.attnSplit, bg, uint32(slabs), uint32(kvHeads), 1); err != nil {
+		g.dropBuffer(scr)
+		g.dropBuffer(bufOut)
+		return nil, err
+	}
+	reduce := [4]wgpuBindGroupEntry{
+		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
+		{binding: 10, buffer: bufParams, size: 32},
+		{binding: 14, buffer: bufOut, size: outBytes},
+		{binding: 40, buffer: scr, size: scrBytes},
+	}
+	bg = g.cachedBindGroup(g.pipes.layAttnReduce, reduce[:])
+	runtime.KeepAlive(&reduce)
+	if err := g.dispatch(g.pipes.attnReduce, bg, uint32(kvHeads), 1, 1); err != nil {
+		g.dropBuffer(scr)
+		g.dropBuffer(bufOut)
+		return nil, err
+	}
+	g.dropBuffer(scr)
 	return &Tensor{g: g, buf: bufOut, shape: append([]int(nil), q.shape...)}, nil
 }
 

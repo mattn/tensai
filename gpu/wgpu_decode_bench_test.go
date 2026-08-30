@@ -143,3 +143,62 @@ func BenchmarkGPUDecodeChain12(b *testing.B) { benchChain(b, 6, 4864*4) }
 // 200 near-empty dependent dispatches: the per-dispatch latency floor a
 // decode step pays on every norm, rope, and cache copy.
 func BenchmarkGPUDecodeChainTiny(b *testing.B) { benchChain(b, 100, 64) }
+
+// The qkv/o shape: ~1MB weights per dispatch. If small matvecs stream
+// slower per byte than Chain48's, the kernel underfills the device on
+// narrow outputs.
+func BenchmarkGPUDecodeChainNarrow(b *testing.B) { benchChain(b, 50, 1152) }
+
+// One decode step's attention chained 100 times at a 400-token context:
+// per-link time is the per-layer attention cost inside a token.
+func BenchmarkGPUDecodeAttn(b *testing.B) {
+	g, err := Open()
+	if err != nil {
+		b.Skipf("wgpu unavailable: %v", err)
+	}
+	defer g.Close()
+	rng := rand.New(rand.NewSource(66))
+	const heads, kvHeads, headSz, steps = 14, 2, 64, 400
+	kc, err := g.Upload(randTensor(rng, 512, kvHeads*headSz))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer kc.Free()
+	vc, err := g.Upload(randTensor(rng, 512, kvHeads*headSz))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer vc.Free()
+	x, err := g.Upload(randTensor(rng, 1, heads*headSz))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer x.Free()
+	run := func() {
+		if err := g.BeginBatch(); err != nil {
+			b.Fatal(err)
+		}
+		cur := x
+		for i := 0; i < 100; i++ {
+			o, err := cur.GroupedCausalAttention(kc, vc, heads, kvHeads, steps, 0)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if cur != x {
+				cur.Free()
+			}
+			cur = o
+		}
+		if _, err := cur.DownloadRange(0, heads*headSz); err != nil {
+			b.Fatal(err)
+		}
+		if cur != x {
+			cur.Free()
+		}
+	}
+	run()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		run()
+	}
+}

@@ -144,6 +144,14 @@ func (q *QMatrix) Shape() (int, int) { return 0, 0 }
 // Free is a no-op in builds without the wgpu tag.
 func (q *QMatrix) Free() {}
 
+// IsF16 is always false in builds without the wgpu tag.
+func (t *Tensor) IsF16() bool { return false }
+
+// RopeCacheF16 always fails in builds without the wgpu tag.
+func (t *Tensor) RopeCacheF16(kc, vc *Tensor, headSz, qw, kvDim, pos int, theta float64, dstOff int) error {
+	return errNoWGPU
+}
+
 // BeginBatch always fails in builds without the wgpu tag.
 func (g *Device) BeginBatch() error { return errNoWGPU }
 
