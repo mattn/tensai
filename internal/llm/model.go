@@ -22,6 +22,7 @@ import (
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
 	"github.com/mattn/tensai/internal/kernels"
+	"github.com/mattn/tensai/internal/workpool"
 	"github.com/mattn/tensai/quant"
 )
 
@@ -1322,21 +1323,15 @@ func (m *qwen) step(token, pos int) []float32 {
 
 		clear(attn)
 		steps := len(b.kc)
-		// Short contexts run the heads serially; past that the goroutine
+		// Short contexts run the heads serially; past that the dispatch
 		// cost disappears into the O(steps*headSz) work per head.
-		if workers := min(runtime.NumCPU(), cfg.Heads); workers > 1 && steps >= 64 {
-			var wg sync.WaitGroup
-			for w := 0; w < workers; w++ {
-				wg.Add(1)
-				go func(w int) {
-					defer wg.Done()
-					scores := make([]float64, steps)
-					for h := w; h < cfg.Heads; h += workers {
-						m.attendHead(b, q, attn, h, group, steps, scores)
-					}
-				}(w)
-			}
-			wg.Wait()
+		if runtime.NumCPU() > 1 && cfg.Heads > 1 && steps >= 64 {
+			workpool.Run(cfg.Heads, 1, func(lo, hi int) {
+				scores := make([]float64, steps)
+				for h := lo; h < hi; h++ {
+					m.attendHead(b, q, attn, h, group, steps, scores)
+				}
+			})
 		} else {
 			scores := make([]float64, steps)
 			for h := 0; h < cfg.Heads; h++ {
