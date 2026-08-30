@@ -24,6 +24,7 @@ import (
 type gpuMat interface {
 	MatMul(*gpu.Tensor) (*gpu.Tensor, error)
 	MatMulOpts(x, bias, dst *gpu.Tensor) (*gpu.Tensor, error)
+	MatMulRMSNorm(x, norm *gpu.Tensor, eps float64, bias, dst *gpu.Tensor) (*gpu.Tensor, error)
 	Free()
 }
 
@@ -49,11 +50,15 @@ type gpuQwen struct {
 	nCtx   int
 	gpuLen int // cache positions currently valid on the GPU
 	// The final norm and lm_head, resident when the device's storage
-	// limit has room for the whole vocabulary projection. Both nil on a
-	// device that cannot hold it, and decode falls back to reading the
-	// hidden state back and finishing on the CPU.
-	gNorm  *gpu.Tensor
-	lmHead gpuMat
+	// limit has room for the vocabulary projection — in one piece when it
+	// fits, else as column slices with lmOff holding each slice's first
+	// column and lmLogits collecting the slices for the one readback.
+	// Empty on a device that cannot hold a slice, and decode falls back
+	// to reading the hidden state back and finishing on the CPU.
+	gNorm    *gpu.Tensor
+	lmHead   []gpuMat
+	lmOff    []int
+	lmLogits *gpu.Tensor
 }
 
 // sliceQ4 copies a column range out of a fused 4-bit quantized matrix;
@@ -142,6 +147,55 @@ func tryUp(g *gpu.Device, q *qmat) (gpuMat, error) {
 	return g.UploadQ4(q.q4)
 }
 
+// upLm uploads the lm_head, split into column slices when the whole
+// weight overflows the device's storage limit — an untied Q8 head over a
+// 150K vocabulary is a few MB past dozen's 128MiB, and one buffer too
+// many used to send the entire projection back to the CPU every token.
+func upLm(g *gpu.Device, q *qmat) ([]gpuMat, []int, error) {
+	var rows, cols int
+	var colBytes uint64
+	if q.q8 != nil {
+		rows, cols = q.q8.Rows, q.q8.Cols
+		colBytes = uint64(4 * ((rows + 3) / 4)) // one uploaded column, as UploadQ8 lays it out
+	} else {
+		rows, cols = q.q4.Rows, q.q4.Cols
+		colBytes = uint64(2 * ((rows + 3) / 4))
+	}
+	chunk := cols
+	if limit := g.StorageLimit(); limit != 0 && colBytes*uint64(cols) > limit {
+		// A megabyte of slack covers the scale table and padding; slice
+		// boundaries stay on 64 columns so every part copies whole tiles.
+		chunk = int((limit-1<<20)/colBytes) &^ 63
+		if chunk <= 0 {
+			return nil, nil, fmt.Errorf("device stores %d bytes, one lm_head column is %d", limit, colBytes)
+		}
+	}
+	var parts []gpuMat
+	var offs []int
+	for lo := 0; lo < cols; lo += chunk {
+		hi := min(lo+chunk, cols)
+		var part gpuMat
+		var err error
+		switch {
+		case lo == 0 && hi == cols:
+			part, err = tryUp(g, q)
+		case q.q8 != nil:
+			part, err = g.UploadQ8(sliceQ(q.q8, lo, hi))
+		default:
+			part, err = g.UploadQ4(sliceQ4(q.q4, lo, hi))
+		}
+		if err != nil {
+			for _, p := range parts {
+				p.Free()
+			}
+			return nil, nil, err
+		}
+		parts = append(parts, part)
+		offs = append(offs, lo)
+	}
+	return parts, offs, nil
+}
+
 // newGPUQwen uploads the model's transformer blocks to the GPU: the int8
 // weight twins, the norm weights and biases, and zeroed KV caches sized
 // for nCtx positions.
@@ -227,11 +281,14 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw io.Writer) (*gpuQwen, err
 	// the whole token, logits included, stays one submission. Devices
 	// with a smaller storage limit just miss out and keep the CPU path.
 	if q := m.qLmT; q != nil {
-		if lm, err := tryUp(g, q); err != nil {
+		if parts, offs, err := upLm(g, q); err != nil {
 			fmt.Fprintf(logw, "lm_head stays on the cpu: %v\n", err)
 		} else {
-			gq.lmHead = lm
+			gq.lmHead, gq.lmOff = parts, offs
 			gq.gNorm = vec(m.normW)
+			if len(parts) > 1 {
+				gq.lmLogits = must(g.Upload(tensai.NewTensor(1, m.cfg.Vocab)))
+			}
 		}
 	}
 	// Warm every kernel the decode and both prefill batch sizes touch:
@@ -252,15 +309,18 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw io.Writer) (*gpuQwen, err
 // it the three split weights each produce their own tensor and owner is
 // nil. Only decode can take the fused path: a multi-row result interleaves
 // q, k, and v per row, and no contiguous view covers that.
-func (gq *gpuQwen) qkv(l *gpuLayer, a *gpu.Tensor) (q, k, v, owner *gpu.Tensor) {
+func (gq *gpuQwen) qkv(l *gpuLayer, x *gpu.Tensor, norm *gpu.Tensor, eps float64) (q, k, v, owner *gpu.Tensor) {
 	if l.qQKV == nil {
-		return must(l.qq.MatMulOpts(a, l.bq, nil)),
-			must(l.qk.MatMulOpts(a, l.bk, nil)),
-			must(l.qv.MatMulOpts(a, l.bv, nil)), nil
+		// Each projection re-derives the same inverse rms in its
+		// prologue; that is still three dispatches against the four the
+		// standalone norm made it.
+		return must(l.qq.MatMulRMSNorm(x, norm, eps, l.bq, nil)),
+			must(l.qk.MatMulRMSNorm(x, norm, eps, l.bk, nil)),
+			must(l.qv.MatMulRMSNorm(x, norm, eps, l.bv, nil)), nil
 	}
 	hs := gq.m.cfg.Heads * gq.m.headSz
 	kvDim := gq.m.cfg.KVHeads * gq.m.headSz
-	f := must(l.qQKV.MatMulOpts(a, l.bQKV, nil))
+	f := must(l.qQKV.MatMulRMSNorm(x, norm, eps, l.bQKV, nil))
 	return must(f.View(0, 1, hs)),
 		must(f.View(hs, 1, kvDim)),
 		must(f.View(hs+kvDim, 1, kvDim)), f
@@ -441,9 +501,7 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 	}
 	for i := range gq.layers {
 		l := &gq.layers[i]
-		a := must(x.RMSNorm(l.ln1, cfg.RMSEps))
-		q, k, v, qkvOwner := gq.qkv(l, a)
-		a.Free()
+		q, k, v, qkvOwner := gq.qkv(l, x, l.ln1, cfg.RMSEps)
 		if l.qNorm != nil {
 			nq := must(q.RMSNormEach(l.qNorm, cfg.RMSEps))
 			q.Free()
@@ -457,11 +515,22 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 			if theta == 0 {
 				theta = cfg.RopeTheta
 			}
-			if err := q.RoPE(m.headSz, pos, theta); err != nil {
-				panic(err)
-			}
-			if err := k.RoPE(m.headSz, pos, theta); err != nil {
-				panic(err)
+			if qkvOwner != nil && l.qNorm == nil {
+				// q and k sit side by side in the fused row and the heads
+				// are uniform, so one dispatch rotates both. Every small
+				// dispatch in this chain costs ~40us of dependent-dispatch
+				// latency on dozen, which is worth more than the rotation.
+				qk := must(qkvOwner.View(0, 1, cfg.Heads*m.headSz+kvDim))
+				if err := qk.RoPE(m.headSz, pos, theta); err != nil {
+					panic(err)
+				}
+			} else {
+				if err := q.RoPE(m.headSz, pos, theta); err != nil {
+					panic(err)
+				}
+				if err := k.RoPE(m.headSz, pos, theta); err != nil {
+					panic(err)
+				}
 			}
 		}
 		if err := k.CopyRowsInto(l.kc, pos*kvDim); err != nil {
@@ -497,10 +566,8 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 			proj.Free()
 		}
 
-		a = must(x.RMSNorm(l.ln2, cfg.RMSEps))
-		gate := must(l.qGate.MatMul(a))
-		up := must(l.qUp.MatMul(a))
-		a.Free()
+		gate := must(l.qGate.MatMulRMSNorm(x, l.ln2, cfg.RMSEps, nil, nil))
+		up := must(l.qUp.MatMulRMSNorm(x, l.ln2, cfg.RMSEps, nil, nil))
 		if l.geglu {
 			if err := gate.GeluMul(up); err != nil {
 				panic(err)
@@ -526,13 +593,23 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 	}
 	// With the lm_head resident the norm and the vocabulary projection
 	// ride the same submission, and the one readback is the logits
-	// themselves — the hidden state never crosses back.
-	if gq.lmHead != nil {
-		a := must(x.RMSNorm(gq.gNorm, cfg.RMSEps))
-		logits := must(gq.lmHead.MatMul(a))
-		a.Free()
+	// themselves — the hidden state never crosses back. A sliced head
+	// gathers its parts into one tensor first: a Download flushes and
+	// waits, so two of them would cost a second round trip.
+	if len(gq.lmHead) == 1 {
+		logits := must(gq.lmHead[0].MatMulRMSNorm(x, gq.gNorm, cfg.RMSEps, nil, nil))
 		defer logits.Free()
 		return must(logits.Download()).Data
+	}
+	if len(gq.lmHead) > 1 {
+		for i, part := range gq.lmHead {
+			p := must(part.MatMulRMSNorm(x, gq.gNorm, cfg.RMSEps, nil, nil))
+			if err := p.CopyRowsInto(gq.lmLogits, gq.lmOff[i]); err != nil {
+				panic(err)
+			}
+			p.Free()
+		}
+		return must(gq.lmLogits.Download()).Data
 	}
 	xt := must(x.Download())
 	a := make([]float32, hs)

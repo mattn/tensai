@@ -133,6 +133,11 @@ func (q *QMatrix) MatMul(x *Tensor) (*Tensor, error) { return nil, errNoWGPU }
 // MatMulOpts always fails in builds without the wgpu tag.
 func (q *QMatrix) MatMulOpts(x, bias, dst *Tensor) (*Tensor, error) { return nil, errNoWGPU }
 
+// MatMulRMSNorm always fails in builds without the wgpu tag.
+func (q *QMatrix) MatMulRMSNorm(x, norm *Tensor, eps float64, bias, dst *Tensor) (*Tensor, error) {
+	return nil, errNoWGPU
+}
+
 // Shape returns zeros in builds without the wgpu tag.
 func (q *QMatrix) Shape() (int, int) { return 0, 0 }
 
@@ -169,6 +174,11 @@ func (q *Q4Matrix) MatMul(x *Tensor) (*Tensor, error) { return nil, errNoWGPU }
 
 // MatMulOpts always fails in builds without the wgpu tag.
 func (q *Q4Matrix) MatMulOpts(x, bias, dst *Tensor) (*Tensor, error) { return nil, errNoWGPU }
+
+// MatMulRMSNorm always fails in builds without the wgpu tag.
+func (q *Q4Matrix) MatMulRMSNorm(x, norm *Tensor, eps float64, bias, dst *Tensor) (*Tensor, error) {
+	return nil, errNoWGPU
+}
 
 // Shape returns zeros in builds without the wgpu tag.
 func (q *Q4Matrix) Shape() (int, int) { return 0, 0 }
