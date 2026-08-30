@@ -652,17 +652,20 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
 // folds the row splits before the guarded store. The split keeps a decode
 // matvec — parallelism = output columns only — wide enough to fill the
 // device.
-struct QMParams { rows: u32, cols: u32, words: u32, m: u32, flags: u32, pad0: u32, pad1: u32, pad2: u32 }
+struct QMParams { rows: u32, cols: u32, words: u32, m: u32, flags: u32, eps: f32, pad1: u32, pad2: u32 }
 @group(0) @binding(15) var<uniform> qp: QMParams;
 @group(0) @binding(16) var<storage, read> qwt: array<u32>;
 @group(0) @binding(17) var<storage, read> qsc: array<f32>;
 @group(0) @binding(18) var<storage, read> qxv: array<f32>;
 @group(0) @binding(19) var<storage, read_write> qov: array<f32>;
 @group(0) @binding(34) var<storage, read> qbias: array<f32>;
+@group(0) @binding(39) var<storage, read> qnormw: array<f32>;
 
 const QWG = 16u;    // packed words per workgroup
 const QSPLIT = 16u; // row splits sharing one word
+const QXS = 2048u;  // widest activation row the norm prologue stages
 var<workgroup> qred: array<vec4<f32>, 256>;
+var<workgroup> qxs: array<f32, QXS>;
 
 @compute @workgroup_size(256, 1, 1)
 fn qmatmul(@builtin(workgroup_id) wid: vec3<u32>,
@@ -671,16 +674,55 @@ fn qmatmul(@builtin(workgroup_id) wid: vec3<u32>,
     let rsub = lid.x / QWG;
     let r = wid.y;
     let xbase = r * qp.rows;
+    // Flag 4 folds the row's RMS normalization in as a prologue: every
+    // workgroup redundantly computes the same inverse rms — a pass over
+    // one row is nothing next to the weight stream — and stages the
+    // normalized row in shared memory, sparing decode a dependent
+    // dispatch per norm without touching the streaming loop's flops.
+    // The stride and the reduction tree mirror rmsnorm_row exactly, so
+    // the products match the standalone dispatch bit for bit. Callers
+    // set the flag only when the row fits QXS.
+    if ((qp.flags & 4u) != 0u) {
+        var ss = 0.0;
+        for (var i = lid.x; i < qp.rows; i = i + 256u) {
+            let v = qxv[xbase + i];
+            ss = ss + v * v;
+        }
+        qred[lid.x].x = ss;
+        workgroupBarrier();
+        for (var s = 128u; s > 0u; s = s >> 1u) {
+            if (lid.x < s) { qred[lid.x].x = qred[lid.x].x + qred[lid.x + s].x; }
+            workgroupBarrier();
+        }
+        let inv = inverseSqrt(qred[0].x / f32(qp.rows) + qp.eps);
+        workgroupBarrier(); // qred is reused by the column reduction below
+        for (var i = lid.x; i < qp.rows; i = i + 256u) {
+            qxs[i] = qxv[xbase + i] * inv * qnormw[i];
+        }
+        workgroupBarrier();
+    }
     var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if (w < qp.words) {
-        for (var i = rsub; i < qp.rows; i = i + QSPLIT) {
-            let xv = qxv[xbase + i];
-            let pw = qwt[i * qp.words + w];
-            acc = acc + xv * vec4<f32>(
-                f32(i32(pw << 24u) >> 24u),
-                f32(i32(pw << 16u) >> 24u),
-                f32(i32(pw << 8u) >> 24u),
-                f32(i32(pw) >> 24u));
+        if ((qp.flags & 4u) != 0u) {
+            for (var i = rsub; i < qp.rows; i = i + QSPLIT) {
+                let xv = qxs[i];
+                let pw = qwt[i * qp.words + w];
+                acc = acc + xv * vec4<f32>(
+                    f32(i32(pw << 24u) >> 24u),
+                    f32(i32(pw << 16u) >> 24u),
+                    f32(i32(pw << 8u) >> 24u),
+                    f32(i32(pw) >> 24u));
+            }
+        } else {
+            for (var i = rsub; i < qp.rows; i = i + QSPLIT) {
+                let xv = qxv[xbase + i];
+                let pw = qwt[i * qp.words + w];
+                acc = acc + xv * vec4<f32>(
+                    f32(i32(pw << 24u) >> 24u),
+                    f32(i32(pw << 16u) >> 24u),
+                    f32(i32(pw << 8u) >> 24u),
+                    f32(i32(pw) >> 24u));
+            }
         }
     }
     qred[lid.x] = acc;
@@ -2790,8 +2832,32 @@ func (q *QMatrix) MatMul(x *Tensor) (*Tensor, error) {
 // then the returned tensor — when dst is non-nil. One dispatch instead
 // of a matmul plus one or two element-wise passes.
 func (q *QMatrix) MatMulOpts(x, bias, dst *Tensor) (*Tensor, error) {
-	if q.freed || x.freed || (bias != nil && bias.freed) || (dst != nil && dst.freed) {
+	return q.matmulF32(x, bias, dst, nil, 0)
+}
+
+// MatMulRMSNorm is MatMulOpts with out = rmsnorm(x, norm, eps) @ Q: the
+// single-row matvec runs the normalization as a kernel prologue — one
+// dependent dispatch fewer per decode norm — while a batch, whose
+// dispatch count is amortized anyway, norms in its own dispatch first.
+func (q *QMatrix) MatMulRMSNorm(x, norm *Tensor, eps float64, bias, dst *Tensor) (*Tensor, error) {
+	// 2048 is the QXS shared-memory stage in the kernel.
+	if x.Size() == q.rows && q.rows <= 2048 {
+		return q.matmulF32(x, bias, dst, norm, float32(eps))
+	}
+	nx, err := x.RMSNorm(norm, eps)
+	if err != nil {
+		return nil, err
+	}
+	defer nx.Free()
+	return q.matmulF32(nx, bias, dst, nil, 0)
+}
+
+func (q *QMatrix) matmulF32(x, bias, dst, norm *Tensor, eps float32) (*Tensor, error) {
+	if q.freed || x.freed || (bias != nil && bias.freed) || (dst != nil && dst.freed) || (norm != nil && norm.freed) {
 		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if norm != nil && norm.Size() != q.rows {
+		return nil, fmt.Errorf("tensai: gpu qmatmul norm length %d != %d rows", norm.Size(), q.rows)
 	}
 	if q.g != x.g {
 		return nil, errors.New("tensai: gpu tensors belong to different GPUs")
@@ -2842,28 +2908,38 @@ func (q *QMatrix) MatMulOpts(x, bias, dst *Tensor) (*Tensor, error) {
 	} else {
 		bufOut = g.takeOutBuffer(outBytes)
 	}
-	params := [8]uint32{uint32(q.rows), uint32(q.cols), uint32(q.words), uint32(m), flags}
+	normBuf, normSize := q.scales, uint64(q.words*4)*4 // dummy; flags gate the read
+	if norm != nil {
+		flags |= 4
+		normBuf, normSize = norm.buf, uint64(norm.Size())*4
+	}
+	params := [8]uint32{uint32(q.rows), uint32(q.cols), uint32(q.words), uint32(m), flags, math.Float32bits(eps)}
 	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
 	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
 	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
 
-	entries := [6]wgpuBindGroupEntry{
+	entries := [7]wgpuBindGroupEntry{
 		{binding: 15, buffer: bufParams, size: 32},
 		{binding: 16, buffer: q.buf, size: uint64(q.rows*q.words) * 4},
 		{binding: 17, buffer: q.scales, size: uint64(q.words*4) * 4},
 		bind(18, x),
 		{binding: 19, buffer: bufOut, size: outBytes},
 		{binding: 34, buffer: biasBuf, size: biasSize},
+		{binding: 39, buffer: normBuf, size: normSize},
 	}
 	// A large batch takes the tiled GEMM, a small one the row-blocked
-	// kernel; a single row keeps the matvec shape.
-	pipe, lay, gy := g.pipes.qmatmul, g.pipes.layQmatmul, uint32(m)
+	// kernel; a single row keeps the matvec shape. Only the matvec's
+	// layout knows the norm binding, so the batched kernels drop it.
+	pipe, lay, bound := g.pipes.qmatmul, g.pipes.layQmatmul, entries[:]
+	gy := uint32(m)
 	if m >= 32 {
 		pipe, lay, gy = g.pipes.qmatmulT, g.pipes.layQmatmulT, uint32((m+63)/64)
+		bound = entries[:6]
 	} else if m > 1 {
 		pipe, lay, gy = g.pipes.qmatmulB, g.pipes.layQmatmulB, uint32((m+7)/8)
+		bound = entries[:6]
 	}
-	bindGroup := g.cachedBindGroup(lay, entries[:])
+	bindGroup := g.cachedBindGroup(lay, bound)
 	runtime.KeepAlive(&entries)
 
 	err := g.dispatch(pipe, bindGroup,
@@ -3441,6 +3517,17 @@ func (q *Q4Matrix) MatMul(x *Tensor) (*Tensor, error) {
 // MatMulOpts is MatMul with a fused epilogue: a per-column bias added
 // when bias is non-nil, and the product accumulated into dst — which is
 // then the returned tensor — when dst is non-nil.
+// MatMulRMSNorm matches QMatrix.MatMulRMSNorm; the 4-bit kernel has no
+// fused prologue, so the normalization always runs as its own dispatch.
+func (q *Q4Matrix) MatMulRMSNorm(x, norm *Tensor, eps float64, bias, dst *Tensor) (*Tensor, error) {
+	nx, err := x.RMSNorm(norm, eps)
+	if err != nil {
+		return nil, err
+	}
+	defer nx.Free()
+	return q.MatMulOpts(nx, bias, dst)
+}
+
 func (q *Q4Matrix) MatMulOpts(x, bias, dst *Tensor) (*Tensor, error) {
 	if q.freed || x.freed || (bias != nil && bias.freed) || (dst != nil && dst.freed) {
 		return nil, errors.New("tensai: gpu tensor already freed")
