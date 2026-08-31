@@ -109,6 +109,9 @@ func (t *Tensor) Add(o *Tensor) error { return errNoWGPU }
 // SiluMul always fails in builds without the wgpu tag.
 func (t *Tensor) SiluMul(o *Tensor) error { return errNoWGPU }
 
+// GLUSplit always fails in builds without the wgpu tag.
+func (t *Tensor) GLUSplit(inter int, gelu bool) (*Tensor, error) { return nil, errNoWGPU }
+
 // CopyRowsInto always fails in builds without the wgpu tag.
 func (t *Tensor) CopyRowsInto(dst *Tensor, off int) error { return errNoWGPU }
 
