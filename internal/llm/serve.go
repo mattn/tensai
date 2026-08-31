@@ -11,6 +11,7 @@ package llm
 // back as tool_calls, which is enough for an agent to drive a loop.
 
 import (
+	"bytes"
 	"crypto/subtle"
 	_ "embed"
 	"encoding/json"
@@ -114,6 +115,150 @@ func toolPreamble(tools []toolDef) string {
 	return b.String()
 }
 
+// xmlToolPreamble is the block Qwen3.5 was trained to read, word for
+// word from its own template: the same <tools> listing, but a call
+// written as a <function> element with one <parameter> per argument.
+// It leads the system turn rather than trailing it.
+func xmlToolPreamble(tools []toolDef) string {
+	var b strings.Builder
+	b.WriteString("# Tools\n\nYou have access to the following functions:\n\n<tools>")
+	for _, t := range tools {
+		if t.Type == "" {
+			t.Type = "function"
+		}
+		raw, err := marshalTool(t)
+		if err != nil {
+			continue
+		}
+		b.WriteString("\n" + raw)
+	}
+	b.WriteString("\n</tools>\n\n" +
+		"If you choose to call a function ONLY reply in the following format with NO suffix:\n\n" +
+		"<tool_call>\n<function=example_function_name>\n" +
+		"<parameter=example_parameter_1>\nvalue_1\n</parameter>\n" +
+		"<parameter=example_parameter_2>\nThis is the value for the second parameter\n" +
+		"that can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n" +
+		"<IMPORTANT>\nReminder:\n" +
+		"- Function calls MUST follow the specified format: an inner <function=...></function> " +
+		"block must be nested within <tool_call></tool_call> XML tags\n" +
+		"- Required parameters MUST be specified\n" +
+		"- You may provide optional reasoning for your function call in natural language BEFORE " +
+		"the function call, but NOT after\n" +
+		"- If there is no function call available, answer the question like normal with your " +
+		"current knowledge and do not tell the user about function calls\n</IMPORTANT>")
+	return b.String()
+}
+
+// marshalTool writes one signature the way Qwen3.5's own template does,
+// which is Python's json.dumps: ", " between members, ": " after a key,
+// and <, > and & left as they are rather than escaped. Go's encoder
+// defaults the other way on both counts, and the difference is not
+// cosmetic -- it is the tokens the model reads.
+func marshalTool(t toolDef) (string, error) {
+	raw, err := encodeJSON(t)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	writeSpaced(&b, raw)
+	return b.String(), nil
+}
+
+// encodeJSON marshals without Go's HTML escaping.
+func encodeJSON(v any) (json.RawMessage, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return json.RawMessage(bytes.TrimRight(buf.Bytes(), "\n")), nil
+}
+
+// writeSpaced re-emits a JSON value with Python's separators, keeping
+// the member order it was given. Anything it cannot walk goes out as it
+// came in.
+func writeSpaced(b *strings.Builder, raw json.RawMessage) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		b.Write(bytes.TrimSpace(raw))
+		return
+	}
+	delim, _ := tok.(json.Delim)
+	switch delim {
+	case '{':
+		b.WriteString("{")
+		for i := 0; dec.More(); i++ {
+			key, err := dec.Token()
+			if err != nil {
+				break
+			}
+			var value json.RawMessage
+			if err := dec.Decode(&value); err != nil {
+				break
+			}
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			name, _ := key.(string)
+			quoted, err := encodeJSON(name)
+			if err != nil {
+				break
+			}
+			b.Write(quoted)
+			b.WriteString(": ")
+			writeSpaced(b, value)
+		}
+		b.WriteString("}")
+	case '[':
+		b.WriteString("[")
+		for i := 0; dec.More(); i++ {
+			var value json.RawMessage
+			if err := dec.Decode(&value); err != nil {
+				break
+			}
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			writeSpaced(b, value)
+		}
+		b.WriteString("]")
+	default:
+		b.Write(bytes.TrimSpace(raw))
+	}
+}
+
+// xmlCallArgs renders a call's JSON arguments as the <parameter> blocks
+// Qwen3.5 reads, in the order they arrived. A string goes in bare --
+// the quotes are JSON's, not the format's -- and anything structured
+// stays JSON, which is what its template writes.
+func xmlCallArgs(args string) string {
+	dec := json.NewDecoder(strings.NewReader(args))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return ""
+	}
+	var b strings.Builder
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			break
+		}
+		name, _ := key.(string)
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			break
+		}
+		value := string(raw)
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			value = s
+		}
+		b.WriteString("<parameter=" + name + ">\n" + value + "\n</parameter>\n")
+	}
+	return b.String()
+}
+
 // render walks the messages through the model's template, ending with an
 // open assistant turn. Models without a system role (Gemma) get the
 // system text folded into the first user message. When tools are offered
@@ -131,11 +276,33 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 		rest = msgs[1:]
 	}
 	hermes := tm.toolCalls == "hermes" && len(tools) > 0
+	qwenXML := tm.toolCalls == "qwen3xml" && len(tools) > 0
+	// Where the signatures go is part of the convention: Hermes appends
+	// them to whatever system text the caller sent, Qwen3.5 leads with
+	// them and appends the caller's text after.
 	if hermes {
 		system += toolPreamble(tools)
 	}
+	if qwenXML {
+		if system = strings.TrimSpace(system); system != "" {
+			system = xmlToolPreamble(tools) + "\n\n" + system
+		} else {
+			system = xmlToolPreamble(tools)
+		}
+	}
+	offered := hermes || qwenXML
 	if !tm.foldSystem {
 		b.WriteString(tm.sysOpen + system + tm.sysClose)
+	}
+	// A thinking family keeps the think block on the assistant turns
+	// that belong to the query still being answered -- the ones an agent
+	// loop replays around its tool results -- and drops it from
+	// everything older, which is what its template does.
+	lastQuery := -1
+	for i, m := range rest {
+		if m.Role == "user" {
+			lastQuery = i
+		}
 	}
 	first := true
 	inTools := false
@@ -147,10 +314,14 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 			inTools = false
 		}
 		switch {
-		case m.Role == "tool" && hermes:
+		case m.Role == "tool" && offered:
 			if !inTools {
 				b.WriteString(tm.userOpen)
 				inTools = true
+			} else {
+				// Each result opens its own line inside the shared turn,
+				// as the trained template writes them.
+				b.WriteString("\n")
 			}
 			b.WriteString("<tool_response>\n" + m.Content + "\n</tool_response>")
 			if i == len(rest)-1 {
@@ -166,7 +337,11 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 			if tm.reasonOpen != "" {
 				_, text = splitReasoning(text, tm.reasonOpen, tm.reasonClose)
 			}
-			b.WriteString(tm.asstOpen + text)
+			b.WriteString(tm.asstOpen)
+			if i > lastQuery {
+				b.WriteString(tm.asstPrefill)
+			}
+			b.WriteString(text)
 			if hermes {
 				for _, c := range m.ToolCalls {
 					args := strings.TrimSpace(c.Function.Arguments)
@@ -176,6 +351,20 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 					b.WriteString("\n<tool_call>\n" +
 						`{"name": ` + strconv.Quote(c.Function.Name) + `, "arguments": ` + args + "}" +
 						"\n</tool_call>")
+				}
+			}
+			if qwenXML {
+				for i, c := range m.ToolCalls {
+					// A call follows text with a blank line between them
+					// and another call with a single newline, but opens
+					// a turn of its own with nothing in front.
+					if i == 0 && strings.TrimSpace(text) != "" {
+						b.WriteString("\n\n")
+					} else if i > 0 {
+						b.WriteString("\n")
+					}
+					b.WriteString("<tool_call>\n<function=" + c.Function.Name + ">\n" +
+						xmlCallArgs(c.Function.Arguments) + "</function>\n</tool_call>")
 				}
 			}
 			b.WriteString(tm.asstClose)
@@ -191,7 +380,7 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 	if inTools {
 		b.WriteString(tm.userClose)
 	}
-	b.WriteString(tm.asstOpen)
+	b.WriteString(tm.asstOpen + tm.asstPrefill)
 	return b.String()
 }
 
@@ -274,6 +463,149 @@ func parseToolCalls(s string) (string, []toolCall) {
 		})
 	}
 	return strings.TrimSpace(text.String()), calls
+}
+
+// parseXMLToolCalls does for Qwen3.5 what parseToolCalls does for the
+// Hermes families: it splits a finished turn into what the model meant
+// to say and the calls it emitted. The block opens with the same
+// <tool_call> tag, so only its body differs.
+func parseXMLToolCalls(s string, tools []toolDef) (string, []toolCall) {
+	const openTag, closeTag = "<tool_call>", "</tool_call>"
+	if !strings.Contains(s, openTag) {
+		return s, nil
+	}
+	var text strings.Builder
+	var calls []toolCall
+	for {
+		i := strings.Index(s, openTag)
+		if i < 0 {
+			text.WriteString(s)
+			break
+		}
+		text.WriteString(s[:i])
+		s = s[i+len(openTag):]
+		body := s
+		if j := strings.Index(s, closeTag); j >= 0 {
+			body, s = s[:j], s[j+len(closeTag):]
+		} else {
+			s = ""
+		}
+		name, args, ok := parseXMLCall(body, tools)
+		if !ok {
+			// Not a call after all: keep the text rather than swallow a
+			// reply that merely talks about the tag.
+			text.WriteString(openTag + body)
+			continue
+		}
+		idx := len(calls)
+		calls = append(calls, toolCall{
+			Index:    &idx,
+			ID:       fmt.Sprintf("call_%d", idx),
+			Type:     "function",
+			Function: callFunc{Name: name, Arguments: args},
+		})
+	}
+	return strings.TrimSpace(text.String()), calls
+}
+
+// parseXMLCall reads one <function=name> element and its <parameter>
+// children back into the JSON object the API hands a caller. A block
+// cut short mid-way still yields the parameters it got through.
+func parseXMLCall(body string, tools []toolDef) (name, args string, ok bool) {
+	const fnOpen, fnClose = "<function=", "</function>"
+	i := strings.Index(body, fnOpen)
+	if i < 0 {
+		return "", "", false
+	}
+	rest := body[i+len(fnOpen):]
+	j := strings.Index(rest, ">")
+	if j < 0 {
+		return "", "", false
+	}
+	name = strings.TrimSpace(rest[:j])
+	if name == "" {
+		return "", "", false
+	}
+	rest = rest[j+1:]
+	if k := strings.Index(rest, fnClose); k >= 0 {
+		rest = rest[:k]
+	}
+	types := paramTypes(tools, name)
+	const pOpen, pClose = "<parameter=", "</parameter>"
+	var b strings.Builder
+	b.WriteString("{")
+	for {
+		i := strings.Index(rest, pOpen)
+		if i < 0 {
+			break
+		}
+		rest = rest[i+len(pOpen):]
+		j := strings.Index(rest, ">")
+		if j < 0 {
+			break
+		}
+		key := strings.TrimSpace(rest[:j])
+		rest = rest[j+1:]
+		value := rest
+		if k := strings.Index(rest, pClose); k >= 0 {
+			value, rest = rest[:k], rest[k+len(pClose):]
+		} else {
+			rest = ""
+		}
+		// The template brackets a value with one newline on each side;
+		// everything between them, blank lines included, is the value.
+		value = strings.TrimSuffix(strings.TrimPrefix(value, "\n"), "\n")
+		if b.Len() > 1 {
+			b.WriteString(", ")
+		}
+		b.WriteString(strconv.Quote(key) + ": " + xmlArgJSON(value, types[key]))
+	}
+	b.WriteString("}")
+	return name, b.String(), true
+}
+
+// xmlArgJSON turns one parameter body back into a JSON value. The wire
+// format carries no types, so the tool's own schema decides: a declared
+// string is taken verbatim however numeric it looks, and anything else
+// is JSON when it parses as JSON. An argument the schema never mentions
+// is a string unless it is bracketed like an object or an array.
+func xmlArgJSON(value, typ string) string {
+	trimmed := strings.TrimSpace(value)
+	structured := strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[")
+	if typ != "string" && (typ != "" || structured) {
+		if trimmed != "" && json.Valid([]byte(trimmed)) {
+			return trimmed
+		}
+	}
+	return strconv.Quote(value)
+}
+
+// paramTypes reads the declared type of each of a tool's parameters out
+// of its JSON Schema. A type given as a union is left unknown, which
+// falls back to reading the value as written.
+func paramTypes(tools []toolDef, name string) map[string]string {
+	for _, t := range tools {
+		if t.Function.Name != name {
+			continue
+		}
+		var schema struct {
+			Properties map[string]struct {
+				Type json.RawMessage `json:"type"`
+			} `json:"properties"`
+		}
+		if json.Unmarshal(t.Function.Parameters, &schema) != nil {
+			return nil
+		}
+		types := make(map[string]string, len(schema.Properties))
+		for k, p := range schema.Properties {
+			var s string
+			if json.Unmarshal(p.Type, &s) == nil {
+				types[k] = s
+			}
+		}
+		return types
+	}
+	return nil
 }
 
 type server struct {
@@ -667,7 +999,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	var calls []toolCall
 	if len(tools) > 0 {
-		content, calls = parseToolCalls(content)
+		if s.tm.toolCalls == "qwen3xml" {
+			content, calls = parseXMLToolCalls(content, tools)
+		} else {
+			content, calls = parseToolCalls(content)
+		}
 		if len(calls) > 0 {
 			finish = "tool_calls"
 		}

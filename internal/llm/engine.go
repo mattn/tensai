@@ -387,10 +387,11 @@ func (e *Engine) Generate(w io.Writer, prompt string, raw bool, n int) RunResult
 	text := prompt
 	if !raw {
 		if e.tm.foldSystem {
-			text = e.tm.bos + e.tm.userOpen + e.system + "\n\n" + prompt + e.tm.userClose + e.tm.asstOpen
+			text = e.tm.bos + e.tm.userOpen + e.system + "\n\n" + prompt + e.tm.userClose +
+				e.tm.asstOpen + e.tm.asstPrefill
 		} else {
 			text = e.tm.bos + e.tm.sysOpen + e.system + e.tm.sysClose +
-				e.tm.userOpen + prompt + e.tm.userClose + e.tm.asstOpen
+				e.tm.userOpen + prompt + e.tm.userClose + e.tm.asstOpen + e.tm.asstPrefill
 		}
 	}
 	ids := e.tok.Encode(text)
@@ -431,7 +432,7 @@ func (e *Engine) Chat(in io.Reader, w io.Writer, n int) {
 			text = e.system + "\n\n" + text
 		}
 		first = false
-		e.feed(e.tok.Encode(e.tm.userOpen + text + e.tm.userClose + e.tm.asstOpen))
+		e.feed(e.tok.Encode(e.tm.userOpen + text + e.tm.userClose + e.tm.asstOpen + e.tm.asstPrefill))
 		e.generate(w, n)
 		e.feed(e.tok.Encode("\n"))
 		if e.steps >= e.nCtx-64 {
@@ -913,8 +914,13 @@ type tmpl struct {
 	sysOpen, sysClose   string
 	userOpen, userClose string
 	asstOpen, asstClose string
-	foldSystem          bool
-	stops               []string
+	// asstPrefill is what the template writes into an assistant turn
+	// before the model speaks -- the empty think block a Qwen3 opens
+	// with when thinking is off. It belongs to the turn being generated,
+	// not to every turn in the history.
+	asstPrefill string
+	foldSystem  bool
+	stops       []string
 	// toolCalls names the function-calling convention the family was
 	// trained on, empty when it has none. "hermes" is the one the ChatML
 	// families speak: tool signatures inside a <tools> block appended to
@@ -999,8 +1005,14 @@ func templateFor(modelType string, think bool) tmpl {
 		if think {
 			t.reasonOpen, t.reasonClose = "<think>", "</think>"
 		} else {
-			t.asstOpen += "<think>\n\n</think>\n\n"
+			t.asstPrefill = "<think>\n\n</think>\n\n"
 		}
+	}
+	// Qwen3.5 left the Hermes convention its predecessors speak: its
+	// tools block is a system turn of its own, and a call is nested XML
+	// rather than JSON.
+	if modelType == "qwen3_5" {
+		t.toolCalls = "qwen3xml"
 	}
 	return t
 }

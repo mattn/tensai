@@ -123,8 +123,9 @@ func TestRenderToolRoundTrip(t *testing.T) {
 	if !strings.Contains(got, want) {
 		t.Errorf("call replay missing:\n%s", got)
 	}
-	// Consecutive results share one user turn, as the trained template does.
-	want = "<|im_start|>user\n<tool_response>\n{\"c\":22}\n</tool_response>" +
+	// Consecutive results share one user turn, each opening its own
+	// line, as the trained template writes them.
+	want = "<|im_start|>user\n<tool_response>\n{\"c\":22}\n</tool_response>\n" +
 		"<tool_response>\n{\"c\":19}\n</tool_response><|im_end|>\n"
 	if !strings.Contains(got, want) {
 		t.Errorf("tool results not grouped into one turn:\n%s", got)
@@ -149,6 +150,11 @@ func TestFamiliesWithoutToolConvention(t *testing.T) {
 		if tm := templateFor(style, false); tm.toolCalls != "hermes" {
 			t.Errorf("templateFor(%q).toolCalls = %q, want hermes", style, tm.toolCalls)
 		}
+	}
+	// Qwen3.5 speaks a convention of its own, not the one its
+	// predecessors were trained on.
+	if tm := templateFor("qwen3_5", false); tm.toolCalls != "qwen3xml" {
+		t.Errorf("templateFor(qwen3_5).toolCalls = %q, want qwen3xml", tm.toolCalls)
 	}
 }
 
@@ -187,5 +193,176 @@ func TestTemplateTakesTools(t *testing.T) {
 		if got := templateTakesTools(tt.tpl); got != tt.want {
 			t.Errorf("templateTakesTools(%s) = %v, want %v", tt.name, got, tt.want)
 		}
+	}
+}
+
+// Qwen3.5 does not speak the Hermes convention: its signatures lead the
+// system turn and a call is a <function> element, not JSON. Every string
+// checked here comes from the template the checkpoint ships.
+func qwen35() tmpl { return templateFor("qwen3_5", false) }
+
+func TestRenderQwen35OffersTools(t *testing.T) {
+	got := render(qwen35(), []chatMessage{{Role: "user", Content: "weather?"}}, "sys", []toolDef{weatherTool()})
+	for _, want := range []string{
+		"<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>",
+		`{"type": "function", "function": {"name": "get_weather", "description": "Look up the weather"`,
+		"If you choose to call a function ONLY reply in the following format with NO suffix:",
+		"<function=example_function_name>",
+		// The caller's own system text follows the block, not the
+		// other way round.
+		"</IMPORTANT>\n\nsys<|im_end|>",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("rendered prompt is missing %q:\n%s", want, got)
+		}
+	}
+	// The Hermes preamble must not leak into a family that never saw it.
+	if strings.Contains(got, "return a json object with function name") {
+		t.Errorf("qwen3.5 prompt carries the hermes preamble:\n%s", got)
+	}
+}
+
+func TestRenderQwen35ReplaysCalls(t *testing.T) {
+	idx := 0
+	msgs := []chatMessage{
+		{Role: "user", Content: "weather in Tokyo?"},
+		{Role: "assistant", Content: "Let me look.", ToolCalls: []toolCall{{
+			Index: &idx, ID: "call_0", Type: "function",
+			Function: callFunc{Name: "get_weather", Arguments: `{"city":"Tokyo","days":2}`},
+		}}},
+		{Role: "tool", ToolCallID: "call_0", Content: `{"c":22}`},
+	}
+	got := render(qwen35(), msgs, "sys", []toolDef{weatherTool()})
+	// The turn belongs to the query still being answered, so it keeps
+	// the think block its template writes there.
+	want := "<|im_start|>assistant\n<think>\n\n</think>\n\nLet me look.\n\n" +
+		"<tool_call>\n<function=get_weather>\n" +
+		"<parameter=city>\nTokyo\n</parameter>\n<parameter=days>\n2\n</parameter>\n" +
+		"</function>\n</tool_call><|im_end|>\n"
+	if !strings.Contains(got, want) {
+		t.Errorf("call replay missing:\n%s", got)
+	}
+	if !strings.HasSuffix(got, "<|im_start|>assistant\n<think>\n\n</think>\n\n") {
+		t.Errorf("prompt does not end with an open thinking turn:\n%s", got)
+	}
+}
+
+// An assistant turn older than the last user message loses the empty
+// think block, which is what the template does with it.
+func TestRenderQwen35DropsStaleThinkBlock(t *testing.T) {
+	msgs := []chatMessage{
+		{Role: "user", Content: "a"},
+		{Role: "assistant", Content: "b"},
+		{Role: "user", Content: "c"},
+	}
+	got := render(qwen35(), msgs, "sys", nil)
+	if !strings.Contains(got, "<|im_start|>assistant\nb<|im_end|>") {
+		t.Errorf("replayed answer grew a think block:\n%s", got)
+	}
+	if n := strings.Count(got, "<think>"); n != 1 {
+		t.Errorf("got %d think blocks, want only the open turn's:\n%s", n, got)
+	}
+}
+
+func TestParseXMLToolCalls(t *testing.T) {
+	tools := []toolDef{{Type: "function", Function: toolFunc{
+		Name: "f",
+		Parameters: json.RawMessage(`{"type":"object","properties":{` +
+			`"s":{"type":"string"},"n":{"type":"integer"},"b":{"type":"boolean"},` +
+			`"xs":{"type":"array"},"o":{"type":"object"}}}`),
+	}}}
+	for _, tt := range []struct {
+		name  string
+		in    string
+		text  string
+		calls []string
+	}{
+		{"plain text", "The capital is Paris.", "The capital is Paris.", nil},
+		{"one string argument",
+			"<tool_call>\n<function=f>\n<parameter=s>\nTokyo\n</parameter>\n</function>\n</tool_call>",
+			"", []string{`f({"s": "Tokyo"})`}},
+		// The schema is the only thing that says what a value means: a
+		// declared string stays text however numeric it looks.
+		{"types come from the schema",
+			"<tool_call>\n<function=f>\n<parameter=n>\n3\n</parameter>\n" +
+				"<parameter=b>\ntrue\n</parameter>\n<parameter=s>\n42\n</parameter>\n" +
+				"<parameter=xs>\n[1, 2]\n</parameter>\n</function>\n</tool_call>",
+			"", []string{`f({"n": 3, "b": true, "s": "42", "xs": [1, 2]})`}},
+		{"text before the call",
+			"I will look.\n<tool_call>\n<function=f>\n</function>\n</tool_call>",
+			"I will look.", []string{"f({})"}},
+		{"two calls",
+			"<tool_call>\n<function=f>\n<parameter=s>\na\n</parameter>\n</function>\n</tool_call>\n" +
+				"<tool_call>\n<function=f>\n<parameter=s>\nb\n</parameter>\n</function>\n</tool_call>",
+			"", []string{`f({"s": "a"})`, `f({"s": "b"})`}},
+		// A value may span lines, and only the newlines the format adds
+		// come off.
+		{"multi-line value",
+			"<tool_call>\n<function=f>\n<parameter=s>\nfirst\n\nlast\n</parameter>\n</function>\n</tool_call>",
+			"", []string{"f({\"s\": \"first\\n\\nlast\"})"}},
+		// Running out of tokens mid-block must not drop what arrived.
+		{"unterminated",
+			"<tool_call>\n<function=f>\n<parameter=s>\nTokyo\n</parameter>",
+			"", []string{`f({"s": "Tokyo"})`}},
+		// An argument the schema never mentions is text unless it is
+		// bracketed like JSON.
+		{"undeclared argument",
+			"<tool_call>\n<function=f>\n<parameter=zz>\n7\n</parameter>\n</function>\n</tool_call>",
+			"", []string{`f({"zz": "7"})`}},
+		// A reply that merely mentions the tag is not a call.
+		{"tag with no function", "see <tool_call>nonsense</tool_call> there",
+			"see <tool_call>nonsense there", nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			text, calls := parseXMLToolCalls(tt.in, tools)
+			if text != tt.text {
+				t.Errorf("text = %q, want %q", text, tt.text)
+			}
+			if len(calls) != len(tt.calls) {
+				t.Fatalf("got %d calls, want %d: %+v", len(calls), len(tt.calls), calls)
+			}
+			for i, want := range tt.calls {
+				got := calls[i].Function.Name + "(" + calls[i].Function.Arguments + ")"
+				if got != want {
+					t.Errorf("call %d = %s, want %s", i, got, want)
+				}
+				if calls[i].Index == nil || *calls[i].Index != i {
+					t.Errorf("call %d has index %v, want %d", i, calls[i].Index, i)
+				}
+				if calls[i].ID == "" || calls[i].Type != "function" {
+					t.Errorf("call %d = %+v, want an id and type function", i, calls[i])
+				}
+			}
+		})
+	}
+}
+
+// What a call parses to must be what replaying it writes back, or an
+// agent loop teaches the model a format it did not emit.
+func TestQwen35CallRoundTrip(t *testing.T) {
+	const block = "<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n" +
+		"</function>\n</tool_call>"
+	_, calls := parseXMLToolCalls(block, []toolDef{weatherTool()})
+	if len(calls) != 1 {
+		t.Fatalf("got %d calls, want 1", len(calls))
+	}
+	msgs := []chatMessage{{Role: "user", Content: "weather?"}, {Role: "assistant", ToolCalls: calls}}
+	if got := render(qwen35(), msgs, "sys", []toolDef{weatherTool()}); !strings.Contains(got, block) {
+		t.Errorf("replay does not reproduce the call:\n%s", got)
+	}
+}
+
+// Go escapes <, > and & and packs JSON tight; the template the model was
+// trained on does neither.
+func TestToolSignaturesMatchPythonJSON(t *testing.T) {
+	tool := toolDef{Type: "function", Function: toolFunc{
+		Name: "f", Description: "a < b & c > d",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"x":{"type":"string"}}}`),
+	}}
+	got := xmlToolPreamble([]toolDef{tool})
+	want := `{"type": "function", "function": {"name": "f", "description": "a < b & c > d", ` +
+		`"parameters": {"type": "object", "properties": {"x": {"type": "string"}}}}}`
+	if !strings.Contains(got, want) {
+		t.Errorf("signature is not written the way the template writes it:\ngot:  %s\nwant: %s", got, want)
 	}
 }
