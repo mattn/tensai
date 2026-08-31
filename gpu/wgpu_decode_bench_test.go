@@ -70,6 +70,79 @@ func TestGPUMatMulRMSNorm(t *testing.T) {
 	}
 }
 
+// benchChainSplit is benchChain with the submission cut in half: the
+// first half of the links flushes mid-chain, so the device starts while
+// the host encodes the rest. The difference against the one-submission
+// chain prices a mid-token flush.
+func benchChainSplit(b *testing.B, links, inter int) {
+	g, err := Open()
+	if err != nil {
+		b.Skipf("wgpu unavailable: %v", err)
+	}
+	defer g.Close()
+	rng := rand.New(rand.NewSource(64))
+	up, err := g.UploadQ8(quant.Quantize(tensai.RandomMatrix(896, inter, rng)))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer up.Free()
+	down, err := g.UploadQ8(quant.Quantize(tensai.RandomMatrix(inter, 896, rng)))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer down.Free()
+	x, err := g.Upload(randTensor(rng, 1, 896))
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer x.Free()
+	run := func() {
+		if err := g.BeginBatch(); err != nil {
+			b.Fatal(err)
+		}
+		cur := x
+		for i := 0; i < links; i++ {
+			if i == links/2 {
+				if err := g.Flush(); err != nil {
+					b.Fatal(err)
+				}
+				if err := g.BeginBatch(); err != nil {
+					b.Fatal(err)
+				}
+			}
+			h, err := up.MatMul(cur)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if cur != x {
+				cur.Free()
+			}
+			o, err := down.MatMul(h)
+			if err != nil {
+				b.Fatal(err)
+			}
+			h.Free()
+			cur = o
+		}
+		out, err := cur.DownloadRange(0, 896)
+		if err != nil {
+			b.Fatal(err)
+		}
+		_ = out
+		if cur != x {
+			cur.Free()
+		}
+	}
+	run()
+	b.SetBytes(int64(links) * 2 * 896 * int64(inter))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		run()
+	}
+}
+
+func BenchmarkGPUDecodeChain48Split(b *testing.B) { benchChainSplit(b, 24, 4864) }
+
 // benchChain times a decode-shaped dispatch chain: single-row matvecs
 // bouncing between hidden and intermediate width, all recorded into one
 // submission the way step() records a token, flushed by one readback.
