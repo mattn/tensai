@@ -48,7 +48,7 @@ Run "tensai <command> -h" for the command's flags.`
 // Options they fill.
 func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 	o := &llm.Options{Log: os.Stderr}
-	model := fs.String("model", "", `which model to run: a name from "tensai models", a path to a directory or .gguf, or a Hugging Face repo to download`)
+	model := fs.String("model", "", `which model to run: a name from "tensai models", a path to a directory or .gguf, a Hugging Face repo to download, or org/repo/file.gguf for one of its gguf files`)
 	q8 := fs.Bool("q8", false, "decode against int8-quantized weights")
 	q4 := fs.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
 	fs.BoolVar(&o.GPU, "gpu", false, "decode on the GPU (requires -q8 or -q4 and a wgpu build tag)")
@@ -127,13 +127,8 @@ func resolveModel(o *llm.Options, ref string) error {
 			return local(ref)
 		}
 	}
-	// A reference that can only be a filesystem path must exist: letting
-	// an absolute path or a .gguf name fall through would send it to the
-	// network as if it were a repo and leave a junk directory named after
-	// the typo in the cache.
-	if filepath.IsAbs(ref) || strings.HasSuffix(ref, ".gguf") {
-		return fmt.Errorf("no model at %s", ref)
-	}
+	// A cached model by bare name — gguf files included, so the name
+	// "tensai models" prints is always a valid reference.
 	root := llm.CacheRoot()
 	if ref == filepath.Base(ref) {
 		for _, cand := range []string{ref, ref + ".gguf"} {
@@ -143,6 +138,22 @@ func resolveModel(o *llm.Options, ref string) error {
 			}
 			return local(p)
 		}
+	}
+	// org/repo/file.gguf names one file in a Hugging Face repo: download
+	// it into the cache root, where the listing and a bare name find it.
+	if strings.HasSuffix(ref, ".gguf") && !filepath.IsAbs(ref) && strings.Count(ref, "/") == 2 {
+		p, err := llm.FetchGGUF(ref)
+		if err != nil {
+			return err
+		}
+		return local(p)
+	}
+	// A reference that can only be a filesystem path must exist: letting
+	// an absolute path or a .gguf name fall through would send it to the
+	// network as if it were a repo and leave a junk directory named after
+	// the typo in the cache.
+	if filepath.IsAbs(ref) || strings.HasSuffix(ref, ".gguf") {
+		return fmt.Errorf("no model at %s", ref)
 	}
 	// Nothing local: the last reading that can still work is a repo, and
 	// a repo has an org, so a bare name here is simply not found.

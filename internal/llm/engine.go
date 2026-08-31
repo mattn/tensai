@@ -571,6 +571,22 @@ func fetchOnce(base, dir, name, tmp string) (retry bool, err error) {
 	return false, nil
 }
 
+// FetchGGUF downloads one GGUF file from a Hugging Face repo — a
+// reference of the form org/repo/file.gguf — into the cache root and
+// returns the local path. The file keeps its own name and lands beside
+// the other cached ggufs, so "tensai models" lists it and a later bare
+// file name finds it. An already-downloaded file returns immediately,
+// and a partial one resumes.
+func FetchGGUF(ref string) (string, error) {
+	parts := strings.Split(ref, "/")
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" ||
+		!strings.HasSuffix(parts[2], ".gguf") || parts[2] == ".gguf" {
+		return "", fmt.Errorf("gguf reference %q is not org/repo/file.gguf", ref)
+	}
+	base := "https://huggingface.co/" + parts[0] + "/" + parts[1] + "/resolve/main/"
+	return fetch(base, CacheRoot(), parts[2])
+}
+
 // progressReader reports download progress on stderr, at most twice a
 // second so slow terminals don't throttle the transfer.
 type progressReader struct {

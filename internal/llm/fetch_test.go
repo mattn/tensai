@@ -174,3 +174,19 @@ func TestFetchDoesNotRetryNotFound(t *testing.T) {
 		t.Errorf("a 404 was retried %d times", n-1)
 	}
 }
+
+func TestFetchGGUFRejectsBadRefs(t *testing.T) {
+	for _, ref := range []string{
+		"file.gguf",              // no repo
+		"repo/file.gguf",         // no org
+		"org/repo/sub/file.gguf", // nested path
+		"org/repo/file",          // not a gguf
+		"org//file.gguf",         // empty repo
+		"//file.gguf",            // empty org and repo
+		"org/repo/.gguf",         // no file name
+	} {
+		if _, err := FetchGGUF(ref); err == nil {
+			t.Errorf("FetchGGUF(%q): expected an error", ref)
+		}
+	}
+}
