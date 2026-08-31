@@ -41,7 +41,7 @@ func (c *Cell) Step(x, h *autograd.Node) *autograd.Node {
 
 // InitState returns a zero hidden state for the given batch size.
 func (c *Cell) InitState(batch int) *autograd.Node {
-	return autograd.Input(tensai.NewMatrix(batch, c.Wh.Value.Rows))
+	return autograd.Input(tensai.NewMatrix(batch, c.Wh.Value.Shape[0]))
 }
 
 // Params returns the cell's trainable parameters, for NewTrainer.
@@ -94,7 +94,7 @@ func (c *LSTMCell) Step(x, h, cell *autograd.Node) (*autograd.Node, *autograd.No
 
 // InitState returns zero (hidden, cell) states for the given batch size.
 func (c *LSTMCell) InitState(batch int) (*autograd.Node, *autograd.Node) {
-	hidden := c.Whf.Value.Rows
+	hidden := c.Whf.Value.Shape[0]
 	return autograd.Input(tensai.NewMatrix(batch, hidden)), autograd.Input(tensai.NewMatrix(batch, hidden))
 }
 
@@ -111,7 +111,7 @@ func (c *LSTMCell) Params() []*autograd.Node {
 // Attention computes scaled dot-product attention softmax(q*k^T/sqrt(d))*v
 // for a single sequence, where q, k, v are (seqLen x d) nodes.
 func Attention(q, k, v *autograd.Node) *autograd.Node {
-	scale := 1 / kernels.SqrtF(tensai.Float(k.Value.Cols))
+	scale := 1 / kernels.SqrtF(tensai.Float(k.Value.Shape[1]))
 	return q.MatMul(k.T()).Scale(scale).Softmax().MatMul(v)
 }
 

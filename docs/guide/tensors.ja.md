@@ -50,6 +50,8 @@ out, _ := tensai.MatMul(scores, v)                // バッチ全体の attentio
 
 バッチ `MatMul` 内部の行列ごとの積は `Dot` と同じカーネルで走り、バッチ方向に並列化されます。
 
+`MatMulTN` と `MatMulNT` は片方を転置した積 (`a^T * b` と `a * b^T`) です。どちらも両オペランドを行方向に読み、転置コピーを作りません。自動微分の逆伝播や attention の `q * k^T` が欲しいのはこの形です。それぞれに `Into` 形 (`MatMulInto`, `MatMulTNInto`, `MatMulNTInto`、および `AddInto`/`SubInto`/`MulInto`/`DivInto`) があり、呼び出し側が持つテンソルに書き込むので、学習ループから確保を無くせます。
+
 ### ブロードキャスト規則
 
 形状は末尾の軸から前へ向かって比較されます。NumPy とまったく同じで、2 つの軸は等しいか一方が 1 のとき互換で、足りない先頭の軸は 1 とみなされます。結果は各軸の大きい方の長さになります。

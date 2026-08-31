@@ -11,7 +11,7 @@
 ## Features
 
 - **Matrix operations** - `Matrix` plus basic operations such as `Dot`, `Add`, `T`, and `AddBias`. Tensors are float32 (`tensai.Float`)
-- **N-dimensional tensors** - `Tensor` generalizes `Matrix` to any rank: element-wise `Add`/`Sub`/`Mul`/`Div` with NumPy-style broadcasting, batched `MatMul` (the leading axes broadcast, the per-matrix products run on the same kernel as `Dot`, parallelized across the batch), axis-permuting `Transpose`, `Reshape` with `-1` inference, and zero-copy views to and from `Matrix`
+- **N-dimensional tensors** - `Tensor` generalizes `Matrix` to any rank: element-wise `Add`/`Sub`/`Mul`/`Div` with NumPy-style broadcasting, batched `MatMul` (the leading axes broadcast, the per-matrix products run on the same kernel as `Dot`, parallelized across the batch) plus its transposed forms `MatMulTN` and `MatMulNT`, so a backward pass never materializes a transposed copy, axis-permuting `Transpose`, `Reshape` with `-1` inference, and zero-copy views to and from `Matrix`
 - **SIMD acceleration** - AVX2 kernels written with Go's experimental `simd/archsimd` package: still pure Go, no cgo, no assembly files. Matmul, ReLU/LeakyReLU, Sigmoid/Tanh/Softmax (via a vectorized polynomial `exp`), GELU (via a vectorized `erf`), LayerNorm, and the Adam update are all 8-lane vectorized. Build with `GOEXPERIMENT=simd` on amd64 (Go 1.26 and 1.27 APIs both supported via build tags); every other build uses the portable fallbacks automatically
 - **Low-allocation training** - layers reuse their forward/backward scratch buffers across training steps (a full MLP step runs in ~29 allocations), so GC stays out of the training loop; `Predict` always returns freshly allocated results
 - **Layers** - `Embedding`, `Dense`, `Conv2D`, `MaxPool2D`, `BatchNorm`, `LayerNorm`, `Dropout`, plus `ReLU`, `LeakyReLU`, `GELU`, `Sigmoid`, `Tanh`, and `Softmax` activations
@@ -22,7 +22,7 @@
 - **k-NN baseline** - a `knn.Classifier` whose distance matrix runs on the same SIMD matmul kernel; useful as a no-training baseline next to the networks
 - **Dataset utilities** - `Dataset` pairs inputs with targets and provides `Shuffle`, train/test `Split` (copy-free views), buffer-reusing mini-batch iteration with `Batches`, and `Standardize`/`StandardizeWith`
 - **Sequential models** - stack layers and run `Compile` -> `Fit` / `FitStep` -> `Predict`
-- **Automatic differentiation** - a micrograd-style reverse-mode autograd engine over matrices (`Param` / `Input` / `Backward`), for models that don't fit the Sequential mold; `ToDot` renders the computation graph for Graphviz
+- **Automatic differentiation** - a micrograd-style reverse-mode autograd engine over n-dimensional tensors (`Param` / `Input` / `Backward`), for models that don't fit the Sequential mold. Values are `Tensor`s, so the same ops run on (batch, seq, model) activations: broadcasting element-wise arithmetic, batched `MatMul`, `Transpose`/`Reshape`, last-axis `Softmax`, axis reductions, `LayerNorm`, embedding `Embed`, and `CrossEntropy` all carry gradients, and a `Matrix` is still accepted anywhere a leaf is built. `ToDot` renders the computation graph for Graphviz
 - **Recurrence and attention** - `rnn.Cell`, `rnn.LSTMCell`, and single-head `rnn.SelfAttention` built on the autograd engine, with backpropagation through time handled automatically
 - **Serialization** - `Save`/`Load` (and `SaveFile`/`LoadFile`) round-trip trained Sequential parameters as JSON, including BatchNorm running statistics; `SaveParams`/`LoadParams` do the same for autograd parameters (RNN/LSTM/attention cells)
 - **TFLite export** - the `encoding/tflite` package marshals Sequential models (FP32, NHWC) into `.tflite` flatbuffers that run on the TFLite/LiteRT runtimes and [go-tflite](https://github.com/mattn/go-tflite), with the FlatBuffers writer implemented in-tree — still no dependencies
@@ -243,7 +243,7 @@ w2 := autograd.Param(tensai.RandomMatrix(8, 1, rng))
 trainer := autograd.NewTrainer(optim.NewAdam(0.05), w1, b1, w2)
 
 for step := 0; step < 2000; step++ {
-	loss := autograd.Input(x).MatMul(w1).AddRow(b1).Tanh().MatMul(w2).Sigmoid().MSELoss(y)
+	loss := autograd.Input(x).MatMul(w1).AddRow(b1).Tanh().MatMul(w2).Sigmoid().MSELoss(y.Tensor())
 	trainer.Step(loss) // backward + update + zero grads, returns the loss value
 }
 ```
@@ -252,7 +252,9 @@ For manual control, the pieces are still public: `loss.Backward()`, `p.Grad`, an
 
 The graph a loss node holds can be visualized: `loss.ToDot()` returns Graphviz DOT (label leaves with `.Named("w1")`), so `go run ./_example/dot | dot -Tsvg > graph.svg` draws the network the same way Gorgonia's encoding/dot does.
 
-Graphs are built dynamically per step (define-by-run) and are single-use. Available ops: `MatMul`, `Add`, `Sub`, `MulElem`, `Scale`, `AddRow`, `T`, `Softmax`, `ReLU`, `Sigmoid`, `Tanh`, `Sum`, `Mean`, `MSELoss`, and `SoftmaxCELoss`. Shape mismatches panic during graph construction. Every op's gradient is verified against finite differences in the test suite.
+A `Tape` recycles the buffers a step allocates — `tape.Bind(params...)` once, `tape.Reset()` after each step — which takes `_example/charrnn` from 22MB of allocation per training step to 0.75MB and about a quarter off its wall time; nothing from the finished step may be read after `Reset`. The same reuse is available one layer down through the `MatMulInto` / `AddInto` family, as `DotInto` has always offered for matrices.
+
+Graphs are built dynamically per step (define-by-run) and are single-use. Available ops: `MatMul` (batched, with broadcast leading axes), `Add`, `Sub`, `Mul`/`MulElem`, `Div`, `Scale`, `Neg`, `AddRow`, `T`/`Transpose`, `Reshape`, `Softmax` (last axis), `Sum`, `Mean`, `SumAxis`/`MeanAxis`, `LayerNorm`, `Embed`, `ReLU`, `LeakyReLU`, `Sigmoid`, `Tanh`, `GELU`, `Exp`, `Log`, `MSELoss`, `SoftmaxCELoss`, and `CrossEntropy`. Element-wise ops broadcast NumPy-style, and a gradient is summed back over whatever axes an operand was stretched along. Shape mismatches panic during graph construction. Every op's gradient is verified against finite differences in the test suite.
 
 ### Recurrent networks and attention
 
@@ -270,7 +272,7 @@ for step := 0; step < epochs; step++ {
 		h, c = cell.Step(autograd.Input(x), h, c)
 	}
 	logits := h.MatMul(wOut).AddRow(bOut)
-	trainer.Step(logits.SoftmaxCELoss(labels))
+	trainer.Step(logits.CrossEntropy(labels)) // labels is a []int of class indices
 }
 ```
 

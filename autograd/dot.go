@@ -50,7 +50,7 @@ func (n *Node) ToDot() string {
 			}
 			attrs = `shape=box, style=filled, fillcolor="#EFEFEF"`
 		}
-		label += fmt.Sprintf("\\n%dx%d", x.Value.Rows, x.Value.Cols)
+		label += "\\n" + shapeString(x.Value.Shape)
 		fmt.Fprintf(&sb, "  n%d [label=\"%s\", %s];\n", id, label, attrs)
 
 		for _, p := range x.parents {

@@ -325,3 +325,80 @@ func TestTensorReshapeAndViews(t *testing.T) {
 		t.Fatal("expected validate error")
 	}
 }
+
+// TestMatMulTransposedModes checks the two transposed products against the
+// same result built with an explicit Transpose, for plain and batched
+// shapes and for a broadcast operand.
+func TestMatMulTransposedModes(t *testing.T) {
+	rng := rand.New(rand.NewSource(97))
+	cases := []struct {
+		a, b []int
+	}{
+		{[]int{4, 3}, []int{4, 5}},       // a^T * b, plain
+		{[]int{2, 4, 3}, []int{2, 4, 5}}, // batched
+		{[]int{2, 3, 4, 3}, []int{4, 5}}, // broadcast b
+		{[]int{4, 3}, []int{2, 4, 5}},    // broadcast a
+	}
+	for _, c := range cases {
+		a, b := randTensor(rng, c.a...), randTensor(rng, c.b...)
+		at, err := a.Transpose()
+		if err != nil {
+			t.Fatalf("transpose %v: %v", c.a, err)
+		}
+		want, err := MatMul(at, b)
+		if err != nil {
+			t.Fatalf("matmul %v^T*%v: %v", c.a, c.b, err)
+		}
+		got, err := MatMulTN(a, b)
+		if err != nil {
+			t.Fatalf("matmul TN %v*%v: %v", c.a, c.b, err)
+		}
+		tensorsClose(t, got, want, 1e-4)
+	}
+
+	ntCases := []struct {
+		a, b []int
+	}{
+		{[]int{4, 3}, []int{5, 3}},
+		{[]int{2, 4, 3}, []int{2, 5, 3}},
+		{[]int{2, 3, 4, 3}, []int{5, 3}},
+		{[]int{4, 3}, []int{2, 5, 3}},
+	}
+	for _, c := range ntCases {
+		a, b := randTensor(rng, c.a...), randTensor(rng, c.b...)
+		bt, err := b.Transpose()
+		if err != nil {
+			t.Fatalf("transpose %v: %v", c.b, err)
+		}
+		want, err := MatMul(a, bt)
+		if err != nil {
+			t.Fatalf("matmul %v*%v^T: %v", c.a, c.b, err)
+		}
+		got, err := MatMulNT(a, b)
+		if err != nil {
+			t.Fatalf("matmul NT %v*%v: %v", c.a, c.b, err)
+		}
+		tensorsClose(t, got, want, 1e-4)
+	}
+
+	// Mismatched inner dimensions must be rejected, not silently reshaped.
+	if _, err := MatMulTN(randTensor(rng, 4, 3), randTensor(rng, 5, 2)); err == nil {
+		t.Error("MatMulTN with mismatched rows should fail")
+	}
+	if _, err := MatMulNT(randTensor(rng, 4, 3), randTensor(rng, 5, 2)); err == nil {
+		t.Error("MatMulNT with mismatched columns should fail")
+	}
+}
+
+// TestTensorClone checks that a clone shares no memory with its source.
+func TestTensorClone(t *testing.T) {
+	rng := rand.New(rand.NewSource(5))
+	a := randTensor(rng, 2, 3, 4)
+	b := a.Clone()
+	tensorsClose(t, b, a, 0)
+	b.Data[0] += 1
+	b.Shape[0] = 1
+	if a.Data[0] == b.Data[0] || a.Shape[0] != 2 {
+		t.Error("clone shares storage with the original")
+	}
+}

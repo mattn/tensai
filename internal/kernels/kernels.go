@@ -111,6 +111,34 @@ func expShiftGeneric(dst, src []float32, shift float32) {
 	}
 }
 
+// binSlicesGeneric computes dst = x op y for the four element-wise binary
+// ops the tensors broadcast with. They are separate loops rather than one
+// loop over a function value: the row is often short, and an indirect call
+// per element costs more than the arithmetic does.
+func addSlicesGeneric(dst, x, y []float32) {
+	for i := range dst {
+		dst[i] = x[i] + y[i]
+	}
+}
+
+func subSlicesGeneric(dst, x, y []float32) {
+	for i := range dst {
+		dst[i] = x[i] - y[i]
+	}
+}
+
+func mulSlicesGeneric(dst, x, y []float32) {
+	for i := range dst {
+		dst[i] = x[i] * y[i]
+	}
+}
+
+func divSlicesGeneric(dst, x, y []float32) {
+	for i := range dst {
+		dst[i] = x[i] / y[i]
+	}
+}
+
 // addSliceGeneric computes dst += src.
 func addSliceGeneric(dst, src []float32) {
 	for i, v := range src {
