@@ -454,8 +454,12 @@ func modelsCmd(args []string) error {
 			return fmt.Errorf("usage: tensai models rm <name>...")
 		}
 		for _, name := range args[1:] {
-			// The listing may print an org/name, which is what a user
-			// copies; the cache directory is only ever the last element.
+			// The listing may print an org/name — or org/repo/file.gguf
+			// for a downloaded gguf — which is what a user copies; the
+			// cached entry is only ever the last element.
+			if strings.Count(name, "/") == 2 && strings.HasSuffix(name, ".gguf") {
+				name = name[strings.LastIndex(name, "/")+1:]
+			}
 			if org, base, ok := strings.Cut(name, "/"); ok {
 				if org == "" || org != filepath.Base(org) || org == "." || org == ".." ||
 					strings.Contains(base, "/") {
@@ -475,8 +479,9 @@ func modelsCmd(args []string) error {
 			}
 			fmt.Println("removed", target)
 			if strings.HasSuffix(name, ".gguf") {
-				// The repack caches live beside their gguf.
-				caches, _ := filepath.Glob(target + ".tensai-*.cache")
+				// The repack caches and the origin sidecar live beside
+				// their gguf.
+				caches, _ := filepath.Glob(target + ".tensai-*")
 				for _, c := range caches {
 					if os.Remove(c) == nil {
 						fmt.Println("removed", c)
@@ -524,7 +529,14 @@ func modelsCmd(args []string) error {
 					}
 				}
 			}
-			emit(ent.Name(), fmt.Sprintf("%-40s %8s  %-8s %-11s %s", ent.Name(), humanSize(size), "gguf",
+			name := ent.Name()
+			// A downloaded gguf lists under its repo, and the full
+			// org/repo/file.gguf it prints is itself a -model reference
+			// that fetches the same file elsewhere.
+			if repo := llm.GGUFOrigin(filepath.Join(root, ent.Name())); repo != "" {
+				name = repo + "/" + ent.Name()
+			}
+			emit(name, fmt.Sprintf("%-40s %8s  %-8s %-11s %s", name, humanSize(size), "gguf",
 				llm.Inspect(filepath.Join(root, ent.Name())), newest.Format("2006-01-02")))
 			total += size
 			found = true
