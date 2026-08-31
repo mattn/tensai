@@ -508,10 +508,13 @@ func modelsCmd(args []string) error {
 	// Rows are collected before printing: naming a model by the repo it
 	// came from moves it out of directory order, and a listing that
 	// looks unsorted is harder to read than one that is.
-	type row struct{ name, line string }
+	// The name column widens to the longest entry when it prints, so a
+	// long org/repo/file.gguf reference does not shear the columns after
+	// it out of line.
+	type row struct{ name, rest string }
 	var rows []row
-	emit := func(name, line string) {
-		rows = append(rows, row{name, line})
+	emit := func(name, rest string) {
+		rows = append(rows, row{name, rest})
 	}
 	for _, ent := range entries {
 		if !ent.IsDir() {
@@ -536,7 +539,7 @@ func modelsCmd(args []string) error {
 			if repo := llm.GGUFOrigin(filepath.Join(root, ent.Name())); repo != "" {
 				name = repo + "/" + ent.Name()
 			}
-			emit(name, fmt.Sprintf("%-40s %8s  %-8s %-11s %s", name, humanSize(size), "gguf",
+			emit(name, fmt.Sprintf("%8s  %-8s %-11s %s", humanSize(size), "gguf",
 				llm.Inspect(filepath.Join(root, ent.Name())), newest.Format("2006-01-02")))
 			total += size
 			found = true
@@ -581,7 +584,7 @@ func modelsCmd(args []string) error {
 		if repo := llm.Origin(dir); repo != "" {
 			name = repo
 		}
-		emit(name, fmt.Sprintf("%-40s %8s  %-8s %-11s %s", name, humanSize(size), kind,
+		emit(name, fmt.Sprintf("%8s  %-8s %-11s %s", humanSize(size), kind,
 			llm.Inspect(dir), newest.Format("2006-01-02")))
 		total += size
 		found = true
@@ -593,11 +596,15 @@ func modelsCmd(args []string) error {
 		}
 		return rows[i].name < rows[j].name
 	})
+	width := 40
 	for _, r := range rows {
-		fmt.Println(r.line)
+		width = max(width, len(r.name))
+	}
+	for _, r := range rows {
+		fmt.Printf("%-*s %s\n", width, r.name, r.rest)
 	}
 	if found {
-		fmt.Printf("%-40s %8s  (%s)\n", "total", humanSize(total), root)
+		fmt.Printf("%-*s %8s  (%s)\n", width, "total", humanSize(total), root)
 	} else {
 		fmt.Fprintf(os.Stderr, "no cached models under %s\n", root)
 	}
