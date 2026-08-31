@@ -500,6 +500,18 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 		panic(err)
 	}
 	for i := range gq.layers {
+		// A whole token is ~3ms of host-side encoding, serial with the
+		// device under one submission. Cutting every eight layers lets
+		// the device chew the early layers while the host encodes the
+		// late ones; a submission boundary costs ~0.24ms against it.
+		if i > 0 && i%6 == 0 {
+			if err := gq.g.Flush(); err != nil {
+				panic(err)
+			}
+			if err := gq.g.BeginBatch(); err != nil {
+				panic(err)
+			}
+		}
 		l := &gq.layers[i]
 		q, k, v, qkvOwner := gq.qkv(l, x, l.ln1, cfg.RMSEps)
 		if l.qNorm != nil {
