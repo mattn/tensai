@@ -14,7 +14,7 @@ import (
 // checkParamGrad compares the analytic gradient of loss w.r.t. param against
 // finite differences. build must construct the graph fresh from the current
 // matrix contents and return (loss node, param node).
-func checkParamGrad(t *testing.T, param *tensai.Matrix, build func() (*autograd.Node, *autograd.Node), name string) {
+func checkParamGrad(t *testing.T, param *tensai.Tensor, build func() (*autograd.Node, *autograd.Node), name string) {
 	t.Helper()
 	loss, p := build()
 	// Param nodes may be shared across successive checks; Backward
@@ -154,7 +154,7 @@ func TestRNNLearnsParity(t *testing.T) {
 
 	var lossVal tensai.Float
 	for step := 0; step < 800; step++ {
-		lossVal = trainer.Step(forward().SoftmaxCELoss(targets))
+		lossVal = trainer.Step(forward().SoftmaxCELoss(targets.Tensor()))
 	}
 	if lossVal > 0.1 {
 		t.Fatalf("RNN failed to learn parity: loss=%g", lossVal)
@@ -176,7 +176,7 @@ func TestSaveLoadParams(t *testing.T) {
 	cell := NewLSTMCell(3, 5, rng)
 	x := tensai.RandomMatrix(4, 3, rng)
 
-	forward := func(c *LSTMCell) *tensai.Matrix {
+	forward := func(c *LSTMCell) *tensai.Tensor {
 		h, s := c.InitState(4)
 		h, _ = c.Step(autograd.Input(x), h, s)
 		return h.Value

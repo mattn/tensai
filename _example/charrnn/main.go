@@ -73,11 +73,11 @@ func (m *charModel) loss(text []rune, pos []int) *autograd.Node {
 	for t := 0; t < seqLen; t++ {
 		logits, hn, cn := m.step(autograd.Input(m.oneHot(text, pos, t)), h, c)
 		h, c = hn, cn
-		targets := tensai.NewMatrix(len(pos), 1)
+		targets := make([]int, len(pos))
 		for i, p := range pos {
-			targets.Data[i] = float32(m.index[text[p+t+1]])
+			targets[i] = m.index[text[p+t+1]]
 		}
-		l := logits.SoftmaxCELoss(targets)
+		l := logits.CrossEntropy(targets)
 		if total == nil {
 			total = l
 		} else {
@@ -143,12 +143,20 @@ func main() {
 	model := newCharModel(vocab, rng)
 	trainer := autograd.NewTrainer(optim.NewAdam(0.01), model.params()...)
 
+	// Unrolling 32 steps builds a large graph every iteration. Binding the
+	// parameters to a tape lets each iteration reuse the previous one's
+	// buffers instead of allocating them again: nothing from the finished
+	// step may be read after Reset, which suits a training loop exactly.
+	tape := autograd.NewTape()
+	tape.Bind(model.params()...)
+
 	for it := 1; it <= iters; it++ {
 		pos := make([]int, batchSize)
 		for i := range pos {
 			pos[i] = rng.Intn(len(text) - seqLen - 1)
 		}
 		lossVal := trainer.Step(model.loss(text, pos))
+		tape.Reset()
 		if it == 1 || it%50 == 0 {
 			fmt.Printf("iter %4d: loss=%.4f\n", it, lossVal)
 		}

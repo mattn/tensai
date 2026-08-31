@@ -194,6 +194,49 @@ func ExpShift(dst, src []float32, shift float32) {
 	})
 }
 
+// AddSlices, SubSlices, MulSlices and DivSlices compute dst = x op y, the
+// element-wise ops the tensor package broadcasts with. mapSlices2 already
+// takes a separate destination, so each is one vector body.
+func AddSlices(dst, x, y []float32) {
+	if !simd.HasAVX2 {
+		addSlicesGeneric(dst, x, y)
+		return
+	}
+	mapSlices2(dst, x, y, func(a, b archsimd.Float32x8) archsimd.Float32x8 {
+		return a.Add(b)
+	})
+}
+
+func SubSlices(dst, x, y []float32) {
+	if !simd.HasAVX2 {
+		subSlicesGeneric(dst, x, y)
+		return
+	}
+	mapSlices2(dst, x, y, func(a, b archsimd.Float32x8) archsimd.Float32x8 {
+		return a.Sub(b)
+	})
+}
+
+func MulSlices(dst, x, y []float32) {
+	if !simd.HasAVX2 {
+		mulSlicesGeneric(dst, x, y)
+		return
+	}
+	mapSlices2(dst, x, y, func(a, b archsimd.Float32x8) archsimd.Float32x8 {
+		return a.Mul(b)
+	})
+}
+
+func DivSlices(dst, x, y []float32) {
+	if !simd.HasAVX2 {
+		divSlicesGeneric(dst, x, y)
+		return
+	}
+	mapSlices2(dst, x, y, func(a, b archsimd.Float32x8) archsimd.Float32x8 {
+		return a.Div(b)
+	})
+}
+
 func AddSlice(dst, src []float32) {
 	if !simd.HasAVX2 {
 		addSliceGeneric(dst, src)

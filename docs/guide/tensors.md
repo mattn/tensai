@@ -50,6 +50,8 @@ out, _ := tensai.MatMul(scores, v)                // attention for the whole bat
 
 The per-matrix products inside a batched `MatMul` run on the same kernel as `Dot`, parallelized across the batch.
 
+`MatMulTN` and `MatMulNT` are the same product with one operand transposed — `a^T * b` and `a * b^T`. They read both operands row-wise and never build a transposed copy, which is what the autograd backward pass and attention's `q * k^T` want. Each also has an `Into` form (`MatMulInto`, `MatMulTNInto`, `MatMulNTInto`, and `AddInto`/`SubInto`/`MulInto`/`DivInto`) that writes into a tensor you already own, so a training loop can stop allocating altogether.
+
 ### Broadcasting rules
 
 Shapes are compared from the trailing axis backwards, exactly as in NumPy: two axes are compatible when they are equal or one of them is 1, and missing leading axes count as 1. The result takes the larger extent on every axis.

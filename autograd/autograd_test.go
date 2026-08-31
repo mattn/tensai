@@ -13,7 +13,7 @@ import (
 // checkParamGrad compares the analytic gradient of loss w.r.t. param against
 // finite differences. build must construct the graph fresh from the current
 // matrix contents and return (loss node, param node).
-func checkParamGrad(t *testing.T, param *tensai.Matrix, build func() (*Node, *Node), name string) {
+func checkParamGrad(t *testing.T, param *tensai.Tensor, build func() (*Node, *Node), name string) {
 	t.Helper()
 	loss, p := build()
 	// Param nodes may be shared across successive checks; Backward
@@ -47,14 +47,14 @@ func checkParamGrad(t *testing.T, param *tensai.Matrix, build func() (*Node, *No
 
 func TestAutogradOps(t *testing.T) {
 	rng := rand.New(rand.NewSource(31))
-	w := tensai.RandomMatrix(3, 4, rng)
-	x := tensai.RandomMatrix(5, 3, rng)
-	b := tensai.RandomMatrix(1, 4, rng)
-	other := tensai.RandomMatrix(5, 4, rng)
+	w := tensai.RandomMatrix(3, 4, rng).Tensor()
+	x := tensai.RandomMatrix(5, 3, rng).Tensor()
+	b := tensai.RandomMatrix(1, 4, rng).Tensor()
+	other := tensai.RandomMatrix(5, 4, rng).Tensor()
 
 	cases := []struct {
 		name  string
-		param *tensai.Matrix
+		param *tensai.Tensor
 		build func() (*Node, *Node)
 	}{
 		{"matmul", w, func() (*Node, *Node) {
@@ -86,9 +86,9 @@ func TestAutogradOps(t *testing.T) {
 
 func TestAutogradSoftmaxCE(t *testing.T) {
 	rng := rand.New(rand.NewSource(37))
-	w := tensai.RandomMatrix(3, 4, rng)
-	x := tensai.RandomMatrix(6, 3, rng)
-	target := tensai.NewMatrix(6, 1)
+	w := tensai.RandomMatrix(3, 4, rng).Tensor()
+	x := tensai.RandomMatrix(6, 3, rng).Tensor()
+	target := tensai.NewMatrix(6, 1).Tensor()
 	for i := range target.Data {
 		target.Data[i] = tensai.Float(rng.Intn(4))
 	}
@@ -100,9 +100,9 @@ func TestAutogradSoftmaxCE(t *testing.T) {
 
 func TestAutogradSharedParam(t *testing.T) {
 	// A parameter used twice must accumulate both contributions.
-	w := tensai.NewMatrix(2, 2)
+	w := tensai.NewTensor(2, 2)
 	w.Data = []tensai.Float{1, 2, 3, 4}
-	x := tensai.NewMatrix(1, 2)
+	x := tensai.NewTensor(1, 2)
 	x.Data = []tensai.Float{1, 1}
 	checkParamGrad(t, w, func() (*Node, *Node) {
 		p := Param(w)
@@ -134,7 +134,7 @@ func TestAutogradTrainsXOR(t *testing.T) {
 
 	var lossVal tensai.Float
 	for step := 0; step < 2000; step++ {
-		lossVal = trainer.Step(forward(inputs).MSELoss(targets))
+		lossVal = trainer.Step(forward(inputs).MSELoss(targets.Tensor()))
 	}
 	if lossVal > 0.01 {
 		t.Fatalf("autograd XOR failed to converge: loss=%g", lossVal)
@@ -173,8 +173,8 @@ func TestToDot(t *testing.T) {
 
 func TestAutogradTransposeAndSoftmax(t *testing.T) {
 	rng := rand.New(rand.NewSource(41))
-	w := tensai.RandomMatrix(3, 4, rng)
-	x := tensai.RandomMatrix(5, 3, rng)
+	w := tensai.RandomMatrix(3, 4, rng).Tensor()
+	x := tensai.RandomMatrix(5, 3, rng).Tensor()
 
 	checkParamGrad(t, w, func() (*Node, *Node) {
 		p := Param(w)
@@ -183,7 +183,7 @@ func TestAutogradTransposeAndSoftmax(t *testing.T) {
 
 	// Weighted sum keeps the softmax gradient non-trivial (a plain Sum of
 	// each row is constant 1 and would zero it out).
-	weights := tensai.RandomMatrix(5, 4, rng)
+	weights := tensai.RandomMatrix(5, 4, rng).Tensor()
 	checkParamGrad(t, w, func() (*Node, *Node) {
 		p := Param(w)
 		return Input(x).MatMul(p).Softmax().MulElem(Input(weights)).Sum(), p

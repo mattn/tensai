@@ -311,3 +311,41 @@ func BenchmarkSoftmaxBackward4096(b *testing.B) {
 		SoftmaxBwdAdd(dst, grad, y)
 	}
 }
+
+// TestBinarySlices checks the element-wise binary kernels against the
+// scalar definition, including the masked tail and the canary just past the
+// destination.
+func TestBinarySlices(t *testing.T) {
+	ops := []struct {
+		name string
+		fn   func(dst, x, y []float32)
+		want func(a, b float32) float32
+	}{
+		{"add", AddSlices, func(a, b float32) float32 { return a + b }},
+		{"sub", SubSlices, func(a, b float32) float32 { return a - b }},
+		{"mul", MulSlices, func(a, b float32) float32 { return a * b }},
+		{"div", DivSlices, func(a, b float32) float32 { return a / b }},
+	}
+	for _, op := range ops {
+		for _, n := range []int{1, 3, 7, 8, 9, 31, 64} {
+			x := make([]float32, n)
+			y := make([]float32, n)
+			for i := range x {
+				x[i] = float32(i) - 3
+				y[i] = float32(i)*0.5 + 1 // never zero, so div stays finite
+			}
+			dst := make([]float32, n+1)
+			dst[n] = 42 // canary just past the writable range
+			op.fn(dst[:n], x, y)
+			if dst[n] != 42 {
+				t.Fatalf("%s n=%d: kernel wrote past the slice end", op.name, n)
+			}
+			for i := range x {
+				want := op.want(x[i], y[i])
+				if diff := float64(dst[i] - want); diff > 1e-6 || diff < -1e-6 {
+					t.Fatalf("%s n=%d: dst[%d]=%g want %g", op.name, n, i, dst[i], want)
+				}
+			}
+		}
+	}
+}

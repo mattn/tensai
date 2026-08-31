@@ -24,7 +24,7 @@ pred, _ := net.Predict(inputs)
 - **行列と N 次元テンソル** — float32 の `Matrix` と任意ランクの `Tensor`。NumPy 流のブロードキャスト、バッチ `MatMul`、ゼロコピーの `Reshape` とビュー
 - **レイヤー** — `Embedding`, `Dense`, `Conv2D`, `MaxPool2D`, `BatchNorm`, `LayerNorm`, `Dropout` と、`ReLU`, `LeakyReLU`, `GELU`, `Sigmoid`, `Tanh`, `Softmax`
 - **学習** — `Sequential` モデルの `Compile` → `Fit` / `FitStep` → `Predict`、3 種類の損失関数、モーメンタム `SGD` / `Adam` / `AdamW`、データセットユーティリティ。MLP の 1 ステップは約 29 アロケーションで回ります
-- **自動微分** — micrograd スタイルの行列上のリバースモードエンジン。その上に `rnn.Cell`, `rnn.LSTMCell`, `rnn.SelfAttention` が乗り、BPTT はただの Go のループです
+- **自動微分** — micrograd スタイルの n 次元テンソル上のリバースモードエンジン。ブロードキャスト演算、バッチ `MatMul`、`LayerNorm`、`Embed`、`CrossEntropy` がすべて微分されるので、(batch, seq, model) の attention ブロックを直接書けます。`Tape` がステップのバッファを再利用し、charrnn の例では 1 ステップの確保量が 22MB から 0.75MB になります。その上に `rnn.Cell`, `rnn.LSTMCell`, `rnn.SelfAttention` が乗り、BPTT はただの Go のループです
 - **SIMD アクセラレーション** — Go の実験的な `simd/archsimd` パッケージで書かれた AVX2 カーネル。`GOEXPERIMENT=simd` でビルドし、それ以外のビルドは自動的にポータブル実装へフォールバックします
 - **WebGPU バックエンド** — `-tags wgpu` でバッチ `MatMul`、attention、量子化されたトランスフォーマーのデコード 1 ステップ丸ごとを wgpu-native の届く GPU 上で実行。`purego` 経由なので cgo 不要
 - **int8 / int4 量子化** — メモリ帯域に到達する weight-only 量子化 matmul、gpt-oss 用の MXFP4 も

@@ -170,6 +170,13 @@ func DotTAInto(out, a, b *Matrix) error {
 	}
 	clear(out.Data) // dotTARows accumulates
 	workers := dotWorkerCount(a.Cols, a.Rows, b.Cols)
+	if workers == 1 {
+		// Small products stay on this goroutine: waking workers for them
+		// costs more than the arithmetic, and a training step runs
+		// thousands of small products.
+		dotTARows(out, a, b, 0, a.Cols)
+		return nil
+	}
 	chunk := (a.Cols + workers - 1) / workers
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -204,6 +211,48 @@ func dotTARowsGeneric(out, a, b *Matrix, lo, hi int) {
 				outRow[c] += av * bv
 			}
 		}
+	}
+}
+
+// DotTBInto computes out = a * b^T, the product every backward pass needs
+// for the left operand of a matmul. a is (m, k) and b is (n, k): both
+// operands are read row-wise, so the whole product runs on the vectorized
+// row-dot kernel and no transpose is materialized.
+func DotTBInto(out, a, b *Matrix) error {
+	if a.Cols != b.Cols {
+		return fmt.Errorf("tensai: dottb shape mismatch: %dx%d * (%dx%d)^T", a.Rows, a.Cols, b.Rows, b.Cols)
+	}
+	if out.Rows != a.Rows || out.Cols != b.Rows {
+		return fmt.Errorf("tensai: dottb output shape mismatch: got %dx%d, want %dx%d",
+			out.Rows, out.Cols, a.Rows, b.Rows)
+	}
+	workers := dotWorkerCount(a.Rows, a.Cols, b.Rows)
+	if workers == 1 {
+		dotTBRows(out, a, b, 0, a.Rows)
+		return nil
+	}
+	chunk := (a.Rows + workers - 1) / workers
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		lo, hi := w*chunk, (w+1)*chunk
+		if hi > a.Rows {
+			hi = a.Rows
+		}
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			dotTBRows(out, a, b, lo, hi)
+		}(lo, hi)
+	}
+	wg.Wait()
+	return nil
+}
+
+// dotTBRows computes rows lo..hi of out = a * b^T. Each output row is one
+// row of a dotted against every row of b, which is what DotVecs does.
+func dotTBRows(out, a, b *Matrix, lo, hi int) {
+	for r := lo; r < hi; r++ {
+		kernels.DotVecs(b.Data, a.Data[r*a.Cols:(r+1)*a.Cols], out.Data[r*out.Cols:(r+1)*out.Cols])
 	}
 }
 
@@ -273,9 +322,7 @@ func Add(a, b *Matrix) (*Matrix, error) {
 		return nil, fmt.Errorf("tensai: add shape mismatch: %dx%d vs %dx%d", a.Rows, a.Cols, b.Rows, b.Cols)
 	}
 	out := NewMatrix(a.Rows, a.Cols)
-	for i := range a.Data {
-		out.Data[i] = a.Data[i] + b.Data[i]
-	}
+	kernels.AddSlices(out.Data, a.Data, b.Data)
 	return out, nil
 }
 
@@ -286,9 +333,8 @@ func AddBias(a *Matrix, bias []Float) (*Matrix, error) {
 	}
 	out := NewMatrix(a.Rows, a.Cols)
 	for r := 0; r < a.Rows; r++ {
-		for c := 0; c < a.Cols; c++ {
-			out.Data[r*a.Cols+c] = a.Data[r*a.Cols+c] + bias[c]
-		}
+		lo, hi := r*a.Cols, (r+1)*a.Cols
+		kernels.AddSlices(out.Data[lo:hi], a.Data[lo:hi], bias)
 	}
 	return out, nil
 }

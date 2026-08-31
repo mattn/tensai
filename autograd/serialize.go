@@ -7,22 +7,47 @@ import (
 	"os"
 
 	"github.com/mattn/tensai"
+	"github.com/mattn/tensai/internal/dims"
 )
 
+// paramJSON is the on-disk form of one parameter. Two-dimensional
+// parameters keep the Rows/Cols encoding checkpoints written before the
+// engine went n-dimensional use, so those files still load (and still
+// round-trip byte for byte); anything else carries its full shape.
+type paramJSON struct {
+	Rows  int            `json:"Rows,omitempty"`
+	Cols  int            `json:"Cols,omitempty"`
+	Shape []int          `json:"Shape,omitempty"`
+	Data  []tensai.Float `json:"Data"`
+}
+
+// shape returns the parameter's shape in either encoding.
+func (p *paramJSON) shape() []int {
+	if len(p.Shape) > 0 {
+		return p.Shape
+	}
+	return []int{p.Rows, p.Cols}
+}
+
 type paramsSnapshot struct {
-	Params []*tensai.Matrix `json:"params"`
+	Params []paramJSON `json:"params"`
 }
 
 // SaveParams writes the values of autograd parameters as JSON, in the given
 // order. Pass the same parameter list a Trainer uses, e.g.
 // SaveParams(w, cell.Params()...).
 func SaveParams(w io.Writer, params ...*Node) error {
-	snap := paramsSnapshot{Params: make([]*tensai.Matrix, len(params))}
+	snap := paramsSnapshot{Params: make([]paramJSON, len(params))}
 	for i, p := range params {
 		if p == nil || p.Value == nil {
 			return fmt.Errorf("tensai: save params: parameter %d is nil", i)
 		}
-		snap.Params[i] = p.Value
+		t := p.Value
+		if len(t.Shape) == 2 {
+			snap.Params[i] = paramJSON{Rows: t.Shape[0], Cols: t.Shape[1], Data: t.Data}
+			continue
+		}
+		snap.Params[i] = paramJSON{Shape: t.Shape, Data: t.Data}
 	}
 	return json.NewEncoder(w).Encode(&snap)
 }
@@ -38,19 +63,22 @@ func LoadParams(r io.Reader, params ...*Node) error {
 		return fmt.Errorf("tensai: load params count mismatch: got %d, want %d",
 			len(snap.Params), len(params))
 	}
-	for i, m := range snap.Params {
-		if err := m.Validate(); err != nil {
-			return fmt.Errorf("tensai: load params %d: %w", i, err)
+	for i := range snap.Params {
+		saved := &snap.Params[i]
+		shape := saved.shape()
+		if len(saved.Data) != dims.Prod(shape) {
+			return fmt.Errorf("tensai: load params %d: %s has %d elements",
+				i, shapeString(shape), len(saved.Data))
 		}
 		p := params[i]
 		if p == nil || p.Value == nil {
 			return fmt.Errorf("tensai: load params: parameter %d is nil", i)
 		}
-		if p.Value.Rows != m.Rows || p.Value.Cols != m.Cols {
-			return fmt.Errorf("tensai: load params %d shape mismatch: got %dx%d, want %dx%d",
-				i, m.Rows, m.Cols, p.Value.Rows, p.Value.Cols)
+		if !dims.Same(p.Value.Shape, shape) {
+			return fmt.Errorf("tensai: load params %d shape mismatch: got %s, want %s",
+				i, shapeString(shape), shapeString(p.Value.Shape))
 		}
-		copy(p.Value.Data, m.Data)
+		copy(p.Value.Data, saved.Data)
 	}
 	return nil
 }

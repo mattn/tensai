@@ -24,7 +24,7 @@ Despite its size, tensai reaches surprisingly far: the same kernels that train a
 - **Matrices and N-d tensors** — float32 `Matrix` and rank-N `Tensor` with NumPy-style broadcasting, batched `MatMul`, zero-copy `Reshape` and views
 - **Layers** — `Embedding`, `Dense`, `Conv2D`, `MaxPool2D`, `BatchNorm`, `LayerNorm`, `Dropout`, plus `ReLU`, `LeakyReLU`, `GELU`, `Sigmoid`, `Tanh`, and `Softmax`
 - **Training** — `Sequential` models with `Compile` → `Fit` / `FitStep` → `Predict`, three loss functions, momentum `SGD` / `Adam` / `AdamW`, and dataset utilities; a full MLP step runs in ~29 allocations
-- **Autograd** — a micrograd-style reverse-mode engine over matrices, with `rnn.Cell`, `rnn.LSTMCell`, and `rnn.SelfAttention` built on top; backpropagation through time is a plain Go loop
+- **Autograd** — a micrograd-style reverse-mode engine over n-dimensional tensors: broadcasting arithmetic, batched `MatMul`, `LayerNorm`, `Embed`, and `CrossEntropy` all differentiate, so an attention block over (batch, seq, model) is written directly. A `Tape` recycles a step's buffers, which takes the charrnn example from 22MB of allocation per step to 0.75MB. `rnn.Cell`, `rnn.LSTMCell`, and `rnn.SelfAttention` are built on top; backpropagation through time is a plain Go loop
 - **SIMD acceleration** — AVX2 kernels written with Go's experimental `simd/archsimd` package; build with `GOEXPERIMENT=simd`, and every other build uses the portable fallbacks automatically
 - **WebGPU backend** — `-tags wgpu` runs batched `MatMul`, attention, and a full quantized transformer decode step on any GPU wgpu-native reaches, through `purego` with no cgo
 - **int8 / int4 quantization** — weight-only quantized matmuls that reach memory bandwidth, plus MXFP4 for gpt-oss
