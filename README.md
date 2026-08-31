@@ -57,6 +57,7 @@ _example/spiral     Runnable 3-class spiral classification example
 _example/iris       Runnable Iris classification example
 _example/mnist      Runnable MNIST classifier (-model dense, cnn, or knn) with save/load
 _example/charrnn    Character-level LSTM text generation on the autograd engine
+_example/tinygpt    Character-level transformer (multi-head causal attention) trained from scratch
 _example/plasma     Demoscene-style terminal plasma rendered by a neural network
 _example/dot        Graphviz DOT export of the z = x + y graph
 _example/tensor     Tour of the n-d Tensor: broadcasting, batched MatMul, attention
@@ -278,6 +279,29 @@ for step := 0; step < epochs; step++ {
 
 `rnn.SelfAttention` operates on one `(seqLen x inSize)` sequence node: `attn.Forward(x)` computes `softmax(Q*K^T/sqrt(d))*V` with learned projections; the raw `rnn.Attention(q, k, v)` form is also exposed.
 
+Batches and heads are written directly on the n-dimensional engine instead: the per-head split is a `Reshape` plus a `Transpose`, and every score in the batch is one `MatMul`.
+
+```go
+heads := func(t *autograd.Node) *autograd.Node { // (batch, seq, model) -> (batch, head, seq, headDim)
+	return t.Reshape(batch, seq, nHeads, headDim).Transpose(0, 2, 1, 3)
+}
+q, k, v := heads(x.MatMul(wq)), heads(x.MatMul(wk)), heads(x.MatMul(wv))
+att := q.MatMul(k.T()).Scale(scale).Add(causalMask).Softmax() // (batch, head, seq, seq)
+y := att.MatMul(v).Transpose(0, 2, 1, 3).Reshape(batch, seq, model).MatMul(wo)
+```
+
+`_example/tinygpt` is that block inside a working character-level transformer — token and position embeddings, two pre-norm blocks, a GELU feed-forward, and next-character cross-entropy. 106k parameters, about a minute of training with the AVX2 build, after which it writes the corpus back:
+
+```
+$ GOEXPERIMENT=simd go run ./_example/tinygpt
+corpus: 1660 chars, vocab: 43, parameters: 106496
+iter    1: loss=4.7166
+iter 1000: loss=0.2258
+
+generated:
+Alice was beginning to get very tired of sitting by her sister on the bank, and look, aving nothing to do: once or twice coat-pocket, and looker a with ouble of of getting up and picgung to a daisies, when suddenly  a White Rabbit with pink eyes  ran close by her.
+```
+
 Autograd parameters are saved and restored positionally with `autograd.SaveParamsFile("cell.json", cell.Params()...)` / `autograd.LoadParamsFile("cell.json", cell.Params()...)` — build the same cell, then load.
 
 ### N-d tensors: broadcasting and batched MatMul
@@ -409,6 +433,7 @@ go run ./_example/fizzbuzz
 go run ./_example/spiral
 go run ./_example/iris
 go run ./_example/charrnn
+GOEXPERIMENT=simd go run ./_example/tinygpt      # trains a small transformer, ~1 minute
 go run ./_example/plasma
 go run ./_example/tensor
 GOEXPERIMENT=simd go run ./_example/gpt2          # downloads the GPT-2 checkpoint (~550MB) on first run
