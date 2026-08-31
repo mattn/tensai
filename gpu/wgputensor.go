@@ -1346,7 +1346,10 @@ struct APParams { seqQ: u32, seqKV: u32, dh: u32, d: u32, rows: u32, off: u32, d
 @group(0) @binding(3) var<storage, read> offs: array<vec4<u32>>;
 @group(0) @binding(10) var<uniform> ap: APParams;
 @group(0) @binding(11) var<storage, read> aq: array<f32>;
-@group(0) @binding(12) var<storage, read> akh: array<f16>;
+// K is bound as u32 words: the QK loop unpacks two f16 lanes per load,
+// halving its load instructions against per-element f16 reads. V keeps
+// the f16 view — its loop is lane-coalesced already.
+@group(0) @binding(12) var<storage, read> akh: array<u32>;
 @group(0) @binding(13) var<storage, read> avh: array<f16>;
 @group(0) @binding(14) var<storage, read_write> aout: array<f32>;
 
@@ -1411,16 +1414,17 @@ fn attn_causal_gh(@builtin(workgroup_id) wid: vec3<u32>,
         var d0 = 0.0; var d1 = 0.0; var d2 = 0.0; var d3 = 0.0;
         var d4 = 0.0; var d5 = 0.0; var d6 = 0.0; var d7 = 0.0;
         if (valid) {
-            for (var c = 0u; c < ap.dh; c = c + 1u) {
-                let kv = f32(akh[offKV + j * ap.dkv + c]);
-                d0 = d0 + qrow_h[c] * kv;
-                d1 = d1 + qrow_h[ap.dh + c] * kv;
-                d2 = d2 + qrow_h[2u * ap.dh + c] * kv;
-                d3 = d3 + qrow_h[3u * ap.dh + c] * kv;
-                d4 = d4 + qrow_h[4u * ap.dh + c] * kv;
-                d5 = d5 + qrow_h[5u * ap.dh + c] * kv;
-                d6 = d6 + qrow_h[6u * ap.dh + c] * kv;
-                d7 = d7 + qrow_h[7u * ap.dh + c] * kv;
+            let kbase = (offKV + j * ap.dkv) >> 1u;
+            for (var c = 0u; c < ap.dh; c = c + 2u) {
+                let kv = unpack2x16float(akh[kbase + (c >> 1u)]);
+                d0 = d0 + qrow_h[c] * kv.x + qrow_h[c + 1u] * kv.y;
+                d1 = d1 + qrow_h[ap.dh + c] * kv.x + qrow_h[ap.dh + c + 1u] * kv.y;
+                d2 = d2 + qrow_h[2u * ap.dh + c] * kv.x + qrow_h[2u * ap.dh + c + 1u] * kv.y;
+                d3 = d3 + qrow_h[3u * ap.dh + c] * kv.x + qrow_h[3u * ap.dh + c + 1u] * kv.y;
+                d4 = d4 + qrow_h[4u * ap.dh + c] * kv.x + qrow_h[4u * ap.dh + c + 1u] * kv.y;
+                d5 = d5 + qrow_h[5u * ap.dh + c] * kv.x + qrow_h[5u * ap.dh + c + 1u] * kv.y;
+                d6 = d6 + qrow_h[6u * ap.dh + c] * kv.x + qrow_h[6u * ap.dh + c + 1u] * kv.y;
+                d7 = d7 + qrow_h[7u * ap.dh + c] * kv.x + qrow_h[7u * ap.dh + c + 1u] * kv.y;
             }
             d0 = d0 * scale; d1 = d1 * scale; d2 = d2 * scale; d3 = d3 * scale;
             d4 = d4 * scale; d5 = d5 * scale; d6 = d6 * scale; d7 = d7 * scale;
@@ -1620,16 +1624,17 @@ fn attn_split_gh(@builtin(workgroup_id) wid: vec3<u32>,
         var d0 = 0.0; var d1 = 0.0; var d2 = 0.0; var d3 = 0.0;
         var d4 = 0.0; var d5 = 0.0; var d6 = 0.0; var d7 = 0.0;
         if (valid) {
-            for (var c = 0u; c < ap.dh; c = c + 1u) {
-                let kv = f32(akh[offKV + j * ap.dkv + c]);
-                d0 = d0 + qrow_h[c] * kv;
-                d1 = d1 + qrow_h[ap.dh + c] * kv;
-                d2 = d2 + qrow_h[2u * ap.dh + c] * kv;
-                d3 = d3 + qrow_h[3u * ap.dh + c] * kv;
-                d4 = d4 + qrow_h[4u * ap.dh + c] * kv;
-                d5 = d5 + qrow_h[5u * ap.dh + c] * kv;
-                d6 = d6 + qrow_h[6u * ap.dh + c] * kv;
-                d7 = d7 + qrow_h[7u * ap.dh + c] * kv;
+            let kbase = (offKV + j * ap.dkv) >> 1u;
+            for (var c = 0u; c < ap.dh; c = c + 2u) {
+                let kv = unpack2x16float(akh[kbase + (c >> 1u)]);
+                d0 = d0 + qrow_h[c] * kv.x + qrow_h[c + 1u] * kv.y;
+                d1 = d1 + qrow_h[ap.dh + c] * kv.x + qrow_h[ap.dh + c + 1u] * kv.y;
+                d2 = d2 + qrow_h[2u * ap.dh + c] * kv.x + qrow_h[2u * ap.dh + c + 1u] * kv.y;
+                d3 = d3 + qrow_h[3u * ap.dh + c] * kv.x + qrow_h[3u * ap.dh + c + 1u] * kv.y;
+                d4 = d4 + qrow_h[4u * ap.dh + c] * kv.x + qrow_h[4u * ap.dh + c + 1u] * kv.y;
+                d5 = d5 + qrow_h[5u * ap.dh + c] * kv.x + qrow_h[5u * ap.dh + c + 1u] * kv.y;
+                d6 = d6 + qrow_h[6u * ap.dh + c] * kv.x + qrow_h[6u * ap.dh + c + 1u] * kv.y;
+                d7 = d7 + qrow_h[7u * ap.dh + c] * kv.x + qrow_h[7u * ap.dh + c + 1u] * kv.y;
             }
             d0 = d0 * scale; d1 = d1 * scale; d2 = d2 * scale; d3 = d3 * scale;
             d4 = d4 * scale; d5 = d5 * scale; d6 = d6 * scale; d7 = d7 * scale;
