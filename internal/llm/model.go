@@ -1166,29 +1166,66 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			}
 
 			// Causal attention: row t sees cache positions [0, startPos+t].
-			// Rows are independent, so they fan out across CPUs.
+			// Rows are independent, so they fan out across CPUs — in blocks
+			// sized so the dots per K load land on the 8-wide kernels, which
+			// keeps a several-thousand-token prefill from drowning in
+			// attention (see attendGroupBlock). Sliding windows shift the
+			// start per row, so they keep the row path.
+			qb := max(1, 8/group)
+			if qb == 1 {
+				qb = 2
+			}
+			if b.window > 0 {
+				qb = 1
+			}
 			attn := tensai.NewMatrix(n, qDim)
 			var wg sync.WaitGroup
-			rowCh := make(chan int, n)
-			for t := 0; t < n; t++ {
+			rowCh := make(chan int, (n+qb-1)/qb)
+			for t := 0; t < n; t += qb {
 				rowCh <- t
 			}
 			close(rowCh)
-			for w := min(runtime.NumCPU(), n); w > 0; w-- {
+			nq := qb * group
+			dh := m.headSz
+			for w := min(runtime.NumCPU(), (n+qb-1)/qb); w > 0; w-- {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
 					scores := make([]float32, group*(startPos+n))
-					ws := make([]float32, group*(startPos+n))
-					for t := range rowCh {
-						steps := startPos + t + 1
-						qr := qkv.Data[t*qkvW : t*qkvW+qDim]
+					ws := make([]float32, (startPos+n+qb)*nq)
+					si := make([]float32, startPos+n+qb)
+					packQ := make([]float32, nq*dh)
+					packO := make([]float32, nq*dh)
+					qrs := make([][]float32, qb)
+					ars := make([][]float32, qb)
+					qrow := func(t int) []float32 {
 						if cfg.AttnOutputGate {
-							qr = qbuf[t*qDim : (t+1)*qDim]
+							return qbuf[t*qDim : (t+1)*qDim]
 						}
-						ar := attn.Data[t*qDim : (t+1)*qDim]
+						return qkv.Data[t*qkvW : t*qkvW+qDim]
+					}
+					for t0 := range rowCh {
+						tEnd := min(t0+qb, n)
+						if tEnd-t0 < qb || qb == 1 {
+							// A short final block (and the window path) runs
+							// row by row, exactly as before.
+							for t := t0; t < tEnd; t++ {
+								steps := startPos + t + 1
+								qr := qrow(t)
+								ar := attn.Data[t*qDim : (t+1)*qDim]
+								for kh := 0; kh < cfg.KVHeads; kh++ {
+									m.attendGroup(b, qr, ar, kh, group, steps, scores, ws)
+								}
+							}
+							continue
+						}
 						for kh := 0; kh < cfg.KVHeads; kh++ {
-							m.attendGroup(b, qr, ar, kh, group, steps, scores, ws)
+							qOff := kh * group * dh
+							for r := 0; r < qb; r++ {
+								qrs[r] = qrow(t0 + r)[qOff : qOff+group*dh]
+								ars[r] = attn.Data[(t0+r)*qDim+qOff : (t0+r)*qDim+qOff+group*dh]
+							}
+							m.attendGroupBlock(b, qrs, ars, kh, group, startPos+t0+1, ws, si, packQ, packO)
 						}
 					}
 				}()
