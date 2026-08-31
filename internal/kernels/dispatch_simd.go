@@ -530,6 +530,11 @@ func DotVecs(qs, k []float32, out []float32) {
 		return
 	}
 	i := 0
+	// Eights first: one k load feeds eight dots, and a blocked caller
+	// arrives with a multiple of eight.
+	for ; i+8 <= len(out); i += 8 {
+		dotVec8(qs[i*d:(i+8)*d], k, out[i:i+8])
+	}
 	for ; i+4 <= len(out); i += 4 {
 		dotVec4(qs[i*d:(i+4)*d], k, out[i:i+4])
 	}
@@ -650,6 +655,10 @@ func Axpys(ws []float32, v, outs []float32) {
 		return
 	}
 	i := 0
+	// Eights first, as in DotVecs: one v load feeds eight rows.
+	for ; i+8 <= len(ws); i += 8 {
+		axpy8(ws[i:i+8], v, outs[i*d:(i+8)*d])
+	}
 	for ; i+4 <= len(ws); i += 4 {
 		axpy4(ws[i:i+4], v, outs[i*d:(i+4)*d])
 	}
