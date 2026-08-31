@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -775,6 +776,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
+	began := time.Now()
 	var req chatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, http.StatusBadRequest, err.Error())
@@ -896,10 +898,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		held.WriteString(piece)
 		text := held.String()
-		// A fence can open a call a weak model writes as plain JSON (see
-		// parseLooseToolCalls); held text that turns out to be ordinary
-		// content goes out after the final parse, via streamed.
-		for _, marker := range []string{"<tool_call>", "```"} {
+		// A ```json fence can open a call a weak model writes as plain
+		// JSON (see parseLooseToolCalls); held text that turns out to be
+		// ordinary content goes out after the final parse, via streamed.
+		// A bare fence streams as usual — a fenced code answer must not
+		// fall silent — and the final parse still rescues a call in one.
+		for _, marker := range []string{"<tool_call>", "```json"} {
 			if i := strings.Index(text, marker); i >= 0 {
 				sawCall = true
 				held.Reset()
@@ -911,7 +915,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		keep := 0
 		if !final {
-			for _, marker := range []string{"<tool_call>", "```"} {
+			for _, marker := range []string{"<tool_call>", "```json"} {
 				keep = max(keep, partialMarker(text, marker))
 			}
 		}
@@ -1031,6 +1035,13 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// replays, so it belongs in the cache alongside the prompt.
 	defer func() { s.cache.live = append(s.cache.live, out...) }()
 	finish := "length"
+	// One line per request on stderr: when a turn takes half a minute,
+	// the reader should be able to see it went to a long prompt, a cold
+	// cache, or a long answer — not wonder whether the server hung.
+	defer func() {
+		fmt.Fprintf(os.Stderr, "%d prompt tokens (%d cached), %d generated, %s in %s\n",
+			len(ids), start, len(out), finish, time.Since(began).Round(100*time.Millisecond))
+	}()
 	ctx := r.Context()
 	if s.draft != nil {
 		emit := func(next int) bool {
