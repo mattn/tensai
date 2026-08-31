@@ -70,6 +70,88 @@ func TestGPUMatMulRMSNorm(t *testing.T) {
 	}
 }
 
+// The fused attention combine must match the standalone attn_reduce_g
+// dispatch followed by the plain projection bit for bit.
+func TestGPUMatMulAttnCombine(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	if !g.HasF16() {
+		t.Skip("device has no shader-f16")
+	}
+	rng := rand.New(rand.NewSource(67))
+	const heads, kvHeads, dh, seqKV = 14, 2, 64, 400
+	const d, kvDim = heads * dh, kvHeads * dh
+	upload16 := func(src *tensai.Tensor) *Tensor {
+		t.Helper()
+		f32, err := g.Upload(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f32.Free()
+		c, err := g.NewF16Tensor(seqKV, kvDim)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f32.CopyRowsInto(c, 0); err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	gk := upload16(randTensor(rng, seqKV, kvDim))
+	defer gk.Free()
+	gv := upload16(randTensor(rng, seqKV, kvDim))
+	defer gv.Free()
+	gq, err := g.Upload(randTensor(rng, 1, d))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gq.Free()
+	w, err := g.UploadQ8(quant.Quantize(tensai.RandomMatrix(d, 300, rng)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Free()
+
+	scr, slabs, err := gq.GroupedCausalAttentionParts(gk, gv, heads, kvHeads, seqKV, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scr == nil {
+		t.Fatal("split path not taken at seqKV 400")
+	}
+	defer scr.Free()
+	fused, err := w.MatMulAttnCombine(scr, slabs, dh, heads/kvHeads, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fused.Free()
+
+	attn, err := gq.GroupedCausalAttention(gk, gv, heads, kvHeads, seqKV, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer attn.Free()
+	split, err := w.MatMulOpts(attn, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer split.Free()
+
+	gt, err := fused.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt, err := split.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range wt.Data {
+		if gt.Data[i] != wt.Data[i] {
+			t.Fatalf("out %d: fused %v != split %v", i, gt.Data[i], wt.Data[i])
+		}
+	}
+}
+
 // benchChainSplit is benchChain with the submission cut in half: the
 // first half of the links flushes mid-chain, so the device starts while
 // the host encodes the rest. The difference against the one-submission

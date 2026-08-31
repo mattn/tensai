@@ -560,26 +560,41 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 		if pos+1 > gq.gpuLen {
 			gq.gpuLen = pos + 1
 		}
-		attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, cfg.KVHeads, pos+1, l.window))
+		// A long-context decode leaves the split scratch to the output
+		// projection, whose prologue folds the softmax combine — one
+		// dependent dispatch fewer than reducing into a row first.
+		attnFused := false
+		if qo8, ok := l.qo.(*gpu.QMatrix); ok && l.postAttn == nil {
+			if scr, slabs, err := q.GroupedCausalAttentionParts(l.kc, l.vc, cfg.Heads, cfg.KVHeads, pos+1, l.window); err != nil {
+				panic(err)
+			} else if scr != nil {
+				must(qo8.MatMulAttnCombine(scr, slabs, m.headSz, cfg.Heads/cfg.KVHeads, nil, x))
+				scr.Free()
+				attnFused = true
+			}
+		}
+		if !attnFused {
+			attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, cfg.KVHeads, pos+1, l.window))
+			// The residual add rides the projection's epilogue unless a
+			// sandwich norm (Gemma) has to run in between.
+			if l.postAttn == nil {
+				must(l.qo.MatMulOpts(attn, nil, x))
+				attn.Free()
+			} else {
+				proj := must(l.qo.MatMul(attn))
+				attn.Free()
+				np := must(proj.RMSNorm(l.postAttn, cfg.RMSEps))
+				proj.Free()
+				proj = np
+				if err := x.Add(proj); err != nil {
+					panic(err)
+				}
+				proj.Free()
+			}
+		}
 		q.Free()
 		if qkvOwner != nil { // the buffer q, k, and v were views onto
 			qkvOwner.Free()
-		}
-		// The residual add rides the projection's epilogue unless a
-		// sandwich norm (Gemma) has to run in between.
-		if l.postAttn == nil {
-			must(l.qo.MatMulOpts(attn, nil, x))
-			attn.Free()
-		} else {
-			proj := must(l.qo.MatMul(attn))
-			attn.Free()
-			np := must(proj.RMSNorm(l.postAttn, cfg.RMSEps))
-			proj.Free()
-			proj = np
-			if err := x.Add(proj); err != nil {
-				panic(err)
-			}
-			proj.Free()
 		}
 
 		gu := must(l.qGU.MatMulRMSNorm(x, l.ln2, cfg.RMSEps, nil, nil))
