@@ -116,6 +116,11 @@ func (t *Tensor) GLUSplit(inter int, gelu bool) (*Tensor, error) { return nil, e
 func (t *Tensor) CopyRowsInto(dst *Tensor, off int) error { return errNoWGPU }
 
 // GroupedCausalAttention always fails in builds without the wgpu tag.
+// GroupedCausalAttentionParts always fails in builds without the wgpu tag.
+func (q *Tensor) GroupedCausalAttentionParts(k, v *Tensor, heads, kvHeads, seqKV, window int) (*Tensor, int, error) {
+	return nil, 0, errNoWGPU
+}
+
 func (q *Tensor) GroupedCausalAttention(k, v *Tensor, heads, kvHeads, seqKV, window int) (*Tensor, error) {
 	return nil, errNoWGPU
 }
@@ -138,6 +143,11 @@ func (q *QMatrix) MatMulOpts(x, bias, dst *Tensor) (*Tensor, error) { return nil
 
 // MatMulRMSNorm always fails in builds without the wgpu tag.
 func (q *QMatrix) MatMulRMSNorm(x, norm *Tensor, eps float64, bias, dst *Tensor) (*Tensor, error) {
+	return nil, errNoWGPU
+}
+
+// MatMulAttnCombine always fails in builds without the wgpu tag.
+func (q *QMatrix) MatMulAttnCombine(scr *Tensor, slabs, dh, group int, bias, dst *Tensor) (*Tensor, error) {
 	return nil, errNoWGPU
 }
 

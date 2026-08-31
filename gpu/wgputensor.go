@@ -660,6 +660,7 @@ struct QMParams { rows: u32, cols: u32, words: u32, m: u32, flags: u32, eps: f32
 @group(0) @binding(19) var<storage, read_write> qov: array<f32>;
 @group(0) @binding(34) var<storage, read> qbias: array<f32>;
 @group(0) @binding(39) var<storage, read> qnormw: array<f32>;
+@group(0) @binding(45) var<storage, read> qascr: array<f32>;
 
 const QWG = 16u;    // packed words per workgroup
 const QSPLIT = 16u; // row splits sharing one word
@@ -701,9 +702,44 @@ fn qmatmul(@builtin(workgroup_id) wid: vec3<u32>,
         }
         workgroupBarrier();
     }
+    // Flag 8 stages attn_split_gh's slabs instead of an activation row:
+    // the output projection folds the softmax combine that attn_reduce_g
+    // used to run as its own dependent dispatch. pad1 carries the slab
+    // count, pad2 the head size and group; every max, rescale, and sum
+    // runs in the same order as the standalone reduce, so the staged row
+    // matches it bit for bit.
+    if ((qp.flags & 8u) != 0u) {
+        let dh = qp.pad2 & 0xffffu;
+        let grp = qp.pad2 >> 16u;
+        let slabs = qp.pad1;
+        let stride = 8u * dh + 16u;
+        for (var i = lid.x; i < qp.rows; i = i + 256u) {
+            let h = i / dh;
+            let c = i - h * dh;
+            let kvh = h / grp;
+            let hg = h - kvh * grp;
+            let base = kvh * slabs * stride;
+            var mh = -3.40282e38;
+            for (var s = 0u; s < slabs; s = s + 1u) {
+                mh = max(mh, qascr[base + s * stride + 8u * dh + hg]);
+            }
+            var lh = 0.0;
+            for (var s = 0u; s < slabs; s = s + 1u) {
+                let ms = qascr[base + s * stride + 8u * dh + hg];
+                lh = lh + qascr[base + s * stride + 8u * dh + 8u + hg] * exp(ms - mh);
+            }
+            var o = 0.0;
+            for (var s = 0u; s < slabs; s = s + 1u) {
+                let ms = qascr[base + s * stride + 8u * dh + hg];
+                o = o + qascr[base + s * stride + hg * dh + c] * exp(ms - mh);
+            }
+            qxs[i] = o / lh;
+        }
+        workgroupBarrier();
+    }
     var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     if (w < qp.words) {
-        if ((qp.flags & 4u) != 0u) {
+        if ((qp.flags & 12u) != 0u) { // a prologue staged the row
             for (var i = rsub; i < qp.rows; i = i + QSPLIT) {
                 let xv = qxs[i];
                 let pw = qwt[i * qp.words + w];
@@ -3189,7 +3225,7 @@ func (q *QMatrix) MatMul(x *Tensor) (*Tensor, error) {
 // then the returned tensor — when dst is non-nil. One dispatch instead
 // of a matmul plus one or two element-wise passes.
 func (q *QMatrix) MatMulOpts(x, bias, dst *Tensor) (*Tensor, error) {
-	return q.matmulF32(x, bias, dst, nil, 0)
+	return q.matmulF32(x, bias, dst, nil, 0, nil, 0, 0, 0)
 }
 
 // MatMulRMSNorm is MatMulOpts with out = rmsnorm(x, norm, eps) @ Q: the
@@ -3199,17 +3235,33 @@ func (q *QMatrix) MatMulOpts(x, bias, dst *Tensor) (*Tensor, error) {
 func (q *QMatrix) MatMulRMSNorm(x, norm *Tensor, eps float64, bias, dst *Tensor) (*Tensor, error) {
 	// 2048 is the QXS shared-memory stage in the kernel.
 	if x.Size() == q.rows && q.rows <= 2048 {
-		return q.matmulF32(x, bias, dst, norm, float32(eps))
+		return q.matmulF32(x, bias, dst, norm, float32(eps), nil, 0, 0, 0)
 	}
 	nx, err := x.RMSNorm(norm, eps)
 	if err != nil {
 		return nil, err
 	}
 	defer nx.Free()
-	return q.matmulF32(nx, bias, dst, nil, 0)
+	return q.matmulF32(nx, bias, dst, nil, 0, nil, 0, 0, 0)
 }
 
-func (q *QMatrix) matmulF32(x, bias, dst, norm *Tensor, eps float32) (*Tensor, error) {
+// MatMulAttnCombine is MatMulOpts for the output projection fed straight
+// by attn_split_gh's scratch: the softmax combine that attn_reduce_g runs
+// as a dependent dispatch of its own folds into the matvec prologue,
+// staging the combined attention row in shared memory in the reduce
+// kernel's exact order. Single-row decode only; the row must fit the
+// kernel's shared stage.
+func (q *QMatrix) MatMulAttnCombine(scr *Tensor, slabs, dh, group int, bias, dst *Tensor) (*Tensor, error) {
+	if q.rows > 2048 { // QXS, the kernel's shared-memory stage
+		return nil, fmt.Errorf("tensai: gpu attn combine over %d rows exceeds the staged 2048", q.rows)
+	}
+	if dh <= 0 || group <= 0 || group > 8 || slabs <= 0 || q.rows%(dh*group) != 0 {
+		return nil, fmt.Errorf("tensai: gpu attn combine geometry dh=%d group=%d slabs=%d for %d rows", dh, group, slabs, q.rows)
+	}
+	return q.matmulF32(scr, bias, dst, nil, 0, scr, slabs, dh, group)
+}
+
+func (q *QMatrix) matmulF32(x, bias, dst, norm *Tensor, eps float32, scr *Tensor, slabs, dh, grp int) (*Tensor, error) {
 	if q.freed || x.freed || (bias != nil && bias.freed) || (dst != nil && dst.freed) || (norm != nil && norm.freed) {
 		return nil, errors.New("tensai: gpu tensor already freed")
 	}
@@ -3219,11 +3271,16 @@ func (q *QMatrix) matmulF32(x, bias, dst, norm *Tensor, eps float32) (*Tensor, e
 	if q.g != x.g {
 		return nil, errors.New("tensai: gpu tensors belong to different GPUs")
 	}
-	n := len(x.shape)
-	if n == 0 || x.shape[n-1] != q.rows {
-		return nil, fmt.Errorf("tensai: gpu qmatmul shape mismatch: %v @ %dx%d", x.shape, q.rows, q.cols)
+	m := 1
+	if scr == nil {
+		// The combine prologue stages the activation row from scr, so x
+		// (= scr) skips the row-shape check and the batch stays one row.
+		n := len(x.shape)
+		if n == 0 || x.shape[n-1] != q.rows {
+			return nil, fmt.Errorf("tensai: gpu qmatmul shape mismatch: %v @ %dx%d", x.shape, q.rows, q.cols)
+		}
+		m = x.Size() / q.rows
 	}
-	m := x.Size() / q.rows
 	if m > 65535 {
 		return nil, fmt.Errorf("tensai: gpu qmatmul batch of %d rows exceeds 65535", m)
 	}
@@ -3233,7 +3290,11 @@ func (q *QMatrix) matmulF32(x, bias, dst, norm *Tensor, eps float32) (*Tensor, e
 	if dst != nil && dst.Size() != m*q.cols {
 		return nil, fmt.Errorf("tensai: gpu qmatmul dst of %d elements, want %d", dst.Size(), m*q.cols)
 	}
-	outShape := append(append([]int(nil), x.shape[:n-1]...), q.cols)
+	outShape := []int{1, q.cols}
+	if scr == nil {
+		n := len(x.shape)
+		outShape = append(append([]int(nil), x.shape[:n-1]...), q.cols)
+	}
 	if m >= 32 && q.g.hasIntDot {
 		return q.matmulIntDot(x, bias, dst, m, outShape)
 	}
@@ -3270,11 +3331,19 @@ func (q *QMatrix) matmulF32(x, bias, dst, norm *Tensor, eps float32) (*Tensor, e
 		flags |= 4
 		normBuf, normSize = norm.buf, uint64(norm.Size())*4
 	}
+	scrBuf, scrSize := q.scales, uint64(q.words*4)*4 // dummy; flags gate the read
 	params := [8]uint32{uint32(q.rows), uint32(q.cols), uint32(q.words), uint32(m), flags, math.Float32bits(eps)}
+	if scr != nil {
+		flags |= 8
+		params[4] = flags
+		params[6] = uint32(slabs)
+		params[7] = uint32(dh) | uint32(grp)<<16
+		scrBuf, scrSize = scr.buf, uint64(scr.Size())*4
+	}
 	bufParams, offParams, release := g.paramsBuffer(unsafe.Pointer(&params[0]), 32)
 	defer release()
 
-	entries := [7]wgpuBindGroupEntry{
+	entries := [8]wgpuBindGroupEntry{
 		{binding: 15, buffer: bufParams, offset: offParams, size: 32},
 		{binding: 16, buffer: q.buf, size: uint64(q.rows*q.words) * 4},
 		{binding: 17, buffer: q.scales, size: uint64(q.words*4) * 4},
@@ -3282,6 +3351,7 @@ func (q *QMatrix) matmulF32(x, bias, dst, norm *Tensor, eps float32) (*Tensor, e
 		{binding: 19, buffer: bufOut, size: outBytes},
 		{binding: 34, buffer: biasBuf, size: biasSize},
 		{binding: 39, buffer: normBuf, size: normSize},
+		{binding: 45, buffer: scrBuf, size: scrSize},
 	}
 	// A large batch takes the tiled GEMM, a small one the row-blocked
 	// kernel; a single row keeps the matvec shape. Only the matvec's
@@ -3891,15 +3961,58 @@ func (q *Tensor) GroupedCausalAttention(k, v *Tensor, heads, kvHeads, seqKV, win
 	return &Tensor{g: g, buf: bufOut, shape: append([]int(nil), q.shape...)}, nil
 }
 
-// groupedDecodeSplit runs the split decode attention: attn_split_gh over
-// (slabs x kvHeads) workgroups into a scratch of per-slab softmax states,
-// then attn_reduce_g folds them into the output row. Both dispatches ride
-// whatever batch is open, like the single-kernel path.
-func (q *Tensor) groupedDecodeSplit(k, v *Tensor, kvHeads, dh, d, kvDim, seqKV int, offs []uint32) (*Tensor, error) {
-	g := q.g
+// GroupedCausalAttentionParts runs only the split half of the decode
+// attention, handing back the per-slab softmax scratch and the slab
+// count so the caller can fold the combine into the projection that
+// follows (QMatrix.MatMulAttnCombine). A shape that would not take the
+// split path returns a nil tensor and no error; the caller then runs
+// GroupedCausalAttention as usual.
+func (q *Tensor) GroupedCausalAttentionParts(k, v *Tensor, heads, kvHeads, seqKV, window int) (*Tensor, int, error) {
+	if q.freed || k.freed || v.freed {
+		return nil, 0, errors.New("tensai: gpu tensor already freed")
+	}
+	nd := len(q.shape)
+	if nd == 0 || heads <= 0 || kvHeads <= 0 || heads%kvHeads != 0 {
+		return nil, 0, nil
+	}
+	d := q.shape[nd-1]
+	if d%heads != 0 {
+		return nil, 0, nil
+	}
+	dh := d / heads
+	group := heads / kvHeads
+	grouped := group > 1 && group <= 8 && dh <= 256
+	if !grouped || !k.f16 || q.Size() != d || window != 0 || seqKV < 256 || q.g.pipes.attnSplit == 0 {
+		return nil, 0, nil
+	}
+	kvDim := kvHeads * dh
+	if k.Size() < seqKV*kvDim || v.Size() < seqKV*kvDim {
+		return nil, 0, fmt.Errorf("tensai: kv cache of %d/%d elements is smaller than %d x %d", k.Size(), v.Size(), seqKV, kvDim)
+	}
+	offs := make([]uint32, 4*kvHeads)
+	for h := 0; h < kvHeads; h++ {
+		offs[4*h] = uint32(h * group * dh)
+		offs[4*h+1] = uint32(h * dh)
+		offs[4*h+2] = uint32(h * group * dh)
+	}
+	return q.attnSplitPass(k, v, kvHeads, dh, d, kvDim, seqKV, offs)
+}
+
+// attnSlabs sizes the decode split: tiles per slab and the slab count
+// for a context of seqKV positions.
+func attnSlabs(seqKV int) (per, slabs int) {
 	tiles := (seqKV + 63) / 64
-	per := (tiles + 31) / 32 // tiles per slab: at most 32 slabs
-	slabs := (tiles + per - 1) / per
+	per = (tiles + 31) / 32 // tiles per slab: at most 32 slabs
+	slabs = (tiles + per - 1) / per
+	return per, slabs
+}
+
+// attnSplitPass runs attn_split_gh over (slabs x kvHeads) workgroups and
+// returns the scratch of per-slab softmax states for a reduce — the
+// standalone kernel's or one fused into the projection that follows.
+func (q *Tensor) attnSplitPass(k, v *Tensor, kvHeads, dh, d, kvDim, seqKV int, offs []uint32) (*Tensor, int, error) {
+	g := q.g
+	per, slabs := attnSlabs(seqKV)
 	stride := 8*dh + 16
 	scrBytes := uint64(kvHeads*slabs*stride) * 4
 
@@ -3908,11 +4021,10 @@ func (q *Tensor) groupedDecodeSplit(k, v *Tensor, kvHeads, dh, d, kvDim, seqKV i
 	wgpuMu.Lock()
 	defer wgpuMu.Unlock()
 	if g.closed {
-		return nil, errors.New("tensai: gpu is closed")
+		return nil, 0, errors.New("tensai: gpu is closed")
 	}
 	uncapturedCB = ""
 
-	outBytes := uint64(q.Size()) * 4
 	// seqQ carries the tiles per slab and rows the slab count; the split
 	// kernels read nothing else differently.
 	params := [8]uint32{
@@ -3923,10 +4035,9 @@ func (q *Tensor) groupedDecodeSplit(k, v *Tensor, kvHeads, dh, d, kvDim, seqKV i
 	defer release()
 	bufOffs := g.offsBuffer(offs)
 	if bufOffs == 0 {
-		return nil, errors.New("tensai: gpu offset buffer allocation failed")
+		return nil, 0, errors.New("tensai: gpu offset buffer allocation failed")
 	}
 	scr := g.takeOutBuffer(scrBytes)
-	bufOut := g.takeOutBuffer(outBytes)
 
 	split := [6]wgpuBindGroupEntry{
 		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
@@ -3940,23 +4051,57 @@ func (q *Tensor) groupedDecodeSplit(k, v *Tensor, kvHeads, dh, d, kvDim, seqKV i
 	runtime.KeepAlive(&split)
 	if err := g.dispatch(g.pipes.attnSplit, bg, uint32(slabs), uint32(kvHeads), 1); err != nil {
 		g.dropBuffer(scr)
-		g.dropBuffer(bufOut)
+		return nil, 0, err
+	}
+	return &Tensor{g: g, buf: scr, shape: []int{kvHeads * slabs, stride}}, slabs, nil
+}
+
+// groupedDecodeSplit runs the split decode attention: attn_split_gh over
+// (slabs x kvHeads) workgroups into a scratch of per-slab softmax states,
+// then attn_reduce_g folds them into the output row. Both dispatches ride
+// whatever batch is open, like the single-kernel path.
+func (q *Tensor) groupedDecodeSplit(k, v *Tensor, kvHeads, dh, d, kvDim, seqKV int, offs []uint32) (*Tensor, error) {
+	scr, slabs, err := q.attnSplitPass(k, v, kvHeads, dh, d, kvDim, seqKV, offs)
+	if err != nil {
 		return nil, err
 	}
+	defer scr.Free()
+	g := q.g
+	per, _ := attnSlabs(seqKV)
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	outBytes := uint64(q.Size()) * 4
+	params := [8]uint32{
+		uint32(per), uint32(seqKV), uint32(dh), uint32(d),
+		uint32(slabs), uint32(seqKV - 1), uint32(kvDim), 0,
+	}
+	bufParams, offParams, release := g.paramsBuffer(unsafe.Pointer(&params[0]), 32)
+	defer release()
+	bufOffs := g.offsBuffer(offs)
+	if bufOffs == 0 {
+		return nil, errors.New("tensai: gpu offset buffer allocation failed")
+	}
+	bufOut := g.takeOutBuffer(outBytes)
 	reduce := [4]wgpuBindGroupEntry{
 		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
 		{binding: 10, buffer: bufParams, offset: offParams, size: 32},
 		{binding: 14, buffer: bufOut, size: outBytes},
-		{binding: 40, buffer: scr, size: scrBytes},
+		bind(40, scr),
 	}
-	bg = g.cachedBindGroup(g.pipes.layAttnReduce, reduce[:])
+	bg := g.cachedBindGroup(g.pipes.layAttnReduce, reduce[:])
 	runtime.KeepAlive(&reduce)
 	if err := g.dispatch(g.pipes.attnReduce, bg, uint32(kvHeads), 1, 1); err != nil {
-		g.dropBuffer(scr)
 		g.dropBuffer(bufOut)
 		return nil, err
 	}
-	g.dropBuffer(scr)
 	return &Tensor{g: g, buf: bufOut, shape: append([]int(nil), q.shape...)}, nil
 }
 
