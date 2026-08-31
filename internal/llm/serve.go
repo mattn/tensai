@@ -465,6 +465,80 @@ func parseToolCalls(s string) (string, []toolCall) {
 	return strings.TrimSpace(text.String()), calls
 }
 
+// parseLooseToolCalls rescues a call the model wrote into its text
+// instead of its trained format: a ```json fenced block — or the whole
+// turn — holding {"name": ..., "arguments": {...}} whose name matches a
+// declared tool. Four-bit sub-1B models keep the intent to call but
+// lose the tag discipline, and without this they answer as prose and
+// the agent loop never runs the tool. Requiring a known name keeps a
+// reply that merely shows JSON from being swallowed.
+func parseLooseToolCalls(s string, tools []toolDef) (string, []toolCall) {
+	known := make(map[string]bool, len(tools))
+	for _, t := range tools {
+		known[t.Function.Name] = true
+	}
+	try := func(body string) (toolCall, bool) {
+		var call struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(body)), &call); err != nil || !known[call.Name] {
+			return toolCall{}, false
+		}
+		args := strings.TrimSpace(string(call.Arguments))
+		if args == "" || args == "null" {
+			args = "{}"
+		}
+		return toolCall{Type: "function", Function: callFunc{Name: call.Name, Arguments: args}}, true
+	}
+	add := func(calls []toolCall, c toolCall) []toolCall {
+		idx := len(calls)
+		c.Index = &idx
+		c.ID = fmt.Sprintf("call_%d", idx)
+		return append(calls, c)
+	}
+	var calls []toolCall
+	var text strings.Builder
+	rest := s
+	for {
+		i := strings.Index(rest, "```")
+		if i < 0 {
+			text.WriteString(rest)
+			break
+		}
+		after := rest[i+3:]
+		body, tail := after, ""
+		closed := false
+		if j := strings.Index(after, "```"); j >= 0 {
+			body, tail, closed = after[:j], after[j+3:], true
+		}
+		// Drop a language word on the fence line ("json", "tool_code", ...).
+		if k := strings.IndexByte(body, '\n'); k >= 0 && len(strings.Fields(body[:k])) <= 1 {
+			body = body[k+1:]
+		}
+		if c, ok := try(body); ok {
+			text.WriteString(rest[:i])
+			calls = add(calls, c)
+		} else if closed {
+			text.WriteString(rest[:i+3] + after[:len(after)-len(tail)])
+		} else {
+			text.WriteString(rest)
+			break
+		}
+		rest = tail
+		if !closed {
+			break
+		}
+	}
+	if len(calls) == 0 {
+		if c, ok := try(s); ok {
+			return "", add(nil, c)
+		}
+		return s, nil
+	}
+	return strings.TrimSpace(text.String()), calls
+}
+
 // parseXMLToolCalls does for Qwen3.5 what parseToolCalls does for the
 // Hermes families: it splits a finished turn into what the model meant
 // to say and the calls it emitted. The block opens with the same
@@ -776,8 +850,12 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// writes before it answers is reasoning, not content, and clients
 	// that show the two differently need them apart.
 	var send func(field, piece string)
+	// streamed counts the content bytes already sent, so text held back
+	// on a false call marker can go out after the final parse clears it.
+	streamed := 0
 	flush := func(piece string) {
 		if send != nil && piece != "" {
+			streamed += len(piece)
 			send("content", piece)
 		}
 	}
@@ -818,17 +896,24 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		held.WriteString(piece)
 		text := held.String()
-		if i := strings.Index(text, "<tool_call>"); i >= 0 {
-			sawCall = true
-			held.Reset()
-			if i > 0 {
-				flush(text[:i])
+		// A fence can open a call a weak model writes as plain JSON (see
+		// parseLooseToolCalls); held text that turns out to be ordinary
+		// content goes out after the final parse, via streamed.
+		for _, marker := range []string{"<tool_call>", "```"} {
+			if i := strings.Index(text, marker); i >= 0 {
+				sawCall = true
+				held.Reset()
+				if i > 0 {
+					flush(text[:i])
+				}
+				return
 			}
-			return
 		}
 		keep := 0
 		if !final {
-			keep = partialMarker(text, "<tool_call>")
+			for _, marker := range []string{"<tool_call>", "```"} {
+				keep = max(keep, partialMarker(text, marker))
+			}
 		}
 		held.Reset()
 		held.WriteString(text[len(text)-keep:])
@@ -1004,14 +1089,21 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		} else {
 			content, calls = parseToolCalls(content)
 		}
+		if len(calls) == 0 {
+			content, calls = parseLooseToolCalls(content, tools)
+		}
 		if len(calls) > 0 {
 			finish = "tool_calls"
 		}
 	}
-
 	if req.Stream {
 		if len(pend) > 0 {
 			push("", true)
+		}
+		// Text held back on a marker that never became a call still
+		// belongs to the client.
+		if len(calls) == 0 && len(content) > streamed {
+			flush(content[streamed:])
 		}
 		// The calls go out as deltas of their own, one chunk each and
 		// complete, so a client accumulating fragments by index ends up
