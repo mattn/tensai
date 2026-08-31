@@ -584,7 +584,44 @@ func FetchGGUF(ref string) (string, error) {
 		return "", fmt.Errorf("gguf reference %q is not org/repo/file.gguf", ref)
 	}
 	base := "https://huggingface.co/" + parts[0] + "/" + parts[1] + "/resolve/main/"
-	return fetch(base, CacheRoot(), parts[2])
+	p, err := fetch(base, CacheRoot(), parts[2])
+	if err == nil {
+		recordGGUFOrigin(p, parts[0]+"/"+parts[1])
+	}
+	return p, err
+}
+
+// recordGGUFOrigin is recordOrigin for a single cached gguf file, which
+// has no directory of its own: the repo lands in a sidecar next to it.
+func recordGGUFOrigin(path, repo string) {
+	if path == "" || !strings.Contains(repo, "/") {
+		return
+	}
+	p := path + originSidecar
+	if b, err := os.ReadFile(p); err == nil && string(b) == repo {
+		return
+	}
+	os.WriteFile(p, []byte(repo), 0o644)
+}
+
+// originSidecar suffixes a cached gguf's origin marker.
+const originSidecar = ".tensai-origin"
+
+// GGUFOrigin returns the org/repo a cached gguf was downloaded from, or
+// "" when no valid record exists. The full reference the listing prints
+// — org/repo/file.gguf — downloads the same file on another machine.
+func GGUFOrigin(path string) string {
+	b, err := os.ReadFile(path + originSidecar)
+	if err != nil {
+		return ""
+	}
+	repo := strings.TrimSpace(string(b))
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" ||
+		strings.ContainsAny(repo, `\`) || strings.Contains(repo, "..") {
+		return ""
+	}
+	return repo
 }
 
 // progressReader reports download progress on stderr, at most twice a
