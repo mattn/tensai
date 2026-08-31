@@ -1009,6 +1009,32 @@ fn slice_cols(@builtin(workgroup_id) wg: vec3<u32>,
     }
 }
 
+// glu_split joins a fused gate|up matmul result in one dispatch:
+// out[r][i] = act(src[r][i]) * src[r][inter+i], the activation silu or
+// (gelu != 0) gelu_tanh — the same expressions as silu_mul_ip and
+// gelu_mul_ip, so a fused projection matches the split one bit for bit.
+struct GSParams { rows: u32, inter: u32, gelu: u32, pad: u32 }
+@group(0) @binding(44) var<uniform> gsp: GSParams;
+
+@compute @workgroup_size(256, 1, 1)
+fn glu_split(@builtin(workgroup_id) wg: vec3<u32>,
+             @builtin(num_workgroups) nwg: vec3<u32>,
+             @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx < gsp.rows * gsp.inter) {
+        let r = idx / gsp.inter;
+        let i = idx - r * gsp.inter;
+        let g = slsrc[r * 2u * gsp.inter + i];
+        let u = slsrc[r * 2u * gsp.inter + gsp.inter + i];
+        var a = g / (1.0 + exp(-g));
+        if (gsp.gelu != 0u) {
+            let inner = 0.7978845608028654 * (g + 0.044715 * g * g * g);
+            a = 0.5 * g * (1.0 + tanh(inner));
+        }
+        sldst[idx] = a * u;
+    }
+}
+
 // gelu_mul_ip: dst = gelu_tanh(dst) * src — Gemma's gate.
 @compute @workgroup_size(256, 1, 1)
 fn gelu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
@@ -1744,6 +1770,7 @@ type gpuPipelines struct {
 	qacts, qmatmulI, attnF16, rowsToF16            uintptr
 	attnSplit, attnReduce, ropeCache               uintptr
 	layAttnSplit, layAttnReduce, layRopeCache      uintptr
+	gluSplit, layGluSplit                          uintptr
 	sliceCols, laySliceCols                        uintptr
 	layMatmul, layMatmulT, layMatmulS, layMatmulTS uintptr
 	layScale, laySoftmax, layAttn, layQmatmul      uintptr
@@ -1778,6 +1805,7 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.attnG, &g.pipes.layAttnG, "attn_causal_g"},
 		{&g.pipes.qmatmulT, &g.pipes.layQmatmulT, "qmatmul_t"},
 		{&g.pipes.sliceCols, &g.pipes.laySliceCols, "slice_cols"},
+		{&g.pipes.gluSplit, &g.pipes.layGluSplit, "glu_split"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -3487,6 +3515,58 @@ func (t *Tensor) Add(o *Tensor) error {
 // joint, with t the gate projection and o the up projection.
 func (t *Tensor) SiluMul(o *Tensor) error {
 	return t.eltwiseIP(t.g.pipes.siluMulIP, t.g.pipes.laySiluMulIP, o)
+}
+
+// GLUSplit joins a fused gate|up projection: t holds rows of 2*inter
+// with gate in the first half and up in the second, and the result is
+// act(gate) * up per row — silu, or gelu_tanh when gelu is set. One
+// dispatch in place of the slice-out-and-multiply chain.
+func (t *Tensor) GLUSplit(inter int, gelu bool) (*Tensor, error) {
+	if t.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if inter <= 0 || t.Size()%(2*inter) != 0 {
+		return nil, fmt.Errorf("tensai: glu split of %d elements into pairs of %d", t.Size(), inter)
+	}
+	rows := t.Size() / (2 * inter)
+	g := t.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	outBytes := uint64(rows*inter) * 4
+	if err := g.checkSize(outBytes); err != nil {
+		return nil, err
+	}
+	bufOut := g.takeOutBuffer(outBytes)
+	var gu uint32
+	if gelu {
+		gu = 1
+	}
+	params := [4]uint32{uint32(rows), uint32(inter), gu, 0}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+
+	entries := [3]wgpuBindGroupEntry{
+		{binding: 44, buffer: bufParams, size: 16},
+		bind(37, t),
+		{binding: 38, buffer: bufOut, size: outBytes},
+	}
+	bindGroup := g.cachedBindGroup(g.pipes.layGluSplit, entries[:])
+	runtime.KeepAlive(&entries)
+
+	x, y := split2D((rows*inter + gpuKernelWG - 1) / gpuKernelWG)
+	if err := g.dispatch(g.pipes.gluSplit, bindGroup, x, y, 1); err != nil {
+		g.dropBuffer(bufOut)
+		return nil, err
+	}
+	return &Tensor{g: g, buf: bufOut, shape: []int{rows, inter}}, nil
 }
 
 // GeluMul computes t = gelu_tanh(t) * o elementwise in place — Gemma's

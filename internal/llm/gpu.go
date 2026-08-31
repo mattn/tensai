@@ -29,18 +29,18 @@ type gpuMat interface {
 }
 
 type gpuLayer struct {
-	ln1, ln2                          *gpu.Tensor
-	qNorm, kNorm                      *gpu.Tensor // Qwen3/Gemma QK-norm; nil otherwise
-	postAttn, postFFN                 *gpu.Tensor // Gemma sandwich norms; nil otherwise
-	noPE                              bool
-	window                            int
-	ropeTheta                         float64
-	geglu                             bool
-	bq, bk, bv                        *gpu.Tensor
-	bQKV                              *gpu.Tensor // fused q|k|v bias, when the split aligns
-	qQKV                              gpuMat      // fused q|k|v projection; nil when split
-	qq, qk, qv, qo, qGate, qUp, qDown gpuMat
-	kc, vc                            *gpu.Tensor // [nCtx, kvDim]
+	ln1, ln2                   *gpu.Tensor
+	qNorm, kNorm               *gpu.Tensor // Qwen3/Gemma QK-norm; nil otherwise
+	postAttn, postFFN          *gpu.Tensor // Gemma sandwich norms; nil otherwise
+	noPE                       bool
+	window                     int
+	ropeTheta                  float64
+	geglu                      bool
+	bq, bk, bv                 *gpu.Tensor
+	bQKV                       *gpu.Tensor // fused q|k|v bias, when the split aligns
+	qQKV                       gpuMat      // fused q|k|v projection; nil when split
+	qq, qk, qv, qo, qGU, qDown gpuMat
+	kc, vc                     *gpu.Tensor // [nCtx, kvDim]
 }
 
 type gpuQwen struct {
@@ -208,7 +208,6 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw io.Writer) (*gpuQwen, err
 		return must(g.Upload(&tensai.Tensor{Shape: []int{len(v)}, Data: v}))
 	}
 	hs := m.cfg.Heads * m.headSz // query dimension; equals hidden except qwen3
-	inter := m.cfg.Intermediate
 	gq := &gpuQwen{m: m, g: g, nCtx: nCtx, layers: make([]gpuLayer, len(m.blocks))}
 	// A half-precision KV cache halves the resident cache when the device
 	// has shader-f16 and the model's head grouping fits the f16 kernel.
@@ -263,8 +262,9 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw io.Writer) (*gpuQwen, err
 			l.qv = upSlice(b.qQKV, hs+kvDim, hs+2*kvDim)
 		}
 		l.qo = up(b.qo)
-		l.qGate = upSlice(b.qGU, 0, inter)
-		l.qUp = upSlice(b.qGU, inter, 2*inter)
+		// gate and up stay one fused weight: one dispatch projects both,
+		// and glu_split joins the halves.
+		l.qGU = up(b.qGU)
 		l.qDown = up(b.qDown)
 		if useF16 {
 			l.kc = must(g.NewF16Tensor(nCtx, kvDim))
@@ -448,17 +448,10 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 		}
 
 		a = must(x.RMSNorm(l.ln2, cfg.RMSEps))
-		gate := must(l.qGate.MatMul(a))
-		up := must(l.qUp.MatMul(a))
+		gu := must(l.qGU.MatMul(a))
 		a.Free()
-		if l.geglu {
-			if err := gate.GeluMul(up); err != nil {
-				panic(err)
-			}
-		} else if err := gate.SiluMul(up); err != nil {
-			panic(err)
-		}
-		up.Free()
+		gate := must(gu.GLUSplit(cfg.Intermediate, l.geglu))
+		gu.Free()
 		if l.postFFN == nil {
 			must(l.qDown.MatMulOpts(gate, nil, x))
 			gate.Free()
@@ -589,16 +582,9 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 			proj.Free()
 		}
 
-		gate := must(l.qGate.MatMulRMSNorm(x, l.ln2, cfg.RMSEps, nil, nil))
-		up := must(l.qUp.MatMulRMSNorm(x, l.ln2, cfg.RMSEps, nil, nil))
-		if l.geglu {
-			if err := gate.GeluMul(up); err != nil {
-				panic(err)
-			}
-		} else if err := gate.SiluMul(up); err != nil {
-			panic(err)
-		}
-		up.Free()
+		gu := must(l.qGU.MatMulRMSNorm(x, l.ln2, cfg.RMSEps, nil, nil))
+		gate := must(gu.GLUSplit(cfg.Intermediate, l.geglu))
+		gu.Free()
 		if l.postFFN == nil {
 			must(l.qDown.MatMulOpts(gate, nil, x))
 			gate.Free()
