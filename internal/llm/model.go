@@ -1171,10 +1171,10 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			// keeps a several-thousand-token prefill from drowning in
 			// attention (see attendGroupBlock). Sliding windows shift the
 			// start per row, so they keep the row path.
-			qb := max(1, 8/group)
-			if qb == 1 {
-				qb = 2
-			}
+			// Eight rows per block puts nq on a multiple of eight — every
+			// dot and axpy runs the 8-wide kernel — and halves the passes
+			// over the K and V arrays besides.
+			qb := 8
 			if b.window > 0 {
 				qb = 1
 			}
