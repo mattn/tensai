@@ -366,3 +366,39 @@ func TestToolSignaturesMatchPythonJSON(t *testing.T) {
 		t.Errorf("signature is not written the way the template writes it:\ngot:  %s\nwant: %s", got, want)
 	}
 }
+
+func TestParseLooseToolCalls(t *testing.T) {
+	tools := []toolDef{weatherTool()}
+	for _, tt := range []struct {
+		name, in  string
+		wantText  string
+		wantCalls int
+		wantFn    string
+		wantArgs  string
+	}{
+		{"fenced json call", "```json\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Osaka\"}}\n```", "", 1, "get_weather", `{"city": "Osaka"}`},
+		{"fence without lang", "```\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Osaka\"}}\n```", "", 1, "get_weather", `{"city": "Osaka"}`},
+		{"unterminated fence", "```json\n{\"name\": \"get_weather\", \"arguments\": {}}", "", 1, "get_weather", "{}"},
+		{"bare object turn", `{"name": "get_weather", "arguments": {"city": "Osaka"}}`, "", 1, "get_weather", `{"city": "Osaka"}`},
+		{"text around call", "調べます。\n```json\n{\"name\": \"get_weather\", \"arguments\": {}}\n```\n以上", "調べます。\n\n以上", 1, "get_weather", "{}"},
+		{"unknown tool stays text", "```json\n{\"name\": \"rm_rf\", \"arguments\": {}}\n```", "```json\n{\"name\": \"rm_rf\", \"arguments\": {}}\n```", 0, "", ""},
+		{"ordinary code block", "例です:\n```go\nfmt.Println(1)\n```", "例です:\n```go\nfmt.Println(1)\n```", 0, "", ""},
+		{"plain text", "こんにちは", "こんにちは", 0, "", ""},
+	} {
+		text, calls := parseLooseToolCalls(tt.in, tools)
+		if len(calls) != tt.wantCalls {
+			t.Fatalf("%s: got %d calls, want %d", tt.name, len(calls), tt.wantCalls)
+		}
+		if strings.TrimSpace(text) != strings.TrimSpace(tt.wantText) {
+			t.Errorf("%s: text %q, want %q", tt.name, text, tt.wantText)
+		}
+		if tt.wantCalls == 1 {
+			if calls[0].Function.Name != tt.wantFn {
+				t.Errorf("%s: name %q", tt.name, calls[0].Function.Name)
+			}
+			if calls[0].Function.Arguments != tt.wantArgs {
+				t.Errorf("%s: args %q, want %q", tt.name, calls[0].Function.Arguments, tt.wantArgs)
+			}
+		}
+	}
+}
