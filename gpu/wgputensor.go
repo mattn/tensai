@@ -1973,6 +1973,74 @@ func (g *Device) Flush() error {
 	return g.flushLocked()
 }
 
+// uarCap sizes the uniform staging arena: a decode chunk stages well
+// under a thousand 256-byte slots.
+const uarCap = 1 << 18
+
+// stageUniform parks a small parameter block in the per-batch uniform
+// arena instead of a pooled buffer of its own: the bytes accumulate on
+// the CPU and reach the device in one queue write at flush, replacing a
+// takeBuffer/putBuffer round trip and a queue write per dispatch. The
+// arena rewinds after every flush — a queue write for the next chunk is
+// ordered after the flushed submission, so the slots may be reused.
+// Only meaningful inside a batch; callers fall back when it reports
+// false. The caller holds wgpuMu.
+func (g *Device) stageUniform(p unsafe.Pointer, n int) (uintptr, uint64, bool) {
+	if g.batchEnc == 0 || n > 256 {
+		return 0, 0, false
+	}
+	if g.uarBuf == 0 {
+		g.uarBuf = g.newBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, uarCap)
+		if g.uarBuf == 0 {
+			return 0, 0, false
+		}
+		g.uarStage = make([]byte, uarCap)
+	}
+	off := g.uarOff
+	if off+256 > uarCap {
+		return 0, 0, false
+	}
+	copy(g.uarStage[off:], unsafe.Slice((*byte)(p), n))
+	g.uarOff = off + 256 // the minimum uniform buffer offset alignment
+	return g.uarBuf, off, true
+}
+
+// paramsBuffer places a dispatch's parameter block: in the batch arena
+// when one is open, else in a pooled buffer written immediately. The
+// returned func releases the fallback buffer and is a no-op for the
+// arena. The caller holds wgpuMu.
+func (g *Device) paramsBuffer(p unsafe.Pointer, n uint64) (uintptr, uint64, func()) {
+	if b, off, ok := g.stageUniform(p, int(n)); ok {
+		return b, off, func() {}
+	}
+	usage := uint64(wgpuBufferUsageUniform | wgpuBufferUsageCopyDst)
+	b := g.takeBuffer(usage, n)
+	fnQueueWriteBuffer(g.queue, b, 0, p, uintptr(n))
+	return b, 0, func() { g.putBuffer(usage, n, b) }
+}
+
+// offsBuffer returns a resident storage buffer holding these attention
+// offsets. They depend only on the head geometry, so every step asks
+// for the same bytes; the buffer uploads once and lives with the
+// device. The caller holds wgpuMu.
+func (g *Device) offsBuffer(offs []uint32) uintptr {
+	raw := unsafe.Slice((*byte)(unsafe.Pointer(&offs[0])), len(offs)*4)
+	key := string(raw)
+	if b, ok := g.offsCache[key]; ok {
+		return b
+	}
+	b := g.newBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
+	if b == 0 {
+		return 0
+	}
+	fnQueueWriteBuffer(g.queue, b, 0, unsafe.Pointer(&offs[0]), uintptr(len(offs))*4)
+	if g.offsCache == nil {
+		g.offsCache = make(map[string]uintptr)
+	}
+	g.offsCache[key] = b
+	return b
+}
+
 // endBatchPass closes the batch's open compute pass, if any, so the
 // encoder can record buffer copies or finish. The caller holds wgpuMu.
 func (g *Device) endBatchPass() {
@@ -1990,6 +2058,12 @@ func (g *Device) flushLocked() error {
 		return nil
 	}
 	g.endBatchPass()
+	if g.uarOff > 0 {
+		// One queue write covers every uniform the chunk staged; it is
+		// enqueued before the submit, so the dispatches read fresh bytes.
+		fnQueueWriteBuffer(g.queue, g.uarBuf, 0, unsafe.Pointer(&g.uarStage[0]), uintptr(g.uarOff))
+		g.uarOff = 0
+	}
 	encoder := g.batchEnc
 	g.batchEnc = 0
 	cmd := fnEncoderFinish(encoder, nil)
@@ -3197,12 +3271,11 @@ func (q *QMatrix) matmulF32(x, bias, dst, norm *Tensor, eps float32) (*Tensor, e
 		normBuf, normSize = norm.buf, uint64(norm.Size())*4
 	}
 	params := [8]uint32{uint32(q.rows), uint32(q.cols), uint32(q.words), uint32(m), flags, math.Float32bits(eps)}
-	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
-	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
-	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
+	bufParams, offParams, release := g.paramsBuffer(unsafe.Pointer(&params[0]), 32)
+	defer release()
 
 	entries := [7]wgpuBindGroupEntry{
-		{binding: 15, buffer: bufParams, size: 32},
+		{binding: 15, buffer: bufParams, offset: offParams, size: 32},
 		{binding: 16, buffer: q.buf, size: uint64(q.rows*q.words) * 4},
 		{binding: 17, buffer: q.scales, size: uint64(q.words*4) * 4},
 		bind(18, x),
@@ -3489,12 +3562,11 @@ func (t *Tensor) eltwiseIP(pipe, lay uintptr, o *Tensor) error {
 	uncapturedCB = ""
 
 	params := [4]uint32{uint32(t.Size()), uint32(o.Size()), 0, 0}
-	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
-	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
-	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+	bufParams, offParams, release := g.paramsBuffer(unsafe.Pointer(&params[0]), 16)
+	defer release()
 
 	entries := [3]wgpuBindGroupEntry{
-		{binding: 26, buffer: bufParams, size: 16},
+		{binding: 26, buffer: bufParams, offset: offParams, size: 16},
 		bind(27, t),
 		bind(28, o),
 	}
@@ -3549,12 +3621,11 @@ func (t *Tensor) GLUSplit(inter int, gelu bool) (*Tensor, error) {
 		gu = 1
 	}
 	params := [4]uint32{uint32(rows), uint32(inter), gu, 0}
-	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
-	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
-	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+	bufParams, offParams, release := g.paramsBuffer(unsafe.Pointer(&params[0]), 16)
+	defer release()
 
 	entries := [3]wgpuBindGroupEntry{
-		{binding: 44, buffer: bufParams, size: 16},
+		{binding: 44, buffer: bufParams, offset: offParams, size: 16},
 		bind(37, t),
 		{binding: 38, buffer: bufOut, size: outBytes},
 	}
@@ -3623,11 +3694,10 @@ func (t *Tensor) RopeCacheF16(kc, vc *Tensor, headSz, qw, kvDim, pos int, theta 
 		uint32(d), uint32(headSz), uint32(qw), uint32(kvDim),
 		uint32(pos), uint32(dstOff), math.Float32bits(float32(theta)),
 	}
-	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
-	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
-	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
+	bufParams, offParams, release := g.paramsBuffer(unsafe.Pointer(&params[0]), 32)
+	defer release()
 	entries := [4]wgpuBindGroupEntry{
-		{binding: 43, buffer: bufParams, size: 32},
+		{binding: 43, buffer: bufParams, offset: offParams, size: 32},
 		bind(41, t),
 		bind(22, kc),
 		bind(42, vc),
@@ -3667,11 +3737,10 @@ func (t *Tensor) CopyRowsInto(dst *Tensor, off int) error {
 		// pass batches it like any other dispatch, no copy involved.
 		n := t.Size()
 		params := [4]uint32{uint32(n), uint32(off)}
-		bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16)
-		defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 16, bufParams)
-		fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 16)
+		bufParams, offParams, release := g.paramsBuffer(unsafe.Pointer(&params[0]), 16)
+		defer release()
 		entries := [3]wgpuBindGroupEntry{
-			{binding: 20, buffer: bufParams, size: 16},
+			{binding: 20, buffer: bufParams, offset: offParams, size: 16},
 			bindN(21, t, uint64(n)*4),
 			bind(22, dst),
 		}
@@ -3788,17 +3857,17 @@ func (q *Tensor) GroupedCausalAttention(k, v *Tensor, heads, kvHeads, seqKV, win
 	uncapturedCB = ""
 
 	outBytes := uint64(q.Size()) * 4
-	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
-	bufOffs := g.takeBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
+	bufParams, offParams, release := g.paramsBuffer(unsafe.Pointer(&params[0]), 32)
+	defer release()
+	bufOffs := g.offsBuffer(offs)
+	if bufOffs == 0 {
+		return nil, errors.New("tensai: gpu offset buffer allocation failed")
+	}
 	bufOut := g.takeOutBuffer(outBytes)
-	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
-	defer g.putBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4, bufOffs)
-	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
-	fnQueueWriteBuffer(g.queue, bufOffs, 0, unsafe.Pointer(&offs[0]), uintptr(len(offs))*4)
 
 	entries := [6]wgpuBindGroupEntry{
 		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
-		{binding: 10, buffer: bufParams, size: 32},
+		{binding: 10, buffer: bufParams, offset: offParams, size: 32},
 		bind(11, q),
 		bind(12, k),
 		bind(13, v),
@@ -3850,18 +3919,18 @@ func (q *Tensor) groupedDecodeSplit(k, v *Tensor, kvHeads, dh, d, kvDim, seqKV i
 		uint32(per), uint32(seqKV), uint32(dh), uint32(d),
 		uint32(slabs), uint32(seqKV - 1), uint32(kvDim), 0,
 	}
-	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32)
-	bufOffs := g.takeBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4)
-	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, 32, bufParams)
-	defer g.putBuffer(wgpuBufferUsageStorage|wgpuBufferUsageCopyDst, uint64(len(offs))*4, bufOffs)
-	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params[0]), 32)
-	fnQueueWriteBuffer(g.queue, bufOffs, 0, unsafe.Pointer(&offs[0]), uintptr(len(offs))*4)
+	bufParams, offParams, release := g.paramsBuffer(unsafe.Pointer(&params[0]), 32)
+	defer release()
+	bufOffs := g.offsBuffer(offs)
+	if bufOffs == 0 {
+		return nil, errors.New("tensai: gpu offset buffer allocation failed")
+	}
 	scr := g.takeOutBuffer(scrBytes)
 	bufOut := g.takeOutBuffer(outBytes)
 
 	split := [6]wgpuBindGroupEntry{
 		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
-		{binding: 10, buffer: bufParams, size: 32},
+		{binding: 10, buffer: bufParams, offset: offParams, size: 32},
 		bind(11, q),
 		bind(12, k),
 		bind(13, v),
@@ -3876,7 +3945,7 @@ func (q *Tensor) groupedDecodeSplit(k, v *Tensor, kvHeads, dh, d, kvDim, seqKV i
 	}
 	reduce := [4]wgpuBindGroupEntry{
 		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
-		{binding: 10, buffer: bufParams, size: 32},
+		{binding: 10, buffer: bufParams, offset: offParams, size: 32},
 		{binding: 14, buffer: bufOut, size: outBytes},
 		{binding: 40, buffer: scr, size: scrBytes},
 	}

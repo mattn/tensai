@@ -53,6 +53,10 @@ type Device struct {
 	bgCache    map[bgKey]uintptr
 	batchEnc   uintptr // open command encoder while batching, see BeginBatch
 	batchPass  uintptr // open compute pass inside the batch encoder
+	uarBuf     uintptr // uniform staging arena, see stageUniform
+	uarStage   []byte
+	uarOff     uint64
+	offsCache  map[string]uintptr // resident attention-offset buffers
 	name       string
 	maxStorage uint64 // usable bytes per storage buffer, 0 = unknown
 	closed     bool
