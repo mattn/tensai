@@ -54,6 +54,29 @@ func Broadcast(a, b []int) ([]int, error) {
 	return out, nil
 }
 
+// BroadcastCount returns the number of elements in the broadcast of two
+// shapes without building it. Incompatible shapes are not reported here --
+// Broadcast is where that is checked -- so callers use this only for
+// sizing decisions.
+func BroadcastCount(a, b []int) int {
+	n := max(len(a), len(b))
+	total := 1
+	for i := 1; i <= n; i++ {
+		da, db := 1, 1
+		if i <= len(a) {
+			da = a[len(a)-i]
+		}
+		if i <= len(b) {
+			db = b[len(b)-i]
+		}
+		if da < db {
+			da = db
+		}
+		total *= da
+	}
+	return total
+}
+
 // BroadcastStrides returns, for each axis of the broadcast shape out, the
 // element stride to advance through a contiguous tensor of the given shape:
 // 0 for axes the tensor is broadcast along (including the leading axes it

@@ -1242,3 +1242,71 @@ func TestGPUQ4MatMul(t *testing.T) {
 		t.Fatal("expected shape mismatch error")
 	}
 }
+
+// TestGPUMatMulTN checks the transposed-A product against the CPU, for the
+// shapes a backward pass produces: a weight gradient is the activation
+// transposed times the output gradient, and the batch axes broadcast the
+// same way the forward product's do.
+func TestGPUMatMulTN(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+
+	rng := rand.New(rand.NewSource(23))
+	cases := [][2][]int{
+		{{4, 3}, {4, 5}},       // (3,4)^T-shaped weight gradient
+		{{2, 4, 3}, {2, 4, 5}}, // batched
+		{{2, 4, 3}, {4, 5}},    // broadcast b
+		{{4, 3}, {2, 4, 5}},    // broadcast a
+		{{64, 48}, {64, 96}},   // wide enough for the 64x64 kernel
+		{{17, 9}, {17, 33}},    // not a multiple of any tile
+	}
+	for _, c := range cases {
+		a, b := randTensor(rng, c[0]...), randTensor(rng, c[1]...)
+		ga, err := g.Upload(a)
+		if err != nil {
+			t.Fatalf("upload: %v", err)
+		}
+		gb, err := g.Upload(b)
+		if err != nil {
+			t.Fatalf("upload: %v", err)
+		}
+		gc, err := ga.MatMulTN(gb)
+		if err != nil {
+			t.Fatalf("gpu matmul-tn %v*%v: %v", c[0], c[1], err)
+		}
+		got, err := gc.Download()
+		if err != nil {
+			t.Fatalf("download: %v", err)
+		}
+		want, err := tensai.MatMulTN(a, b)
+		if err != nil {
+			t.Fatalf("cpu matmul-tn: %v", err)
+		}
+		if !dims.Same(got.Shape, want.Shape) {
+			t.Fatalf("%v*%v shape: got %v want %v", c[0], c[1], got.Shape, want.Shape)
+		}
+		for i := range want.Data {
+			if diff := math.Abs(float64(got.Data[i] - want.Data[i])); diff > 1e-4 {
+				t.Fatalf("%v*%v element %d: gpu=%v cpu=%v", c[0], c[1], i, got.Data[i], want.Data[i])
+			}
+		}
+		ga.Free()
+		gb.Free()
+		gc.Free()
+	}
+
+	// A mismatched contracted axis must be rejected.
+	ga, err := g.Upload(randTensor(rng, 4, 3))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	defer ga.Free()
+	gb, err := g.Upload(randTensor(rng, 5, 3))
+	if err != nil {
+		t.Fatalf("upload: %v", err)
+	}
+	defer gb.Free()
+	if _, err := ga.MatMulTN(gb); err == nil {
+		t.Fatal("expected shape mismatch error")
+	}
+}

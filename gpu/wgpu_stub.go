@@ -38,6 +38,12 @@ func (g *Device) Name() string { return "" }
 // MatMul always fails in builds without the wgpu tag.
 func (g *Device) MatMul(a, b *tensai.Tensor) (*tensai.Tensor, error) { return nil, errNoWGPU }
 
+// MatMulTN is a no-op stub; build with -tags wgpu or wgpu24.
+func (g *Device) MatMulTN(a, b *tensai.Tensor) (*tensai.Tensor, error) { return nil, errNoWGPU }
+
+// MatMulNT is a no-op stub; build with -tags wgpu or wgpu24.
+func (g *Device) MatMulNT(a, b *tensai.Tensor) (*tensai.Tensor, error) { return nil, errNoWGPU }
+
 // Close is a no-op in builds without the wgpu tag.
 func (g *Device) Close() {}
 
@@ -56,6 +62,9 @@ func (t *Tensor) MatMul(o *Tensor) (*Tensor, error) { return nil, errNoWGPU }
 
 // MatMulT always fails in builds without the wgpu tag.
 func (t *Tensor) MatMulT(o *Tensor) (*Tensor, error) { return nil, errNoWGPU }
+
+// MatMulTN is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) MatMulTN(o *Tensor) (*Tensor, error) { return nil, errNoWGPU }
 
 // Scale always fails in builds without the wgpu tag.
 func (t *Tensor) Scale(s tensai.Float) error { return errNoWGPU }

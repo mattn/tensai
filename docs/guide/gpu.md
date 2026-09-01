@@ -65,6 +65,32 @@ Multi-head attention carves each head out of the packed layout with strided kern
 
 The rest of a transformer decode step is there as well — `RMSNorm`, in-place `RoPE`, `Add`, `SiluMul`, `GroupedCausalAttention` (a KV cache packing fewer heads than the queries), and `CopyRowsInto` to append fresh k/v rows to a resident cache — so `tensai run -q8 -gpu` runs every block on the device and only the hidden state comes back per token. `BeginBatch`/`Flush` record a whole token's dispatches into one submission, and freed intermediates recycle through a buffer pool.
 
+## Training: the accelerator hook
+
+The products above are all inference shapes. Training adds two more per matmul -- the input gradient `grad * w^T` and the weight gradient `x^T * grad` -- which resident tensors now have as `MatMulT` and `MatMulTN`.
+
+A `Device` satisfies `tensai.Accelerator`, so a single call routes every product the CPU would otherwise run, in any package, onto the GPU:
+
+```go
+dev, err := gpu.Open(gpu.HighPerformance)
+if err == nil {
+	defer dev.Close()
+	tensai.UseAccelerator(dev) // and tensai.UseAccelerator(nil) to stop
+}
+```
+
+Only products at or above `tensai.DefaultAcceleratorThreshold` (4e8 multiply-accumulates) go to the device; below it the AVX2 kernels win, and the round trip would only cost time. `tensai.UseAcceleratorThreshold` sets a different bound. If the backend returns an error the product runs on the CPU instead, so acceleration never changes an answer -- only how long it takes to get it.
+
+Nothing else in a training step moves: activations, gradients, and the optimizer stay on the host, so every accelerated product uploads its operands and downloads its result. That caps the win, and it is why the threshold is where it is. On an AMD 780M through `-tags wgpu24`, one autograd step of a two-projection block (`x @ w1 -> GELU -> @ w2 -> MSE`, so six products) measures:
+
+| model width | CPU (AVX2) | with the device | |
+|---|---|---|---|
+| 512 | 31.3ms | 32.4ms | below the threshold: unchanged |
+| 1024 | 176ms | 145ms | 1.22x |
+| 2048 | 1367ms | 955ms | 1.43x |
+
+The same products with both operands already resident run 2.5-2.8x faster than the CPU, so most of the remaining gap is the transfers. Closing it means keeping a whole training graph on the device, which needs the element-wise, activation, and normalization kernels a backward pass touches -- the inference set does not cover them yet.
+
 ## Measuring the crossover
 
 `_example/wgpu -sweep` walks a ladder of sizes and marks where the GPU overtakes the CPU kernel. Because the CPU side is the same `dotRows` kernel the rest of the package uses, building the example twice compares portable Go, AVX2, and both GPU usage patterns:

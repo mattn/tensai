@@ -272,6 +272,108 @@ fn matmul_ts(@builtin(global_invocation_id) gid: vec3<u32>,
     }
 }
 
+// matmul_tn / matmul_tns read a transposed instead: a holds k rows of
+// length m (row stride lda), so the product is a^T * b. Training needs it
+// for the weight gradient, which is the input activation transposed times
+// the output gradient.
+
+@compute @workgroup_size(16, 16, 1)
+fn matmul_tn(@builtin(local_invocation_id) lid: vec3<u32>,
+             @builtin(workgroup_id) wid: vec3<u32>) {
+    let batch = wid.z;
+    let offA = offs[batch].x;
+    let offB = offs[batch].y;
+    let offC = offs[batch].z;
+    let rowBase = wid.y * BLK + lid.y * TT;
+    let colBase = wid.x * BLK + lid.x * TT;
+    let li = lid.y * 16u + lid.x;
+    var acc: array<f32, 16>;
+    let tiles = (p.k + TILE - 1u) / TILE;
+    for (var t = 0u; t < tiles; t = t + 1u) {
+        for (var i = 0u; i < 4u; i = i + 1u) {
+            let idx = li * 4u + i;
+            let ar = idx / TILE;
+            let ac = idx % TILE;
+            let gr = wid.y * BLK + ar;
+            let gc = t * TILE + ac;
+            // a holds k rows of length m; transpose while loading.
+            if (gr < p.m && gc < p.k) {
+                tileA[idx] = a[offA + gc * p.lda + gr];
+            } else {
+                tileA[idx] = 0.0;
+            }
+            let br = idx / BLK;
+            let bc = idx % BLK;
+            let gkr = t * TILE + br;
+            let gbc = wid.x * BLK + bc;
+            if (gkr < p.k && gbc < p.n) {
+                tileB[idx] = b[offB + gkr * p.ldb + gbc];
+            } else {
+                tileB[idx] = 0.0;
+            }
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < TILE; kk = kk + 1u) {
+            var af: array<f32, 4>;
+            var bf: array<f32, 4>;
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                af[i] = tileA[(lid.y * TT + i) * TILE + kk];
+                bf[i] = tileB[kk * BLK + lid.x * TT + i];
+            }
+            for (var i = 0u; i < 4u; i = i + 1u) {
+                for (var j = 0u; j < 4u; j = j + 1u) {
+                    acc[i * 4u + j] = acc[i * 4u + j] + af[i] * bf[j];
+                }
+            }
+        }
+        workgroupBarrier();
+    }
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            let r = rowBase + i;
+            let c = colBase + j;
+            if (r < p.m && c < p.n) {
+                outv[offC + r * p.ldc + c] = acc[i * 4u + j];
+            }
+        }
+    }
+}
+
+@compute @workgroup_size(16, 16, 1)
+fn matmul_tns(@builtin(global_invocation_id) gid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let col = gid.x;
+    let row = gid.y;
+    let batch = gid.z;
+    let offA = offs[batch].x;
+    let offB = offs[batch].y;
+    let offC = offs[batch].z;
+    var sum = 0.0;
+    let tiles = (p.k + TILE - 1u) / TILE;
+    for (var t = 0u; t < tiles; t = t + 1u) {
+        let ak = t * TILE + lid.x;
+        if (row < p.m && ak < p.k) {
+            tileSA[lid.y * TILE + lid.x] = a[offA + ak * p.lda + row];
+        } else {
+            tileSA[lid.y * TILE + lid.x] = 0.0;
+        }
+        let bk = t * TILE + lid.y;
+        if (bk < p.k && col < p.n) {
+            tileSB[lid.y * TILE + lid.x] = b[offB + bk * p.ldb + col];
+        } else {
+            tileSB[lid.y * TILE + lid.x] = 0.0;
+        }
+        workgroupBarrier();
+        for (var i = 0u; i < TILE; i = i + 1u) {
+            sum = sum + tileSA[lid.y * TILE + i] * tileSB[i * TILE + lid.x];
+        }
+        workgroupBarrier();
+    }
+    if (row < p.m && col < p.n) {
+        outv[offC + row * p.ldc + col] = sum;
+    }
+}
+
 struct ScaleParams { count: u32, s: f32 }
 @group(0) @binding(5) var<uniform> scp: ScaleParams;
 @group(0) @binding(6) var<storage, read_write> sbuf: array<f32>;
@@ -1805,6 +1907,8 @@ func (g *Device) IntDot() bool { return g.hasIntDot }
 // struct.
 type gpuPipelines struct {
 	matmul, matmulT, matmulS, matmulTS             uintptr
+	matmulTN, matmulTNS                            uintptr
+	layMatmulTN, layMatmulTNS                      uintptr
 	scale, softmax, attn, qmatmul                  uintptr
 	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
 	geluMulIP, qmatmulB, attnG, qmatmulT           uintptr
@@ -1832,6 +1936,8 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.matmulT, &g.pipes.layMatmulT, "matmul_t"},
 		{&g.pipes.matmulS, &g.pipes.layMatmulS, "matmul_s"},
 		{&g.pipes.matmulTS, &g.pipes.layMatmulTS, "matmul_ts"},
+		{&g.pipes.matmulTN, &g.pipes.layMatmulTN, "matmul_tn"},
+		{&g.pipes.matmulTNS, &g.pipes.layMatmulTNS, "matmul_tns"},
 		{&g.pipes.scale, &g.pipes.layScale, "scale_ip"},
 		{&g.pipes.softmax, &g.pipes.laySoftmax, "softmax_last"},
 		{&g.pipes.attn, &g.pipes.layAttn, "attn_causal"},
@@ -2682,7 +2788,7 @@ func (t *Tensor) Free() {
 // Device-resident tensor without any host transfer. Chain calls freely; only
 // Download moves data back.
 func (t *Tensor) MatMul(o *Tensor) (*Tensor, error) {
-	return t.matmul(o, false)
+	return t.matmul(o, gemmNN)
 }
 
 // MatMulT multiplies t by o with o's last two axes read transposed: a
@@ -2690,10 +2796,29 @@ func (t *Tensor) MatMul(o *Tensor) (*Tensor, error) {
 // (batch..., m, n), without materializing the transpose. This is the
 // attention pattern q @ k^T.
 func (t *Tensor) MatMulT(o *Tensor) (*Tensor, error) {
-	return t.matmul(o, true)
+	return t.matmul(o, gemmNT)
 }
 
-func (t *Tensor) matmul(o *Tensor, transB bool) (*Tensor, error) {
+// MatMulTN multiplies t by o with t's last two axes read transposed: a
+// (batch..., k, m) tensor times a (batch..., k, n) tensor yields
+// (batch..., m, n). This is the weight gradient of a matmul -- the input
+// activation transposed times the output gradient -- again without
+// materializing a transpose.
+func (t *Tensor) MatMulTN(o *Tensor) (*Tensor, error) {
+	return t.matmul(o, gemmTN)
+}
+
+// gemmMode selects which operand of a product is read transposed, matching
+// the three MatMul entry points in the root package.
+type gemmMode int
+
+const (
+	gemmNN gemmMode = iota // a * b
+	gemmTN                 // a^T * b
+	gemmNT                 // a * b^T
+)
+
+func (t *Tensor) matmul(o *Tensor, mode gemmMode) (*Tensor, error) {
 	if t.freed || o.freed {
 		return nil, errors.New("tensai: gpu tensor already freed")
 	}
@@ -2704,14 +2829,25 @@ func (t *Tensor) matmul(o *Tensor, transB bool) (*Tensor, error) {
 	if na < 2 || nb < 2 {
 		return nil, fmt.Errorf("tensai: matmul needs at least 2 axes: %v * %v", t.shape, o.shape)
 	}
-	m, k := t.shape[na-2], t.shape[na-1]
+	// The stored geometry of t; the logical product is (m, k) * (k, n).
+	aRows, aCols := t.shape[na-2], t.shape[na-1]
+	m, k := aRows, aCols
+	if mode == gemmTN {
+		k, m = aRows, aCols
+	}
 	var n int
-	if transB {
+	switch mode {
+	case gemmNT:
 		if o.shape[nb-1] != k {
 			return nil, fmt.Errorf("tensai: matmul-t shape mismatch: %v * %v^T", t.shape, o.shape)
 		}
 		n = o.shape[nb-2]
-	} else {
+	case gemmTN:
+		if o.shape[nb-2] != k {
+			return nil, fmt.Errorf("tensai: matmul-tn shape mismatch: (%v)^T * %v", t.shape, o.shape)
+		}
+		n = o.shape[nb-1]
+	default:
 		if o.shape[nb-2] != k {
 			return nil, fmt.Errorf("tensai: matmul shape mismatch: %v * %v", t.shape, o.shape)
 		}
@@ -2736,15 +2872,16 @@ func (t *Tensor) matmul(o *Tensor, transB bool) (*Tensor, error) {
 			offA += i * as[d]
 			offB += i * bs[d]
 		}
-		offs[4*bi] = uint32(offA * m * k)
-		offs[4*bi+1] = uint32(offB * k * n)
+		offs[4*bi] = uint32(offA * aRows * aCols)
+		offs[4*bi+1] = uint32(offB * o.shape[nb-2] * o.shape[nb-1])
 		offs[4*bi+2] = uint32(bi * m * n)
 	}
-	ldb := n
-	if transB {
+	// Row strides of the operands as they are stored.
+	lda, ldb := aCols, n
+	if mode == gemmNT {
 		ldb = k
 	}
-	return t.g.stridedMatMul(t, o, outShape, transB, m, k, n, batches, k, ldb, n, offs)
+	return t.g.stridedMatMul(t, o, outShape, mode, m, k, n, batches, lda, ldb, n, offs)
 }
 
 // stridedMatMul runs `batches` independent (m x k) x (k x n) products —
@@ -2753,7 +2890,7 @@ func (t *Tensor) matmul(o *Tensor, transB bool) (*Tensor, error) {
 // allocated output, and lda/ldb/ldc are the row strides. Explicit strides
 // let callers carve sub-matrices out of a wider layout, which is how
 // multi-head attention splits heads without materializing a permute.
-func (g *Device) stridedMatMul(a, b *Tensor, outShape []int, transB bool, m, k, n, batches, lda, ldb, ldc int, offs []uint32) (*Tensor, error) {
+func (g *Device) stridedMatMul(a, b *Tensor, outShape []int, mode gemmMode, m, k, n, batches, lda, ldb, ldc int, offs []uint32) (*Tensor, error) {
 	if batches > 65535 {
 		return nil, fmt.Errorf("tensai: gpu matmul batch count %d exceeds 65535", batches)
 	}
@@ -2791,15 +2928,21 @@ func (g *Device) stridedMatMul(a, b *Tensor, outShape []int, transB bool, m, k, 
 	// sixteen times the workgroups.
 	block := gpuBlock
 	pipe, lay := g.pipes.matmul, g.pipes.layMatmul
-	if transB {
+	switch mode {
+	case gemmNT:
 		pipe, lay = g.pipes.matmulT, g.pipes.layMatmulT
+	case gemmTN:
+		pipe, lay = g.pipes.matmulTN, g.pipes.layMatmulTN
 	}
 	blocks := ((m + gpuBlock - 1) / gpuBlock) * ((n + gpuBlock - 1) / gpuBlock) * batches
 	if m < 32 || n < 32 || blocks < 16 {
 		block = 16
 		pipe, lay = g.pipes.matmulS, g.pipes.layMatmulS
-		if transB {
+		switch mode {
+		case gemmNT:
 			pipe, lay = g.pipes.matmulTS, g.pipes.layMatmulTS
+		case gemmTN:
+			pipe, lay = g.pipes.matmulTNS, g.pipes.layMatmulTNS
 		}
 	}
 	entries := [5]wgpuBindGroupEntry{
@@ -3020,7 +3163,7 @@ func (q *Tensor) multiHeadAttention(k, v *Tensor, heads int, causal bool) (*Tens
 			offs[4*i+2] = uint32(i * seq * seqKV)
 		}
 	}
-	scores, err := q.g.stridedMatMul(q, k, []int{bh, seq, seqKV}, true,
+	scores, err := q.g.stridedMatMul(q, k, []int{bh, seq, seqKV}, gemmNT,
 		seq, dh, seqKV, bh, d, d, seqKV, offs)
 	if err != nil {
 		return nil, err
@@ -3051,7 +3194,7 @@ func (q *Tensor) multiHeadAttention(k, v *Tensor, heads int, causal bool) (*Tens
 		}
 	}
 	outShape := append(append([]int(nil), q.shape[:nq-2]...), seq, d)
-	return q.g.stridedMatMul(weights, v, outShape, false,
+	return q.g.stridedMatMul(weights, v, outShape, gemmNN,
 		seq, seqKV, dh, bh, seqKV, d, d, offs2)
 }
 
@@ -3123,6 +3266,26 @@ func (q *Tensor) fusedCausalMHA(k, v *Tensor, heads, batch, seq, seqKV, d, dh, b
 // the product back, so it only pays off for large products — keep operands
 // resident with Upload / Tensor.MatMul to amortize the transfers.
 func (g *Device) MatMul(a, b *tensai.Tensor) (*tensai.Tensor, error) {
+	return g.roundTrip(a, b, (*Tensor).MatMul)
+}
+
+// MatMulTN and MatMulNT are the transposed products a training step needs,
+// with the same upload-compute-download round trip. Together with MatMul
+// they satisfy tensai.Accelerator, so passing a Device to
+// tensai.UseAccelerator moves every large product -- including both halves
+// of a backward pass -- onto the GPU.
+func (g *Device) MatMulTN(a, b *tensai.Tensor) (*tensai.Tensor, error) {
+	return g.roundTrip(a, b, (*Tensor).MatMulTN)
+}
+
+func (g *Device) MatMulNT(a, b *tensai.Tensor) (*tensai.Tensor, error) {
+	return g.roundTrip(a, b, (*Tensor).MatMulT)
+}
+
+// roundTrip uploads both operands, runs one product, and downloads the
+// result. Callers that chain several products should keep their tensors
+// resident with Upload instead.
+func (g *Device) roundTrip(a, b *tensai.Tensor, op func(a, b *Tensor) (*Tensor, error)) (*tensai.Tensor, error) {
 	ga, err := g.Upload(a)
 	if err != nil {
 		return nil, err
@@ -3133,7 +3296,7 @@ func (g *Device) MatMul(a, b *tensai.Tensor) (*tensai.Tensor, error) {
 		return nil, err
 	}
 	defer gb.Free()
-	gc, err := ga.MatMul(gb)
+	gc, err := op(ga, gb)
 	if err != nil {
 		return nil, err
 	}
