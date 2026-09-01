@@ -119,12 +119,12 @@ func ggufArch(path string) (string, error) {
 }
 
 // gpuSupportsArch reports whether the device decoder has kernels for an
-// architecture. gemma4 varies its head and feed-forward widths from
-// layer to layer, shares KV caches between layers, and reads a per-layer
-// embedding off disk every token; the device path assumes none of that.
-func gpuSupportsArch(arch string) bool {
-	return arch != "gemma4"
-}
+// architecture. Every architecture the loader speaks has them today; the
+// hook stays because the answer has to be known before the load, which
+// repacks the weights differently for -gpu -- an architecture that
+// arrives without device kernels belongs here, not in a failure after
+// gigabytes of the wrong repacking.
+func gpuSupportsArch(string) bool { return true }
 
 // Open downloads (if needed) and loads the model, the optional draft
 // model, and the GPU residency, returning an Engine positioned at an
@@ -291,10 +291,22 @@ func Open(o Options) (*Engine, error) {
 		// context; a long-context model (Qwen3 declares 40960 positions)
 		// would allocate several GB, so clamp to a 2GB total budget and to
 		// the device's per-buffer storage limit.
-		kvDim := model.cfg.KVHeads * model.headSz
-		maxCtx := (2 << 30) / (2 * model.cfg.Layers * kvDim * 4)
+		// Widths are per layer and a layer may share an earlier layer's
+		// cache, so the budget counts what is actually allocated and the
+		// per-buffer limit follows the widest one.
+		total, widest := 0, 0
+		for i := range model.blocks {
+			b := &model.blocks[i]
+			if b.kvFrom >= 0 {
+				continue
+			}
+			kvDim := model.cfg.KVHeads * model.headSize(b)
+			total += kvDim
+			widest = max(widest, kvDim)
+		}
+		maxCtx := (2 << 30) / (2 * total * 4)
 		if lim := g.StorageLimit(); lim > 0 {
-			if perBuf := int(lim / uint64(kvDim*4)); perBuf < maxCtx {
+			if perBuf := int(lim / uint64(widest*4)); perBuf < maxCtx {
 				maxCtx = perBuf
 			}
 		}

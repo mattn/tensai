@@ -861,7 +861,11 @@ struct AttnParams {
 @group(0) @binding(14) var<storage, read_write> aout: array<f32>;
 
 const AT = 64u;
-var<workgroup> qrow: array<f32, 256>;
+// One query head, staged for the whole workgroup. Gemma 4's global
+// layers are 512 wide, which is the widest head this kernel takes; the
+// grouped kernel below stages a whole group instead and so tops out at
+// a narrower head.
+var<workgroup> qrow: array<f32, 512>;
 var<workgroup> ap_sc: array<f32, 64>;
 var<workgroup> ap_red: array<f32, 64>;
 
@@ -1061,6 +1065,10 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
     var acc1 = 0.0;
     var acc2 = 0.0;
     var acc3 = 0.0;
+    var acc4 = 0.0;
+    var acc5 = 0.0;
+    var acc6 = 0.0;
+    var acc7 = 0.0;
     let tiles = (limit + AT - 1u) / AT;
     for (var tt = start / AT; tt < tiles; tt = tt + 1u) {
         // Lane t scores kv position tt*64+t.
@@ -1097,11 +1105,16 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
         let rescale = exp(m - mNew);
         l = l * rescale + tileSum;
         m = mNew;
-        // Lane t now accumulates output channels t, t+64, t+128, t+192.
+        // Lane t now accumulates output channels t, t+64, and so on to
+        // t+448: eight of them, which is what carries a 512-wide head.
         acc0 = acc0 * rescale;
         acc1 = acc1 * rescale;
         acc2 = acc2 * rescale;
         acc3 = acc3 * rescale;
+        acc4 = acc4 * rescale;
+        acc5 = acc5 * rescale;
+        acc6 = acc6 * rescale;
+        acc7 = acc7 * rescale;
         let jEnd = min(limit, tt * AT + AT);
         for (var jj = max(start, tt * AT); jj < jEnd; jj = jj + 1u) {
             let pj = ap_sc[jj - tt * AT];
@@ -1117,6 +1130,18 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
             if (192u + t < ap.dh) {
                 acc3 = acc3 + pj * av[offKV + jj * ap.dkv + 192u + t];
             }
+            if (256u + t < ap.dh) {
+                acc4 = acc4 + pj * av[offKV + jj * ap.dkv + 256u + t];
+            }
+            if (320u + t < ap.dh) {
+                acc5 = acc5 + pj * av[offKV + jj * ap.dkv + 320u + t];
+            }
+            if (384u + t < ap.dh) {
+                acc6 = acc6 + pj * av[offKV + jj * ap.dkv + 384u + t];
+            }
+            if (448u + t < ap.dh) {
+                acc7 = acc7 + pj * av[offKV + jj * ap.dkv + 448u + t];
+            }
         }
         workgroupBarrier();
     }
@@ -1131,6 +1156,18 @@ fn attn_causal(@builtin(workgroup_id) wid: vec3<u32>,
     }
     if (192u + t < ap.dh) {
         aout[offO + qi * ap.d + 192u + t] = acc3 / l;
+    }
+    if (256u + t < ap.dh) {
+        aout[offO + qi * ap.d + 256u + t] = acc4 / l;
+    }
+    if (320u + t < ap.dh) {
+        aout[offO + qi * ap.d + 320u + t] = acc5 / l;
+    }
+    if (384u + t < ap.dh) {
+        aout[offO + qi * ap.d + 384u + t] = acc6 / l;
+    }
+    if (448u + t < ap.dh) {
+        aout[offO + qi * ap.d + 448u + t] = acc7 / l;
     }
 }
 
@@ -5328,8 +5365,8 @@ func (q *Tensor) GroupedCausalAttention(k, v *Tensor, heads, kvHeads, seqKV, win
 		return nil, fmt.Errorf("tensai: %d query heads / %d kv heads do not divide dimension %d", heads, kvHeads, d)
 	}
 	dh := d / heads
-	if dh > 256 {
-		return nil, fmt.Errorf("tensai: grouped attention head dimension %d exceeds 256", dh)
+	if dh > 512 {
+		return nil, fmt.Errorf("tensai: grouped attention head dimension %d exceeds 512", dh)
 	}
 	seq := q.Size() / d
 	kvDim := kvHeads * dh

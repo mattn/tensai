@@ -13,6 +13,7 @@ package llm
 import (
 	"fmt"
 	"io"
+	"math"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/gpu"
@@ -41,6 +42,22 @@ type gpuLayer struct {
 	qQKV                       gpuMat      // fused q|k|v projection; nil when split
 	qq, qk, qv, qo, qGU, qDown gpuMat
 	kc, vc                     *gpu.Tensor // [nCtx, kvDim]
+	// The widths belong to the layer, not to the model: gemma4 alternates
+	// two head widths and two feed-forward widths, and its deeper layers
+	// project queries only and attend against an earlier layer's cache
+	// (kvFrom, -1 when the layer keeps its own).
+	headSz, qDim, kvDim, ff int
+	kvFrom                  int
+	// gemma4: its logits carry no 1/sqrt(head) (qScale folds that back
+	// into the queries), its values are normalized without a weight of
+	// their own (vNorm is the ones vector that says so), its block
+	// output takes a scalar, and its per-layer embedding is a second
+	// residual through a gate and a projection.
+	qScale             float32
+	vNorm              *gpu.Tensor
+	outScale           float32
+	qPleGate, qPleProj gpuMat
+	plePost            *gpu.Tensor
 }
 
 type gpuQwen struct {
@@ -55,6 +72,9 @@ type gpuQwen struct {
 	// column and lmLogits collecting the slices for the one readback.
 	// Empty on a device that cannot hold a slice, and decode falls back
 	// to reading the hidden state back and finishing on the CPU.
+	// pleDim is the width of one layer's slice of gemma4's per-layer
+	// embedding, zero for every other architecture.
+	pleDim   int
 	gNorm    *gpu.Tensor
 	lmHead   []gpuMat
 	lmOff    []int
@@ -200,28 +220,24 @@ func upLm(g *gpu.Device, q *qmat) ([]gpuMat, []int, error) {
 // weight twins, the norm weights and biases, and zeroed KV caches sized
 // for nCtx positions.
 func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw io.Writer) (*gpuQwen, error) {
-	// The device path assumes one head width, one feed-forward width, and
-	// a KV cache per layer -- none of which gemma4 has, and its per-layer
-	// embeddings have no kernel here at all.
-	if m.ple != nil {
-		return nil, fmt.Errorf("gpu decode does not support %s yet", m.cfg.ModelType)
-	}
-	kvDim := m.cfg.KVHeads * m.headSz
 	vec := func(v []float32) *gpu.Tensor {
 		if v == nil { // llama: no attention biases
 			return nil
 		}
 		return must(g.Upload(&tensai.Tensor{Shape: []int{len(v)}, Data: v}))
 	}
-	hs := m.cfg.Heads * m.headSz // query dimension; equals hidden except qwen3
-	gq := &gpuQwen{m: m, g: g, nCtx: nCtx, layers: make([]gpuLayer, len(m.blocks))}
-	// A half-precision KV cache halves the resident cache when the device
-	// has shader-f16 and the model's head grouping fits the f16 kernel.
+	gq := &gpuQwen{m: m, g: g, nCtx: nCtx, layers: make([]gpuLayer, len(m.blocks)), pleDim: m.cfg.PLEDim}
 	group := m.cfg.Heads / m.cfg.KVHeads
-	useF16 := g.HasF16() && group > 1 && group <= 8 && m.headSz <= 256
-	// A view onto the fused result needs a 256-byte aligned offset, so
-	// both the q and the q|k boundary have to sit on 64 floats.
-	fuseQKV := hs%64 == 0 && kvDim%64 == 0
+	// A ones vector stands in for the weight gemma4's value norm does
+	// not have, so the ordinary per-head norm kernel can run it.
+	var vOnes *gpu.Tensor
+	if m.cfg.ModelType == "gemma4" {
+		ones := make([]float32, m.cfg.HeadDim)
+		for i := range ones {
+			ones[i] = 1
+		}
+		vOnes = must(g.Upload(&tensai.Tensor{Shape: []int{len(ones)}, Data: ones}))
+	}
 	// upSlice uploads a column range of a fused weight in whichever width
 	// it was quantized to; up uploads a whole one.
 	upSlice := func(q *qmat, lo, hi int) gpuMat {
@@ -246,6 +262,24 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw io.Writer) (*gpuQwen, err
 		l.window = b.window
 		l.ropeTheta = b.ropeTheta
 		l.geglu = b.geglu
+		l.headSz = m.headSize(b)
+		l.qDim = m.cfg.Heads * l.headSz
+		l.kvDim = m.cfg.KVHeads * l.headSz
+		l.ff = m.ffWidth(b)
+		l.kvFrom = b.kvFrom
+		hs, kvDim := l.qDim, l.kvDim
+		// A half-precision KV cache halves the resident cache when the
+		// device has shader-f16 and this layer's head grouping fits the
+		// f16 kernel; gemma4's two widths can land either way.
+		useF16 := g.HasF16() && group > 1 && group <= 8 && l.headSz <= 256
+		// A view onto the fused result needs a 256-byte aligned offset,
+		// so both the q and the q|k boundary have to sit on 64 floats.
+		fuseQKV := hs%64 == 0 && kvDim%64 == 0
+		if l.kvFrom >= 0 {
+			// Nothing but queries comes out of the projection, so the
+			// views that would carve k and v out never happen.
+			fuseQKV = true
+		}
 		l.ln1, l.ln2 = vec(b.ln1), vec(b.ln2)
 		l.qNorm, l.kNorm = vec(b.qNorm), vec(b.kNorm)
 		l.postAttn, l.postFFN = vec(b.postAttn), vec(b.postFFN)
@@ -267,15 +301,38 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw io.Writer) (*gpuQwen, err
 			l.qk = upSlice(b.qQKV, hs, hs+kvDim)
 			l.qv = upSlice(b.qQKV, hs+kvDim, hs+2*kvDim)
 		}
+		if b.unitQK {
+			// The kernel divides by the square root of the head width;
+			// multiplying the queries by it first leaves the logits
+			// where gemma4 wants them, at no extra dispatch beyond the
+			// one scale.
+			l.qScale = float32(math.Sqrt(float64(l.headSz)))
+		}
+		if b.vNorm {
+			l.vNorm = must(vOnes.View(0, 1, l.headSz))
+		}
+		if len(b.outScale) > 0 {
+			l.outScale = b.outScale[0]
+		}
+		if b.qPleGate != nil && b.qPleProj != nil {
+			l.qPleGate, l.qPleProj = up(b.qPleGate), up(b.qPleProj)
+			l.plePost = vec(b.plePost)
+		}
 		l.qo = up(b.qo)
 		// gate and up stay one fused weight: one dispatch projects both,
 		// and glu_split joins the halves.
 		l.qGU = up(b.qGU)
 		l.qDown = up(b.qDown)
-		if useF16 {
+		switch {
+		case l.kvFrom >= 0:
+			// This layer writes no keys or values: it attends against
+			// the cache an earlier layer of its own kind already fills.
+			src := &gq.layers[l.kvFrom]
+			l.kc, l.vc = src.kc, src.vc
+		case useF16:
 			l.kc = must(g.NewF16Tensor(nCtx, kvDim))
 			l.vc = must(g.NewF16Tensor(nCtx, kvDim))
-		} else {
+		default:
 			l.kc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
 			l.vc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
 		}
@@ -324,12 +381,14 @@ func (gq *gpuQwen) qkv(l *gpuLayer, x *gpu.Tensor, norm *gpu.Tensor, eps float64
 			must(l.qk.MatMulRMSNorm(x, norm, eps, l.bk, nil)),
 			must(l.qv.MatMulRMSNorm(x, norm, eps, l.bv, nil)), nil
 	}
-	hs := gq.m.cfg.Heads * gq.m.headSz
-	kvDim := gq.m.cfg.KVHeads * gq.m.headSz
 	f := must(l.qQKV.MatMulRMSNorm(x, norm, eps, l.bQKV, nil))
-	return must(f.View(0, 1, hs)),
-		must(f.View(hs, 1, kvDim)),
-		must(f.View(hs+kvDim, 1, kvDim)), f
+	if l.kvFrom >= 0 {
+		// Queries only: there is nothing else in the row.
+		return must(f.View(0, 1, l.qDim)), nil, nil, f
+	}
+	return must(f.View(0, 1, l.qDim)),
+		must(f.View(l.qDim, 1, l.kvDim)),
+		must(f.View(l.qDim+l.kvDim, 1, l.kvDim)), f
 }
 
 // qkvRows is qkv for a batch of token rows. The fused result is
@@ -343,13 +402,14 @@ func (gq *gpuQwen) qkvRows(l *gpuLayer, a *gpu.Tensor) (q, k, v *gpu.Tensor) {
 			must(l.qk.MatMulOpts(a, l.bk, nil)),
 			must(l.qv.MatMulOpts(a, l.bv, nil))
 	}
-	hs := gq.m.cfg.Heads * gq.m.headSz
-	kvDim := gq.m.cfg.KVHeads * gq.m.headSz
 	f := must(l.qQKV.MatMulOpts(a, l.bQKV, nil))
 	defer f.Free()
-	return must(f.SliceCols(0, hs)),
-		must(f.SliceCols(hs, kvDim)),
-		must(f.SliceCols(hs+kvDim, kvDim))
+	if l.kvFrom >= 0 {
+		return must(f.SliceCols(0, l.qDim)), nil, nil
+	}
+	return must(f.SliceCols(0, l.qDim)),
+		must(f.SliceCols(l.qDim, l.kvDim)),
+		must(f.SliceCols(l.qDim+l.kvDim, l.kvDim))
 }
 
 // prefill feeds a batch of tokens through the GPU-resident blocks — the
@@ -382,11 +442,50 @@ func (gq *gpuQwen) prefill(tokens []int, startPos int) []float32 {
 	return gq.prefillChunk(tokens, startPos)
 }
 
+// pleRows builds gemma4's per-layer inputs for a batch and uploads them
+// laid out layer by layer, so each layer's slice is a contiguous view:
+// [layers][rows, dim]. The table row itself is read off disk on the host,
+// which is where it belongs -- it is a different row for every token and
+// nothing else in the model touches it.
+func (gq *gpuQwen) pleRows(tokens []int, embed *tensai.Matrix) *gpu.Tensor {
+	m := gq.m
+	pe, err := m.pleInputs(tokens, embed)
+	if err != nil {
+		panic(err.Error())
+	}
+	dim, layers, n := gq.pleDim, m.cfg.Layers, len(tokens)
+	out := tensai.NewTensor(layers, n, dim)
+	for li := 0; li < layers; li++ {
+		for t := 0; t < n; t++ {
+			copy(out.Data[(li*n+t)*dim:], pe.Data[t*layers*dim+li*dim:t*layers*dim+(li+1)*dim])
+		}
+	}
+	return must(gq.g.Upload(out))
+}
+
+// pleBlock is gemma4's second residual on the device: a gelu gate on the
+// block output picks out this layer's slice of the token's per-layer
+// embedding, and the projection of that goes back into the stream.
+func (gq *gpuQwen) pleBlock(l *gpuLayer, li, rows int, x, pe *gpu.Tensor) {
+	slice := must(pe.View(li*rows*gq.pleDim, rows, gq.pleDim))
+	gate := must(l.qPleGate.MatMul(x))
+	if err := gate.GeluMul(slice); err != nil {
+		panic(err)
+	}
+	proj := must(l.qPleProj.MatMul(gate))
+	gate.Free()
+	np := must(proj.RMSNorm(l.plePost, gq.m.cfg.RMSEps))
+	proj.Free()
+	if err := x.Add(np); err != nil {
+		panic(err)
+	}
+	np.Free()
+}
+
 func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 	m := gq.m
 	cfg := m.cfg
 	hs := cfg.HiddenSize
-	kvDim := cfg.KVHeads * m.headSz
 	n := len(tokens)
 	if startPos+n > gq.nCtx {
 		panic(fmt.Sprintf("prefill of %d tokens exceeds gpu cache of %d", startPos+n, gq.nCtx))
@@ -395,6 +494,16 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 	flat := &tensai.Tensor{Shape: []int{n, hs}, Data: make([]float32, n*hs)}
 	for t, tk := range tokens {
 		copy(flat.Data[t*hs:], m.embed.Data[tk*hs:(tk+1)*hs])
+	}
+	if m.embScale != 0 {
+		for i := range flat.Data {
+			flat.Data[i] *= m.embScale
+		}
+	}
+	var pe *gpu.Tensor
+	if m.ple != nil {
+		pe = gq.pleRows(tokens, &tensai.Matrix{Rows: n, Cols: hs, Data: flat.Data})
+		defer pe.Free()
 	}
 	x := must(gq.g.Upload(flat))
 	defer x.Free()
@@ -410,30 +519,46 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 			nq := must(q.RMSNormEach(l.qNorm, cfg.RMSEps))
 			q.Free()
 			q = nq
-			nk := must(k.RMSNormEach(l.kNorm, cfg.RMSEps))
-			k.Free()
-			k = nk
+			if k != nil {
+				nk := must(k.RMSNormEach(l.kNorm, cfg.RMSEps))
+				k.Free()
+				k = nk
+			}
+		}
+		theta := l.ropeTheta
+		if theta == 0 {
+			theta = cfg.RopeTheta
 		}
 		if !l.noPE {
-			theta := l.ropeTheta
-			if theta == 0 {
-				theta = cfg.RopeTheta
-			}
-			if err := q.RoPE(m.headSz, startPos, theta); err != nil {
+			if err := q.RoPE(l.headSz, startPos, theta); err != nil {
 				panic(err)
 			}
-			if err := k.RoPE(m.headSz, startPos, theta); err != nil {
+			if k != nil {
+				if err := k.RoPE(l.headSz, startPos, theta); err != nil {
+					panic(err)
+				}
+			}
+		}
+		if l.qScale != 0 {
+			if err := q.Scale(l.qScale); err != nil {
 				panic(err)
 			}
 		}
-		if err := k.CopyRowsInto(l.kc, startPos*kvDim); err != nil {
-			panic(err)
+		if k != nil {
+			if l.vNorm != nil {
+				nv := must(v.RMSNormEach(l.vNorm, cfg.RMSEps))
+				v.Free()
+				v = nv
+			}
+			if err := k.CopyRowsInto(l.kc, startPos*l.kvDim); err != nil {
+				panic(err)
+			}
+			if err := v.CopyRowsInto(l.vc, startPos*l.kvDim); err != nil {
+				panic(err)
+			}
+			k.Free()
+			v.Free()
 		}
-		if err := v.CopyRowsInto(l.vc, startPos*kvDim); err != nil {
-			panic(err)
-		}
-		k.Free()
-		v.Free()
 		attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, cfg.KVHeads, startPos+n, l.window))
 		q.Free()
 		// The residual add rides the projection's epilogue unless a
@@ -456,7 +581,7 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 		a = must(x.RMSNorm(l.ln2, cfg.RMSEps))
 		gu := must(l.qGU.MatMul(a))
 		a.Free()
-		gate := must(gu.GLUSplit(cfg.Intermediate, l.geglu))
+		gate := must(gu.GLUSplit(l.ff, l.geglu))
 		gu.Free()
 		if l.postFFN == nil {
 			must(l.qDown.MatMulOpts(gate, nil, x))
@@ -472,6 +597,14 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 			}
 			down.Free()
 		}
+		if pe != nil {
+			gq.pleBlock(l, i, n, x, pe)
+		}
+		if l.outScale != 0 {
+			if err := x.Scale(l.outScale); err != nil {
+				panic(err)
+			}
+		}
 	}
 	gq.gpuLen = startPos + n
 	// Only the final position's hidden state comes back; the download
@@ -479,7 +612,7 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 	last := must(x.DownloadRange((n-1)*hs, hs))
 	a := make([]float32, hs)
 	rmsnormInto(a, last.Data, m.normW, cfg.RMSEps)
-	return mv(a, m.lmT, m.qLmT, nil)
+	return m.capLogits(mv(a, m.lmT, m.qLmT, nil))
 }
 
 // step feeds one token at position pos through the GPU-resident blocks and
@@ -489,9 +622,20 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 	m := gq.m
 	cfg := m.cfg
 	hs := cfg.HiddenSize
-	kvDim := cfg.KVHeads * m.headSz
-
-	x := must(gq.g.Upload(&tensai.Tensor{Shape: []int{1, hs}, Data: m.embed.Data[token*hs : (token+1)*hs]}))
+	row := m.embed.Data[token*hs : (token+1)*hs]
+	var pe *gpu.Tensor
+	if m.embScale != 0 {
+		scaled := make([]float32, hs)
+		for i, v := range row {
+			scaled[i] = v * m.embScale
+		}
+		row = scaled
+	}
+	if m.ple != nil {
+		pe = gq.pleRows([]int{token}, &tensai.Matrix{Rows: 1, Cols: hs, Data: row})
+		defer pe.Free()
+	}
+	x := must(gq.g.Upload(&tensai.Tensor{Shape: []int{1, hs}, Data: row}))
 	defer x.Free()
 	// One submission for the whole token: every dispatch below is recorded
 	// into a single command buffer, and the Download at the end flushes it.
@@ -517,47 +661,68 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 			nq := must(q.RMSNormEach(l.qNorm, cfg.RMSEps))
 			q.Free()
 			q = nq
-			nk := must(k.RMSNormEach(l.kNorm, cfg.RMSEps))
-			k.Free()
-			k = nk
+			if k != nil {
+				nk := must(k.RMSNormEach(l.kNorm, cfg.RMSEps))
+				k.Free()
+				k = nk
+			}
 		}
 		theta := l.ropeTheta
 		if theta == 0 {
 			theta = cfg.RopeTheta
 		}
-		if !l.noPE && qkvOwner != nil && l.qNorm == nil && l.kc.IsF16() {
+		if l.qScale != 0 {
+			if err := q.Scale(l.qScale); err != nil {
+				panic(err)
+			}
+		}
+		if k != nil && l.vNorm != nil {
+			nv := must(v.RMSNormEach(l.vNorm, cfg.RMSEps))
+			v.Free()
+			v = nv
+		}
+		switch {
+		case k == nil:
+			// A layer that keeps no cache rotates its queries and reads
+			// the keys and values an earlier layer already wrote.
+			if !l.noPE {
+				if err := q.RoPE(l.headSz, pos, theta); err != nil {
+					panic(err)
+				}
+			}
+		case !l.noPE && qkvOwner != nil && l.qNorm == nil && l.kc.IsF16():
 			// One dispatch rotates q and k on the fused row and appends
 			// the rotated k and the v straight into the caches. Every
 			// small dispatch in this chain costs ~40us of dependent-
 			// dispatch latency on dozen, so the three-in-one matters
 			// more than any of the work inside.
-			if err := qkvOwner.RopeCacheF16(l.kc, l.vc, m.headSz, cfg.Heads*m.headSz, kvDim, pos, theta, pos*kvDim); err != nil {
+			if err := qkvOwner.RopeCacheF16(l.kc, l.vc, l.headSz, l.qDim, l.kvDim, pos, theta, pos*l.kvDim); err != nil {
 				panic(err)
 			}
 			k.Free()
 			v.Free()
-		} else {
+		default:
 			if !l.noPE {
 				if qkvOwner != nil && l.qNorm == nil {
 					// q and k sit side by side in the fused row and the
 					// heads are uniform, so one dispatch rotates both.
-					qk := must(qkvOwner.View(0, 1, cfg.Heads*m.headSz+kvDim))
-					if err := qk.RoPE(m.headSz, pos, theta); err != nil {
+					qk := must(qkvOwner.View(0, 1, l.qDim+l.kvDim))
+					if err := qk.RoPE(l.headSz, pos, theta); err != nil {
 						panic(err)
 					}
 				} else {
-					if err := q.RoPE(m.headSz, pos, theta); err != nil {
+					if err := q.RoPE(l.headSz, pos, theta); err != nil {
 						panic(err)
 					}
-					if err := k.RoPE(m.headSz, pos, theta); err != nil {
+					if err := k.RoPE(l.headSz, pos, theta); err != nil {
 						panic(err)
 					}
 				}
 			}
-			if err := k.CopyRowsInto(l.kc, pos*kvDim); err != nil {
+			if err := k.CopyRowsInto(l.kc, pos*l.kvDim); err != nil {
 				panic(err)
 			}
-			if err := v.CopyRowsInto(l.vc, pos*kvDim); err != nil {
+			if err := v.CopyRowsInto(l.vc, pos*l.kvDim); err != nil {
 				panic(err)
 			}
 			k.Free()
@@ -574,7 +739,7 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 			if scr, slabs, err := q.GroupedCausalAttentionParts(l.kc, l.vc, cfg.Heads, cfg.KVHeads, pos+1, l.window); err != nil {
 				panic(err)
 			} else if scr != nil {
-				must(qo8.MatMulAttnCombine(scr, slabs, m.headSz, cfg.Heads/cfg.KVHeads, nil, x))
+				must(qo8.MatMulAttnCombine(scr, slabs, l.headSz, cfg.Heads/cfg.KVHeads, nil, x))
 				scr.Free()
 				attnFused = true
 			}
@@ -604,7 +769,7 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 		}
 
 		gu := must(l.qGU.MatMulRMSNorm(x, l.ln2, cfg.RMSEps, nil, nil))
-		gate := must(gu.GLUSplit(cfg.Intermediate, l.geglu))
+		gate := must(gu.GLUSplit(l.ff, l.geglu))
 		gu.Free()
 		if l.postFFN == nil {
 			must(l.qDown.MatMulOpts(gate, nil, x))
@@ -620,6 +785,14 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 			}
 			down.Free()
 		}
+		if pe != nil {
+			gq.pleBlock(l, i, 1, x, pe)
+		}
+		if l.outScale != 0 {
+			if err := x.Scale(l.outScale); err != nil {
+				panic(err)
+			}
+		}
 	}
 	// With the lm_head resident the norm and the vocabulary projection
 	// ride the same submission, and the one readback is the logits
@@ -629,7 +802,7 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 	if len(gq.lmHead) == 1 {
 		logits := must(gq.lmHead[0].MatMulRMSNorm(x, gq.gNorm, cfg.RMSEps, nil, nil))
 		defer logits.Free()
-		return must(logits.Download()).Data
+		return m.capLogits(must(logits.Download()).Data)
 	}
 	if len(gq.lmHead) > 1 {
 		for i, part := range gq.lmHead {
@@ -639,10 +812,10 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 			}
 			p.Free()
 		}
-		return must(gq.lmLogits.Download()).Data
+		return m.capLogits(must(gq.lmLogits.Download()).Data)
 	}
 	xt := must(x.Download())
 	a := make([]float32, hs)
 	rmsnormInto(a, xt.Data, m.normW, cfg.RMSEps)
-	return mv(a, m.lmT, m.qLmT, nil)
+	return m.capLogits(mv(a, m.lmT, m.qLmT, nil))
 }
