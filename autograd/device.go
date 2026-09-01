@@ -176,12 +176,24 @@ func (n *Node) syncGrad() {
 	n.grad = g
 }
 
-// devNode wraps a device buffer as a graph node on the same tape.
+// devNode wraps a device buffer as a graph node on the same tape. The
+// buffer's own shape is made to agree with the node's: a kernel is free to
+// hand back a flatter view of the same elements -- an embedding lookup
+// returns (rows, dim) for what the graph calls (batch, seq, dim) -- and the
+// next device op reads the buffer's shape, not the node's, so letting the
+// two drift apart quietly reshapes the graph.
 func devNode(op string, v *gpu.Tensor, shape []int, parents ...*Node) *Node {
+	tp := tapeOf(parents...)
+	if !dims.Same(v.Shape(), shape) {
+		if view, err := v.View(0, shape...); err == nil {
+			tp.track(v) // the view borrows the buffer; the owner still frees it
+			v = view
+		}
+	}
 	out := &Node{
 		op:      op,
 		parents: parents,
-		tape:    tapeOf(parents...),
+		tape:    tp,
 		dev:     v,
 		shapeOf: append([]int(nil), shape...),
 	}
@@ -190,7 +202,7 @@ func devNode(op string, v *gpu.Tensor, shape []int, parents ...*Node) *Node {
 			out.requiresGrad = true
 		}
 	}
-	out.tape.track(v)
+	tp.track(v)
 	return out
 }
 
