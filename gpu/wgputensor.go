@@ -253,6 +253,201 @@ fn matmul_l(@builtin(local_invocation_id) lid: vec3<u32>,
     storeRow(offC, rowBase + 3u, colBase, acc3);
 }
 
+// matmul_v4 is matmul_l with the tile loads widened: the same buffers are
+// bound again as vec4 arrays, so each thread brings in four values with one
+// instruction instead of four. It needs k and n to be multiples of four and
+// the row strides and batch offsets to be too, which the host checks before
+// picking it.
+@group(0) @binding(56) var<storage, read> a4: array<vec4<f32>>;
+@group(0) @binding(57) var<storage, read> b4: array<vec4<f32>>;
+
+@compute @workgroup_size(16, 16, 1)
+fn matmul_v4(@builtin(local_invocation_id) lid: vec3<u32>,
+             @builtin(workgroup_id) wid: vec3<u32>) {
+    let batch = wid.z;
+    let offA = offs[batch].x;
+    let offB = offs[batch].y;
+    let offC = offs[batch].z;
+    let rowBase = wid.y * BLK + lid.y * TT;
+    let colBase = wid.x * BLK + lid.x * TT;
+    let li = lid.y * 16u + lid.x;
+    var acc0 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc3 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    // Each of the 256 threads fills one vec4 of each tile: a is four k
+    // values of one row, b is four n values of one k.
+    let aRow = li / 4u;          // 0..63 within the block
+    let aQuad = (li % 4u) * 4u;  // k offset within the tile
+    let bRow = li / 16u;         // 0..15, the k index within the tile
+    let bQuad = (li % 16u) * 4u; // n offset within the block
+    let tiles = (p.k + TILE - 1u) / TILE;
+    for (var t = 0u; t < tiles; t = t + 1u) {
+        let gr = wid.y * BLK + aRow;
+        let gc = t * TILE + aQuad;
+        var av = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        if (gr < p.m && gc < p.k) {
+            av = a4[(offA + gr * p.lda + gc) / 4u];
+        }
+        tileA[aRow * TILE + aQuad] = av.x;
+        tileA[aRow * TILE + aQuad + 1u] = av.y;
+        tileA[aRow * TILE + aQuad + 2u] = av.z;
+        tileA[aRow * TILE + aQuad + 3u] = av.w;
+
+        let gkr = t * TILE + bRow;
+        let gbc = wid.x * BLK + bQuad;
+        var bvv = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        if (gkr < p.k && gbc < p.n) {
+            bvv = b4[(offB + gkr * p.ldb + gbc) / 4u];
+        }
+        tileB[bRow * BLK + bQuad] = bvv.x;
+        tileB[bRow * BLK + bQuad + 1u] = bvv.y;
+        tileB[bRow * BLK + bQuad + 2u] = bvv.z;
+        tileB[bRow * BLK + bQuad + 3u] = bvv.w;
+        workgroupBarrier();
+        for (var kk = 0u; kk < TILE; kk = kk + 1u) {
+            let aBase = lid.y * TT;
+            let bBase = kk * BLK + lid.x * TT;
+            let bv = vec4<f32>(tileB[bBase], tileB[bBase + 1u], tileB[bBase + 2u], tileB[bBase + 3u]);
+            acc0 = fma(vec4<f32>(tileA[aBase * TILE + kk]), bv, acc0);
+            acc1 = fma(vec4<f32>(tileA[(aBase + 1u) * TILE + kk]), bv, acc1);
+            acc2 = fma(vec4<f32>(tileA[(aBase + 2u) * TILE + kk]), bv, acc2);
+            acc3 = fma(vec4<f32>(tileA[(aBase + 3u) * TILE + kk]), bv, acc3);
+        }
+        workgroupBarrier();
+    }
+    storeRow(offC, rowBase, colBase, acc0);
+    storeRow(offC, rowBase + 1u, colBase, acc1);
+    storeRow(offC, rowBase + 2u, colBase, acc2);
+    storeRow(offC, rowBase + 3u, colBase, acc3);
+}
+
+// matmul_v4t and matmul_v4tn widen the loads of the transposed modes. The
+// operand that is read transposed is fetched four values along k (or along
+// m) at a time and scattered into the tile, which is what makes the wide
+// load legal there.
+@compute @workgroup_size(16, 16, 1)
+fn matmul_v4t(@builtin(local_invocation_id) lid: vec3<u32>,
+              @builtin(workgroup_id) wid: vec3<u32>) {
+    let batch = wid.z;
+    let offA = offs[batch].x;
+    let offB = offs[batch].y;
+    let offC = offs[batch].z;
+    let rowBase = wid.y * BLK + lid.y * TT;
+    let colBase = wid.x * BLK + lid.x * TT;
+    let li = lid.y * 16u + lid.x;
+    var acc0 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc3 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let aRow = li / 4u;
+    let aQuad = (li % 4u) * 4u;
+    let bCol = li % BLK;        // the n index within the block
+    let bQuad = (li / BLK) * 4u; // four k values per thread
+    let tiles = (p.k + TILE - 1u) / TILE;
+    for (var t = 0u; t < tiles; t = t + 1u) {
+        let gr = wid.y * BLK + aRow;
+        let gc = t * TILE + aQuad;
+        var av = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        if (gr < p.m && gc < p.k) {
+            av = a4[(offA + gr * p.lda + gc) / 4u];
+        }
+        tileA[aRow * TILE + aQuad] = av.x;
+        tileA[aRow * TILE + aQuad + 1u] = av.y;
+        tileA[aRow * TILE + aQuad + 2u] = av.z;
+        tileA[aRow * TILE + aQuad + 3u] = av.w;
+
+        // b holds n rows of length k: four k values of one row, scattered
+        // down the tile's k axis.
+        let gbc = wid.x * BLK + bCol;
+        let gkr = t * TILE + bQuad;
+        var bw = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        if (gbc < p.n && gkr < p.k) {
+            bw = b4[(offB + gbc * p.ldb + gkr) / 4u];
+        }
+        tileB[bQuad * BLK + bCol] = bw.x;
+        tileB[(bQuad + 1u) * BLK + bCol] = bw.y;
+        tileB[(bQuad + 2u) * BLK + bCol] = bw.z;
+        tileB[(bQuad + 3u) * BLK + bCol] = bw.w;
+        workgroupBarrier();
+        for (var kk = 0u; kk < TILE; kk = kk + 1u) {
+            let aBase = lid.y * TT;
+            let bBase = kk * BLK + lid.x * TT;
+            let bv = vec4<f32>(tileB[bBase], tileB[bBase + 1u], tileB[bBase + 2u], tileB[bBase + 3u]);
+            acc0 = fma(vec4<f32>(tileA[aBase * TILE + kk]), bv, acc0);
+            acc1 = fma(vec4<f32>(tileA[(aBase + 1u) * TILE + kk]), bv, acc1);
+            acc2 = fma(vec4<f32>(tileA[(aBase + 2u) * TILE + kk]), bv, acc2);
+            acc3 = fma(vec4<f32>(tileA[(aBase + 3u) * TILE + kk]), bv, acc3);
+        }
+        workgroupBarrier();
+    }
+    storeRow(offC, rowBase, colBase, acc0);
+    storeRow(offC, rowBase + 1u, colBase, acc1);
+    storeRow(offC, rowBase + 2u, colBase, acc2);
+    storeRow(offC, rowBase + 3u, colBase, acc3);
+}
+
+@compute @workgroup_size(16, 16, 1)
+fn matmul_v4tn(@builtin(local_invocation_id) lid: vec3<u32>,
+               @builtin(workgroup_id) wid: vec3<u32>) {
+    let batch = wid.z;
+    let offA = offs[batch].x;
+    let offB = offs[batch].y;
+    let offC = offs[batch].z;
+    let rowBase = wid.y * BLK + lid.y * TT;
+    let colBase = wid.x * BLK + lid.x * TT;
+    let li = lid.y * 16u + lid.x;
+    var acc0 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc3 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let aCol = li % TILE;         // the k index within the tile
+    let aQuad = (li / TILE) * 4u; // four output rows per thread
+    let bRow = li / 16u;
+    let bQuad = (li % 16u) * 4u;
+    let tiles = (p.k + TILE - 1u) / TILE;
+    for (var t = 0u; t < tiles; t = t + 1u) {
+        // a holds k rows of length m: four m values of one k, scattered
+        // down the tile's m axis.
+        let gc = t * TILE + aCol;
+        let gr = wid.y * BLK + aQuad;
+        var av = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        if (gc < p.k && gr < p.m) {
+            av = a4[(offA + gc * p.lda + gr) / 4u];
+        }
+        tileA[aQuad * TILE + aCol] = av.x;
+        tileA[(aQuad + 1u) * TILE + aCol] = av.y;
+        tileA[(aQuad + 2u) * TILE + aCol] = av.z;
+        tileA[(aQuad + 3u) * TILE + aCol] = av.w;
+
+        let gkr = t * TILE + bRow;
+        let gbc = wid.x * BLK + bQuad;
+        var bvv = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        if (gkr < p.k && gbc < p.n) {
+            bvv = b4[(offB + gkr * p.ldb + gbc) / 4u];
+        }
+        tileB[bRow * BLK + bQuad] = bvv.x;
+        tileB[bRow * BLK + bQuad + 1u] = bvv.y;
+        tileB[bRow * BLK + bQuad + 2u] = bvv.z;
+        tileB[bRow * BLK + bQuad + 3u] = bvv.w;
+        workgroupBarrier();
+        for (var kk = 0u; kk < TILE; kk = kk + 1u) {
+            let aBase = lid.y * TT;
+            let bBase = kk * BLK + lid.x * TT;
+            let bv = vec4<f32>(tileB[bBase], tileB[bBase + 1u], tileB[bBase + 2u], tileB[bBase + 3u]);
+            acc0 = fma(vec4<f32>(tileA[aBase * TILE + kk]), bv, acc0);
+            acc1 = fma(vec4<f32>(tileA[(aBase + 1u) * TILE + kk]), bv, acc1);
+            acc2 = fma(vec4<f32>(tileA[(aBase + 2u) * TILE + kk]), bv, acc2);
+            acc3 = fma(vec4<f32>(tileA[(aBase + 3u) * TILE + kk]), bv, acc3);
+        }
+        workgroupBarrier();
+    }
+    storeRow(offC, rowBase, colBase, acc0);
+    storeRow(offC, rowBase + 1u, colBase, acc1);
+    storeRow(offC, rowBase + 2u, colBase, acc2);
+    storeRow(offC, rowBase + 3u, colBase, acc3);
+}
+
 // matmul_lt and matmul_ltn are the same register-tiled body with one
 // operand read transposed while its tile is loaded, so the inner loop is
 // shared with matmul_l.
@@ -2448,6 +2643,8 @@ type gpuPipelines struct {
 	layBinOp, layActFwd, layActBwd                 uintptr
 	laySumCols, layAdamStep                        uintptr
 	matmulL, matmulLT, matmulLTN                   uintptr
+	matmulV4, matmulV4T, matmulV4TN                uintptr
+	layMatmulV4, layMatmulV4T, layMatmulV4TN       uintptr
 	layMatmulL, layMatmulLT, layMatmulLTN          uintptr
 	lnFwd, lnXhat, lnBwd, softmaxBwd, permute      uintptr
 	embedGather, embedScatter                      uintptr
@@ -2484,6 +2681,9 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.matmulTN, &g.pipes.layMatmulTN, "matmul_tn"},
 		{&g.pipes.matmulTNS, &g.pipes.layMatmulTNS, "matmul_tns"},
 		{&g.pipes.matmulL, &g.pipes.layMatmulL, "matmul_l"},
+		{&g.pipes.matmulV4, &g.pipes.layMatmulV4, "matmul_v4"},
+		{&g.pipes.matmulV4T, &g.pipes.layMatmulV4T, "matmul_v4t"},
+		{&g.pipes.matmulV4TN, &g.pipes.layMatmulV4TN, "matmul_v4tn"},
 		{&g.pipes.matmulLT, &g.pipes.layMatmulLT, "matmul_lt"},
 		{&g.pipes.matmulLTN, &g.pipes.layMatmulLTN, "matmul_ltn"},
 		{&g.pipes.scale, &g.pipes.layScale, "scale_ip"},
@@ -3494,9 +3694,29 @@ func (g *Device) stridedMatMul(a, b *Tensor, outShape []int, mode gemmMode, m, k
 	case gemmTN:
 		pipe, lay = g.pipes.matmulLTN, g.pipes.layMatmulLTN
 	}
+	// The vec4 loads need every address they widen to be quad-aligned, and
+	// which dimension each mode widens along differs.
+	// A vec4 binding also has to cover a whole number of quads, which a
+	// view carved out of a packed layout need not.
+	wide := !noWideGemm && lda%4 == 0 && ldb%4 == 0 &&
+		a.Size()%4 == 0 && b.Size()%4 == 0 && quadAligned(offs)
+	switch {
+	case !wide:
+	case mode == gemmNN && k%4 == 0 && n%4 == 0:
+		pipe, lay = g.pipes.matmulV4, g.pipes.layMatmulV4
+	case mode == gemmNT && k%4 == 0:
+		pipe, lay = g.pipes.matmulV4T, g.pipes.layMatmulV4T
+	case mode == gemmTN && m%4 == 0 && n%4 == 0:
+		pipe, lay = g.pipes.matmulV4TN, g.pipes.layMatmulV4TN
+	default:
+		wide = false
+	}
 	blocks := ((m + gpuBlock - 1) / gpuBlock) * ((n + gpuBlock - 1) / gpuBlock) * batches
 	if m < 32 || n < 32 || blocks < 16 {
+		// The small kernels read the operands through the scalar bindings,
+		// so the wide ones must not be bound with them.
 		block = 16
+		wide = false
 		pipe, lay = g.pipes.matmulS, g.pipes.layMatmulS
 		switch mode {
 		case gemmNT:
@@ -3505,14 +3725,19 @@ func (g *Device) stridedMatMul(a, b *Tensor, outShape []int, mode gemmMode, m, k
 			pipe, lay = g.pipes.matmulTNS, g.pipes.layMatmulTNS
 		}
 	}
-	entries := [5]wgpuBindGroupEntry{
-		{binding: 0, buffer: bufParams, size: 32},
-		bind(1, a),
-		bind(2, b),
-		{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
-		{binding: 4, buffer: bufOut, size: outBytes},
+	// A bind group has to match its pipeline's layout exactly, and the
+	// vec4 kernel reads the operands only through the wide bindings.
+	entries := make([]wgpuBindGroupEntry, 0, 5)
+	entries = append(entries, wgpuBindGroupEntry{binding: 0, buffer: bufParams, size: 32})
+	if wide {
+		entries = append(entries, bind(56, a), bind(57, b))
+	} else {
+		entries = append(entries, bind(1, a), bind(2, b))
 	}
-	bindGroup := g.cachedBindGroup(lay, entries[:])
+	entries = append(entries,
+		wgpuBindGroupEntry{binding: 3, buffer: bufOffs, size: uint64(len(offs)) * 4},
+		wgpuBindGroupEntry{binding: 4, buffer: bufOut, size: outBytes})
+	bindGroup := g.cachedBindGroup(lay, entries)
 	runtime.KeepAlive(&entries)
 
 	err := g.dispatch(pipe, bindGroup,
@@ -3522,6 +3747,21 @@ func (g *Device) stridedMatMul(a, b *Tensor, outShape []int, mode gemmMode, m, k
 		return nil, err
 	}
 	return &Tensor{g: g, buf: bufOut, shape: outShape}, nil
+}
+
+// noWideGemm turns the vec4-load kernel off, so a benchmark can compare it
+// against the scalar-load one in the same process.
+var noWideGemm bool
+
+// quadAligned reports whether every batch offset a kernel will divide by
+// four actually is a multiple of four.
+func quadAligned(offs []uint32) bool {
+	for i := 0; i+1 < len(offs); i += 4 {
+		if offs[i]%4 != 0 || offs[i+1]%4 != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // split2D spreads n workgroups over a 2-D dispatch grid, since a single
