@@ -551,6 +551,9 @@ func matmulStack(a, b *Tensor, mode gemmMode) (*Tensor, error) {
 		return nil, err
 	}
 	na, nb := len(a.Shape), len(b.Shape)
+	if out, ok := offload(a, b, d, mode); ok {
+		return out, nil
+	}
 	if na == 2 && nb == 2 {
 		out := newTensorShape([]int{d.m, d.n})
 		return out, gemmExec(out, a, b, d, mode, nil)
@@ -569,6 +572,13 @@ func matmulStackInto(out, a, b *Tensor, mode gemmMode) error {
 	if err != nil {
 		return err
 	}
+	if res, ok := offload(a, b, d, mode); ok {
+		if !dims.Same(out.Shape, res.Shape) {
+			return fmt.Errorf("tensai: matmul output shape %v, want %v", out.Shape, res.Shape)
+		}
+		copy(out.Data, res.Data)
+		return nil
+	}
 	na, nb := len(a.Shape), len(b.Shape)
 	no := len(out.Shape)
 	if no < 2 || out.Shape[no-2] != d.m || out.Shape[no-1] != d.n {
@@ -586,6 +596,35 @@ func matmulStackInto(out, a, b *Tensor, mode gemmMode) error {
 		return fmt.Errorf("tensai: matmul output shape %v, want (%d, %d)", out.Shape, d.m, d.n)
 	}
 	return gemmExec(out, a, b, d, mode, batch)
+}
+
+// offload runs the product on an installed Accelerator when there is one
+// and the product is big enough to be worth the trip. A backend error is
+// not fatal: the caller falls through to the CPU kernels, which always
+// produce the same answer.
+func offload(a, b *Tensor, d gemmDims, mode gemmMode) (*Tensor, bool) {
+	batches := dims.BroadcastCount(a.Shape[:len(a.Shape)-2], b.Shape[:len(b.Shape)-2])
+	macs := int64(d.m) * int64(d.k) * int64(d.n) * int64(batches)
+	acc := acceleratorFor(macs)
+	if acc == nil {
+		return nil, false
+	}
+	var (
+		out *Tensor
+		err error
+	)
+	switch mode {
+	case gemmTN:
+		out, err = acc.MatMulTN(a, b)
+	case gemmNT:
+		out, err = acc.MatMulNT(a, b)
+	default:
+		out, err = acc.MatMul(a, b)
+	}
+	if err != nil || out == nil {
+		return nil, false
+	}
+	return out, true
 }
 
 // gemmExec runs the product. batch is nil when both operands are plain
