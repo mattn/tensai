@@ -16,8 +16,8 @@
 // kernels win, while a wider model crosses over. On an AMD 780M:
 //
 //	                                        CPU        -gpu
-//	default (model 64, batch 8, seq 32)     23ms/step  62ms/step
-//	-model 256 -heads 8 -batch 16 -seq 64  282ms/step 173ms/step
+//	default (model 64, batch 8, seq 32)     24ms/step  72ms/step
+//	-model 256 -heads 8 -batch 16 -seq 64  317ms/step 145ms/step
 //
 // The losses are identical either way, which is the point of the check.
 package main

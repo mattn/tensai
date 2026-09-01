@@ -193,6 +193,201 @@ fn matmul_t(@builtin(local_invocation_id) lid: vec3<u32>,
     }
 }
 
+// matmul_l is the 64x64 block again, but with the accumulators as four
+// vec4 registers instead of an indexed array. A private array that the
+// compiler cannot fully unroll lands in scratch memory rather than
+// registers, and at 16 accumulators per thread that is the difference
+// between the inner loop running out of registers and not.
+@compute @workgroup_size(16, 16, 1)
+fn matmul_l(@builtin(local_invocation_id) lid: vec3<u32>,
+            @builtin(workgroup_id) wid: vec3<u32>) {
+    let batch = wid.z;
+    let offA = offs[batch].x;
+    let offB = offs[batch].y;
+    let offC = offs[batch].z;
+    let rowBase = wid.y * BLK + lid.y * TT;
+    let colBase = wid.x * BLK + lid.x * TT;
+    let li = lid.y * 16u + lid.x;
+    var acc0 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc3 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let tiles = (p.k + TILE - 1u) / TILE;
+    for (var t = 0u; t < tiles; t = t + 1u) {
+        for (var i = 0u; i < 4u; i = i + 1u) {
+            let idx = li * 4u + i;
+            let ar = idx / TILE;
+            let ac = idx % TILE;
+            let gr = wid.y * BLK + ar;
+            let gc = t * TILE + ac;
+            if (gr < p.m && gc < p.k) {
+                tileA[idx] = a[offA + gr * p.lda + gc];
+            } else {
+                tileA[idx] = 0.0;
+            }
+            let br = idx / BLK;
+            let bc = idx % BLK;
+            let gkr = t * TILE + br;
+            let gbc = wid.x * BLK + bc;
+            if (gkr < p.k && gbc < p.n) {
+                tileB[idx] = b[offB + gkr * p.ldb + gbc];
+            } else {
+                tileB[idx] = 0.0;
+            }
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < TILE; kk = kk + 1u) {
+            let aBase = lid.y * TT;
+            let bBase = kk * BLK + lid.x * TT;
+            let bv = vec4<f32>(tileB[bBase], tileB[bBase + 1u], tileB[bBase + 2u], tileB[bBase + 3u]);
+            acc0 = fma(vec4<f32>(tileA[aBase * TILE + kk]), bv, acc0);
+            acc1 = fma(vec4<f32>(tileA[(aBase + 1u) * TILE + kk]), bv, acc1);
+            acc2 = fma(vec4<f32>(tileA[(aBase + 2u) * TILE + kk]), bv, acc2);
+            acc3 = fma(vec4<f32>(tileA[(aBase + 3u) * TILE + kk]), bv, acc3);
+        }
+        workgroupBarrier();
+    }
+    storeRow(offC, rowBase, colBase, acc0);
+    storeRow(offC, rowBase + 1u, colBase, acc1);
+    storeRow(offC, rowBase + 2u, colBase, acc2);
+    storeRow(offC, rowBase + 3u, colBase, acc3);
+}
+
+// matmul_lt and matmul_ltn are the same register-tiled body with one
+// operand read transposed while its tile is loaded, so the inner loop is
+// shared with matmul_l.
+@compute @workgroup_size(16, 16, 1)
+fn matmul_lt(@builtin(local_invocation_id) lid: vec3<u32>,
+             @builtin(workgroup_id) wid: vec3<u32>) {
+    let batch = wid.z;
+    let offA = offs[batch].x;
+    let offB = offs[batch].y;
+    let offC = offs[batch].z;
+    let rowBase = wid.y * BLK + lid.y * TT;
+    let colBase = wid.x * BLK + lid.x * TT;
+    let li = lid.y * 16u + lid.x;
+    var acc0 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc3 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let tiles = (p.k + TILE - 1u) / TILE;
+    for (var t = 0u; t < tiles; t = t + 1u) {
+        for (var i = 0u; i < 4u; i = i + 1u) {
+            let idx = li * 4u + i;
+            let ar = idx / TILE;
+            let ac = idx % TILE;
+            let gr = wid.y * BLK + ar;
+            let gc = t * TILE + ac;
+            if (gr < p.m && gc < p.k) {
+                tileA[idx] = a[offA + gr * p.lda + gc];
+            } else {
+                tileA[idx] = 0.0;
+            }
+            // b holds n rows of length k; transpose it into the tile.
+            let br = idx / BLK;
+            let bc = idx % BLK;
+            let gkr = t * TILE + br;
+            let gbc = wid.x * BLK + bc;
+            if (gkr < p.k && gbc < p.n) {
+                tileB[idx] = b[offB + gbc * p.ldb + gkr];
+            } else {
+                tileB[idx] = 0.0;
+            }
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < TILE; kk = kk + 1u) {
+            let aBase = lid.y * TT;
+            let bBase = kk * BLK + lid.x * TT;
+            let bv = vec4<f32>(tileB[bBase], tileB[bBase + 1u], tileB[bBase + 2u], tileB[bBase + 3u]);
+            acc0 = fma(vec4<f32>(tileA[aBase * TILE + kk]), bv, acc0);
+            acc1 = fma(vec4<f32>(tileA[(aBase + 1u) * TILE + kk]), bv, acc1);
+            acc2 = fma(vec4<f32>(tileA[(aBase + 2u) * TILE + kk]), bv, acc2);
+            acc3 = fma(vec4<f32>(tileA[(aBase + 3u) * TILE + kk]), bv, acc3);
+        }
+        workgroupBarrier();
+    }
+    storeRow(offC, rowBase, colBase, acc0);
+    storeRow(offC, rowBase + 1u, colBase, acc1);
+    storeRow(offC, rowBase + 2u, colBase, acc2);
+    storeRow(offC, rowBase + 3u, colBase, acc3);
+}
+
+@compute @workgroup_size(16, 16, 1)
+fn matmul_ltn(@builtin(local_invocation_id) lid: vec3<u32>,
+              @builtin(workgroup_id) wid: vec3<u32>) {
+    let batch = wid.z;
+    let offA = offs[batch].x;
+    let offB = offs[batch].y;
+    let offC = offs[batch].z;
+    let rowBase = wid.y * BLK + lid.y * TT;
+    let colBase = wid.x * BLK + lid.x * TT;
+    let li = lid.y * 16u + lid.x;
+    var acc0 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc3 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let tiles = (p.k + TILE - 1u) / TILE;
+    for (var t = 0u; t < tiles; t = t + 1u) {
+        for (var i = 0u; i < 4u; i = i + 1u) {
+            let idx = li * 4u + i;
+            let ar = idx / TILE;
+            let ac = idx % TILE;
+            let gr = wid.y * BLK + ar;
+            let gc = t * TILE + ac;
+            // a holds k rows of length m; transpose it into the tile.
+            if (gr < p.m && gc < p.k) {
+                tileA[idx] = a[offA + gc * p.lda + gr];
+            } else {
+                tileA[idx] = 0.0;
+            }
+            let br = idx / BLK;
+            let bc = idx % BLK;
+            let gkr = t * TILE + br;
+            let gbc = wid.x * BLK + bc;
+            if (gkr < p.k && gbc < p.n) {
+                tileB[idx] = b[offB + gkr * p.ldb + gbc];
+            } else {
+                tileB[idx] = 0.0;
+            }
+        }
+        workgroupBarrier();
+        for (var kk = 0u; kk < TILE; kk = kk + 1u) {
+            let aBase = lid.y * TT;
+            let bBase = kk * BLK + lid.x * TT;
+            let bv = vec4<f32>(tileB[bBase], tileB[bBase + 1u], tileB[bBase + 2u], tileB[bBase + 3u]);
+            acc0 = fma(vec4<f32>(tileA[aBase * TILE + kk]), bv, acc0);
+            acc1 = fma(vec4<f32>(tileA[(aBase + 1u) * TILE + kk]), bv, acc1);
+            acc2 = fma(vec4<f32>(tileA[(aBase + 2u) * TILE + kk]), bv, acc2);
+            acc3 = fma(vec4<f32>(tileA[(aBase + 3u) * TILE + kk]), bv, acc3);
+        }
+        workgroupBarrier();
+    }
+    storeRow(offC, rowBase, colBase, acc0);
+    storeRow(offC, rowBase + 1u, colBase, acc1);
+    storeRow(offC, rowBase + 2u, colBase, acc2);
+    storeRow(offC, rowBase + 3u, colBase, acc3);
+}
+
+// storeRow writes four contiguous outputs, skipping the ones a ragged edge
+// puts past the end.
+fn storeRow(offC: u32, r: u32, c: u32, v: vec4<f32>) {
+    if (r >= p.m) {
+        return;
+    }
+    let base = offC + r * p.ldc + c;
+    if (c + 3u < p.n) {
+        outv[base] = v.x;
+        outv[base + 1u] = v.y;
+        outv[base + 2u] = v.z;
+        outv[base + 3u] = v.w;
+        return;
+    }
+    if (c < p.n) { outv[base] = v.x; }
+    if (c + 1u < p.n) { outv[base + 1u] = v.y; }
+    if (c + 2u < p.n) { outv[base + 2u] = v.z; }
+    if (c + 3u < p.n) { outv[base + 3u] = v.w; }
+}
+
 // matmul_s / matmul_ts are the plain 16x16 shared-memory variants (one
 // output per thread). They win on small or skinny products, where 64x64
 // blocks would leave most of the workgroup idle; stridedMatMul picks the
@@ -2252,6 +2447,8 @@ type gpuPipelines struct {
 	binOp, actFwd, actBwd, sumCols, adamStep       uintptr
 	layBinOp, layActFwd, layActBwd                 uintptr
 	laySumCols, layAdamStep                        uintptr
+	matmulL, matmulLT, matmulLTN                   uintptr
+	layMatmulL, layMatmulLT, layMatmulLTN          uintptr
 	lnFwd, lnXhat, lnBwd, softmaxBwd, permute      uintptr
 	embedGather, embedScatter                      uintptr
 	layEmbedGather, layEmbedScatter                uintptr
@@ -2286,6 +2483,9 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.matmulTS, &g.pipes.layMatmulTS, "matmul_ts"},
 		{&g.pipes.matmulTN, &g.pipes.layMatmulTN, "matmul_tn"},
 		{&g.pipes.matmulTNS, &g.pipes.layMatmulTNS, "matmul_tns"},
+		{&g.pipes.matmulL, &g.pipes.layMatmulL, "matmul_l"},
+		{&g.pipes.matmulLT, &g.pipes.layMatmulLT, "matmul_lt"},
+		{&g.pipes.matmulLTN, &g.pipes.layMatmulLTN, "matmul_ltn"},
 		{&g.pipes.scale, &g.pipes.layScale, "scale_ip"},
 		{&g.pipes.softmax, &g.pipes.laySoftmax, "softmax_last"},
 		{&g.pipes.attn, &g.pipes.layAttn, "attn_causal"},
@@ -3287,12 +3487,12 @@ func (g *Device) stridedMatMul(a, b *Tensor, outShape []int, mode gemmMode, m, k
 	// the Device at all — both take the plain 16x16 variants, whose grid has
 	// sixteen times the workgroups.
 	block := gpuBlock
-	pipe, lay := g.pipes.matmul, g.pipes.layMatmul
+	pipe, lay := g.pipes.matmulL, g.pipes.layMatmulL
 	switch mode {
 	case gemmNT:
-		pipe, lay = g.pipes.matmulT, g.pipes.layMatmulT
+		pipe, lay = g.pipes.matmulLT, g.pipes.layMatmulLT
 	case gemmTN:
-		pipe, lay = g.pipes.matmulTN, g.pipes.layMatmulTN
+		pipe, lay = g.pipes.matmulLTN, g.pipes.layMatmulLTN
 	}
 	blocks := ((m + gpuBlock - 1) / gpuBlock) * ((n + gpuBlock - 1) / gpuBlock) * batches
 	if m < 32 || n < 32 || blocks < 16 {
