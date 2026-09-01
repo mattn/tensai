@@ -57,7 +57,7 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 	draft := fs.String("draft", "", "a smaller same-family model for speculative decoding, named the way -model is")
 	fs.IntVar(&o.SpecK, "spec", 3, "draft tokens proposed per speculative step")
 	fs.BoolVar(&o.Think, "think", false, "let Qwen3 models reason in a <think> block before answering")
-	fs.StringVar(&o.System, "system", llm.DefaultSystem, "system message for the chat template")
+	fs.StringVar(&o.System, "system", llm.DefaultSystem, `system message for the chat template; empty ("") sends no system turn at all`)
 	fs.Float64Var(&o.Temp, "temp", 0, "sampling temperature; 0 = greedy")
 	fs.Float64Var(&o.TopP, "topp", 0.9, "nucleus sampling: keep the smallest set of tokens with this much probability mass (1 disables)")
 	fs.Int64Var(&o.Seed, "seed", 1, "sampling seed for -temp > 0")
