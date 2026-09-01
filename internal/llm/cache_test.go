@@ -93,9 +93,9 @@ func TestWeightCacheRoundTrip(t *testing.T) {
 		same("wPleProj", a.wPleProj.Data, b.wPleProj.Data)
 		same("wQKV", a.wQKV.Data, b.wQKV.Data)
 		// The geometry comes from the config, not from the cache.
-		if b.ff != a.ff || b.headSz != a.headSz || b.kvFrom != a.kvFrom || !b.unitQK {
-			t.Errorf("layer %d geometry: ff %d head %d kvFrom %d unitQK %v",
-				i, b.ff, b.headSz, b.kvFrom, b.unitQK)
+		if b.ff != a.ff || b.headSz != a.headSz || b.kvShared != a.kvShared || !b.unitQK {
+			t.Errorf("layer %d geometry: ff %d head %d kvShared %v unitQK %v",
+				i, b.ff, b.headSz, b.kvShared, b.unitQK)
 		}
 	}
 }

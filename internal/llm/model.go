@@ -158,7 +158,8 @@ type qblock struct {
 	noPE         bool           // smollm3: every fourth layer skips RoPE
 	headSz       int            // this layer's head width; gemma4 alternates 256 and 512
 	ff           int            // this layer's feed-forward width; 0 = cfg.Intermediate
-	kvFrom       int            // gemma4: the layer whose KV cache this one attends against; -1 = its own
+	kvShared     bool           // gemma4: this layer keeps no cache of its own
+	kvFrom       int            // the layer whose cache it attends against, when kvShared
 	vNorm        bool           // gemma4: RMS-normalize V with no weight of its own
 	unitQK       bool           // gemma4: attention logits are not divided by sqrt(head)
 	ropeFF       []float32      // gemma4 global layers: per-pair rope frequency divisor
@@ -1032,7 +1033,7 @@ func (m *qwen) ffWidth(b *qblock) int {
 // earlier layer's for the gemma4 blocks that project no keys or values.
 // The source layer always runs first, so sharing the slices is enough.
 func (m *qwen) kvCache(b *qblock) {
-	if b.kvFrom >= 0 {
+	if b.kvShared {
 		src := &m.blocks[b.kvFrom]
 		b.kc, b.vc = src.kc, src.vc
 	}
@@ -1230,7 +1231,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		qDim := cfg.Heads * headSz
 		qProjW := m.qProjWidth(b)
 		qkvW := qProjW + 2*kvDim
-		if b.kvFrom >= 0 {
+		if b.kvShared {
 			// This layer projects queries only.
 			qkvW = qProjW
 		}
@@ -1264,7 +1265,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			// Two batch-wide backings detach the cache rows from the wide
 			// fused buffer instead of 2n little allocations per layer.
 			var kb, vb []float32
-			if b.kvFrom < 0 {
+			if !b.kvShared {
 				kb = make([]float32, n*kvDim)
 				vb = make([]float32, n*kvDim)
 			}
@@ -1282,7 +1283,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 						m.rope(qr[h*headSz:(h+1)*headSz], pos, b)
 					}
 				}
-				if b.kvFrom >= 0 {
+				if b.kvShared {
 					continue
 				}
 				kr := row[qProjW : qProjW+kvDim]
@@ -1499,7 +1500,7 @@ func (m *qwen) step(token, pos int) []float32 {
 		qDim := cfg.Heads * headSz
 		qProjW := m.qProjWidth(b)
 		qkvW := qProjW + 2*kvDim
-		if b.kvFrom >= 0 {
+		if b.kvShared {
 			// This layer projects queries only.
 			qkvW = qProjW
 		}
@@ -1531,7 +1532,7 @@ func (m *qwen) step(token, pos int) []float32 {
 				m.rope(q[h*headSz:(h+1)*headSz], pos, b)
 			}
 		}
-		if b.kvFrom >= 0 {
+		if b.kvShared {
 			m.kvCache(b)
 		} else {
 			k := row[qProjW : qProjW+kvDim]

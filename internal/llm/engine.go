@@ -315,7 +315,7 @@ func Open(o Options) (*Engine, error) {
 		total, widest := 0, 0
 		for i := range model.blocks {
 			b := &model.blocks[i]
-			if b.kvFrom >= 0 {
+			if b.kvShared {
 				continue
 			}
 			kvDim := model.cfg.KVHeads * model.headSize(b)
