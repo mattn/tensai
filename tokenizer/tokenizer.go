@@ -33,6 +33,7 @@ type Tokenizer struct {
 	ranks       map[[2]string]int
 	cfg         splitConfig
 	spm         bool
+	spmBPE      bool // gemma4: SentencePiece normalization over BPE merges
 	scores      []float32
 	byteID      [256]int
 	unkID       int
@@ -311,6 +312,9 @@ func (t *Tokenizer) Encode(s string) []int {
 }
 
 func (t *Tokenizer) encodeText(s string) []int {
+	if t.spmBPE {
+		return t.spmBPEEncode(s)
+	}
 	if t.spm {
 		return t.spmEncode(s)
 	}
@@ -348,6 +352,19 @@ func (t *Tokenizer) bpe(word string) []int {
 	if ids, ok := t.cache[word]; ok {
 		return ids
 	}
+	parts := t.bpeParts(word)
+	ids := make([]int, 0, len(parts))
+	for _, p := range parts {
+		if id, ok := t.vocab[p]; ok {
+			ids = append(ids, id)
+		}
+	}
+	t.cache[word] = ids
+	return ids
+}
+
+// bpeParts merges a run's characters by rank and returns the pieces.
+func (t *Tokenizer) bpeParts(word string) []string {
 	parts := make([]string, 0, len(word))
 	for _, r := range word {
 		parts = append(parts, string(r))
@@ -365,14 +382,7 @@ func (t *Tokenizer) bpe(word string) []int {
 		merged := parts[best] + parts[best+1]
 		parts = append(parts[:best], append([]string{merged}, parts[best+2:]...)...)
 	}
-	ids := make([]int, 0, len(parts))
-	for _, p := range parts {
-		if id, ok := t.vocab[p]; ok {
-			ids = append(ids, id)
-		}
-	}
-	t.cache[word] = ids
-	return ids
+	return parts
 }
 
 // split reproduces the model's pre-tokenization regex with a hand-written

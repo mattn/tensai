@@ -85,6 +85,20 @@ type config struct {
 	YarnOrigCtx  int     `json:"-"`
 	YarnBetaFast float64 `json:"-"`
 	YarnBetaSlow float64 `json:"-"`
+	// gemma4 varies its geometry layer by layer and the GGUF states it as
+	// arrays: FFPerLayer the feed-forward width, SWAPattern which layers
+	// slide a window (those use the narrower head and the local rope
+	// base). Layers from KVFromStart on project queries only and attend
+	// against an earlier layer's cache. PLEDim is the width of one
+	// layer's slice of the per-layer embedding table, and LogitCap the
+	// tanh the final logits pass through.
+	FFPerLayer   []int   `json:"-"`
+	SWAPattern   []bool  `json:"-"`
+	HeadDimSWA   int     `json:"-"`
+	RopeThetaSWA float64 `json:"-"`
+	KVFromStart  int     `json:"-"`
+	PLEDim       int     `json:"-"`
+	LogitCap     float64 `json:"-"`
 	// gptOss keeps the Hugging Face spelling of the fields above around
 	// for the loader, which needs its per-layer attention spans.
 	gptOss gptOssConfig `json:"-"`
@@ -143,6 +157,11 @@ type qblock struct {
 	postFFN      []float32
 	noPE         bool           // smollm3: every fourth layer skips RoPE
 	headSz       int            // this layer's head width; gemma4 alternates 256 and 512
+	ff           int            // this layer's feed-forward width; 0 = cfg.Intermediate
+	kvFrom       int            // gemma4: the layer whose KV cache this one attends against; -1 = its own
+	vNorm        bool           // gemma4: RMS-normalize V with no weight of its own
+	unitQK       bool           // gemma4: attention logits are not divided by sqrt(head)
+	ropeFF       []float32      // gemma4 global layers: per-pair rope frequency divisor
 	window       int            // gemma3: sliding-attention span; 0 = full
 	ropeTheta    float64        // per-layer rope base; 0 = the config default
 	ropeFreq     []float64      // precomputed theta^(-2*i/head_dim)
@@ -166,9 +185,17 @@ type qblock struct {
 	bo         []float32 // attention output bias (gpt-oss)
 	sharedGU   *qmat
 	sharedDown *qmat
-	sharedGate []float32   // [hidden]; sigmoid(dot) scales the shared expert
-	kc, vc     [][]float32 // KV cache, kvHeads*headDim per position
-	dstate     *deltaState // recurrent state for a delta layer; nil until first use
+	// gemma4's per-layer embedding: a gelu gate on the block's output
+	// picks up this layer's slice of the token's per-layer embedding and
+	// projects it back to the hidden width as a second residual, after
+	// which the whole block output takes a learned scalar.
+	wPleGate, wPleProj *tensai.Matrix
+	qPleGate, qPleProj *qmat
+	plePost            []float32
+	outScale           float32
+	sharedGate         []float32   // [hidden]; sigmoid(dot) scales the shared expert
+	kc, vc             [][]float32 // KV cache, kvHeads*headDim per position
+	dstate             *deltaState // recurrent state for a delta layer; nil until first use
 	// delta holds a qwen3_5 linear-attention layer, which has no KV cache:
 	// it carries a fixed-size recurrent state instead, so its cost per
 	// token does not grow with the context. nil on a full-attention layer.
@@ -190,6 +217,16 @@ type qwen struct {
 	qLmT   *qmat
 	normW  []float32
 	blocks []qblock
+	// gemma4's per-layer embeddings: ple reads one token's row of the
+	// table, too large to dequantize whole, and pleIn projects the token
+	// embedding into the same space to be averaged with it. embScale is
+	// Gemma's sqrt(hidden) on the way in, applied per token so the tied
+	// lm head keeps the embedding's own values.
+	ple      *pleTable
+	wPleIn   *tensai.Matrix
+	qPleIn   *qmat
+	pleNorm  []float32
+	embScale float32
 	// dscratch is one token's working set for the delta layers, which all
 	// share the same shapes; nil until a delta layer runs.
 	dscratch *deltaScratch
@@ -516,12 +553,13 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 }
 
 func (m *qwen) initRopeFreqs() {
-	// A partial rotary factor rotates only the first rotDim of each head,
-	// and the frequencies run over that width rather than the whole head.
-	rotDim := m.rotaryDim()
-	half := rotDim / 2
 	for i := range m.blocks {
 		b := &m.blocks[i]
+		// A partial rotary factor rotates only the first rotDim of each
+		// head, and the frequencies run over that width rather than the
+		// whole head.
+		rotDim := m.rotaryDim(b)
+		half := rotDim / 2
 		if b.noPE || half == 0 {
 			continue
 		}
@@ -531,7 +569,15 @@ func (m *qwen) initRopeFreqs() {
 		}
 		b.ropeFreq = make([]float64, half)
 		for j := range b.ropeFreq {
-			b.ropeFreq[j] = math.Pow(theta, -2*float64(j)/float64(rotDim))
+			f := math.Pow(theta, -2*float64(j)/float64(rotDim))
+			// gemma4's global layers rotate only the first eighth of the
+			// head: the rest divide by a frequency factor so large that
+			// the angle vanishes. Folding the factors in here keeps the
+			// rotation itself uniform.
+			if b.ropeFF != nil {
+				f /= float64(b.ropeFF[j])
+			}
+			b.ropeFreq[j] = f
 		}
 	}
 }
@@ -625,6 +671,13 @@ func rmsnormInto(out, x, w []float32, eps float64) {
 		ss += float64(v) * float64(v)
 	}
 	inv := 1 / math.Sqrt(ss/float64(len(x))+eps)
+	if w == nil {
+		// gemma4 normalizes V with no weight of its own.
+		for i, v := range x {
+			out[i] = float32(float64(v) * inv)
+		}
+		return
+	}
 	for i, v := range x {
 		out[i] = float32(float64(v)*inv) * w[i]
 	}
@@ -847,7 +900,7 @@ func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, sco
 	d := m.headSize(b)
 	qOff := h * d
 	kvOff := (h / group) * d
-	scale := 1 / math.Sqrt(float64(d))
+	scale := m.qkScale(b, d)
 	qh := q[qOff : qOff+d]
 	maxs := math.Inf(-1)
 	for t := start; t < steps; t++ {
@@ -894,7 +947,7 @@ func (m *qwen) attendGroup(b *qblock, q, attn []float32, kh, group, steps int, s
 	d := m.headSize(b)
 	qOff := kh * group * d
 	kvOff := kh * d
-	scale := 1 / math.Sqrt(float64(d))
+	scale := m.qkScale(b, d)
 	qg := q[qOff : qOff+group*d]
 	for t := start; t < steps; t++ {
 		tensai.DotVecs(qg, b.kc[t][kvOff:kvOff+d], ws[t*group:(t+1)*group])
@@ -950,6 +1003,43 @@ func (m *qwen) headSize(b *qblock) int {
 	return m.headSz
 }
 
+// vRMSNorm normalizes each of V's heads with no weight of its own, which
+// gemma4 does before caching them and nothing else here does.
+func (m *qwen) vRMSNorm(v []float32, headSz int) {
+	for o := 0; o < len(v); o += headSz {
+		rmsnormInto(v[o:o+headSz], v[o:o+headSz], nil, m.cfg.RMSEps)
+	}
+}
+
+// qkScale is what the attention logits are multiplied by. Every model
+// here but gemma4 divides by the square root of the head width; gemma4
+// leaves the logits alone, its learned QK norms setting the scale.
+func (m *qwen) qkScale(b *qblock, d int) float64 {
+	if b.unitQK {
+		return 1
+	}
+	return 1 / math.Sqrt(float64(d))
+}
+
+// ffWidth is the layer's feed-forward width. Only gemma4 varies it from
+// layer to layer; the rest leave the field zero.
+func (m *qwen) ffWidth(b *qblock) int {
+	if b.ff > 0 {
+		return b.ff
+	}
+	return m.cfg.Intermediate
+}
+
+// kvCache points a layer at the cache it attends against: its own, or an
+// earlier layer's for the gemma4 blocks that project no keys or values.
+// The source layer always runs first, so sharing the slices is enough.
+func (m *qwen) kvCache(b *qblock) {
+	if b.kvFrom >= 0 {
+		src := &m.blocks[b.kvFrom]
+		b.kc, b.vc = src.kc, src.vc
+	}
+}
+
 // qkNorm applies Qwen3's per-head RMS normalization in place; w has one
 // weight per head channel. A nil w (qwen2, llama) is a no-op.
 func (m *qwen) qkNorm(v, w []float32, headSz int) {
@@ -993,11 +1083,12 @@ func applyGate(attn, gate []float32) {
 
 // rotaryDim is how much of each head RoPE turns: the whole thing unless
 // the config asks for a fraction of it.
-func (m *qwen) rotaryDim() int {
+func (m *qwen) rotaryDim(b *qblock) int {
+	d := m.headSize(b)
 	if f := m.cfg.PartialRotary; f > 0 && f < 1 {
-		return int(float64(m.headSz)*f) / 2 * 2
+		return int(float64(d)*f) / 2 * 2
 	}
-	return m.headSz
+	return d
 }
 
 // rope rotates one head in place, half-split style: pair (i, i+dh/2).
@@ -1005,7 +1096,7 @@ func (m *qwen) rotaryDim() int {
 // leaves the rest as it is, which qwen3_5 uses to spend a 256-wide head
 // on content while rotating 64 of it for position.
 func (m *qwen) rope(h []float32, pos int, b *qblock) {
-	if n := m.rotaryDim(); n < len(h) {
+	if n := m.rotaryDim(b); n < len(h) {
 		if n < 2 {
 			return
 		}
@@ -1025,10 +1116,10 @@ func (m *qwen) rope(h []float32, pos int, b *qblock) {
 		// (interpolation), with a linear ramp between; the magnitudes
 		// scale by 1 + 0.1*ln(factor).
 		corr := func(rot float64) float64 {
-			return float64(m.headSz) * math.Log(float64(m.cfg.YarnOrigCtx)/(rot*2*math.Pi)) / (2 * math.Log(theta))
+			return float64(len(h)) * math.Log(float64(m.cfg.YarnOrigCtx)/(rot*2*math.Pi)) / (2 * math.Log(theta))
 		}
 		low = math.Max(0, math.Floor(corr(m.cfg.YarnBetaFast)))
-		high = math.Min(float64(m.headSz-1), math.Ceil(corr(m.cfg.YarnBetaSlow)))
+		high = math.Min(float64(len(h)-1), math.Ceil(corr(m.cfg.YarnBetaSlow)))
 		mscale = 1 + 0.1*math.Log(m.cfg.YarnFactor)
 	}
 	for i := 0; i < half; i++ {
@@ -1062,7 +1153,7 @@ func (m *qwen) prefill(tokens []int, startPos int) []float32 {
 	last := x.Data[(len(tokens)-1)*hs : len(tokens)*hs]
 	a := make([]float32, hs)
 	rmsnormInto(a, last, m.normW, m.cfg.RMSEps)
-	return mv(a, m.lmT, m.qLmT, nil)
+	return m.capLogits(mv(a, m.lmT, m.qLmT, nil))
 }
 
 // prefillLogits is prefill with the lm_head applied to every position:
@@ -1075,7 +1166,9 @@ func (m *qwen) prefillLogits(tokens []int, startPos int) *tensai.Matrix {
 	for t := 0; t < x.Rows; t++ {
 		rmsnormInto(a.Data[t*hs:(t+1)*hs], x.Data[t*hs:(t+1)*hs], m.normW, m.cfg.RMSEps)
 	}
-	return mmb(a, m.lmT, m.qLmT, nil)
+	logits := mmb(a, m.lmT, m.qLmT, nil)
+	m.capLogits(logits.Data)
+	return logits
 }
 
 // truncate rolls the KV cache back to n positions — how speculative
@@ -1102,6 +1195,21 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 	for t, tk := range tokens {
 		copy(x.Data[t*hs:(t+1)*hs], m.embed.Data[tk*hs:(tk+1)*hs])
 	}
+	if m.embScale != 0 {
+		for i := range x.Data {
+			x.Data[i] *= m.embScale
+		}
+	}
+	// gemma4 hands every block its own slice of each token's per-layer
+	// embedding, read off disk and mixed with a projection of the token
+	// embedding once per token.
+	var pe *tensai.Matrix
+	if m.ple != nil {
+		var err error
+		if pe, err = m.pleInputs(tokens, x); err != nil {
+			panic(err.Error())
+		}
+	}
 	a := tensai.NewMatrix(n, hs)
 	norm := func(w []float32) {
 		for t := 0; t < n; t++ {
@@ -1124,6 +1232,10 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		qDim := cfg.Heads * headSz
 		qProjW := m.qProjWidth(b)
 		qkvW := qProjW + 2*kvDim
+		if b.kvFrom >= 0 {
+			// This layer projects queries only.
+			qkvW = qProjW
+		}
 		norm(b.ln1)
 		if b.delta != nil {
 			// Only the convolution and the recurrence are sequential --
@@ -1153,8 +1265,11 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			qkv := mmb(a, b.wQKV, b.qQKV, b.bQKV)
 			// Two batch-wide backings detach the cache rows from the wide
 			// fused buffer instead of 2n little allocations per layer.
-			kb := make([]float32, n*kvDim)
-			vb := make([]float32, n*kvDim)
+			var kb, vb []float32
+			if b.kvFrom < 0 {
+				kb = make([]float32, n*kvDim)
+				vb = make([]float32, n*kvDim)
+			}
 			for t := 0; t < n; t++ {
 				pos := startPos + t
 				row := qkv.Data[t*qkvW : (t+1)*qkvW]
@@ -1163,13 +1278,22 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 					m.splitGate(row[:qProjW], qbuf[t*qDim:(t+1)*qDim], gbuf[t*qDim:(t+1)*qDim])
 					qr = qbuf[t*qDim : (t+1)*qDim]
 				}
-				kr := row[qProjW : qProjW+kvDim]
 				m.qkNorm(qr, b.qNorm, headSz)
-				m.qkNorm(kr, b.kNorm, headSz)
 				if !b.noPE {
 					for h := 0; h < cfg.Heads; h++ {
 						m.rope(qr[h*headSz:(h+1)*headSz], pos, b)
 					}
+				}
+				if b.kvFrom >= 0 {
+					continue
+				}
+				kr := row[qProjW : qProjW+kvDim]
+				vr := row[qProjW+kvDim:]
+				m.qkNorm(kr, b.kNorm, headSz)
+				if b.vNorm {
+					m.vRMSNorm(vr, headSz)
+				}
+				if !b.noPE {
 					for h := 0; h < cfg.KVHeads; h++ {
 						m.rope(kr[h*headSz:(h+1)*headSz], pos, b)
 					}
@@ -1177,10 +1301,11 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 				kt := kb[t*kvDim : (t+1)*kvDim : (t+1)*kvDim]
 				vt := vb[t*kvDim : (t+1)*kvDim : (t+1)*kvDim]
 				copy(kt, kr)
-				copy(vt, row[qProjW+kvDim:])
+				copy(vt, vr)
 				b.kc = append(b.kc, kt)
 				b.vc = append(b.vc, vt)
 			}
+			m.kvCache(b)
 
 			// Causal attention: row t sees cache positions [0, startPos+t].
 			// Rows are independent, so they fan out across CPUs — in blocks
@@ -1291,7 +1416,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			wg.Wait()
 		} else {
 			gu := mmb(a, b.wGU, b.qGU, nil)
-			inter := cfg.Intermediate
+			inter := m.ffWidth(b)
 			gate := tensai.NewMatrix(n, inter)
 			for t := 0; t < n; t++ {
 				row := gu.Data[t*2*inter:]
@@ -1308,6 +1433,14 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		for i := range x.Data {
 			x.Data[i] += down.Data[i]
 		}
+		if pe != nil {
+			m.pleBatch(b, li, x, pe)
+		}
+		if b.outScale != 0 {
+			for i := range x.Data {
+				x.Data[i] *= b.outScale
+			}
+		}
 	}
 	return x
 }
@@ -1320,7 +1453,27 @@ func (m *qwen) step(token, pos int) []float32 {
 
 	x := make([]float32, hs)
 	copy(x, m.embed.Data[token*hs:(token+1)*hs])
+	if m.embScale != 0 {
+		for i := range x {
+			x[i] *= m.embScale
+		}
+	}
 	a := make([]float32, hs)
+
+	// gemma4 hands every block its own slice of this token's per-layer
+	// embedding, which is read off disk and mixed with a projection of
+	// the token embedding once per token.
+	var pe, pgate, pproj []float32
+	if m.ple != nil {
+		emb := tensai.NewMatrix(1, hs)
+		copy(emb.Data, x)
+		peM, err := m.pleInputs([]int{token}, emb)
+		if err != nil {
+			panic(err.Error())
+		}
+		pe = peM.Data
+		pgate, pproj = make([]float32, cfg.PLEDim), make([]float32, hs)
+	}
 
 	// Widths are per layer -- gemma4 alternates two head sizes -- so the
 	// scratch is sized for the widest and re-sliced each block.
@@ -1340,6 +1493,7 @@ func (m *qwen) step(token, pos int) []float32 {
 	proj := make([]float32, hs)
 	gu := make([]float32, 2*cfg.Intermediate)
 	downBuf := make([]float32, hs)
+	dim := cfg.PLEDim
 	for li := range m.blocks {
 		b := &m.blocks[li]
 		headSz := m.headSize(b)
@@ -1347,6 +1501,10 @@ func (m *qwen) step(token, pos int) []float32 {
 		qDim := cfg.Heads * headSz
 		qProjW := m.qProjWidth(b)
 		qkvW := qProjW + 2*kvDim
+		if b.kvFrom >= 0 {
+			// This layer projects queries only.
+			qkvW = qProjW
+		}
 		rmsnormInto(a, x, b.ln1, cfg.RMSEps)
 		if b.delta != nil {
 			if b.dstate == nil {
@@ -1369,22 +1527,31 @@ func (m *qwen) step(token, pos int) []float32 {
 			m.splitGate(row[:qProjW], qbuf, gbuf)
 			q = qbuf[:qDim]
 		}
-		k := row[qProjW : qProjW+kvDim]
-		v := row[qProjW+kvDim:]
 		m.qkNorm(q, b.qNorm, headSz)
-		m.qkNorm(k, b.kNorm, headSz)
 		if !b.noPE {
 			for h := 0; h < cfg.Heads; h++ {
 				m.rope(q[h*headSz:(h+1)*headSz], pos, b)
 			}
-			for h := 0; h < cfg.KVHeads; h++ {
-				m.rope(k[h*headSz:(h+1)*headSz], pos, b)
-			}
 		}
-		// Copy k and v out of the fused row so the cache does not retain
-		// the whole qkv buffer per position.
-		b.kc = append(b.kc, append(make([]float32, 0, kvDim), k...))
-		b.vc = append(b.vc, append(make([]float32, 0, kvDim), v...))
+		if b.kvFrom >= 0 {
+			m.kvCache(b)
+		} else {
+			k := row[qProjW : qProjW+kvDim]
+			v := row[qProjW+kvDim:]
+			m.qkNorm(k, b.kNorm, headSz)
+			if b.vNorm {
+				m.vRMSNorm(v, headSz)
+			}
+			if !b.noPE {
+				for h := 0; h < cfg.KVHeads; h++ {
+					m.rope(k[h*headSz:(h+1)*headSz], pos, b)
+				}
+			}
+			// Copy k and v out of the fused row so the cache does not
+			// retain the whole qkv buffer per position.
+			b.kc = append(b.kc, append(make([]float32, 0, kvDim), k...))
+			b.vc = append(b.vc, append(make([]float32, 0, kvDim), v...))
+		}
 
 		att := attn[:qDim]
 		clear(att)
@@ -1416,10 +1583,18 @@ func (m *qwen) step(token, pos int) []float32 {
 		}
 
 		m.blockFFN(b, x, a, gu, downBuf)
+		if pe != nil {
+			m.pleBlock(b, x, pe[li*dim:(li+1)*dim], pgate, pproj)
+		}
+		if b.outScale != 0 {
+			for i := range x {
+				x[i] *= b.outScale
+			}
+		}
 	}
 
 	rmsnormInto(a, x, m.normW, cfg.RMSEps)
-	return mv(a, m.lmT, m.qLmT, nil)
+	return m.capLogits(mv(a, m.lmT, m.qLmT, nil))
 }
 
 // blockFFN runs the second half of a block in place on x: normalize,
@@ -1432,8 +1607,9 @@ func (m *qwen) blockFFN(b *qblock, x, a, gu, downBuf []float32) {
 	if len(b.experts) > 0 {
 		down = m.moeFFN(b, a)
 	} else {
-		mvInto(gu, a, b.wGU, b.qGU, nil)
-		gate, up := gu[:cfg.Intermediate], gu[cfg.Intermediate:]
+		ff := m.ffWidth(b)
+		mvInto(gu[:2*ff], a, b.wGU, b.qGU, nil)
+		gate, up := gu[:ff], gu[ff:2*ff]
 		activate(gate, up, b.geglu)
 		mvInto(downBuf, gate, b.wDown, b.qDown, nil)
 		down = downBuf

@@ -194,3 +194,117 @@ func (t *Tokenizer) spmDecode(ids []int) string {
 	}
 	return sb.String()
 }
+
+// NewSPMBPE builds the tokenizer Gemma 4 ships, which is a SentencePiece
+// normalizer over BPE merges rather than over unigram scores: spaces
+// become the visible U+2581, there is no word-level pre-splitting, and
+// the merges run on raw UTF-8 rather than on byte-encoded stand-ins.
+// Only newlines break the text up, because a merge never spans one.
+//
+// tokens is the vocabulary in id order, merges the "a b" pairs in rank
+// order, and types classifies each token the way NewSPM's do.
+func NewSPMBPE(tokens, merges []string, types []int32, addSpacePrefix bool) (*Tokenizer, error) {
+	if len(tokens) != len(types) {
+		return nil, fmt.Errorf("tokenizer: %d tokens but %d types", len(tokens), len(types))
+	}
+	if len(tokens) == 0 {
+		return nil, fmt.Errorf("tokenizer: empty vocabulary")
+	}
+	t := &Tokenizer{
+		vocab:       make(map[string]int, len(tokens)),
+		inverse:     make(map[int]string, len(tokens)),
+		byID:        map[int]string{},
+		ranks:       make(map[[2]string]int, len(merges)),
+		byteDec:     map[rune]byte{},
+		cache:       map[string][]int{},
+		spm:         true,
+		spmBPE:      true,
+		spacePrefix: addSpacePrefix,
+		unkID:       -1,
+	}
+	for i := range t.byteID {
+		t.byteID[i] = -1
+	}
+	for id, tok := range tokens {
+		switch types[id] {
+		case spmControl, spmUserDef:
+			t.specials = append(t.specials, special{content: tok, id: id})
+			t.byID[id] = tok
+		case spmUnknown:
+			t.unkID = id
+			t.inverse[id] = tok
+		case spmByte:
+			var b byte
+			if _, err := fmt.Sscanf(tok, "<0x%02X>", &b); err == nil {
+				t.byteID[b] = id
+			}
+			t.inverse[id] = tok
+		default:
+			t.vocab[tok] = id
+			t.inverse[id] = tok
+		}
+	}
+	sortSpecials(t)
+	for rank, m := range merges {
+		first, second, ok := strings.Cut(m, " ")
+		if !ok {
+			return nil, fmt.Errorf("tokenizer: merge %q is not a pair", m)
+		}
+		t.ranks[[2]string{first, second}] = rank
+	}
+	return t, nil
+}
+
+// spmBPEEncode normalizes the way SentencePiece does and then merges by
+// rank. Newlines are the only split: a merge never spans one, so cutting
+// there changes nothing and keeps the merge loop off long inputs.
+func (t *Tokenizer) spmBPEEncode(s string) []int {
+	if s == "" {
+		return nil
+	}
+	if t.spacePrefix && !strings.HasPrefix(s, " ") {
+		s = " " + s
+	}
+	s = strings.ReplaceAll(s, " ", "▁")
+	var ids []int
+	for len(s) > 0 {
+		i := strings.IndexByte(s, '\n')
+		switch {
+		case i < 0:
+			ids = append(ids, t.bpeOrBytes(s)...)
+			s = ""
+		case i > 0:
+			ids = append(ids, t.bpeOrBytes(s[:i])...)
+			s = s[i:]
+		default:
+			j := 0
+			for j < len(s) && s[j] == '\n' {
+				j++
+			}
+			ids = append(ids, t.bpeOrBytes(s[:j])...)
+			s = s[j:]
+		}
+	}
+	return ids
+}
+
+// bpeOrBytes merges one run and falls back to the per-byte tokens for
+// anything the merges leave outside the vocabulary.
+func (t *Tokenizer) bpeOrBytes(run string) []int {
+	parts := t.bpeParts(run)
+	ids := make([]int, 0, len(parts))
+	for _, p := range parts {
+		if id, ok := t.vocab[p]; ok {
+			ids = append(ids, id)
+			continue
+		}
+		for _, b := range []byte(p) {
+			if id := t.byteID[b]; id >= 0 {
+				ids = append(ids, id)
+			} else if t.unkID >= 0 {
+				ids = append(ids, t.unkID)
+			}
+		}
+	}
+	return ids
+}
