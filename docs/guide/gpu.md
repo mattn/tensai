@@ -91,6 +91,18 @@ Nothing else in a training step moves: activations, gradients, and the optimizer
 
 The same products with both operands already resident run 2.5-2.8x faster than the CPU, so most of the remaining gap is the transfers. Closing it means keeping a whole training graph on the device, which needs the element-wise, activation, and normalization kernels a backward pass touches -- the inference set does not cover them yet.
 
+Those are the products. The rest of a backward pass is there too, as resident kernels the inference path never needed on their own:
+
+```go
+h, _ := gx.MatMul(gw)               // forward
+a, _ := h.Activate(gpu.ActGELU)     // and h.ActivateGrad(gpu.ActGELU, grad) on the way back
+s, _ := a.Binary(gpu.OpMul, gscale) // add, sub, mul, div; a shorter operand repeats
+db, _ := gdelta.SumCols()           // the gradient of a row broadcast over a batch
+gw.AdamStep(ggrad, gm, gv, lr, b1, b2, rc1, rc2, eps, 0)
+```
+
+`Activate` and `ActivateGrad` cover ReLU, tanh, sigmoid and GELU, and follow the CPU kernels exactly -- the GELU here is the error function, not the tanh approximation the inference path fuses into its FFN -- so a model can move between device and host mid-training. `AdamStep` matches the `optim` kernel the same way, moments included.
+
 ## Measuring the crossover
 
 `_example/wgpu -sweep` walks a ladder of sizes and marks where the GPU overtakes the CPU kernel. Because the CPU side is the same `dotRows` kernel the rest of the package uses, building the example twice compares portable Go, AVX2, and both GPU usage patterns:

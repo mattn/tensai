@@ -91,6 +91,18 @@ if err == nil {
 
 同じ積を両オペランド常駐で回すと CPU の 2.5〜2.8 倍速いので、残りの差の大半は転送です。これを詰めるには学習グラフ全体をデバイスに置く必要があり、逆伝播が触る要素ごとの演算・活性化・正規化のカーネルが要ります — 推論用の一式ではまだ足りていません。
 
+ここまでが積です。逆伝播の残りも、推論では単独では要らなかった常駐カーネルとして揃っています:
+
+```go
+h, _ := gx.MatMul(gw)               // 順伝播
+a, _ := h.Activate(gpu.ActGELU)     // 戻りは h.ActivateGrad(gpu.ActGELU, grad)
+s, _ := a.Binary(gpu.OpMul, gscale) // add, sub, mul, div。短いオペランドは繰り返す
+db, _ := gdelta.SumCols()           // バッチにブロードキャストした行の勾配
+gw.AdamStep(ggrad, gm, gv, lr, b1, b2, rc1, rc2, eps, 0)
+```
+
+`Activate` と `ActivateGrad` は ReLU・tanh・sigmoid・GELU に対応し、CPU カーネルと同じ式です — ここの GELU は誤差関数版で、推論経路が FFN に融合している tanh 近似ではありません — なので学習の途中でデバイスとホストを行き来できます。`AdamStep` も `optim` のカーネルと一致し、モーメントも含めて同じです。
+
 ## クロスオーバーの測定
 
 `_example/wgpu -sweep` はサイズの階段を上りながら、GPU が CPU カーネルを追い越す地点に印を付けます。CPU 側はパッケージの他の部分と同じ `dotRows` カーネルなので、サンプルを 2 回ビルドすればポータブル Go、AVX2、GPU の 2 つの使用パターンを比較できます:
