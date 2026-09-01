@@ -254,7 +254,11 @@ func TestGPUResidentTransformer(t *testing.T) {
 	tape.Bind(devP...)
 	var devLoss tensai.Float
 	for i := 0; i < steps; i++ {
-		devLoss = devTrainer.Step(forward(tokens, mask, devP).CrossEntropy(labels))
+		logits := forward(tokens, mask, devP)
+		if i == 0 && !logits.Resident() {
+			t.Fatal("the block did not stay on the device: something pulled a value home")
+		}
+		devLoss = devTrainer.Step(logits.CrossEntropy(labels))
 		tape.Reset()
 	}
 

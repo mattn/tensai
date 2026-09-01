@@ -103,7 +103,7 @@ tape.Bind(params...) // parameters upload once and stay resident
 
 `Value()` and `Grad()` download on demand, so reading a node still works — that is what makes them methods. `Resident()` reports where a node's value currently is.
 
-Operations the device has kernels for run there; anything else falls back to the CPU, bringing home only what that operation needs. That covers the three products, element-wise arithmetic with a repeating operand, ReLU/tanh/sigmoid/GELU and their gradients, `LayerNorm`, `Softmax`, `Transpose` and `Reshape`, the sum a broadcast collects, and the Adam update — so a whole transformer block stays resident. `Embed` is the exception: the gather is cheap and its scatter has no kernel yet, so the embedding table's gradient comes home each step.
+Operations the device has kernels for run there; anything else falls back to the CPU, bringing home only what that operation needs. That covers the three products, element-wise arithmetic with a repeating operand, `Scale`, ReLU/tanh/sigmoid/GELU and their gradients, `LayerNorm`, `Softmax`, `Transpose`, `Reshape`, `Embed` (its scatter-add included), the sum a broadcast collects, and the Adam update — so a whole transformer block stays resident, and only the loss crosses the bus.
 
 On an AMD 780M through `-tags wgpu24`, one step of `x @ w1 -> GELU -> @ w2 -> MSE`:
 
@@ -117,8 +117,8 @@ A transformer block -- pre-norm attention with a causal mask and a GELU feed-for
 
 | model width | CPU (AVX2) | resident graph |
 |---|---|---|
-| 256 | 80.9ms | **58.6ms** |
-| 512 | 199.5ms | **89.5ms** |
+| 256 | 99.4ms | **68.8ms** |
+| 512 | 217.0ms | **89.1ms** |
 
 The hook (`tensai.UseAccelerator`) sends each product to the device on its own, so it pays a round trip per product; residency pays one upload per step for the batch and one download for the loss. Both are opt-in, and they compose: with a tape on a device the hook is not consulted.
 

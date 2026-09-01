@@ -115,6 +115,15 @@ func (t *Tensor) LayerNormGrad(grad, gain *Tensor, eps tensai.Float) (*Tensor, e
 // SoftmaxGrad is a no-op stub; build with -tags wgpu or wgpu24.
 func (t *Tensor) SoftmaxGrad(grad *Tensor) (*Tensor, error) { return nil, errNoWGPU }
 
+// UploadIndices is a no-op stub; build with -tags wgpu or wgpu24.
+func (g *Device) UploadIndices(ids []int) (*Tensor, error) { return nil, errNoWGPU }
+
+// Embed is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) Embed(ids *Tensor) (*Tensor, error) { return nil, errNoWGPU }
+
+// EmbedGrad is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) EmbedGrad(grad, ids *Tensor) error { return errNoWGPU }
+
 // Permute is a no-op stub; build with -tags wgpu or wgpu24.
 func (t *Tensor) Permute(perm ...int) (*Tensor, error) { return nil, errNoWGPU }
 

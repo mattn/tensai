@@ -1423,6 +1423,49 @@ fn permute(@builtin(workgroup_id) wg: vec3<u32>,
     tout[idx] = ta[src];
 }
 
+@group(0) @binding(54) var<storage, read> tids: array<u32>;
+@group(0) @binding(55) var<storage, read_write> tatom: array<atomic<u32>>;
+
+// embed_gather copies one table row per index: the forward pass of an
+// embedding lookup.
+@compute @workgroup_size(256, 1, 1)
+fn embed_gather(@builtin(workgroup_id) wg: vec3<u32>,
+                @builtin(num_workgroups) nwg: vec3<u32>,
+                @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx >= tp.count) {
+        return;
+    }
+    let d = tp.aCount;
+    tout[idx] = ta[tids[idx / d] * d + (idx % d)];
+}
+
+// embed_scatter adds each gradient row back into the table row its index
+// names. Two tokens in a batch can be the same word, so the adds have to
+// be atomic -- and WGSL has no atomic add for f32, so this is the usual
+// compare-and-swap on the bit pattern.
+@compute @workgroup_size(256, 1, 1)
+fn embed_scatter(@builtin(workgroup_id) wg: vec3<u32>,
+                 @builtin(num_workgroups) nwg: vec3<u32>,
+                 @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx >= tp.count) {
+        return;
+    }
+    let d = tp.aCount;
+    let dst = tids[idx / d] * d + (idx % d);
+    let add = ta[idx];
+    var old = atomicLoad(&tatom[dst]);
+    loop {
+        let sum = bitcast<u32>(bitcast<f32>(old) + add);
+        let res = atomicCompareExchangeWeak(&tatom[dst], old, sum);
+        if (res.exchanged) {
+            break;
+        }
+        old = res.old_value;
+    }
+}
+
 // slice_cols lifts a column window out of every row. The fused QKV
 // projection lands in one buffer and prefill wants q, k, and v as
 // tensors of their own; a bind offset cannot express that, because the
@@ -2210,6 +2253,8 @@ type gpuPipelines struct {
 	layBinOp, layActFwd, layActBwd                 uintptr
 	laySumCols, layAdamStep                        uintptr
 	lnFwd, lnXhat, lnBwd, softmaxBwd, permute      uintptr
+	embedGather, embedScatter                      uintptr
+	layEmbedGather, layEmbedScatter                uintptr
 	layLnFwd, layLnXhat, layLnBwd                  uintptr
 	laySoftmaxBwd, layPermute                      uintptr
 	scale, softmax, attn, qmatmul                  uintptr
@@ -2266,6 +2311,8 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.lnBwd, &g.pipes.layLnBwd, "ln_bwd"},
 		{&g.pipes.softmaxBwd, &g.pipes.laySoftmaxBwd, "softmax_bwd"},
 		{&g.pipes.permute, &g.pipes.layPermute, "permute"},
+		{&g.pipes.embedGather, &g.pipes.layEmbedGather, "embed_gather"},
+		{&g.pipes.embedScatter, &g.pipes.layEmbedScatter, "embed_scatter"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -3817,6 +3864,125 @@ func (g *Device) trainRows(pipe, lay uintptr, p trainParams, rows int, outShape 
 		return nil, err
 	}
 	return &Tensor{g: g, buf: bufOut, shape: append([]int(nil), outShape...)}, nil
+}
+
+// UploadIndices puts token indices on the device for Embed and EmbedGrad.
+// They are u32 rather than f32; the tensor is a handle for those two calls
+// and not something to compute with.
+func (g *Device) UploadIndices(ids []int) (*Tensor, error) {
+	if len(ids) == 0 {
+		return nil, errors.New("tensai: cannot upload an empty index list")
+	}
+	raw := make([]uint32, len(ids))
+	for i, id := range ids {
+		if id < 0 {
+			return nil, fmt.Errorf("tensai: negative index %d", id)
+		}
+		raw[i] = uint32(id)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	bytes := uint64(len(raw)) * 4
+	if err := g.checkSize(bytes); err != nil {
+		return nil, err
+	}
+	buf := g.takeBuffer(gpuTensorUsage, bytes)
+	if buf == 0 {
+		return nil, errors.New("tensai: gpu buffer allocation failed")
+	}
+	fnQueueWriteBuffer(g.queue, buf, 0, unsafe.Pointer(&raw[0]), uintptr(bytes))
+	runtime.KeepAlive(raw)
+	return &Tensor{g: g, buf: buf, shape: []int{len(raw)}}, nil
+}
+
+// Embed looks every index up in t, a (vocab, dim) table, and returns the
+// rows stacked in order.
+func (t *Tensor) Embed(ids *Tensor) (*Tensor, error) {
+	if t.freed || ids.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if len(t.shape) != 2 {
+		return nil, fmt.Errorf("tensai: embed needs a (vocab, dim) table, got %v", t.shape)
+	}
+	dim := t.shape[1]
+	rows := ids.Size()
+	count := rows * dim
+	p := trainParams{count: uint32(count), aCount: uint32(dim), bCount: uint32(rows)}
+	return t.g.embedOp(t.g.pipes.embedGather, t.g.pipes.layEmbedGather, p, count,
+		[]int{rows, dim}, t, ids, nil)
+}
+
+// EmbedGrad adds each row of grad into the row of t its index names, which
+// is the backward pass of Embed. t is the table's gradient, and repeated
+// indices accumulate.
+func (t *Tensor) EmbedGrad(grad, ids *Tensor) error {
+	if t.freed || grad.freed || ids.freed {
+		return errors.New("tensai: gpu tensor already freed")
+	}
+	if len(t.shape) != 2 {
+		return fmt.Errorf("tensai: embed gradient needs a (vocab, dim) table, got %v", t.shape)
+	}
+	dim := t.shape[1]
+	rows := ids.Size()
+	if grad.Size() != rows*dim {
+		return fmt.Errorf("tensai: embed gradient has %d elements, want %d", grad.Size(), rows*dim)
+	}
+	p := trainParams{count: uint32(rows * dim), aCount: uint32(dim), bCount: uint32(rows)}
+	_, err := t.g.embedOp(t.g.pipes.embedScatter, t.g.pipes.layEmbedScatter, p, rows*dim,
+		nil, grad, ids, t)
+	return err
+}
+
+// embedOp dispatches one of the two embedding kernels. outShape is nil for
+// the scatter, which accumulates into the existing buffer bound as atom.
+func (g *Device) embedOp(pipe, lay uintptr, p trainParams, count int, outShape []int, a, ids, atom *Tensor) (*Tensor, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, trainParamBytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, trainParamBytes, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&p), trainParamBytes)
+
+	entries := make([]wgpuBindGroupEntry, 0, 4)
+	entries = append(entries,
+		wgpuBindGroupEntry{binding: 46, buffer: bufParams, size: trainParamBytes},
+		bind(47, a),
+		bind(54, ids))
+	var bufOut uintptr
+	var out *Tensor
+	if outShape != nil {
+		outBytes := uint64(dims.Prod(outShape)) * 4
+		if err := g.checkSize(outBytes); err != nil {
+			return nil, err
+		}
+		bufOut = g.takeOutBuffer(outBytes)
+		entries = append(entries, wgpuBindGroupEntry{binding: 49, buffer: bufOut, size: outBytes})
+		out = &Tensor{g: g, buf: bufOut, shape: append([]int(nil), outShape...)}
+	} else {
+		entries = append(entries, bind(55, atom))
+	}
+	bindGroup := g.cachedBindGroup(lay, entries)
+	runtime.KeepAlive(&entries)
+
+	x, y := split2D((count + 255) / 256)
+	if err := g.dispatch(pipe, bindGroup, x, y, 1); err != nil {
+		if bufOut != 0 {
+			g.dropBuffer(bufOut)
+		}
+		return nil, err
+	}
+	return out, nil
 }
 
 // Permute reorders the axes of a tensor of rank up to four: perm[i] names
