@@ -15,12 +15,14 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"runtime"
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/gguf"
@@ -720,6 +722,29 @@ func unpermuteMap(rows, heads int) func(int) int {
 	}
 }
 
+// headWidth is the model's head width, and ffRange how its feed-forward
+// width is stated: one number, or the span a per-layer model varies over.
+func headWidth(cfg config) int {
+	if cfg.HeadDim != 0 {
+		return cfg.HeadDim
+	}
+	return cfg.HiddenSize / cfg.Heads
+}
+
+func ffRange(cfg config) string {
+	lo, hi := cfg.Intermediate, cfg.Intermediate
+	for i, w := range cfg.FFPerLayer {
+		if i == 0 {
+			lo, hi = w, w
+		}
+		lo, hi = min(lo, w), max(hi, w)
+	}
+	if lo == hi {
+		return fmt.Sprint(lo)
+	}
+	return fmt.Sprintf("%d-%d", lo, hi)
+}
+
 // blockShape sets the per-layer facts that derive from the config and
 // architecture rather than from tensors, shared by the tensor load and
 // the repack-cache path (which skips the tensors entirely).
@@ -787,13 +812,16 @@ func blockShape(b *qblock, cfg config, i int) {
 // grouped-int8 matrices — no dequantize/requantize round trip, and finer
 // (32-row) scales than the float path would produce. The GPU path has no
 // grouped kernel yet, so -gpu passes direct=false.
-func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Tokenizer, error) {
+func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen, *tokenizer.Tokenizer, error) {
 	g, err := gguf.Open(path)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer g.Close()
 
+	if st, err := os.Stat(path); err == nil {
+		fmt.Fprintf(vlog, "reading %s (%.1f GiB)\n", path, float64(st.Size())/(1<<30))
+	}
 	arch, _ := g.String("general.architecture")
 	switch arch {
 	case "llama", "qwen2", "qwen3", "smollm3", "gemma3", "gemma4", "phi3", "qwen2moe", "qwen3moe", "gpt-oss":
@@ -880,10 +908,16 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 		}
 	}
 
+	fmt.Fprintf(vlog, "%s: %d layers, hidden %d, %d heads over %d kv, head %d, ff %s, ctx %d, vocab %d\n",
+		arch, cfg.Layers, cfg.HiddenSize, cfg.Heads, cfg.KVHeads, headWidth(cfg),
+		ffRange(cfg), cfg.MaxPos, cfg.Vocab)
+	tokStart := time.Now()
 	tok, err := ggufTokenizer(g)
 	if err != nil {
 		return nil, nil, err
 	}
+	tokKind, _ := g.String("tokenizer.ggml.model")
+	fmt.Fprintf(vlog, "tokenizer: %s, built in %v\n", tokKind, time.Since(tokStart).Round(time.Millisecond))
 
 	tensor := func(name string) *tensai.Tensor {
 		t, err := g.Tensor(name)
@@ -1307,6 +1341,7 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 	// conversion cost, prefer that valid cache on ordinary -q8 runs too.
 	// A missing, stale, or corrupt fast cache silently leaves the normal
 	// direct-repack path unchanged.
+	fmt.Fprintf(vlog, "repack cache: %s\n", map[bool]string{true: cachePath(path, bits, direct), false: "off"}[useCache])
 	if useCache && direct && bits == 8 {
 		fastPath := cachePath(path, bits, false)
 		if m, err := loadWeightCache(fastPath, path, bits, false, cfg, headSz); err == nil {
@@ -1317,11 +1352,19 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 	cpath := cachePath(path, bits, direct)
 	if useCache {
 		if m, err := loadWeightCache(cpath, path, bits, direct, cfg, headSz); err == nil {
+			fmt.Fprintln(vlog, "weights mapped from the repack cache")
 			return m, tok, nil
 		} else if !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "repack cache unusable (%v); repacking\n", err)
 		}
 	}
+	how := "requantizing through float32"
+	if direct {
+		how = "repacking the stored blocks"
+	}
+	fmt.Fprintf(vlog, "%s into int%d weights, %d layers over %d workers\n",
+		how, bits, cfg.Layers, min(runtime.NumCPU(), 8))
+	repackStart := time.Now()
 	m := &qwen{cfg: cfg, headSz: headSz}
 	m.embed = tensor("token_embd.weight")
 	var ropeFF []float32
@@ -1489,6 +1532,7 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 		}(i)
 	}
 	wg.Wait()
+	fmt.Fprintf(vlog, "weights ready in %v\n", time.Since(repackStart).Round(time.Millisecond))
 	m.initRopeFreqs()
 	if useCache {
 		// Write the cache and serve this run from it too: the freshly

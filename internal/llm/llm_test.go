@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"io"
 	"math"
 	"math/rand"
 	"testing"
@@ -33,7 +34,7 @@ func TestSampleDistribution(t *testing.T) {
 }
 
 func BenchmarkPrefill(b *testing.B) {
-	m, _, err := loadGGUF("../../qwen2.5-0.5b-instruct-q8_0.gguf", 8, true, true)
+	m, _, err := loadGGUF("../../qwen2.5-0.5b-instruct-q8_0.gguf", 8, true, true, io.Discard)
 	if err != nil {
 		b.Skip(err)
 	}

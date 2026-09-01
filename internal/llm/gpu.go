@@ -219,7 +219,7 @@ func upLm(g *gpu.Device, q *qmat) ([]gpuMat, []int, error) {
 // newGPUQwen uploads the model's transformer blocks to the GPU: the int8
 // weight twins, the norm weights and biases, and zeroed KV caches sized
 // for nCtx positions.
-func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw io.Writer) (*gpuQwen, error) {
+func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw, vlog io.Writer) (*gpuQwen, error) {
 	vec := func(v []float32) *gpu.Tensor {
 		if v == nil { // llama: no attention biases
 			return nil
@@ -256,6 +256,11 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw io.Writer) (*gpuQwen, err
 		b := &m.blocks[i]
 		if b.qQKV == nil || (b.qQKV.q8 == nil && b.qQKV.q4 == nil) {
 			return nil, fmt.Errorf("gpu decode needs quantized weights (run with -q8 or -q4)")
+		}
+		// A big model spends half a minute here; say how far along it is
+		// rather than leaving the terminal silent.
+		if i > 0 && i%8 == 0 {
+			fmt.Fprintf(vlog, "  uploaded %d/%d layers\n", i, len(m.blocks))
 		}
 		l := &gq.layers[i]
 		l.noPE = b.noPE

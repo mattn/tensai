@@ -96,6 +96,8 @@ commands:
 
 All model commands share the same flags: `-model` (which model to run), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
 
+`-v` narrates what is otherwise a silent wait. It says what the file claims to be (architecture, layer and head counts, context, vocabulary), how the weights are being read (repacked or mapped from the cache, and how long each took), which template family and system prompt were chosen, and — the one thing a caller cannot otherwise see — the prompt as rendered, markers and all. Under `serve` each request announces itself on arrival with its message and tool counts, then reports how many tokens it prefilled and how fast. It adds lines and changes nothing else.
+
 Each family gets a system prompt of its own when the caller does not choose one. `-system ""` sends no system turn at all rather than an empty one, which is what a model's own template writes when it is handed no system message: it is the flag to reach for when comparing against another runtime, since the system turn is otherwise the one thing in the prompt that differs.
 
 `-model` is the only thing that says which model to run, and it reads whichever
