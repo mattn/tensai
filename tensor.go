@@ -168,6 +168,16 @@ func DotTAInto(out, a, b *Matrix) error {
 		return fmt.Errorf("tensai: dotta output shape mismatch: got %dx%d, want %dx%d",
 			out.Rows, out.Cols, a.Cols, b.Cols)
 	}
+	// When the result is small enough to sit in vector registers, the
+	// operands can be streamed once instead of the output being read back
+	// and written for every element. The kernel covers four output rows
+	// and eight columns at a time, so a bigger result means reading the
+	// operands again for each block -- past a few blocks that costs more
+	// than it saves, and past that the general kernel wins.
+	if a.Rows >= 512 && ((a.Cols+3)/4)*((b.Cols+7)/8) <= 8 {
+		dotTATall(out, a, b, 0, a.Cols)
+		return nil
+	}
 	clear(out.Data) // dotTARows accumulates
 	workers := dotWorkerCount(a.Cols, a.Rows, b.Cols)
 	if workers == 1 {

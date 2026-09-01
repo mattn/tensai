@@ -91,6 +91,70 @@ func dotWorkerCount(rows, inner, cols int) int {
 // dotTARows computes out rows lo..hi of out = a^T * b with the same
 // SSE-free 8-lane FMA pattern as dotRows: a's element is fetched as integer
 // bits for the zero test and broadcast through an integer register.
+// dotTATall computes out = a^T * b when b has at most eight columns: the
+// output rows lo..hi are accumulated four at a time in vector registers,
+// so the inputs are streamed instead of the output being read back and
+// written for every element. The general kernel below does the opposite,
+// which is right when the output is wide and wrong when it is a handful of
+// values -- the shape a convolution's weight gradient has, where the
+// contracted axis is every pixel of every image in the batch.
+func dotTATall(out, a, b *Matrix, lo, hi int) {
+	if !simd.HasAVX2 {
+		dotTARowsGeneric(out, a, b, lo, hi)
+		return
+	}
+	defer archsimd.ClearAVXUpperBits()
+
+	k, n, rows := a.Cols, b.Cols, a.Rows
+	for j0 := 0; j0 < n; j0 += 8 {
+		width := min(8, n-j0)
+		dotTATallCols(out, a, b, lo, hi, k, n, rows, j0, width)
+	}
+}
+
+// dotTATallCols is dotTATall over one eight-wide slice of b's columns.
+func dotTATallCols(out, a, b *Matrix, lo, hi, k, n, rows, j0, width int) {
+	for i0 := lo; i0 < hi; i0 += 4 {
+		var acc0, acc1, acc2, acc3 archsimd.Float32x8
+		switch hi - i0 {
+		case 1:
+			for r := 0; r < rows; r++ {
+				bv := simd.LoadF32x8Part(b.Data[r*n+j0 : r*n+j0+width])
+				aRow := a.Data[r*k+i0:]
+				acc0 = bv.MulAdd(archsimd.BroadcastFloat32x8(aRow[0]), acc0)
+			}
+		case 2:
+			for r := 0; r < rows; r++ {
+				bv := simd.LoadF32x8Part(b.Data[r*n+j0 : r*n+j0+width])
+				aRow := a.Data[r*k+i0:]
+				acc0 = bv.MulAdd(archsimd.BroadcastFloat32x8(aRow[0]), acc0)
+				acc1 = bv.MulAdd(archsimd.BroadcastFloat32x8(aRow[1]), acc1)
+			}
+		case 3:
+			for r := 0; r < rows; r++ {
+				bv := simd.LoadF32x8Part(b.Data[r*n+j0 : r*n+j0+width])
+				aRow := a.Data[r*k+i0:]
+				acc0 = bv.MulAdd(archsimd.BroadcastFloat32x8(aRow[0]), acc0)
+				acc1 = bv.MulAdd(archsimd.BroadcastFloat32x8(aRow[1]), acc1)
+				acc2 = bv.MulAdd(archsimd.BroadcastFloat32x8(aRow[2]), acc2)
+			}
+		default:
+			for r := 0; r < rows; r++ {
+				bv := simd.LoadF32x8Part(b.Data[r*n+j0 : r*n+j0+width])
+				aRow := a.Data[r*k+i0:]
+				acc0 = bv.MulAdd(archsimd.BroadcastFloat32x8(aRow[0]), acc0)
+				acc1 = bv.MulAdd(archsimd.BroadcastFloat32x8(aRow[1]), acc1)
+				acc2 = bv.MulAdd(archsimd.BroadcastFloat32x8(aRow[2]), acc2)
+				acc3 = bv.MulAdd(archsimd.BroadcastFloat32x8(aRow[3]), acc3)
+			}
+		}
+		accs := [4]archsimd.Float32x8{acc0, acc1, acc2, acc3}
+		for i := i0; i < hi && i < i0+4; i++ {
+			simd.StoreF32x8Part(accs[i-i0], out.Data[i*n+j0:i*n+j0+width])
+		}
+	}
+}
+
 func dotTARows(out, a, b *Matrix, lo, hi int) {
 	if !simd.HasAVX2 {
 		dotTARowsGeneric(out, a, b, lo, hi)
