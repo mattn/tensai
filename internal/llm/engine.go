@@ -1090,6 +1090,24 @@ func templateFor(modelType string, think bool) tmpl {
 			stops:      []string{"<|end|>", "<|endoftext|>"},
 		}
 	}
+	if modelType == "gemma4" {
+		// Gemma 4 replaced Gemma 3's turn markers: every turn opens with
+		// <|turn>role and closes with <turn|>, and thinking is asked for
+		// by a token at the top of the system turn, coming back in a
+		// channel of its own rather than inline.
+		t := tmpl{
+			bos:     "<bos>",
+			sysOpen: "<|turn>system\n", sysClose: "<turn|>\n",
+			userOpen: "<|turn>user\n", userClose: "<turn|>\n",
+			asstOpen: "<|turn>model\n", asstClose: "<turn|>\n",
+			stops: []string{"<turn|>"},
+		}
+		if think {
+			t.sysOpen += "<|think|>\n"
+			t.reasonOpen, t.reasonClose = "<|channel>thought\n", "<channel|>"
+		}
+		return t
+	}
 	if modelType == "gemma3" {
 		return tmpl{
 			bos:      "<bos>",

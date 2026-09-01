@@ -288,6 +288,43 @@ func (f *File) Float(key string) (float64, bool) {
 	return float64(n), ok
 }
 
+// Ints returns an integer array metadata value, whatever width the file
+// stored its elements at, or nil when the key is absent or not an array
+// of integers. Gemma 4 states its per-layer feed-forward widths this way.
+func (f *File) Ints(key string) []int64 {
+	arr, ok := f.kv[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]int64, len(arr))
+	for i, v := range arr {
+		n, ok := toInt64(v)
+		if !ok {
+			return nil
+		}
+		out[i] = n
+	}
+	return out
+}
+
+// Bools returns a boolean array metadata value, or nil when the key is
+// absent or not an array of booleans -- Gemma 4's sliding-window pattern.
+func (f *File) Bools(key string) []bool {
+	arr, ok := f.kv[key].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]bool, len(arr))
+	for i, v := range arr {
+		b, ok := v.(bool)
+		if !ok {
+			return nil
+		}
+		out[i] = b
+	}
+	return out
+}
+
 func toInt64(v any) (int64, bool) {
 	switch n := v.(type) {
 	case uint8:
@@ -368,6 +405,16 @@ func Float16(h uint16) float32 { return f16to32(h) }
 
 // Tensor reads one tensor, dequantizing to float32.
 func (f *File) Tensor(name string) (*tensai.Tensor, error) {
+	return f.TensorRows(name, 0, -1)
+}
+
+// TensorRows reads and dequantizes a range of a tensor's leading axis --
+// rows [from, to), or to the end when to is negative. A quantized tensor
+// stores its values in fixed-size blocks, so a row range can only start
+// and end on a block boundary; every row length here is a multiple of the
+// block size, which is what makes a single row of a per-layer embedding
+// table readable without dequantizing the other quarter of a million.
+func (f *File) TensorRows(name string, from, to int) (*tensai.Tensor, error) {
 	t, ok := f.tensors[name]
 	if !ok {
 		return nil, fmt.Errorf("gguf: no tensor %q", name)
@@ -380,28 +427,46 @@ func (f *File) Tensor(name string) (*tensai.Tensor, error) {
 		}
 		return nil, fmt.Errorf("gguf: tensor %q: unsupported encoding %s", name, typ)
 	}
-	n := int64(1)
-	for _, d := range t.shape {
-		n *= int64(d)
+	// Only a 2-D or higher tensor has rows to slice; anything flatter is a
+	// single row so that a whole-tensor read still works on it.
+	rows, axis := 1, 0
+	if len(t.shape) > 1 {
+		rows, axis = t.shape[0], 1
 	}
-	if n%spec.values != 0 {
-		return nil, fmt.Errorf("gguf: tensor %q: %d values not a whole number of blocks", name, n)
+	if to < 0 || to > rows {
+		to = rows
+	}
+	if from < 0 || from > to {
+		return nil, fmt.Errorf("gguf: tensor %q: row range [%d,%d) is not within %d rows", name, from, to, rows)
+	}
+	rowLen := int64(1)
+	for _, d := range t.shape[axis:] {
+		rowLen *= int64(d)
+	}
+	if rowLen%spec.values != 0 {
+		return nil, fmt.Errorf("gguf: tensor %q: a row of %d values is not a whole number of blocks", name, rowLen)
+	}
+	n := rowLen * int64(to-from)
+	shape := append([]int(nil), t.shape...)
+	if axis == 1 {
+		shape[0] = to - from
 	}
 	var raw []byte
 	nbytes := n / spec.values * spec.bytes
+	skip := rowLen * int64(from) / spec.values * spec.bytes
 	if f.data != nil {
-		lo := f.dataBase + t.offset
+		lo := f.dataBase + t.offset + skip
 		if lo < 0 || lo+nbytes > int64(len(f.data)) {
 			return nil, fmt.Errorf("gguf: tensor %q extends past the file", name)
 		}
 		raw = f.data[lo : lo+nbytes]
 	} else {
 		raw = make([]byte, nbytes)
-		if _, err := f.r.ReadAt(raw, f.dataBase+t.offset); err != nil {
+		if _, err := f.r.ReadAt(raw, f.dataBase+t.offset+skip); err != nil {
 			return nil, fmt.Errorf("gguf: tensor %q: %w", name, err)
 		}
 	}
-	out := tensai.NewTensor(t.shape...)
+	out := tensai.NewTensor(shape...)
 	dst := out.Data
 	switch t.typ {
 	case typeF32:

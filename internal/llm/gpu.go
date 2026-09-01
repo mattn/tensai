@@ -200,6 +200,12 @@ func upLm(g *gpu.Device, q *qmat) ([]gpuMat, []int, error) {
 // weight twins, the norm weights and biases, and zeroed KV caches sized
 // for nCtx positions.
 func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw io.Writer) (*gpuQwen, error) {
+	// The device path assumes one head width, one feed-forward width, and
+	// a KV cache per layer -- none of which gemma4 has, and its per-layer
+	// embeddings have no kernel here at all.
+	if m.ple != nil {
+		return nil, fmt.Errorf("gpu decode does not support %s yet", m.cfg.ModelType)
+	}
 	kvDim := m.cfg.KVHeads * m.headSz
 	vec := func(v []float32) *gpu.Tensor {
 		if v == nil { // llama: no attention biases

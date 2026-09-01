@@ -35,6 +35,8 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 	case "gpt2":
 	case "llama": // SentencePiece: Gemma and the Llama-2 family
 		return ggufSPMTokenizer(g)
+	case "gemma4":
+		return ggufSPMBPETokenizer(g)
 	default:
 		return nil, fmt.Errorf("unsupported tokenizer model %q", model)
 	}
@@ -105,6 +107,49 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 		return nil, err
 	}
 	return tokenizer.Parse(raw)
+}
+
+// ggufSPMBPETokenizer builds Gemma 4's tokenizer: SentencePiece
+// normalization -- spaces to U+2581, no byte encoding -- over BPE merges.
+// The token types say which tokens are matched verbatim rather than
+// merged, which matters here beyond the turn markers: the vocabulary
+// spells ordinary tokens like <div> and <=> the same way.
+func ggufSPMBPETokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
+	toksAny, ok := g.KV("tokenizer.ggml.tokens")
+	if !ok {
+		return nil, fmt.Errorf("gguf has no embedded tokenizer")
+	}
+	mergesAny, ok := g.KV("tokenizer.ggml.merges")
+	if !ok {
+		return nil, fmt.Errorf("gguf spm-bpe tokenizer has no merges")
+	}
+	typesAny, ok := g.KV("tokenizer.ggml.token_type")
+	if !ok {
+		return nil, fmt.Errorf("gguf spm-bpe tokenizer has no token types")
+	}
+	ta, _ := toksAny.([]any)
+	ya, _ := typesAny.([]any)
+	ma, _ := mergesAny.([]any)
+	if len(ta) != len(ya) {
+		return nil, fmt.Errorf("gguf has %d tokens but %d token types", len(ta), len(ya))
+	}
+	tokens := make([]string, len(ta))
+	types := make([]int32, len(ta))
+	for i := range ta {
+		tokens[i], _ = ta[i].(string)
+		types[i], _ = ya[i].(int32)
+	}
+	merges := make([]string, len(ma))
+	for i := range ma {
+		merges[i], _ = ma[i].(string)
+	}
+	// llama.cpp defaults SentencePiece space-prefixing on when the key is
+	// absent; Gemma 4 writes an explicit false.
+	pre := true
+	if v, ok := g.KV("tokenizer.ggml.add_space_prefix"); ok {
+		pre, _ = v.(bool)
+	}
+	return tokenizer.NewSPMBPE(tokens, merges, types, pre)
 }
 
 // unpermuteRows reverses llama.cpp's rope interleave on a projection's
@@ -683,6 +728,7 @@ func blockShape(b *qblock, cfg config, i int) {
 	// SmolLM3 skips RoPE on every fourth layer; the GGUF carries no
 	// flag for it, matching llama.cpp's hardcoded rule.
 	b.noPE = arch == "smollm3" && i%4 == 3
+	b.kvFrom = -1
 	switch arch {
 	case "gemma3":
 		// Five of every six layers attend over a sliding window
@@ -693,6 +739,31 @@ func blockShape(b *qblock, cfg config, i int) {
 		if (i+1)%6 != 0 {
 			b.window = cfg.SlidingWin
 			b.ropeTheta = 10000
+		}
+	case "gemma4":
+		// Four of every five layers slide a window with the narrower
+		// head and the local rope base; the fifth attends globally with
+		// the wide head. The feed-forward width doubles halfway down.
+		// Q and K carry their own norms, V is normalized without one,
+		// and those norms set the scale the logits would otherwise get
+		// from the head width.
+		b.geglu = true
+		b.vNorm = true
+		b.unitQK = true
+		b.ff = cfg.FFPerLayer[i]
+		b.headSz = cfg.HeadDim
+		if cfg.SWAPattern[i] {
+			b.window = cfg.SlidingWin
+			b.ropeTheta = cfg.RopeThetaSWA
+			b.headSz = cfg.HeadDimSWA
+		}
+		// Past KVFromStart a layer projects queries only and attends
+		// against the last layer of its own kind that kept a cache.
+		if i >= cfg.KVFromStart {
+			b.kvFrom = cfg.KVFromStart - 1
+			if cfg.SWAPattern[i] {
+				b.kvFrom = cfg.KVFromStart - 2
+			}
 		}
 	case "gpt-oss":
 		// Even layers slide a 128-token window, the attention sinks
@@ -725,9 +796,9 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 
 	arch, _ := g.String("general.architecture")
 	switch arch {
-	case "llama", "qwen2", "qwen3", "smollm3", "gemma3", "phi3", "qwen2moe", "qwen3moe", "gpt-oss":
+	case "llama", "qwen2", "qwen3", "smollm3", "gemma3", "gemma4", "phi3", "qwen2moe", "qwen3moe", "gpt-oss":
 	default:
-		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2(+moe), qwen3(+moe), llama, smollm3, gemma3, and phi3)", arch)
+		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2(+moe), qwen3(+moe), llama, smollm3, gemma3, gemma4, and phi3)", arch)
 	}
 	meta := func(key string) int64 {
 		n, _ := g.Int(arch + "." + key)
@@ -751,6 +822,11 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 	}
 	if cfg.HiddenSize == 0 || cfg.Layers == 0 || cfg.Heads == 0 || cfg.KVHeads == 0 {
 		return nil, nil, fmt.Errorf("gguf is missing %s.* dimensions", arch)
+	}
+	if arch == "gemma4" {
+		if err := gemma4Config(g, &cfg); err != nil {
+			return nil, nil, err
+		}
 	}
 	if arch == "qwen2moe" || arch == "qwen3moe" || arch == "gpt-oss" {
 		cfg.NExpert = int(meta("expert_count"))
@@ -1225,7 +1301,9 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 	}
 	// A valid repack cache stands in for the whole tensor load: the
 	// weights map straight from the cache file as clean pages.
-	useCache := cache && bits != 0
+	// gemma4's per-layer embeddings, per-layer widths, and shared caches
+	// have no place in the repack cache format, so it sits that one out.
+	useCache := cache && bits != 0 && arch != "gemma4"
 	// Requantization's per-column scales decode materially faster than
 	// the direct Q8_0 group scales. Once a user has paid its one-time
 	// conversion cost, prefer that valid cache on ordinary -q8 runs too.
@@ -1248,6 +1326,20 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 	}
 	m := &qwen{cfg: cfg, headSz: headSz}
 	m.embed = tensor("token_embd.weight")
+	var ropeFF []float32
+	if arch == "gemma4" {
+		// Gemma scales embeddings by sqrt(hidden). Doing it per token
+		// rather than to the table leaves the tied lm head the values it
+		// was trained with.
+		m.embScale = float32(math.Sqrt(float64(cfg.HiddenSize)))
+		m.pleNorm = tensor("per_layer_proj_norm.weight").Data
+		m.wPleIn, m.qPleIn = linAuto([]string{"per_layer_model_proj.weight"}, []int{0})
+		ropeFF = tensor("rope_freqs.weight").Data
+		m.ple, err = newPLETable(path, cfg)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	if arch == "gemma3" {
 		// Gemma scales embeddings by sqrt(hidden) before the first block.
 		s := float32(math.Sqrt(float64(cfg.HiddenSize)))
@@ -1328,10 +1420,25 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 				// Phi-3 ships q/k/v pre-fused in that order — the layout
 				// the runtime wants, no permutation (NEOX rope).
 				b.wQKV, b.qQKV = linAuto([]string{p + "attn_qkv.weight"}, []int{0})
+			} else if b.kvFrom >= 0 {
+				// A layer that attends against an earlier layer's cache
+				// projects queries and nothing else.
+				b.wQKV, b.qQKV = linAuto([]string{p + "attn_q.weight"}, []int{qPerm})
 			} else {
 				b.wQKV, b.qQKV = linAuto(
 					[]string{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"},
 					[]int{qPerm, kPerm, 0})
+			}
+			if arch == "gemma4" {
+				b.wPleGate, b.qPleGate = linAuto([]string{p + "inp_gate.weight"}, []int{0})
+				b.wPleProj, b.qPleProj = linAuto([]string{p + "proj.weight"}, []int{0})
+				b.plePost = tensor(p + "post_norm.weight").Data
+				if s := vecOpt(p + "layer_output_scale.weight"); len(s) > 0 {
+					b.outScale = s[0]
+				}
+				if !cfg.SWAPattern[i] {
+					b.ropeFF = ropeFF
+				}
 			}
 			b.wo, b.qo = linAuto([]string{p + "attn_output.weight"}, []int{0})
 			switch {

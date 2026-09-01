@@ -36,9 +36,22 @@ architecture allows would close most of that and is not implemented yet.
 | llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | the block everyone forked |
 | smollm3 | SmolLM3-3B | RoPE skipped every fourth layer |
 | gemma3 | Gemma 3 | sliding windows on 5/6 layers, sandwich norms, gelu-tanh gate, SentencePiece |
+| gemma4 | Gemma 4 E2B/E4B | per-layer embeddings read from disk a token at a time, two head widths, the deeper layers attending against an earlier layer's cache, logits through a tanh cap |
 | phi3 | Phi-3/3.5-mini | q/k/v and gate/up shipped pre-fused |
 | qwen2moe / qwen3moe | Qwen1.5-MoE-A2.7B, Qwen3-30B-A3B | top-k routed experts, a shared expert on qwen2moe |
 | gpt-oss | gpt-oss-20b | MXFP4 experts, attention sinks, YaRN rope, harmony channels |
+
+Gemma 4 keeps most of its parameters in a per-layer embedding table — 2.3
+of E2B's 4.6 billion — that no step needs more than one row of, so the
+table stays in the file and every token reads its own row on demand. What
+that leaves resident is an ordinary transformer about the size of a 2B.
+Its layers alternate a 256-wide local head with a 512-wide global one,
+the deeper two thirds project queries only and attend against the last
+layer of their own kind that kept a cache, and the logits leave through a
+tanh cap. Its template does define a tool convention, which is not
+implemented here yet, so a request carrying tools is refused as it is for
+the families that have none. The repack cache and GPU decode both sit
+this architecture out.
 
 The DeepSeek-R1 distills are stock qwen2/llama blocks wearing DeepSeek's turn markers, which the loader spots in the embedded chat template and switches automatically, `<think>` reasoning included.
 
@@ -228,7 +241,7 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 
 Send the result back as a `tool` message naming the call it answers, alongside the assistant turn that made it, and the model writes the reply. Streaming works the same way: text streams as usual, the calls arrive as `tool_calls` deltas indexed from zero, and the turn ends with `finish_reason: "tool_calls"`.
 
-The signatures are handed to the model in the convention its own family was trained on. For the ChatML families — qwen2, qwen3, their MoE variants, llama, and SmolLM — that is a `<tools>` block appended to the system turn and calls written as `<tool_call>` JSON. Qwen3.5 left that behind: its `<tools>` block leads the system turn instead, and a call is a `<function=name>` element with one `<parameter=key>` per argument, which carries no types, so the tool's own JSON Schema decides what each value means. Whether a particular checkpoint was prepared for it is not a guess: its own chat template either branches on the tool definitions it may be handed or it does not, and that answer overrides the family. A GGUF carries the template in its metadata; a downloaded checkpoint gets it from `tokenizer_config.json` (or `chat_template.jinja`, where newer ones keep it). A model named by a path or a cached name is read where it sits and never fetched from, so a checkpoint cached before this existed falls back to its family until the file is there. Families with no such convention (gemma3, phi3, mistral, deepseek, gpt-oss), and checkpoints whose template never mentions tools (SmolLM2, say), answer a request carrying `tools` with 400 rather than dropping them silently. Nothing constrains the sampler, so a call is the model's choice: `tool_choice: "none"` withholds the signatures, but `"required"` cannot force what only a grammar could, and it reads as `"auto"`. Bigger models call far more reliably than the 0.5B default.
+The signatures are handed to the model in the convention its own family was trained on. For the ChatML families — qwen2, qwen3, their MoE variants, llama, and SmolLM — that is a `<tools>` block appended to the system turn and calls written as `<tool_call>` JSON. Qwen3.5 left that behind: its `<tools>` block leads the system turn instead, and a call is a `<function=name>` element with one `<parameter=key>` per argument, which carries no types, so the tool's own JSON Schema decides what each value means. Whether a particular checkpoint was prepared for it is not a guess: its own chat template either branches on the tool definitions it may be handed or it does not, and that answer overrides the family. A GGUF carries the template in its metadata; a downloaded checkpoint gets it from `tokenizer_config.json` (or `chat_template.jinja`, where newer ones keep it). A model named by a path or a cached name is read where it sits and never fetched from, so a checkpoint cached before this existed falls back to its family until the file is there. Families with no such convention (gemma3, gemma4, phi3, mistral, deepseek, gpt-oss), and checkpoints whose template never mentions tools (SmolLM2, say), answer a request carrying `tools` with 400 rather than dropping them silently. Nothing constrains the sampler, so a call is the model's choice: `tool_choice: "none"` withholds the signatures, but `"required"` cannot force what only a grammar could, and it reads as `"auto"`. Bigger models call far more reliably than the 0.5B default.
 
 - The default bind is loopback only (`127.0.0.1:8080`, or `$TENSAI_ADDR`); widen it explicitly if you mean to
 - `-api-key` (or `$TENSAI_API_KEY`) requires a bearer token on the `/v1` routes; the demo page stays open

@@ -33,7 +33,7 @@ func buildTestFile(t *testing.T) []byte {
 	w.u32(0x46554747) // GGUF
 	w.u32(3)
 	w.u64(6) // tensors
-	w.u64(6) // metadata keys
+	w.u64(8) // metadata keys
 
 	w.str("general.architecture")
 	w.u32(8)
@@ -57,6 +57,19 @@ func buildTestFile(t *testing.T) []byte {
 	w.str("flag")
 	w.u32(7) // bool
 	w.buf.WriteByte(1)
+	w.str("llama.feed_forward_length")
+	w.u32(9) // array of u32
+	w.u32(4)
+	w.u64(3)
+	w.u32(6144)
+	w.u32(6144)
+	w.u32(12288)
+	w.str("llama.attention.sliding_window_pattern")
+	w.u32(9) // array of bool
+	w.u32(7)
+	w.u64(2)
+	w.buf.WriteByte(1)
+	w.buf.WriteByte(0)
 
 	// Tensor directory: offsets are relative to the aligned data section
 	// and themselves aligned.
@@ -155,6 +168,16 @@ func TestReadSynthetic(t *testing.T) {
 		t.Fatalf("tokens: %v", toks)
 	}
 
+	if got := f.Ints("llama.feed_forward_length"); len(got) != 3 || got[0] != 6144 || got[2] != 12288 {
+		t.Fatalf("feed_forward_length: %v", got)
+	}
+	if got := f.Bools("llama.attention.sliding_window_pattern"); len(got) != 2 || !got[0] || got[1] {
+		t.Fatalf("sliding_window_pattern: %v", got)
+	}
+	if f.Ints("llama.block_count") != nil || f.Bools("tokenizer.ggml.tokens") != nil {
+		t.Fatal("a non-array or wrongly typed key produced an array")
+	}
+
 	typ, shape, ok := f.Info("f32t")
 	if !ok || typ != "F32" || len(shape) != 2 || shape[0] != 2 || shape[1] != 4 {
 		t.Fatalf("f32t info: %v %v %v", typ, shape, ok)
@@ -168,6 +191,25 @@ func TestReadSynthetic(t *testing.T) {
 		if v != float32(i) {
 			t.Fatalf("f32t[%d] = %v", i, v)
 		}
+	}
+
+	// A row range reads one slice of the leading axis without touching the
+	// rest, which is how a per-layer embedding table is read a token at a
+	// time instead of all at once.
+	row, err := f.TensorRows("f32t", 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := row.Shape; len(got) != 2 || got[0] != 1 || got[1] != 4 {
+		t.Fatalf("row shape = %v", got)
+	}
+	for i, v := range row.Data {
+		if v != float32(4+i) {
+			t.Fatalf("row[%d] = %v", i, v)
+		}
+	}
+	if _, err := f.TensorRows("f32t", 1, 0); err == nil {
+		t.Fatal("reversed row range accepted")
 	}
 
 	half, err := f.Tensor("f16t")
