@@ -467,6 +467,53 @@ func (e *Engine) Serve(addr, apiKey string) error {
 // a little room without a wedged one holding the load up for long.
 const fetchAttempts = 5
 
+// hfToken returns a Hugging Face access token, which gated repositories
+// need: Gemma and Llama serve 401 without one. It looks where the
+// huggingface tooling puts it -- the environment first, then the file
+// "huggingface-cli login" writes -- so a machine already logged in needs
+// no further setup. The answer is read once; a token that appears later
+// takes a restart, which is what a long-running serve wants anyway.
+func hfToken() string {
+	hfTokenOnce.Do(func() {
+		for _, env := range []string{"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN"} {
+			if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+				hfTokenValue = v
+				return
+			}
+		}
+		home := os.Getenv("HF_HOME")
+		if home == "" {
+			dir, err := os.UserHomeDir()
+			if err != nil {
+				return
+			}
+			home = filepath.Join(dir, ".cache", "huggingface")
+		}
+		b, err := os.ReadFile(filepath.Join(home, "token"))
+		if err != nil {
+			return
+		}
+		hfTokenValue = strings.TrimSpace(string(b))
+	})
+	return hfTokenValue
+}
+
+var (
+	hfTokenOnce  sync.Once
+	hfTokenValue string
+)
+
+// tokenHint explains what to do about a refused download, differently
+// depending on whether a token was sent at all.
+func tokenHint() string {
+	if hfToken() == "" {
+		return " (this repository is gated: accept its licence on huggingface.co," +
+			" then set HF_TOKEN or run \"huggingface-cli login\")"
+	}
+	return " (the token in use does not have access: accept the repository's" +
+		" licence on huggingface.co with the account that owns it)"
+}
+
 // fetch downloads name into dir unless it is already there. A partial
 // download stays on disk as name.tmp and the next attempt resumes it with
 // a Range request rather than starting a multi-gigabyte file over. The
@@ -511,6 +558,9 @@ func fetchOnce(base, dir, name, tmp string) (retry bool, err error) {
 	if err != nil {
 		return false, err
 	}
+	if tok := hfToken(); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
 	var off int64
 	tag, _ := os.ReadFile(tmp + ".etag")
 	if fi, err := os.Stat(tmp); err == nil && fi.Size() > 0 && len(tag) > 0 {
@@ -535,8 +585,12 @@ func fetchOnce(base, dir, name, tmp string) (retry bool, err error) {
 		os.Remove(tmp)
 		os.Remove(tmp + ".etag")
 		return true, fmt.Errorf("downloading %s: %s", name, resp.Status)
+	case http.StatusUnauthorized, http.StatusForbidden:
+		// Gated repositories -- Gemma and Llama among them -- answer this
+		// until the licence is accepted and a token is sent.
+		return false, fmt.Errorf("downloading %s: %s%s", name, resp.Status, tokenHint())
 	default:
-		// 5xx and 429 may pass; a 404 or a 403 will not.
+		// 5xx and 429 may pass; a 404 will not.
 		retry = resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests
 		return retry, fmt.Errorf("downloading %s: %s", name, resp.Status)
 	}
