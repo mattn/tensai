@@ -85,11 +85,11 @@ Nothing else in a training step moves: activations, gradients, and the optimizer
 
 | model width | CPU (AVX2) | with the device | |
 |---|---|---|---|
-| 512 | 31.3ms | 32.4ms | below the threshold: unchanged |
-| 1024 | 176ms | 145ms | 1.22x |
-| 2048 | 1367ms | 955ms | 1.43x |
+| 512 | 34.7ms | 33.9ms | below the threshold: unchanged |
+| 1024 | 194ms | 105ms | 1.85x |
+| 2048 | 1569ms | 573ms | 2.74x |
 
-The same products with both operands already resident run 2.5-2.8x faster than the CPU, so most of the remaining gap is the transfers. Closing it means keeping a whole training graph on the device, which needs the element-wise, activation, and normalization kernels a backward pass touches -- the inference set does not cover them yet.
+Keeping the whole graph resident instead removes the transfers as well: the same step runs 220ms at width 2048, 7x the CPU. See [Automatic Differentiation](autograd.md) for how a tape does that.
 
 Those are the products. The rest of a backward pass is there too, as resident kernels the inference path never needed on their own:
 

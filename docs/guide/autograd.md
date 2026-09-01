@@ -109,16 +109,16 @@ On an AMD 780M through `-tags wgpu24`, one step of `x @ w1 -> GELU -> @ w2 -> MS
 
 | model width | CPU (AVX2) | accelerator hook | resident graph |
 |---|---|---|---|
-| 512 | 33.3ms | 31.8ms | **22.2ms** |
-| 1024 | 182.6ms | 146.1ms | **75.9ms** |
-| 2048 | 1786.6ms | 930.1ms | **521.3ms** |
+| 512 | 34.7ms | 33.9ms | **12.7ms** |
+| 1024 | 194.5ms | 105.4ms | **41.1ms** |
+| 2048 | 1568.6ms | 572.8ms | **220.4ms** |
 
 A transformer block -- pre-norm attention with a causal mask and a GELU feed-forward, batch 8, sequence 128, vocabulary 512 -- trains at:
 
 | model width | CPU (AVX2) | resident graph |
 |---|---|---|
-| 256 | 99.4ms | **68.8ms** |
-| 512 | 217.0ms | **89.1ms** |
+| 256 | 90.5ms | **49.3ms** |
+| 512 | 230.5ms | **65.9ms** |
 
 The hook (`tensai.UseAccelerator`) sends each product to the device on its own, so it pays a round trip per product; residency pays one upload per step for the batch and one download for the loss. Both are opt-in, and they compose: with a tape on a device the hook is not consulted.
 
