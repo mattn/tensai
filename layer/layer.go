@@ -46,7 +46,6 @@ type Dense struct {
 	gradB []tensai.Float
 
 	input *tensai.Matrix
-	tW    *tensai.Matrix // scratch: weights^T
 }
 
 // NewDense returns a Dense layer with the given output size.
@@ -110,16 +109,32 @@ func (d *Dense) Backward(gradOutput *tensai.Matrix) (*tensai.Matrix, error) {
 		kernels.AddSlice(d.gradB, gradOutput.Data[r*gradOutput.Cols:(r+1)*gradOutput.Cols])
 	}
 
-	// gradInput = gradOutput * weights^T  (batch x in)
-	d.tW = tensai.EnsureMatrix(d.tW, d.weights.Cols, d.weights.Rows)
-	if err := tensai.TInto(d.tW, d.weights); err != nil {
-		return nil, err
-	}
+	// gradInput = gradOutput * weights^T  (batch x in), again without
+	// materializing the transpose: both operands are read row-wise.
 	gradInput := d.bwdBuf(gradOutput.Rows, d.weights.Rows)
-	if err := tensai.DotInto(gradInput, gradOutput, d.tW); err != nil {
+	if err := tensai.DotTBInto(gradInput, gradOutput, d.weights); err != nil {
 		return nil, err
 	}
 	return gradInput, nil
+}
+
+// BackwardParams computes only the parameter gradients, skipping the
+// product that would give the gradient of the input. The first layer of a
+// model is fed data, so nothing upstream wants that one -- and at a wide
+// layer it is a third of the step.
+func (d *Dense) BackwardParams(gradOutput *tensai.Matrix) error {
+	if d.input == nil {
+		return fmt.Errorf("tensai: dense backward called before forward")
+	}
+	d.gradW = tensai.EnsureMatrix(d.gradW, d.weights.Rows, d.weights.Cols)
+	if err := tensai.DotTAInto(d.gradW, d.input, gradOutput); err != nil {
+		return err
+	}
+	clear(d.gradB)
+	for r := 0; r < gradOutput.Rows; r++ {
+		kernels.AddSlice(d.gradB, gradOutput.Data[r*gradOutput.Cols:(r+1)*gradOutput.Cols])
+	}
+	return nil
 }
 
 func (d *Dense) Grads() (*tensai.Matrix, []tensai.Float) {

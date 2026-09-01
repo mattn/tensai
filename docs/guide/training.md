@@ -78,7 +78,7 @@ For deployment beyond Go, trained models export to TFLite and ONNX — see [Mode
 
 ## Training a Sequential on the autograd engine
 
-`Fit` runs the layers' own Forward and Backward, which is the fastest path on a CPU and the only one that has been there from the start. `net.Graph()` builds the same model as an autograd graph instead:
+`Fit` runs the layers' own Forward and Backward. `net.Graph()` builds the same model as an autograd graph instead:
 
 ```go
 g, err := net.Graph()
@@ -96,6 +96,8 @@ g.Sync() // brings a device's weights back into the layers
 ```
 
 The parameters are the layers' own matrices, so training through the graph trains the model: `Predict`, `Save` and the exports keep working, and the graph's forward pass matches `Predict` to float32 rounding. What it adds is the GPU -- a graph runs wherever a tape sends it, which the hand-written stack cannot.
+
+On a CPU the two are within a few percent of each other (`go test -bench Step ./model`), which is not where they started: comparing them turned up two things the layer path was doing that the graph was not, and fixing both made a step of a 1024-wide model 1.5x faster. The layer path allocates less -- it reuses a scratch buffer per layer, where the graph allocates its intermediates from the tape -- so it stays the default.
 
 Every layer has a graph form; `SetTraining` switches Dropout and BatchNorm between their training and inference behaviour, as `Fit` and `Predict` do for the layer stack.
 

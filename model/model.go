@@ -127,9 +127,26 @@ func (s *Sequential) forward(input *tensai.Matrix) (*tensai.Matrix, error) {
 }
 
 // backward runs gradients back through the stack.
+// paramGradienter is a layer that can fill its parameter gradients without
+// also producing the gradient of its input.
+type paramGradienter interface {
+	BackwardParams(gradOutput *tensai.Matrix) error
+}
+
 func (s *Sequential) backward(grad *tensai.Matrix) error {
 	current := grad
 	for i := len(s.layers) - 1; i >= 0; i-- {
+		// Nothing upstream of the first layer wants a gradient: its input
+		// is the data. Skipping that product is a third of a wide layer's
+		// backward pass.
+		if i == 0 {
+			if pg, ok := s.layers[i].(paramGradienter); ok {
+				if err := pg.BackwardParams(current); err != nil {
+					return fmt.Errorf("tensai: layer 0 backward: %w", err)
+				}
+				return nil
+			}
+		}
 		out, err := s.layers[i].Backward(current)
 		if err != nil {
 			return fmt.Errorf("tensai: layer %d backward: %w", i, err)
