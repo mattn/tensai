@@ -275,3 +275,76 @@ func TestGPUResidentTransformer(t *testing.T) {
 		}
 	}
 }
+
+// TestGPUResidentShapes pins the shapes a resident chain reports. A kernel
+// may hand back a flatter view of the same elements -- the embedding lookup
+// returns (rows, dim) for what the graph calls (batch, seq, dim) -- and the
+// next device op reads the buffer's shape, so a mismatch quietly reshapes
+// everything downstream. It surfaced as a broadcast failure two operations
+// later, which is why the shapes are checked here step by step.
+func TestGPUResidentShapes(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+
+	const batch, seq, dim, vocab = 2, 4, 8, 5
+	rng := rand.New(rand.NewSource(311))
+	table := autograd.Param(randTensor(rng, vocab, dim))
+	pos := autograd.Param(randTensor(rng, 1, seq, dim))
+	w := autograd.Param(randTensor(rng, dim, dim))
+	tape := autograd.NewTape()
+	tape.UseDevice(g)
+	tape.Bind(table, pos, w)
+	defer tape.Reset()
+
+	tokens := make([]int, batch*seq)
+	for i := range tokens {
+		tokens[i] = rng.Intn(vocab)
+	}
+	steps := []struct {
+		name string
+		node *autograd.Node
+		want []int
+	}{}
+	x := table.Embed(tokens, batch, seq)
+	steps = append(steps, struct {
+		name string
+		node *autograd.Node
+		want []int
+	}{"embed", x, []int{batch, seq, dim}})
+	h := x.Add(pos)
+	steps = append(steps, struct {
+		name string
+		node *autograd.Node
+		want []int
+	}{"add", h, []int{batch, seq, dim}})
+	y := h.MatMul(w)
+	steps = append(steps, struct {
+		name string
+		node *autograd.Node
+		want []int
+	}{"matmul", y, []int{batch, seq, dim}})
+	sum := x.Add(y) // the residual that fails when a shape drifted
+	steps = append(steps, struct {
+		name string
+		node *autograd.Node
+		want []int
+	}{"residual", sum, []int{batch, seq, dim}})
+
+	for _, s := range steps {
+		if !s.node.Resident() {
+			t.Errorf("%s left the device", s.name)
+		}
+		got := s.node.Shape()
+		if len(got) != len(s.want) {
+			t.Fatalf("%s shape %v, want %v", s.name, got, s.want)
+		}
+		for i := range s.want {
+			if got[i] != s.want[i] {
+				t.Fatalf("%s shape %v, want %v", s.name, got, s.want)
+			}
+		}
+		if v := s.node.Value(); len(v.Shape) != len(s.want) {
+			t.Fatalf("%s downloaded shape %v, want %v", s.name, v.Shape, s.want)
+		}
+	}
+}
