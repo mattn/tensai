@@ -410,6 +410,15 @@ func SiluMul(gate, up []Float) {
 	kernels.SiluMul(gate, up)
 }
 
+// GeluMul is SiluMul's twin for the gate Gemma uses: gelu(gate) * up,
+// in place on gate, with the tanh approximation those models trained on.
+func GeluMul(gate, up []Float) {
+	if len(gate) != len(up) {
+		panic("tensai: GeluMul length mismatch")
+	}
+	kernels.GeluMul(gate, up)
+}
+
 // DotVecs is the grouped-query form of DotVec: out[i] gets the dot of k
 // with the i-th of len(out) query vectors packed contiguously in qs, the
 // shared k streamed once for up to four of them per pass — the score

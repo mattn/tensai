@@ -13,6 +13,7 @@ import (
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/gguf"
+	"github.com/mattn/tensai/internal/workpool"
 )
 
 // gemma4Config reads the per-layer geometry out of the GGUF metadata.
@@ -169,14 +170,19 @@ func gelu(v []float32) {
 }
 
 // capLogits squashes the final logits through Gemma's tanh soft cap.
+// A quarter of a million of them go through it every token, which is
+// worth the same workers the projection that produced them used: it was
+// a tenth of the decode step on its own.
 func (m *qwen) capLogits(logits []float32) []float32 {
 	cap := float32(m.cfg.LogitCap)
 	if cap == 0 {
 		return logits
 	}
-	for i, v := range logits {
-		logits[i] = float32(math.Tanh(float64(v/cap))) * cap
-	}
+	workpool.Run(len(logits), 64, func(lo, hi int) {
+		for i, v := range logits[lo:hi] {
+			logits[lo+i] = float32(math.Tanh(float64(v/cap))) * cap
+		}
+	})
 	return logits
 }
 
