@@ -142,6 +142,7 @@ type qblock struct {
 	postAttn     []float32 // Gemma sandwich norms; nil otherwise
 	postFFN      []float32
 	noPE         bool           // smollm3: every fourth layer skips RoPE
+	headSz       int            // this layer's head width; gemma4 alternates 256 and 512
 	window       int            // gemma3: sliding-attention span; 0 = full
 	ropeTheta    float64        // per-layer rope base; 0 = the config default
 	ropeFreq     []float64      // precomputed theta^(-2*i/head_dim)
@@ -843,13 +844,14 @@ func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, sco
 	if b.window > 0 && steps > b.window {
 		start = steps - b.window
 	}
-	qOff := h * m.headSz
-	kvOff := (h / group) * m.headSz
-	scale := 1 / math.Sqrt(float64(m.headSz))
-	qh := q[qOff : qOff+m.headSz]
+	d := m.headSize(b)
+	qOff := h * d
+	kvOff := (h / group) * d
+	scale := 1 / math.Sqrt(float64(d))
+	qh := q[qOff : qOff+d]
 	maxs := math.Inf(-1)
 	for t := start; t < steps; t++ {
-		s := float64(tensai.DotVec(qh, b.kc[t][kvOff:kvOff+m.headSz])) * scale
+		s := float64(tensai.DotVec(qh, b.kc[t][kvOff:kvOff+d])) * scale
 		scores[t] = s
 		if s > maxs {
 			maxs = s
@@ -868,9 +870,9 @@ func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, sco
 		// absorbs probability mass.
 		sum += math.Exp(float64(b.sinks[h]) - maxs)
 	}
-	out := attn[qOff : qOff+m.headSz]
+	out := attn[qOff : qOff+d]
 	for t := start; t < steps; t++ {
-		tensai.Axpy(float32(scores[t]/sum), b.vc[t][kvOff:kvOff+m.headSz], out)
+		tensai.Axpy(float32(scores[t]/sum), b.vc[t][kvOff:kvOff+d], out)
 	}
 }
 
@@ -889,7 +891,7 @@ func (m *qwen) attendGroup(b *qblock, q, attn []float32, kh, group, steps int, s
 	if b.window > 0 && steps > b.window {
 		start = steps - b.window
 	}
-	d := m.headSz
+	d := m.headSize(b)
 	qOff := kh * group * d
 	kvOff := kh * d
 	scale := 1 / math.Sqrt(float64(d))
@@ -939,22 +941,31 @@ func (m *qwen) attendGroup(b *qblock, q, attn []float32, kh, group, steps int, s
 	}
 }
 
+// headSize is the layer's head width. Every model here but gemma4 uses one
+// width throughout, and those blocks leave the field zero.
+func (m *qwen) headSize(b *qblock) int {
+	if b.headSz > 0 {
+		return b.headSz
+	}
+	return m.headSz
+}
+
 // qkNorm applies Qwen3's per-head RMS normalization in place; w has one
 // weight per head channel. A nil w (qwen2, llama) is a no-op.
-func (m *qwen) qkNorm(v, w []float32) {
+func (m *qwen) qkNorm(v, w []float32, headSz int) {
 	if w == nil {
 		return
 	}
-	for o := 0; o < len(v); o += m.headSz {
-		rmsnormInto(v[o:o+m.headSz], v[o:o+m.headSz], w, m.cfg.RMSEps)
+	for o := 0; o < len(v); o += headSz {
+		rmsnormInto(v[o:o+headSz], v[o:o+headSz], w, m.cfg.RMSEps)
 	}
 }
 
 // qProjWidth is how wide the query projection is. qwen3_5 makes it twice
 // the queries and spends the second half gating the attention output, so
 // the fused qkv row is wider than the queries suggest.
-func (m *qwen) qProjWidth() int {
-	w := m.cfg.Heads * m.headSz
+func (m *qwen) qProjWidth(b *qblock) int {
+	w := m.cfg.Heads * m.headSize(b)
 	if m.cfg.AttnOutputGate {
 		w *= 2
 	}
@@ -1085,7 +1096,6 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 	cfg := m.cfg
 	hs := cfg.HiddenSize
 	group := cfg.Heads / cfg.KVHeads
-	kvDim := cfg.KVHeads * m.headSz
 	n := len(tokens)
 
 	x := tensai.NewMatrix(n, hs)
@@ -1098,15 +1108,22 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			rmsnormInto(a.Data[t*hs:(t+1)*hs], x.Data[t*hs:(t+1)*hs], w, cfg.RMSEps)
 		}
 	}
-	qDim := cfg.Heads * m.headSz
-	qProjW := m.qProjWidth()
-	qkvW := qProjW + 2*kvDim
 	var qbuf, gbuf []float32
 	if cfg.AttnOutputGate {
-		qbuf, gbuf = make([]float32, n*qDim), make([]float32, n*qDim)
+		// Only models with one head width throughout have this gate, so
+		// the buffers can be sized once.
+		w := n * cfg.Heads * m.headSz
+		qbuf, gbuf = make([]float32, w), make([]float32, w)
 	}
 	for li := range m.blocks {
 		b := &m.blocks[li]
+		// gemma4 alternates head widths from layer to layer, so the
+		// projection geometry belongs to the block rather than the model.
+		headSz := m.headSize(b)
+		kvDim := cfg.KVHeads * headSz
+		qDim := cfg.Heads * headSz
+		qProjW := m.qProjWidth(b)
+		qkvW := qProjW + 2*kvDim
 		norm(b.ln1)
 		if b.delta != nil {
 			// Only the convolution and the recurrence are sequential --
@@ -1147,14 +1164,14 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 					qr = qbuf[t*qDim : (t+1)*qDim]
 				}
 				kr := row[qProjW : qProjW+kvDim]
-				m.qkNorm(qr, b.qNorm)
-				m.qkNorm(kr, b.kNorm)
+				m.qkNorm(qr, b.qNorm, headSz)
+				m.qkNorm(kr, b.kNorm, headSz)
 				if !b.noPE {
 					for h := 0; h < cfg.Heads; h++ {
-						m.rope(qr[h*m.headSz:(h+1)*m.headSz], pos, b)
+						m.rope(qr[h*headSz:(h+1)*headSz], pos, b)
 					}
 					for h := 0; h < cfg.KVHeads; h++ {
-						m.rope(kr[h*m.headSz:(h+1)*m.headSz], pos, b)
+						m.rope(kr[h*headSz:(h+1)*headSz], pos, b)
 					}
 				}
 				kt := kb[t*kvDim : (t+1)*kvDim : (t+1)*kvDim]
@@ -1186,7 +1203,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			}
 			close(rowCh)
 			nq := qb * group
-			dh := m.headSz
+			dh := headSz
 			for w := min(runtime.NumCPU(), (n+qb-1)/qb); w > 0; w-- {
 				wg.Add(1)
 				go func() {
@@ -1305,21 +1322,31 @@ func (m *qwen) step(token, pos int) []float32 {
 	copy(x, m.embed.Data[token*hs:(token+1)*hs])
 	a := make([]float32, hs)
 
-	kvDim := cfg.KVHeads * m.headSz
-	qDim := cfg.Heads * m.headSz
-	qProjW := m.qProjWidth()
-	qkvW := qProjW + 2*kvDim
-	qkv := make([]float32, qkvW)
-	attn := make([]float32, qDim)
+	// Widths are per layer -- gemma4 alternates two head sizes -- so the
+	// scratch is sized for the widest and re-sliced each block.
+	maxHead := m.headSz
+	for li := range m.blocks {
+		if h := m.blocks[li].headSz; h > maxHead {
+			maxHead = h
+		}
+	}
+	maxQ := cfg.Heads * maxHead
+	qkv := make([]float32, maxQ+2*cfg.KVHeads*maxHead+cfg.Heads*maxHead)
+	attn := make([]float32, maxQ)
 	var qbuf, gbuf []float32
 	if cfg.AttnOutputGate {
-		qbuf, gbuf = make([]float32, qDim), make([]float32, qDim)
+		qbuf, gbuf = make([]float32, maxQ), make([]float32, maxQ)
 	}
 	proj := make([]float32, hs)
 	gu := make([]float32, 2*cfg.Intermediate)
 	downBuf := make([]float32, hs)
 	for li := range m.blocks {
 		b := &m.blocks[li]
+		headSz := m.headSize(b)
+		kvDim := cfg.KVHeads * headSz
+		qDim := cfg.Heads * headSz
+		qProjW := m.qProjWidth(b)
+		qkvW := qProjW + 2*kvDim
 		rmsnormInto(a, x, b.ln1, cfg.RMSEps)
 		if b.delta != nil {
 			if b.dstate == nil {
@@ -1335,22 +1362,23 @@ func (m *qwen) step(token, pos int) []float32 {
 			m.blockFFN(b, x, a, gu, downBuf)
 			continue
 		}
-		mvInto(qkv, a, b.wQKV, b.qQKV, b.bQKV)
-		q := qkv[:qDim]
+		row := qkv[:qkvW]
+		mvInto(row, a, b.wQKV, b.qQKV, b.bQKV)
+		q := row[:qDim]
 		if cfg.AttnOutputGate {
-			m.splitGate(qkv[:qProjW], qbuf, gbuf)
-			q = qbuf
+			m.splitGate(row[:qProjW], qbuf, gbuf)
+			q = qbuf[:qDim]
 		}
-		k := qkv[qProjW : qProjW+kvDim]
-		v := qkv[qProjW+kvDim:]
-		m.qkNorm(q, b.qNorm)
-		m.qkNorm(k, b.kNorm)
+		k := row[qProjW : qProjW+kvDim]
+		v := row[qProjW+kvDim:]
+		m.qkNorm(q, b.qNorm, headSz)
+		m.qkNorm(k, b.kNorm, headSz)
 		if !b.noPE {
 			for h := 0; h < cfg.Heads; h++ {
-				m.rope(q[h*m.headSz:(h+1)*m.headSz], pos, b)
+				m.rope(q[h*headSz:(h+1)*headSz], pos, b)
 			}
 			for h := 0; h < cfg.KVHeads; h++ {
-				m.rope(k[h*m.headSz:(h+1)*m.headSz], pos, b)
+				m.rope(k[h*headSz:(h+1)*headSz], pos, b)
 			}
 		}
 		// Copy k and v out of the fused row so the cache does not retain
@@ -1358,7 +1386,8 @@ func (m *qwen) step(token, pos int) []float32 {
 		b.kc = append(b.kc, append(make([]float32, 0, kvDim), k...))
 		b.vc = append(b.vc, append(make([]float32, 0, kvDim), v...))
 
-		clear(attn)
+		att := attn[:qDim]
+		clear(att)
 		steps := len(b.kc)
 		// Short contexts run the heads serially; past that the dispatch
 		// cost disappears into the O(steps*headSz) work per head.
@@ -1366,19 +1395,19 @@ func (m *qwen) step(token, pos int) []float32 {
 			workpool.Run(cfg.Heads, 1, func(lo, hi int) {
 				scores := make([]float64, steps)
 				for h := lo; h < hi; h++ {
-					m.attendHead(b, q, attn, h, group, steps, scores)
+					m.attendHead(b, q, att, h, group, steps, scores)
 				}
 			})
 		} else {
 			scores := make([]float64, steps)
 			for h := 0; h < cfg.Heads; h++ {
-				m.attendHead(b, q, attn, h, group, steps, scores)
+				m.attendHead(b, q, att, h, group, steps, scores)
 			}
 		}
 		if cfg.AttnOutputGate {
-			applyGate(attn, gbuf)
+			applyGate(att, gbuf[:qDim])
 		}
-		mvInto(proj, attn, b.wo, b.qo, b.bo)
+		mvInto(proj, att, b.wo, b.qo, b.bo)
 		if b.postAttn != nil {
 			rmsnormInto(proj, proj, b.postAttn, cfg.RMSEps)
 		}
