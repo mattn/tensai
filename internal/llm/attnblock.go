@@ -22,11 +22,13 @@ import (
 // si steps0+qb, packO nq*headSz; sliding-window layers take the per-row
 // path instead.
 func (m *qwen) attendGroupBlock(b *qblock, qrs, ars [][]float32, kh, group, steps0 int, ws, si, packQ, packO []float32) {
-	d := m.headSz
+	// The head width and the logit scale belong to the layer, not to the
+	// model: gemma4 alternates two widths and leaves its logits unscaled.
+	d := m.headSize(b)
 	qb := len(qrs)
 	nq := qb * group
 	kvOff := kh * d
-	scale := float32(1 / math.Sqrt(float64(d)))
+	scale := float32(m.qkScale(b, d))
 
 	// Shared prefix: every row of the block sees positions [0, steps0).
 	for r, qr := range qrs {
