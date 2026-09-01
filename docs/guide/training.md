@@ -97,7 +97,9 @@ g.Sync() // brings a device's weights back into the layers
 
 The parameters are the layers' own matrices, so training through the graph trains the model: `Predict`, `Save` and the exports keep working, and the graph's forward pass matches `Predict` to float32 rounding. What it adds is the GPU -- a graph runs wherever a tape sends it, which the hand-written stack cannot.
 
-Dense, the activations, LayerNorm, Conv2D and MaxPool2D have graph forms. Dropout, BatchNorm and Embedding do not yet, and a model holding one is refused rather than trained differently than it would be by `Fit`.
+Dense, the activations, LayerNorm, Conv2D, MaxPool2D, Dropout and BatchNorm have graph forms; `SetTraining` switches the last two between their training and inference behaviour, as `Fit` and `Predict` do for the layer stack. Embedding does not yet, and a model holding one is refused rather than trained differently than it would be by `Fit`.
+
+BatchNorm is worth a note: its graph form is the definition -- take the batch's mean and variance, normalize, scale and shift -- and the gradient the engine derives from that matches the hand-written one the layer carries, element for element. The running estimates it keeps update the same way too, since they are a side effect of the forward pass in both.
 
 ## Low-allocation training
 

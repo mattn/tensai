@@ -42,7 +42,8 @@ On a node, `Value()` and `Grad()` return `*tensai.Tensor`. They are methods rath
 | `MaxPool2D(size)`, `AvgPool2D(size)` | square windows over the last two axes, stride equal to the window |
 | `Sum()`, `Mean()` | reduce everything to one element |
 | `SumAxis(axis, keepDims)`, `MeanAxis(axis, keepDims)` | reduce one axis; a negative axis counts from the end |
-| `ReLU()`, `LeakyReLU(a)`, `Sigmoid()`, `Tanh()`, `GELU()`, `Exp()`, `Log()` | element-wise |
+| `ReLU()`, `LeakyReLU(a)`, `Sigmoid()`, `Tanh()`, `GELU()`, `Exp()`, `Log()`, `Sqrt()` | element-wise |
+| `Dropout(rate, rng)` | zeroes elements and scales the survivors; the mask is drawn once and the backward pass reuses it |
 | `MSELoss(target)`, `SoftmaxCELoss(target)`, `CrossEntropy(labels []int)` | scalar losses; the cross-entropies read the last axis as classes |
 
 Graphs are built dynamically per step and are single-use. Shape mismatches panic during construction rather than returning an error: chaining would be unusable otherwise, and a wrong shape is a programming mistake. Every op's gradient is verified against finite differences in the test suite.

@@ -2,6 +2,7 @@ package autograd
 
 import (
 	"fmt"
+	"math/rand"
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/gpu"
@@ -267,6 +268,19 @@ func (n *Node) Exp() *Node {
 	}, func(dst, grad, _, out []tensai.Float) {
 		for i, gv := range grad {
 			dst[i] += gv * out[i]
+		}
+	})
+}
+
+// Sqrt applies the square root element-wise.
+func (n *Node) Sqrt() *Node {
+	return n.unary("sqrt", func(dst, src []tensai.Float) {
+		for i, x := range src {
+			dst[i] = kernels.SqrtF(x)
+		}
+	}, func(dst, grad, _, out []tensai.Float) {
+		for i, gv := range grad {
+			dst[i] += gv * 0.5 / out[i]
 		}
 	})
 }
@@ -673,4 +687,38 @@ func resolveShape(from, shape []int) []int {
 		out[infer] = dims.Prod(from) / known
 	}
 	return out
+}
+
+// Dropout zeroes each element with probability rate and scales the
+// survivors by 1/(1-rate), so the expected value is unchanged and
+// inference is a plain pass-through -- "inverted dropout", the same form
+// layer.Dropout uses. A rate of zero returns the input untouched.
+//
+// The mask is drawn once, when the graph is built, and the backward pass
+// reuses it: the same elements that were dropped get no gradient.
+func (n *Node) Dropout(rate tensai.Float, rng *rand.Rand) *Node {
+	if rate < 0 || rate >= 1 {
+		panic(fmt.Sprintf("tensai: dropout rate must be in [0,1): %g", rate))
+	}
+	if rate == 0 {
+		return n
+	}
+	keep := 1 - rate
+	mask := make([]tensai.Float, dims.Prod(n.Shape()))
+	for i := range mask {
+		if tensai.Float(rng.Float64()) < keep {
+			mask[i] = 1 / keep
+		}
+	}
+	v := n.tape.tensor(n.Shape())
+	src := n.Value().Data
+	for i := range v.Data {
+		v.Data[i] = src[i] * mask[i]
+	}
+	return newNode("dropout", v, n).withBack(func(out *Node) {
+		g := n.ensureGrad()
+		for i, gv := range out.Grad().Data {
+			g.Data[i] += gv * mask[i]
+		}
+	})
 }

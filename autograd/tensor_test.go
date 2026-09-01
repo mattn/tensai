@@ -129,6 +129,10 @@ func TestTensorOpGradients(t *testing.T) {
 			p := Param(w)
 			return Input(x).MatMul(p).Exp().Mul(Input(weights)).Sum(), p
 		}},
+		{"sqrt", denom, func() (*Node, *Node) {
+			p := Param(denom)
+			return p.Sqrt().Mul(Input(bias)).Sum(), p
+		}},
 		{"log", denom, func() (*Node, *Node) {
 			p := Param(denom)
 			return p.Log().Mul(Input(bias)).Sum(), p
@@ -481,4 +485,38 @@ func mustTensor(t *testing.T, data []tensai.Float, shape ...int) *tensai.Tensor 
 		t.Fatal(err)
 	}
 	return out
+}
+
+// TestDropoutMask checks that the gradient follows the same mask the
+// forward pass drew: a dropped element gets nothing, a kept one gets the
+// upstream gradient scaled the way its value was.
+func TestDropoutMask(t *testing.T) {
+	rng := rand.New(rand.NewSource(97))
+	x := randTensor(rng, 4, 16)
+	for i := range x.Data {
+		x.Data[i] += 2 // keep every value clear of zero
+	}
+	p := Param(x)
+	const rate = 0.5
+	out := p.Dropout(rate, rand.New(rand.NewSource(5)))
+	upstream := randTensor(rng, 4, 16)
+	out.Mul(Input(upstream)).Sum().Backward()
+
+	var kept int
+	for i, v := range out.Value().Data {
+		want := tensai.Float(0)
+		if v != 0 {
+			kept++
+			want = upstream.Data[i] / (1 - rate)
+			if diff := math.Abs(float64(v - x.Data[i]/(1-rate))); diff > 1e-5 {
+				t.Fatalf("element %d survived unscaled: %v from %v", i, v, x.Data[i])
+			}
+		}
+		if diff := math.Abs(float64(p.Grad().Data[i] - want)); diff > 1e-5 {
+			t.Fatalf("gradient %d: got %v want %v", i, p.Grad().Data[i], want)
+		}
+	}
+	if kept == 0 || kept == len(x.Data) {
+		t.Fatalf("the mask kept %d of %d elements, which tests nothing", kept, len(x.Data))
+	}
 }
