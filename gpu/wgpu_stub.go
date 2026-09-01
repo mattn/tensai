@@ -99,6 +99,25 @@ func (t *Tensor) Activate(a Act) (*Tensor, error) { return nil, errNoWGPU }
 // ActivateGrad is a no-op stub; build with -tags wgpu or wgpu24.
 func (t *Tensor) ActivateGrad(a Act, grad *Tensor) (*Tensor, error) { return nil, errNoWGPU }
 
+// LayerNorm is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) LayerNorm(gain, bias *Tensor, eps tensai.Float) (*Tensor, error) {
+	return nil, errNoWGPU
+}
+
+// LayerNormXhat is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) LayerNormXhat(eps tensai.Float) (*Tensor, error) { return nil, errNoWGPU }
+
+// LayerNormGrad is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) LayerNormGrad(grad, gain *Tensor, eps tensai.Float) (*Tensor, error) {
+	return nil, errNoWGPU
+}
+
+// SoftmaxGrad is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) SoftmaxGrad(grad *Tensor) (*Tensor, error) { return nil, errNoWGPU }
+
+// Permute is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) Permute(perm ...int) (*Tensor, error) { return nil, errNoWGPU }
+
 // SumCols is a no-op stub; build with -tags wgpu or wgpu24.
 func (t *Tensor) SumCols() (*Tensor, error) { return nil, errNoWGPU }
 

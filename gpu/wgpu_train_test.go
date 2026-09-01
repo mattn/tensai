@@ -267,3 +267,177 @@ func upload3(t *testing.T, g *Device, a, b, c *tensai.Tensor) (*Tensor, *Tensor,
 	}
 	return ga, gb, gc
 }
+
+// TestGPULayerNorm checks the normalization and both of its gradients
+// against the CPU kernels the layer package uses.
+func TestGPULayerNorm(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(53))
+
+	const rows, cols = 5, 40
+	x := randTensor(rng, rows, cols)
+	grad := randTensor(rng, rows, cols)
+	gain := randTensor(rng, cols)
+	bias := randTensor(rng, cols)
+	const eps = 1e-5
+
+	gx, ggrad := upload2(t, g, x, grad)
+	defer gx.Free()
+	defer ggrad.Free()
+	ggain, gbias := upload2(t, g, gain, bias)
+	defer ggain.Free()
+	defer gbias.Free()
+
+	// Forward, against LnFwdRow.
+	out, err := gx.LayerNorm(ggain, gbias, eps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Free()
+	got, err := out.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]tensai.Float, rows*cols)
+	xhat := make([]tensai.Float, rows*cols)
+	invStd := make([]tensai.Float, rows)
+	for r := 0; r < rows; r++ {
+		lo, hi := r*cols, (r+1)*cols
+		invStd[r] = kernels.LnFwdRow(want[lo:hi], xhat[lo:hi], x.Data[lo:hi], gain.Data, bias.Data, eps)
+	}
+	checkClose(t, "layernorm", got, want, 1e-4)
+
+	// The normalized values on their own.
+	xh, err := gx.LayerNormXhat(eps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer xh.Free()
+	gotXhat, err := xh.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkClose(t, "layernorm xhat", gotXhat, xhat, 1e-4)
+
+	// Backward, against LnBwdRow.
+	dx, err := gx.LayerNormGrad(ggrad, ggain, eps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dx.Free()
+	gotDx, err := dx.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantDx := make([]tensai.Float, rows*cols)
+	gradGamma, gradBeta := make([]tensai.Float, cols), make([]tensai.Float, cols)
+	for r := 0; r < rows; r++ {
+		lo, hi := r*cols, (r+1)*cols
+		kernels.LnBwdRow(wantDx[lo:hi], grad.Data[lo:hi], xhat[lo:hi], gain.Data, gradGamma, gradBeta, invStd[r])
+	}
+	checkClose(t, "layernorm backward", gotDx, wantDx, 1e-4)
+}
+
+// TestGPUSoftmaxGrad checks the softmax backward pass against the CPU
+// kernel, on a 4-D stack the way attention produces it.
+func TestGPUSoftmaxGrad(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(59))
+
+	const b, h, seq = 2, 3, 12
+	scores := randTensor(rng, b, h, seq, seq)
+	gscores, err := g.Upload(scores)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gscores.Free()
+	y, err := gscores.Softmax()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer y.Free()
+	hostY, err := y.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	grad := randTensor(rng, b, h, seq, seq)
+	ggrad, err := g.Upload(grad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ggrad.Free()
+	dx, err := y.SoftmaxGrad(ggrad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dx.Free()
+	got, err := dx.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want := make([]tensai.Float, len(grad.Data))
+	for pos := 0; pos < len(want); pos += seq {
+		kernels.SoftmaxBwdAdd(want[pos:pos+seq], grad.Data[pos:pos+seq], hostY.Data[pos:pos+seq])
+	}
+	checkClose(t, "softmax backward", got, want, 1e-4)
+}
+
+// TestGPUPermute checks the axis permutation against the CPU transpose,
+// including the (batch, seq, head, dim) -> (batch, head, seq, dim) move
+// attention makes.
+func TestGPUPermute(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(61))
+
+	cases := []struct {
+		shape []int
+		perm  []int
+	}{
+		{[]int{3, 5}, []int{1, 0}},
+		{[]int{2, 3, 4}, []int{1, 0, 2}},
+		{[]int{2, 6, 3, 8}, []int{0, 2, 1, 3}},
+		{[]int{2, 6, 3, 8}, []int{3, 1, 0, 2}},
+	}
+	for _, c := range cases {
+		x := randTensor(rng, c.shape...)
+		gx, err := g.Upload(x)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := gx.Permute(c.perm...)
+		if err != nil {
+			t.Fatalf("permute %v by %v: %v", c.shape, c.perm, err)
+		}
+		got, err := out.Download()
+		gx.Free()
+		out.Free()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := x.Transpose(c.perm...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range want.Shape {
+			if got.Shape[i] != want.Shape[i] {
+				t.Fatalf("permute %v by %v: shape %v, want %v", c.shape, c.perm, got.Shape, want.Shape)
+			}
+		}
+		checkClose(t, "permute", got, want.Data, 1e-6)
+	}
+
+	// Rank five is beyond what the kernel expresses.
+	big, err := g.Upload(randTensor(rng, 2, 2, 2, 2, 2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer big.Free()
+	if _, err := big.Permute(0, 1, 2, 4, 3); err == nil {
+		t.Error("expected an unsupported-rank error")
+	}
+}

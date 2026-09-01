@@ -1267,6 +1267,162 @@ fn adam_step(@builtin(workgroup_id) wg: vec3<u32>,
     tout[idx] = w - tp.lr * (m * tp.rc1 / (sqrt(v * tp.rc2) + tp.eps) + tp.decay * w);
 }
 
+@group(0) @binding(52) var<storage, read> tc: array<f32>;
+@group(0) @binding(53) var<uniform> pmp: PermuteParams;
+
+struct PermuteParams {
+    count: u32, rank: u32, pad0: u32, pad1: u32,
+    shape: vec4<u32>,  // output shape, in the first rank lanes
+    stride: vec4<u32>, // source stride for each output axis
+}
+
+var<workgroup> lred: array<f32, 256>;
+var<workgroup> lred2: array<f32, 256>;
+
+// rowSum reduces one value per thread to a workgroup total in lred.
+fn rowSum(lid: u32, v: f32) -> f32 {
+    lred[lid] = v;
+    workgroupBarrier();
+    for (var s = 128u; s > 0u; s = s >> 1u) {
+        if (lid < s) { lred[lid] = lred[lid] + lred[lid + s]; }
+        workgroupBarrier();
+    }
+    let total = lred[0];
+    workgroupBarrier();
+    return total;
+}
+
+// ln_stats returns the mean and inverse standard deviation of one row.
+fn ln_stats(base: u32, cols: u32, lid: u32) -> vec2<f32> {
+    var sum = 0.0;
+    for (var i = lid; i < cols; i = i + 256u) {
+        sum = sum + ta[base + i];
+    }
+    let mean = rowSum(lid, sum) / f32(cols);
+    var sq = 0.0;
+    for (var i = lid; i < cols; i = i + 256u) {
+        let d = ta[base + i] - mean;
+        sq = sq + d * d;
+    }
+    let variance = rowSum(lid, sq) / f32(cols);
+    return vec2<f32>(mean, 1.0 / sqrt(variance + tp.eps));
+}
+
+// ln_fwd normalizes each row and applies the per-feature gain and bias.
+@compute @workgroup_size(256, 1, 1)
+fn ln_fwd(@builtin(workgroup_id) wid: vec3<u32>,
+          @builtin(num_workgroups) nwg: vec3<u32>,
+          @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.y * nwg.x + wid.x;
+    if (row >= tp.rows) {
+        return;
+    }
+    let cols = tp.count;
+    let base = row * cols;
+    let st = ln_stats(base, cols, lid.x);
+    for (var i = lid.x; i < cols; i = i + 256u) {
+        let h = (ta[base + i] - st.x) * st.y;
+        tout[base + i] = h * tb[i] + tc[i];
+    }
+}
+
+// ln_xhat is the same normalization without the affine part: the backward
+// pass needs it to build the gain's gradient.
+@compute @workgroup_size(256, 1, 1)
+fn ln_xhat(@builtin(workgroup_id) wid: vec3<u32>,
+           @builtin(num_workgroups) nwg: vec3<u32>,
+           @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.y * nwg.x + wid.x;
+    if (row >= tp.rows) {
+        return;
+    }
+    let cols = tp.count;
+    let base = row * cols;
+    let st = ln_stats(base, cols, lid.x);
+    for (var i = lid.x; i < cols; i = i + 256u) {
+        tout[base + i] = (ta[base + i] - st.x) * st.y;
+    }
+}
+
+// ln_bwd turns the output gradient in tb into the input gradient, given the
+// input in ta and the gain in tc. It recomputes the row statistics rather
+// than carrying them over from the forward pass: one more pass over a row
+// that is already in cache costs less than the buffer would.
+@compute @workgroup_size(256, 1, 1)
+fn ln_bwd(@builtin(workgroup_id) wid: vec3<u32>,
+          @builtin(num_workgroups) nwg: vec3<u32>,
+          @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.y * nwg.x + wid.x;
+    if (row >= tp.rows) {
+        return;
+    }
+    let cols = tp.count;
+    let base = row * cols;
+    let st = ln_stats(base, cols, lid.x);
+    // sum(dxhat) and sum(dxhat * xhat) over the row.
+    var s1 = 0.0;
+    var s2 = 0.0;
+    for (var i = lid.x; i < cols; i = i + 256u) {
+        let xhat = (ta[base + i] - st.x) * st.y;
+        let dxhat = tb[base + i] * tc[i];
+        s1 = s1 + dxhat;
+        s2 = s2 + dxhat * xhat;
+    }
+    let sumD = rowSum(lid.x, s1);
+    let sumDX = rowSum(lid.x, s2);
+    let n = f32(cols);
+    for (var i = lid.x; i < cols; i = i + 256u) {
+        let xhat = (ta[base + i] - st.x) * st.y;
+        let dxhat = tb[base + i] * tc[i];
+        tout[base + i] = st.y / n * (n * dxhat - sumD - xhat * sumDX);
+    }
+}
+
+// softmax_bwd turns the output gradient in tb into the input gradient of a
+// softmax whose output is in ta: dx = y * (grad - sum(grad * y)).
+@compute @workgroup_size(256, 1, 1)
+fn softmax_bwd(@builtin(workgroup_id) wid: vec3<u32>,
+               @builtin(num_workgroups) nwg: vec3<u32>,
+               @builtin(local_invocation_id) lid: vec3<u32>) {
+    let row = wid.y * nwg.x + wid.x;
+    if (row >= tp.rows) {
+        return;
+    }
+    let cols = tp.count;
+    let base = row * cols;
+    var dot = 0.0;
+    for (var i = lid.x; i < cols; i = i + 256u) {
+        dot = dot + ta[base + i] * tb[base + i];
+    }
+    let total = rowSum(lid.x, dot);
+    for (var i = lid.x; i < cols; i = i + 256u) {
+        tout[base + i] = ta[base + i] * (tb[base + i] - total);
+    }
+}
+
+// permute reorders the axes of a tensor of rank up to four: each output
+// element walks back to its source through the per-axis strides the host
+// worked out.
+@compute @workgroup_size(256, 1, 1)
+fn permute(@builtin(workgroup_id) wg: vec3<u32>,
+           @builtin(num_workgroups) nwg: vec3<u32>,
+           @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx >= pmp.count) {
+        return;
+    }
+    var rem = idx;
+    var src = 0u;
+    for (var d = pmp.rank; d > 0u; d = d - 1u) {
+        let axis = d - 1u;
+        let size = pmp.shape[axis];
+        let i = rem % size;
+        rem = rem / size;
+        src = src + i * pmp.stride[axis];
+    }
+    tout[idx] = ta[src];
+}
+
 // slice_cols lifts a column window out of every row. The fused QKV
 // projection lands in one buffer and prefill wants q, k, and v as
 // tensors of their own; a bind offset cannot express that, because the
@@ -2053,6 +2209,9 @@ type gpuPipelines struct {
 	binOp, actFwd, actBwd, sumCols, adamStep       uintptr
 	layBinOp, layActFwd, layActBwd                 uintptr
 	laySumCols, layAdamStep                        uintptr
+	lnFwd, lnXhat, lnBwd, softmaxBwd, permute      uintptr
+	layLnFwd, layLnXhat, layLnBwd                  uintptr
+	laySoftmaxBwd, layPermute                      uintptr
 	scale, softmax, attn, qmatmul                  uintptr
 	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
 	geluMulIP, qmatmulB, attnG, qmatmulT           uintptr
@@ -2102,6 +2261,11 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.actBwd, &g.pipes.layActBwd, "act_bwd"},
 		{&g.pipes.sumCols, &g.pipes.laySumCols, "sum_cols"},
 		{&g.pipes.adamStep, &g.pipes.layAdamStep, "adam_step"},
+		{&g.pipes.lnFwd, &g.pipes.layLnFwd, "ln_fwd"},
+		{&g.pipes.lnXhat, &g.pipes.layLnXhat, "ln_xhat"},
+		{&g.pipes.lnBwd, &g.pipes.layLnBwd, "ln_bwd"},
+		{&g.pipes.softmaxBwd, &g.pipes.laySoftmaxBwd, "softmax_bwd"},
+		{&g.pipes.permute, &g.pipes.layPermute, "permute"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -3538,6 +3702,196 @@ func (t *Tensor) ActivateGrad(a Act, grad *Tensor) (*Tensor, error) {
 	}
 	p := trainParams{count: uint32(count), aCount: uint32(count), bCount: uint32(count), mode: uint32(a)}
 	return t.g.trainOp(t.g.pipes.actBwd, t.g.pipes.layActBwd, p, count, t.shape, t, grad)
+}
+
+// LayerNorm normalizes the last axis of a (rows, cols) tensor and applies
+// a per-feature gain and bias, both of which must hold cols elements.
+func (t *Tensor) LayerNorm(gain, bias *Tensor, eps tensai.Float) (*Tensor, error) {
+	rows, cols, err := t.rowsCols()
+	if err != nil {
+		return nil, err
+	}
+	if gain.Size() != cols || bias.Size() != cols {
+		return nil, fmt.Errorf("tensai: layernorm gain and bias must hold %d elements", cols)
+	}
+	p := trainParams{count: uint32(cols), rows: uint32(rows), eps: float32(eps)}
+	return t.g.trainRows(t.g.pipes.lnFwd, t.g.pipes.layLnFwd, p, rows, t.shape, t, gain, bias)
+}
+
+// LayerNormXhat is the normalization without the affine part -- the
+// backward pass builds the gain's gradient from it.
+func (t *Tensor) LayerNormXhat(eps tensai.Float) (*Tensor, error) {
+	rows, cols, err := t.rowsCols()
+	if err != nil {
+		return nil, err
+	}
+	p := trainParams{count: uint32(cols), rows: uint32(rows), eps: float32(eps)}
+	return t.g.trainRows(t.g.pipes.lnXhat, t.g.pipes.layLnXhat, p, rows, t.shape, t, nil, nil)
+}
+
+// LayerNormGrad turns the output gradient into the input gradient of a
+// LayerNorm whose input was t and whose gain was gain.
+func (t *Tensor) LayerNormGrad(grad, gain *Tensor, eps tensai.Float) (*Tensor, error) {
+	rows, cols, err := t.rowsCols()
+	if err != nil {
+		return nil, err
+	}
+	if grad.Size() != t.Size() {
+		return nil, fmt.Errorf("tensai: layernorm gradient has %d elements, want %d", grad.Size(), t.Size())
+	}
+	if gain.Size() != cols {
+		return nil, fmt.Errorf("tensai: layernorm gain must hold %d elements", cols)
+	}
+	p := trainParams{count: uint32(cols), rows: uint32(rows), eps: float32(eps)}
+	return t.g.trainRows(t.g.pipes.lnBwd, t.g.pipes.layLnBwd, p, rows, t.shape, t, grad, gain)
+}
+
+// SoftmaxGrad turns the output gradient into the input gradient of a
+// softmax whose output is t.
+func (t *Tensor) SoftmaxGrad(grad *Tensor) (*Tensor, error) {
+	rows, cols, err := t.rowsCols()
+	if err != nil {
+		return nil, err
+	}
+	if grad.Size() != t.Size() {
+		return nil, fmt.Errorf("tensai: softmax gradient has %d elements, want %d", grad.Size(), t.Size())
+	}
+	p := trainParams{count: uint32(cols), rows: uint32(rows)}
+	return t.g.trainRows(t.g.pipes.softmaxBwd, t.g.pipes.laySoftmaxBwd, p, rows, t.shape, t, grad, nil)
+}
+
+// rowsCols splits a tensor into rows of its last axis.
+func (t *Tensor) rowsCols() (int, int, error) {
+	if t.freed {
+		return 0, 0, errors.New("tensai: gpu tensor already freed")
+	}
+	n := len(t.shape)
+	if n < 1 {
+		return 0, 0, fmt.Errorf("tensai: row op needs at least one axis, got %v", t.shape)
+	}
+	cols := t.shape[n-1]
+	if cols == 0 {
+		return 0, 0, fmt.Errorf("tensai: row op on an empty tensor %v", t.shape)
+	}
+	return t.Size() / cols, cols, nil
+}
+
+// trainRows runs a kernel that takes one workgroup per row. b and c may be
+// nil; they bind to 48 and 52 when they are not.
+func (g *Device) trainRows(pipe, lay uintptr, p trainParams, rows int, outShape []int, a, b, c *Tensor) (*Tensor, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	outBytes := uint64(dims.Prod(outShape)) * 4
+	if err := g.checkSize(outBytes); err != nil {
+		return nil, err
+	}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, trainParamBytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, trainParamBytes, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&p), trainParamBytes)
+	bufOut := g.takeOutBuffer(outBytes)
+
+	entries := make([]wgpuBindGroupEntry, 0, 5)
+	entries = append(entries,
+		wgpuBindGroupEntry{binding: 46, buffer: bufParams, size: trainParamBytes},
+		bind(47, a))
+	if b != nil {
+		entries = append(entries, bind(48, b))
+	}
+	entries = append(entries, wgpuBindGroupEntry{binding: 49, buffer: bufOut, size: outBytes})
+	if c != nil {
+		entries = append(entries, bind(52, c))
+	}
+	bindGroup := g.cachedBindGroup(lay, entries)
+	runtime.KeepAlive(&entries)
+
+	x, y := split2D(rows)
+	if err := g.dispatch(pipe, bindGroup, x, y, 1); err != nil {
+		g.dropBuffer(bufOut)
+		return nil, err
+	}
+	return &Tensor{g: g, buf: bufOut, shape: append([]int(nil), outShape...)}, nil
+}
+
+// Permute reorders the axes of a tensor of rank up to four: perm[i] names
+// the axis of t that becomes axis i of the result, the way
+// tensai.Tensor.Transpose reads it.
+func (t *Tensor) Permute(perm ...int) (*Tensor, error) {
+	if t.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	n := len(t.shape)
+	if n < 2 || n > 4 || len(perm) != n {
+		return nil, fmt.Errorf("tensai: gpu permute %v of shape %v is not supported", perm, t.shape)
+	}
+	seen := make([]bool, n)
+	for _, p := range perm {
+		if p < 0 || p >= n || seen[p] {
+			return nil, fmt.Errorf("tensai: invalid permutation %v", perm)
+		}
+		seen[p] = true
+	}
+	// Contiguous strides of the source, then the stride to walk for each
+	// axis of the output.
+	src := make([]int, n)
+	stride := 1
+	for i := n - 1; i >= 0; i-- {
+		src[i] = stride
+		stride *= t.shape[i]
+	}
+	outShape := make([]int, n)
+	var params struct {
+		count, rank, pad0, pad1 uint32
+		shape                   [4]uint32
+		stride                  [4]uint32
+	}
+	for i, p := range perm {
+		outShape[i] = t.shape[p]
+		params.shape[i] = uint32(t.shape[p])
+		params.stride[i] = uint32(src[p])
+	}
+	params.count = uint32(t.Size())
+	params.rank = uint32(n)
+
+	g := t.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+	const permuteParamBytes = 48
+	outBytes := uint64(t.Size()) * 4
+	if err := g.checkSize(outBytes); err != nil {
+		return nil, err
+	}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, permuteParamBytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, permuteParamBytes, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&params), permuteParamBytes)
+	bufOut := g.takeOutBuffer(outBytes)
+
+	entries := [3]wgpuBindGroupEntry{
+		{binding: 53, buffer: bufParams, size: permuteParamBytes},
+		bind(47, t),
+		{binding: 49, buffer: bufOut, size: outBytes},
+	}
+	bindGroup := g.cachedBindGroup(g.pipes.layPermute, entries[:])
+	runtime.KeepAlive(&entries)
+
+	x, y := split2D((t.Size() + 255) / 256)
+	if err := g.dispatch(g.pipes.permute, bindGroup, x, y, 1); err != nil {
+		g.dropBuffer(bufOut)
+		return nil, err
+	}
+	return &Tensor{g: g, buf: bufOut, shape: outShape}, nil
 }
 
 // SumCols reduces a (rows, cols) tensor to a (1, cols) row -- the gradient

@@ -288,6 +288,13 @@ func (n *Node) T() *Node { return n.Transpose() }
 // Transpose permutes the axes of n; perm must list every axis exactly once.
 // With no arguments it swaps the last two axes.
 func (n *Node) Transpose(perm ...int) *Node {
+	full := perm
+	if len(full) == 0 {
+		full = swapLastTwo(len(n.Shape()))
+	}
+	if out, ok := devTranspose(n, full); ok {
+		return out
+	}
 	v, err := n.Value().Transpose(perm...)
 	if err != nil {
 		panic(err.Error())
@@ -323,6 +330,9 @@ func swapLastTwo(n int) []int {
 // in the engine, node values are read-only once built -- so this is the
 // cheap way in and out of the per-head layout attention wants.
 func (n *Node) Reshape(shape ...int) *Node {
+	if out, ok := devReshape(n, resolveShape(n.Shape(), shape)); ok {
+		return out
+	}
 	v, err := n.Value().Reshape(shape...)
 	if err != nil {
 		panic(err.Error())
@@ -338,6 +348,9 @@ func (n *Node) Reshape(shape ...int) *Node {
 
 // Softmax normalizes the last axis of n into a probability distribution.
 func (n *Node) Softmax() *Node {
+	if out, ok := devSoftmax(n); ok {
+		return out
+	}
 	shape := n.Shape()
 	d := shape[len(shape)-1]
 	v := n.tape.tensor(shape) // every element is written below
@@ -455,6 +468,9 @@ func reducedShape(shape []int, a int, keepDims bool) []int {
 // be parameters, so a transformer block's normalization trains along with
 // the rest.
 func (n *Node) LayerNorm(gain, bias *Node, eps tensai.Float) *Node {
+	if out, ok := devLayerNorm(n, gain, bias, eps); ok {
+		return out
+	}
 	shape := n.Shape()
 	d := shape[len(shape)-1]
 	gamma := affineData(gain, d, 1, "gain")
@@ -630,4 +646,22 @@ func binShape(a, b []int) []int {
 		panic(err.Error())
 	}
 	return shape
+}
+
+// resolveShape fills in the one dimension a Reshape may leave as -1, so the
+// device path knows the shape before it relabels a buffer.
+func resolveShape(from, shape []int) []int {
+	out := append([]int(nil), shape...)
+	known, infer := 1, -1
+	for i, d := range out {
+		if d == -1 {
+			infer = i
+			continue
+		}
+		known *= d
+	}
+	if infer >= 0 && known > 0 {
+		out[infer] = dims.Prod(from) / known
+	}
+	return out
 }
