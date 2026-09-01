@@ -55,7 +55,7 @@ type Conv2D struct {
 	batch int
 
 	// backward/forward scratch, reused across training steps
-	prod, wT, gRe, dcols, gradIn *tensai.Matrix
+	prod, gRe, dcols, gradIn *tensai.Matrix
 }
 
 // NewConv2D returns a convolution layer producing outC channels with a
@@ -147,7 +147,17 @@ func (c *Conv2D) Forward(input *tensai.Matrix) (*tensai.Matrix, error) {
 	return out, nil
 }
 
-func (c *Conv2D) Backward(gradOutput *tensai.Matrix) (*tensai.Matrix, error) {
+// BackwardParams computes only the weight and bias gradients, skipping the
+// product and the scatter that would give the gradient of the input. The
+// first layer of a model is fed data, so nothing upstream wants it.
+func (c *Conv2D) BackwardParams(gradOutput *tensai.Matrix) error {
+	_, err := c.backwardParams(gradOutput)
+	return err
+}
+
+// backwardParams fills the parameter gradients and returns the regrouped
+// output gradient, which the full backward pass needs as well.
+func (c *Conv2D) backwardParams(gradOutput *tensai.Matrix) (*tensai.Matrix, error) {
 	if c.cols == nil {
 		return nil, fmt.Errorf("tensai: conv2d backward called before forward")
 	}
@@ -177,13 +187,17 @@ func (c *Conv2D) Backward(gradOutput *tensai.Matrix) (*tensai.Matrix, error) {
 	if err := tensai.DotTAInto(c.gradW, c.cols, g); err != nil {
 		return nil, err
 	}
+	return g, nil
+}
 
-	c.wT = tensai.EnsureMatrix(c.wT, c.weights.Cols, c.weights.Rows)
-	if err := tensai.TInto(c.wT, c.weights); err != nil {
+func (c *Conv2D) Backward(gradOutput *tensai.Matrix) (*tensai.Matrix, error) {
+	g, err := c.backwardParams(gradOutput)
+	if err != nil {
 		return nil, err
 	}
+
 	c.dcols = tensai.EnsureMatrix(c.dcols, g.Rows, c.weights.Rows)
-	if err := tensai.DotInto(c.dcols, g, c.wT); err != nil {
+	if err := tensai.DotTBInto(c.dcols, g, c.weights); err != nil {
 		return nil, err
 	}
 	dcols := c.dcols
