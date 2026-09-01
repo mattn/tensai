@@ -103,7 +103,7 @@ tape.Bind(params...) // parameters upload once and stay resident
 
 `Value()` and `Grad()` download on demand, so reading a node still works — that is what makes them methods. `Resident()` reports where a node's value currently is.
 
-Operations the device has kernels for (the three products, element-wise arithmetic with a repeating operand, ReLU/tanh/sigmoid/GELU and their gradients, the sum a broadcast collects, and Adam) run there; anything else falls back to the CPU, bringing home only what that operation needs. So a graph made of those ops never leaves the device, and one that uses `LayerNorm` or `Embed` — which have no kernels yet — pays a round trip at those points and continues.
+Operations the device has kernels for run there; anything else falls back to the CPU, bringing home only what that operation needs. That covers the three products, element-wise arithmetic with a repeating operand, ReLU/tanh/sigmoid/GELU and their gradients, `LayerNorm`, `Softmax`, `Transpose` and `Reshape`, the sum a broadcast collects, and the Adam update — so a whole transformer block stays resident. `Embed` is the exception: the gather is cheap and its scatter has no kernel yet, so the embedding table's gradient comes home each step.
 
 On an AMD 780M through `-tags wgpu24`, one step of `x @ w1 -> GELU -> @ w2 -> MSE`:
 
@@ -112,6 +112,13 @@ On an AMD 780M through `-tags wgpu24`, one step of `x @ w1 -> GELU -> @ w2 -> MS
 | 512 | 33.3ms | 31.8ms | **22.2ms** |
 | 1024 | 182.6ms | 146.1ms | **75.9ms** |
 | 2048 | 1786.6ms | 930.1ms | **521.3ms** |
+
+A transformer block -- pre-norm attention with a causal mask and a GELU feed-forward, batch 8, sequence 128, vocabulary 512 -- trains at:
+
+| model width | CPU (AVX2) | resident graph |
+|---|---|---|
+| 256 | 80.9ms | **58.6ms** |
+| 512 | 199.5ms | **89.5ms** |
 
 The hook (`tensai.UseAccelerator`) sends each product to the device on its own, so it pays a round trip per product; residency pays one upload per step for the batch and one download for the loss. Both are opt-in, and they compose: with a tape on a device the hook is not consulted.
 

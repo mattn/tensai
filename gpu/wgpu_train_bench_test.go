@@ -4,6 +4,7 @@ package gpu_test
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"testing"
 
@@ -203,5 +204,81 @@ func BenchmarkElementwise(b *testing.B) {
 			}
 		})
 		gx.Free()
+	}
+}
+
+// BenchmarkTransformerStep times one training step of a transformer block
+// -- pre-norm attention with a causal mask and a GELU feed-forward -- on
+// the CPU and with the graph resident on the device.
+func BenchmarkTransformerStep(b *testing.B) {
+	g, err := gpu.Open()
+	if err != nil {
+		b.Skipf("wgpu unavailable: %v", err)
+	}
+	defer g.Close()
+
+	const (
+		batch, seq, vocab = 8, 128, 512
+		heads             = 8
+	)
+	step := func(model int, resident bool) func(*testing.B) {
+		return func(b *testing.B) {
+			headDim := model / heads
+			rng := rand.New(rand.NewSource(7))
+			tokens := make([]int, batch*seq)
+			labels := make([]int, batch*seq)
+			for i := range tokens {
+				tokens[i] = rng.Intn(vocab)
+				labels[i] = rng.Intn(vocab)
+			}
+			mask := tensai.NewTensor(1, 1, seq, seq)
+			for i := 0; i < seq; i++ {
+				for j := i + 1; j < seq; j++ {
+					mask.Data[i*seq+j] = tensai.Float(math.Inf(-1))
+				}
+			}
+			ones := tensai.NewTensor(model)
+			for i := range ones.Data {
+				ones.Data[i] = 1
+			}
+			embed := autograd.Param(randTensor(rng, vocab, model))
+			gain := autograd.Param(ones)
+			bias := autograd.Param(tensai.NewTensor(model))
+			wq := autograd.Param(randTensor(rng, model, model))
+			wk := autograd.Param(randTensor(rng, model, model))
+			wv := autograd.Param(randTensor(rng, model, model))
+			wo := autograd.Param(randTensor(rng, model, model))
+			head := autograd.Param(randTensor(rng, model, vocab))
+			params := []*autograd.Node{embed, gain, bias, wq, wk, wv, wo, head}
+			trainer := autograd.NewTrainer(optim.NewAdam(0.001), params...)
+			tape := autograd.NewTape()
+			if resident {
+				tape.UseDevice(g)
+			}
+			tape.Bind(params...)
+
+			forward := func() *autograd.Node {
+				split := func(t *autograd.Node) *autograd.Node {
+					return t.Reshape(batch, seq, heads, headDim).Transpose(0, 2, 1, 3)
+				}
+				x := embed.Embed(tokens, batch, seq)
+				h := x.LayerNorm(gain, bias, 1e-5)
+				q, k, v := split(h.MatMul(wq)), split(h.MatMul(wk)), split(h.MatMul(wv))
+				att := q.MatMul(k.T()).Scale(1 / float32(math.Sqrt(float64(headDim)))).Add(autograd.Input(mask)).Softmax()
+				y := att.MatMul(v).Transpose(0, 2, 1, 3).Reshape(batch, seq, model).MatMul(wo)
+				return x.Add(y).GELU().MatMul(head)
+			}
+			trainer.Step(forward().CrossEntropy(labels))
+			tape.Reset()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				trainer.Step(forward().CrossEntropy(labels))
+				tape.Reset()
+			}
+		}
+	}
+	for _, model := range []int{256, 512} {
+		b.Run(fmt.Sprintf("cpu/%d", model), step(model, false))
+		b.Run(fmt.Sprintf("resident/%d", model), step(model, true))
 	}
 }

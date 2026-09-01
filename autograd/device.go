@@ -531,3 +531,190 @@ func devSumWidth(size int) int {
 	}
 	return 0
 }
+
+// devLayerNorm normalizes on the device, keeping the gradients of the input
+// and of the affine parameters there too. A nil gain or bias becomes a
+// constant buffer for the kernel, and collects no gradient.
+func devLayerNorm(n, gain, bias *Node, eps tensai.Float) (*Node, bool) {
+	tp := tapeOf(n, gain, bias)
+	if tp.Device() == nil {
+		return nil, false
+	}
+	shape := n.Shape()
+	cols := shape[len(shape)-1]
+	tp.openBatch()
+	gx, ok := n.resident(tp)
+	if !ok {
+		return nil, false
+	}
+	gg, ok := devAffine(tp, gain, cols, 1)
+	if !ok {
+		return nil, false
+	}
+	gb, ok := devAffine(tp, bias, cols, 0)
+	if !ok {
+		return nil, false
+	}
+	gv, err := gx.LayerNorm(gg, gb, eps)
+	if err != nil {
+		return nil, false
+	}
+	parents := []*Node{n}
+	for _, p := range []*Node{gain, bias} {
+		if p != nil {
+			parents = append(parents, p)
+		}
+	}
+	out := devNode("layernorm", gv, shape, parents...)
+	return out.withBack(func(out *Node) {
+		grad, ok := out.residentGrad()
+		if !ok {
+			panic("tensai: no device gradient for a device layernorm")
+		}
+		if n.requiresGrad {
+			dx, err := gx.LayerNormGrad(grad, gg, eps)
+			if err != nil {
+				panic("tensai: device layernorm backward: " + err.Error())
+			}
+			out.tape.track(dx)
+			if !devAccum(n, dx, shape) {
+				panic("tensai: device layernorm cannot reduce its input gradient")
+			}
+		}
+		if gain != nil && gain.requiresGrad {
+			// The gain's gradient is the column sums of grad * xhat.
+			xhat, err := gx.LayerNormXhat(eps)
+			if err != nil {
+				panic("tensai: device layernorm backward: " + err.Error())
+			}
+			out.tape.track(xhat)
+			prod, err := grad.Binary(gpu.OpMul, xhat)
+			if err != nil {
+				panic("tensai: device layernorm backward: " + err.Error())
+			}
+			out.tape.track(prod)
+			if !devAccum(gain, prod, shape) {
+				panic("tensai: device layernorm cannot reduce its gain gradient")
+			}
+		}
+		if bias != nil && bias.requiresGrad && !devAccum(bias, grad, shape) {
+			panic("tensai: device layernorm cannot reduce its bias gradient")
+		}
+	}), true
+}
+
+// devAffine returns a LayerNorm gain or bias on the device, standing in a
+// constant buffer when the node is nil.
+func devAffine(t *Tape, p *Node, cols int, fill tensai.Float) (*gpu.Tensor, bool) {
+	if p != nil {
+		return p.resident(t)
+	}
+	c := tensai.NewTensor(cols)
+	for i := range c.Data {
+		c.Data[i] = fill
+	}
+	g, err := t.dev.Upload(c)
+	if err != nil {
+		return nil, false
+	}
+	t.track(g)
+	return g, true
+}
+
+// devSoftmax normalizes the last axis on the device; the backward pass is
+// the softmax Jacobian applied in one kernel.
+func devSoftmax(n *Node) (*Node, bool) {
+	if n.device() == nil {
+		return nil, false
+	}
+	n.tape.openBatch()
+	gx, ok := n.resident(n.tape)
+	if !ok {
+		return nil, false
+	}
+	gy, err := gx.Softmax()
+	if err != nil {
+		return nil, false
+	}
+	out := devNode("softmax", gy, n.Shape(), n)
+	return out.withBack(func(out *Node) {
+		grad, ok := out.residentGrad()
+		if !ok {
+			panic("tensai: no device gradient for a device softmax")
+		}
+		dx, err := gy.SoftmaxGrad(grad)
+		if err != nil {
+			panic("tensai: device softmax backward: " + err.Error())
+		}
+		out.tape.track(dx)
+		if !devAccum(n, dx, n.Shape()) {
+			panic("tensai: device softmax cannot reduce its gradient")
+		}
+	}), true
+}
+
+// devTranspose permutes axes on the device; the gradient permutes back.
+func devTranspose(n *Node, perm []int) (*Node, bool) {
+	if n.device() == nil {
+		return nil, false
+	}
+	n.tape.openBatch()
+	gx, ok := n.resident(n.tape)
+	if !ok {
+		return nil, false
+	}
+	gv, err := gx.Permute(perm...)
+	if err != nil {
+		return nil, false
+	}
+	inv := make([]int, len(perm))
+	for i, p := range perm {
+		inv[p] = i
+	}
+	out := devNode("transpose", gv, gv.Shape(), n)
+	return out.withBack(func(out *Node) {
+		grad, ok := out.residentGrad()
+		if !ok {
+			panic("tensai: no device gradient for a device transpose")
+		}
+		d, err := grad.Permute(inv...)
+		if err != nil {
+			panic("tensai: device transpose backward: " + err.Error())
+		}
+		out.tape.track(d)
+		if !devAccum(n, d, n.Shape()) {
+			panic("tensai: device transpose cannot reduce its gradient")
+		}
+	}), true
+}
+
+// devReshape relabels a resident buffer: the data does not move, so this is
+// a view on both the way out and the way back.
+func devReshape(n *Node, shape []int) (*Node, bool) {
+	if n.device() == nil {
+		return nil, false
+	}
+	gx, ok := n.resident(n.tape)
+	if !ok {
+		return nil, false
+	}
+	gv, err := gx.View(0, shape...)
+	if err != nil {
+		return nil, false
+	}
+	out := devNode("reshape", gv, shape, n)
+	return out.withBack(func(out *Node) {
+		grad, ok := out.residentGrad()
+		if !ok {
+			panic("tensai: no device gradient for a device reshape")
+		}
+		flat, err := grad.View(0, n.Shape()...)
+		if err != nil {
+			panic("tensai: device reshape backward: " + err.Error())
+		}
+		out.tape.track(flat)
+		if !devAccum(n, flat, n.Shape()) {
+			panic("tensai: device reshape cannot reduce its gradient")
+		}
+	}), true
+}

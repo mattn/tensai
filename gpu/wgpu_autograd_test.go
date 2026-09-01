@@ -182,3 +182,92 @@ func TestGPUResidentStaysOnDevice(t *testing.T) {
 	}
 	tape.Reset()
 }
+
+// TestGPUResidentTransformer trains a transformer block -- embeddings, a
+// pre-norm attention with a causal mask, a GELU feed-forward, and
+// cross-entropy over the vocabulary -- on the CPU and on the device, and
+// checks the two agree. Every op but the embedding lookup has a device
+// kernel, so this exercises LayerNorm, softmax, the permutes attention
+// needs, and the products between them.
+func TestGPUResidentTransformer(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+
+	const (
+		batch, seq, model, heads, vocab = 2, 8, 32, 4, 11
+		headDim                         = model / heads
+	)
+	build := func() (tokens, labels []int, mask *tensai.Tensor, params []*autograd.Node) {
+		rng := rand.New(rand.NewSource(211))
+		tokens = make([]int, batch*seq)
+		labels = make([]int, batch*seq)
+		for i := range tokens {
+			tokens[i] = rng.Intn(vocab)
+			labels[i] = rng.Intn(vocab)
+		}
+		mask = tensai.NewTensor(1, 1, seq, seq)
+		for i := 0; i < seq; i++ {
+			for j := i + 1; j < seq; j++ {
+				mask.Data[i*seq+j] = tensai.Float(math.Inf(-1))
+			}
+		}
+		ones := tensai.NewTensor(model)
+		for i := range ones.Data {
+			ones.Data[i] = 1
+		}
+		params = []*autograd.Node{
+			autograd.Param(randTensor(rng, vocab, model)), // embeddings
+			autograd.Param(ones),                          // norm gain
+			autograd.Param(tensai.NewTensor(model)),       // norm bias
+			autograd.Param(randTensor(rng, model, model)), // wq
+			autograd.Param(randTensor(rng, model, model)), // wk
+			autograd.Param(randTensor(rng, model, model)), // wv
+			autograd.Param(randTensor(rng, model, model)), // wo
+			autograd.Param(randTensor(rng, model, vocab)), // head
+		}
+		return tokens, labels, mask, params
+	}
+	forward := func(tokens []int, mask *tensai.Tensor, p []*autograd.Node) *autograd.Node {
+		heads3 := func(t *autograd.Node) *autograd.Node {
+			return t.Reshape(batch, seq, heads, headDim).Transpose(0, 2, 1, 3)
+		}
+		x := p[0].Embed(tokens, batch, seq)
+		h := x.LayerNorm(p[1], p[2], 1e-5)
+		q, k, v := heads3(h.MatMul(p[3])), heads3(h.MatMul(p[4])), heads3(h.MatMul(p[5]))
+		att := q.MatMul(k.T()).Scale(1 / float32(math.Sqrt(headDim))).Add(autograd.Input(mask)).Softmax()
+		y := att.MatMul(v).Transpose(0, 2, 1, 3).Reshape(batch, seq, model).MatMul(p[6])
+		return x.Add(y).GELU().MatMul(p[7])
+	}
+
+	const steps = 15
+	tokens, labels, mask, cpuP := build()
+	cpuTrainer := autograd.NewTrainer(optim.NewAdam(0.01), cpuP...)
+	var cpuLoss tensai.Float
+	for i := 0; i < steps; i++ {
+		cpuLoss = cpuTrainer.Step(forward(tokens, mask, cpuP).CrossEntropy(labels))
+	}
+
+	_, _, _, devP := build()
+	devTrainer := autograd.NewTrainer(optim.NewAdam(0.01), devP...)
+	tape := autograd.NewTape()
+	tape.UseDevice(g)
+	tape.Bind(devP...)
+	var devLoss tensai.Float
+	for i := 0; i < steps; i++ {
+		devLoss = devTrainer.Step(forward(tokens, mask, devP).CrossEntropy(labels))
+		tape.Reset()
+	}
+
+	if diff := math.Abs(float64(cpuLoss - devLoss)); diff > 1e-2*(1+math.Abs(float64(cpuLoss))) {
+		t.Fatalf("loss differs after %d steps: cpu=%g device=%g", steps, cpuLoss, devLoss)
+	}
+	names := []string{"embed", "gain", "bias", "wq", "wk", "wv", "wo", "head"}
+	for i := range cpuP {
+		want, got := cpuP[i].Value(), devP[i].Value()
+		for j := range want.Data {
+			if diff := math.Abs(float64(want.Data[j] - got.Data[j])); diff > 2e-2*(1+math.Abs(float64(want.Data[j]))) {
+				t.Fatalf("%s element %d: cpu=%v device=%v", names[i], j, want.Data[j], got.Data[j])
+			}
+		}
+	}
+}
