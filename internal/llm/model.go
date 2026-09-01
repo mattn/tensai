@@ -192,10 +192,12 @@ type qblock struct {
 	wPleGate, wPleProj *tensai.Matrix
 	qPleGate, qPleProj *qmat
 	plePost            []float32
-	outScale           float32
-	sharedGate         []float32   // [hidden]; sigmoid(dot) scales the shared expert
-	kc, vc             [][]float32 // KV cache, kvHeads*headDim per position
-	dstate             *deltaState // recurrent state for a delta layer; nil until first use
+	// outScale is the layer's output scalar, as the file stores it: one
+	// value, or nothing on a layer that has none.
+	outScale   []float32
+	sharedGate []float32   // [hidden]; sigmoid(dot) scales the shared expert
+	kc, vc     [][]float32 // KV cache, kvHeads*headDim per position
+	dstate     *deltaState // recurrent state for a delta layer; nil until first use
 	// delta holds a qwen3_5 linear-attention layer, which has no KV cache:
 	// it carries a fixed-size recurrent state instead, so its cost per
 	// token does not grow with the context. nil on a full-attention layer.
@@ -574,7 +576,7 @@ func (m *qwen) initRopeFreqs() {
 			// head: the rest divide by a frequency factor so large that
 			// the angle vanishes. Folding the factors in here keeps the
 			// rotation itself uniform.
-			if b.ropeFF != nil {
+			if len(b.ropeFF) == half {
 				f /= float64(b.ropeFF[j])
 			}
 			b.ropeFreq[j] = f
@@ -1436,9 +1438,9 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		if pe != nil {
 			m.pleBatch(b, li, x, pe)
 		}
-		if b.outScale != 0 {
+		if len(b.outScale) > 0 {
 			for i := range x.Data {
-				x.Data[i] *= b.outScale
+				x.Data[i] *= b.outScale[0]
 			}
 		}
 	}
@@ -1586,9 +1588,9 @@ func (m *qwen) step(token, pos int) []float32 {
 		if pe != nil {
 			m.pleBlock(b, x, pe[li*dim:(li+1)*dim], pgate, pproj)
 		}
-		if b.outScale != 0 {
+		if len(b.outScale) > 0 {
 			for i := range x {
-				x[i] *= b.outScale
+				x[i] *= b.outScale[0]
 			}
 		}
 	}
