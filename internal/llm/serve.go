@@ -278,6 +278,10 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 	}
 	hermes := tm.toolCalls == "hermes" && len(tools) > 0
 	qwenXML := tm.toolCalls == "qwen3xml" && len(tools) > 0
+	// Gemma 4 writes its signatures into the system turn as blocks of
+	// its own, and keeps a call and the result answering it inside one
+	// model turn rather than passing the result back as a user turn.
+	gemma4 := tm.toolCalls == "gemma4" && len(tools) > 0
 	// Where the signatures go is part of the convention: Hermes appends
 	// them to whatever system text the caller sent, Qwen3.5 leads with
 	// them and appends the caller's text after.
@@ -290,6 +294,9 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 		} else {
 			system = xmlToolPreamble(tools)
 		}
+	}
+	if gemma4 {
+		system += gemma4ToolPreamble(tools)
 	}
 	offered := hermes || qwenXML
 	// An empty system prompt means no system turn, not an empty one.
@@ -308,6 +315,9 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 	}
 	first := true
 	inTools := false
+	// openTurn is a gemma4 model turn left open for the results of the
+	// calls it just made; generation carries on inside it.
+	openTurn := false
 	for i, m := range rest {
 		// A run of tool results is one user turn, so close the open one
 		// only when the next message leaves the run.
@@ -316,6 +326,15 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 			inTools = false
 		}
 		switch {
+		case m.Role == "tool" && gemma4:
+			// The result belongs to the model turn that called for it,
+			// which is still open.
+			b.WriteString(gemma4Response(gemma4ToolName(rest[:i], m), m.Content))
+			if i+1 < len(rest) && rest[i+1].Role != "tool" {
+				b.WriteString(tm.asstClose)
+				openTurn = false
+			}
+			first = false
 		case m.Role == "tool" && offered:
 			if !inTools {
 				b.WriteString(tm.userOpen)
@@ -355,6 +374,16 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 						"\n</tool_call>")
 				}
 			}
+			if gemma4 {
+				for _, c := range m.ToolCalls {
+					b.WriteString(gemma4Call(c.Function.Name, c.Function.Arguments))
+				}
+				// A turn whose calls are answered next stays open.
+				if len(m.ToolCalls) > 0 && i+1 < len(rest) && rest[i+1].Role == "tool" {
+					openTurn = true
+					continue
+				}
+			}
 			if qwenXML {
 				for i, c := range m.ToolCalls {
 					// A call follows text with a blank line between them
@@ -382,8 +411,25 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 	if inTools {
 		b.WriteString(tm.userClose)
 	}
-	b.WriteString(tm.asstOpen + tm.asstPrefill)
+	// An open gemma4 turn is where the answer goes: opening another one
+	// would tell the model its own call and result belong to somebody
+	// else's turn.
+	if !openTurn {
+		b.WriteString(tm.asstOpen)
+	}
+	b.WriteString(tm.asstPrefill)
 	return b.String()
+}
+
+// callMarkers is what the streamer holds text back on: the opening of a
+// call in the family's own convention, plus the fence a weak model
+// writes a call in when it forgets the convention (parseLooseToolCalls
+// rescues those at the end of the turn).
+func callMarkers(conv string) []string {
+	if conv == "gemma4" {
+		return []string{"<|tool_call>", "```json"}
+	}
+	return []string{"<tool_call>", "```json"}
 }
 
 // splitReasoning takes the block a thinking model writes before its
@@ -904,7 +950,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// ordinary content goes out after the final parse, via streamed.
 		// A bare fence streams as usual — a fenced code answer must not
 		// fall silent — and the final parse still rescues a call in one.
-		for _, marker := range []string{"<tool_call>", "```json"} {
+		for _, marker := range callMarkers(s.tm.toolCalls) {
 			if i := strings.Index(text, marker); i >= 0 {
 				sawCall = true
 				held.Reset()
@@ -916,7 +962,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		keep := 0
 		if !final {
-			for _, marker := range []string{"<tool_call>", "```json"} {
+			for _, marker := range callMarkers(s.tm.toolCalls) {
 				keep = max(keep, partialMarker(text, marker))
 			}
 		}
@@ -1096,7 +1142,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	var calls []toolCall
 	if len(tools) > 0 {
-		if s.tm.toolCalls == "qwen3xml" {
+		if s.tm.toolCalls == "gemma4" {
+			content, calls = parseGemma4ToolCalls(content)
+		} else if s.tm.toolCalls == "qwen3xml" {
 			content, calls = parseXMLToolCalls(content, tools)
 		} else {
 			content, calls = parseToolCalls(content)

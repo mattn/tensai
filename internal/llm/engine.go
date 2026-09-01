@@ -1142,7 +1142,10 @@ func templateFor(modelType string, think bool) tmpl {
 			sysOpen: "<|turn>system\n", sysClose: "<turn|>\n",
 			userOpen: "<|turn>user\n", userClose: "<turn|>\n",
 			asstOpen: "<|turn>model\n", asstClose: "<turn|>\n",
-			stops: []string{"<turn|>"},
+			// The turn marker ends a reply; <eos> ends one that ran out
+			// of anything to say, which is what a bare tool call is.
+			stops:     []string{"<turn|>", "<eos>"},
+			toolCalls: "gemma4",
 		}
 		if think {
 			t.sysOpen += "<|think|>\n"
