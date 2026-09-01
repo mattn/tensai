@@ -8,6 +8,18 @@
 // split is a Reshape plus a Transpose, and every attention score in the
 // batch is one batched MatMul. The gradients come from the engine, so the
 // model is only its forward pass.
+//
+// With -gpu (and a wgpu build) the whole block trains on the device --
+// values, gradients and the Adam update all stay there, and only the loss
+// comes back each step. Whether that is faster depends on the shape: at the
+// default size the tensors are too small to keep a GPU busy and the AVX2
+// kernels win, while a wider model crosses over. On an AMD 780M:
+//
+//	                                        CPU        -gpu
+//	default (model 64, batch 8, seq 32)     23ms/step  62ms/step
+//	-model 256 -heads 8 -batch 16 -seq 64  282ms/step 173ms/step
+//
+// The losses are identical either way, which is the point of the check.
 package main
 
 import (
@@ -17,13 +29,19 @@ import (
 	"math/rand"
 	"os"
 	"strings"
+	"time"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/autograd"
+	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/optim"
 )
 
-const (
+// The shape of the model. They are variables rather than constants so the
+// flags can scale it: the CPU wins at the default size, where the tensors
+// are too small to keep a GPU busy, and the device pulls ahead as the model
+// grows -- see the -gpu flag below.
+var (
 	seqLen    = 32 // tokens the model sees at once
 	dModel    = 64
 	nHeads    = 4
@@ -31,8 +49,9 @@ const (
 	dFF       = 4 * dModel
 	nBlocks   = 2
 	batchSize = 8
-	eps       = 1e-5
 )
+
+const eps = 1e-5
 
 // block is one pre-norm transformer block.
 type block struct {
@@ -77,7 +96,7 @@ func (b *block) forward(x, mask *autograd.Node, batch int) *autograd.Node {
 
 	// (batch, head, seq, seq) scores, masked so a position only sees what
 	// came before it, then the weighted sum of the values.
-	att := q.MatMul(k.T()).Scale(1 / float32(math.Sqrt(headDim))).Add(mask).Softmax()
+	att := q.MatMul(k.T()).Scale(1 / float32(math.Sqrt(float64(headDim)))).Add(mask).Softmax()
 	merged := att.MatMul(v).Transpose(0, 2, 1, 3).Reshape(batch, seqLen, dModel)
 	x = x.Add(merged.MatMul(b.wo))
 
@@ -229,7 +248,18 @@ func main() {
 	temp := flag.Float64("temp", 0.8, "sampling temperature")
 	n := flag.Int("n", 400, "characters to generate")
 	seed := flag.Int64("seed", 7, "random seed")
+	useGPU := flag.Bool("gpu", false, "train on the GPU (needs -tags wgpu24 or wgpu)")
+	flag.IntVar(&dModel, "model", dModel, "model width")
+	flag.IntVar(&nHeads, "heads", nHeads, "attention heads")
+	flag.IntVar(&nBlocks, "blocks", nBlocks, "transformer blocks")
+	flag.IntVar(&batchSize, "batch", batchSize, "sequences per step")
+	flag.IntVar(&seqLen, "seq", seqLen, "tokens the model sees at once")
 	flag.Parse()
+	if dModel%nHeads != 0 {
+		fmt.Fprintf(os.Stderr, "tinygpt: model width %d is not divisible by %d heads\n", dModel, nHeads)
+		os.Exit(1)
+	}
+	headDim, dFF = dModel/nHeads, 4*dModel
 
 	text := []rune(corpus)
 	vocab := vocabOf(text)
@@ -247,9 +277,22 @@ func main() {
 	// Every step builds a fresh graph and drops it; the tape hands the last
 	// step's buffers back instead of allocating them again.
 	tape := autograd.NewTape()
+	if *useGPU {
+		// With a device the whole block stays there: values, gradients and
+		// the Adam update. Only the loss comes back each step.
+		dev, err := gpu.Open(gpu.HighPerformance)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "tinygpt: %v\n", err)
+			os.Exit(1)
+		}
+		defer dev.Close()
+		tape.UseDevice(dev)
+		fmt.Printf("training on %s\n", dev.Name())
+	}
 	tape.Bind(params...)
 	m.tape = tape
 
+	start := time.Now()
 	for it := 1; it <= *iters; it++ {
 		tokens, labels := m.batchAt(text, rng)
 		lossVal := trainer.Step(m.forward(tokens, batchSize).CrossEntropy(labels))
@@ -258,6 +301,9 @@ func main() {
 			fmt.Printf("iter %4d: loss=%.4f\n", it, lossVal)
 		}
 	}
+	took := time.Since(start)
+	fmt.Printf("trained %d steps in %v (%.1fms/step)\n",
+		*iters, took.Round(time.Millisecond), float64(took.Milliseconds())/float64(*iters))
 
 	if len(text) < seqLen {
 		fmt.Fprintln(os.Stderr, "tinygpt: corpus shorter than the context window")

@@ -12,7 +12,7 @@
 | iris | `go run ./_example/iris` | Iris の分類 |
 | mnist | `go run ./_example/mnist` | MNIST 分類器 (`-model dense`, `cnn`, `knn`) と保存/読込 |
 | charrnn | `go run ./_example/charrnn` | 自動微分エンジン上の文字レベル LSTM テキスト生成 |
-| tinygpt | `GOEXPERIMENT=simd go run ./_example/tinygpt` | n 次元自動微分エンジンでゼロから学習する文字レベル transformer |
+| tinygpt | `GOEXPERIMENT=simd go run ./_example/tinygpt` | n 次元自動微分エンジンでゼロから学習する文字レベル transformer (`-gpu` でデバイス学習) |
 | plasma | `go run ./_example/plasma` | ニューラルネットワークが描くターミナルプラズマ — 生きた SIMD ベンチマーク |
 | dot | `go run ./_example/dot` | z = x + y グラフの Graphviz DOT エクスポート |
 | tensor | `go run ./_example/tensor` | N 次元 Tensor ツアー: ブロードキャスト、バッチ MatMul、attention |
@@ -40,7 +40,9 @@ go run ./_example/mnist -model cnn -export mnist.tflite  # TFLite へエクス�
 
 ## tinygpt
 
-charrnn と同じ埋め込みテキストで、小さな文字レベル transformer (トークン埋め込みと位置埋め込み、4 ヘッドの因果 attention と GELU の feed-forward を持つ pre-norm ブロック 2 段、最終 norm と出力射影) を学習し、そこからサンプリングします。パラメータは約 106k、`GOEXPERIMENT=simd` で 1 分ほど学習すれば、コーパスの文をそのまま再現するようになります。モデル全体が n 次元自動微分エンジンで書かれています: 活性は `(batch, sequence, model)` のテンソル、ヘッド分割は `Reshape` と `Transpose`、各ステップのバッファは `Tape` が再利用します。フラグは `-iters`, `-lr`, `-temp`, `-n`, `-seed`。
+charrnn と同じ埋め込みテキストで、小さな文字レベル transformer (トークン埋め込みと位置埋め込み、4 ヘッドの因果 attention と GELU の feed-forward を持つ pre-norm ブロック 2 段、最終 norm と出力射影) を学習し、そこからサンプリングします。パラメータは約 106k、`GOEXPERIMENT=simd` で 1 分ほど学習すれば、コーパスの文をそのまま再現するようになります。モデル全体が n 次元自動微分エンジンで書かれています: 活性は `(batch, sequence, model)` のテンソル、ヘッド分割は `Reshape` と `Transpose`、各ステップのバッファは `Tape` が再利用します。フラグは `-iters`, `-lr`, `-temp`, `-n`, `-seed`、それに形を変える `-model`, `-heads`, `-blocks`, `-batch`, `-seq`。
+
+`-gpu` (wgpu ビルド時) はブロック全体をデバイスで学習します。値も勾配も Adam の更新もデバイスに留まり、毎ステップ帰ってくるのは損失だけです。速くなるかは形次第で、既定のサイズではテンソルが小さすぎて GPU が埋まらず AVX2 カーネルが勝ち、モデルを広げるとクロスオーバーします。AMD 780M では既定サイズで 23ms/step に対し `-gpu` が 62ms/step、`-model 256 -heads 8 -batch 16 -seq 64` では 282ms に対し 173ms でした。損失はどちらでも桁まで一致します。
 
 ## plasma
 
