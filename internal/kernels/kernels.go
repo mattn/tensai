@@ -77,6 +77,24 @@ func siluMulGeneric(gate, up []float32) {
 	}
 }
 
+// geluMulGeneric is Gemma's gate: gelu(gate) * up, in place on gate, with
+// the tanh approximation the trained models use rather than the erf gelu.
+// Written as a sigmoid, since 0.5*g*(1+tanh(y)) is g/(1+exp(-2y)), it is
+// the same shape as siluMulGeneric and rides the same vector exp.
+func geluMulGeneric(gate, up []float32) {
+	for i, g := range gate {
+		y := geluTanhInner * (g + geluTanhCube*g*g*g)
+		gate[i] = g / (1 + ExpF(-y)) * up[i]
+	}
+}
+
+// The tanh gelu's constants, folded so the sigmoid form needs no halving:
+// geluTanhInner is 2*sqrt(2/pi).
+const (
+	geluTanhInner = 1.5957691216057308
+	geluTanhCube  = 0.044715
+)
+
 // siluGeneric applies x * sigmoid(x) in place.
 func siluGeneric(v []float32) {
 	for i, x := range v {

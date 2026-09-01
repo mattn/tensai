@@ -134,6 +134,24 @@ func SiluMul(gate, up []float32) {
 	})
 }
 
+// GeluMul is Gemma's gate: gelu(gate) * up, in place on gate. The tanh
+// approximation the trained models use rewrites as a sigmoid, so this is
+// SiluMul with the argument run through the cubic first.
+func GeluMul(gate, up []float32) {
+	if !simd.HasAVX2 {
+		geluMulGeneric(gate, up)
+		return
+	}
+	one := archsimd.BroadcastFloat32x8(1)
+	zero := archsimd.BroadcastFloat32x8(0)
+	inner := archsimd.BroadcastFloat32x8(geluTanhInner)
+	cube := archsimd.BroadcastFloat32x8(geluTanhCube)
+	mapSlices2(gate, gate, up, func(g, u archsimd.Float32x8) archsimd.Float32x8 {
+		y := inner.Mul(g.Add(cube.Mul(g).Mul(g).Mul(g)))
+		return g.Div(one.Add(vexpf(zero.Sub(y)))).Mul(u)
+	})
+}
+
 // Silu applies x * sigmoid(x) in place. SiluMul is the same thing paired
 // with a gate; the delta rule wants it on its own, over a convolution's
 // output rather than a SwiGLU's.

@@ -349,3 +349,31 @@ func TestBinarySlices(t *testing.T) {
 		}
 	}
 }
+
+// GeluMul has to agree with the tanh gelu written out longhand, which is
+// what the Gemma models were trained on and what llama.cpp computes.
+func TestGeluMulMatchesTanhForm(t *testing.T) {
+	gate := []float32{-6, -2.5, -1, -0.25, 0, 0.25, 1, 2.5, 6, 11.5, -11.5}
+	up := []float32{1, -2, 0.5, 3, 1, -1, 2, 0.25, -0.5, 1, 1}
+	want := make([]float32, len(gate))
+	for i, g := range gate {
+		const c = 0.7978845608028654 // sqrt(2/pi)
+		d := float64(g)
+		want[i] = float32(0.5*d*(1+math.Tanh(c*(d+0.044715*d*d*d)))) * up[i]
+	}
+	got := append([]float32(nil), gate...)
+	GeluMul(got, up)
+	for i := range want {
+		if diff := math.Abs(float64(got[i] - want[i])); diff > 3e-6*(1+math.Abs(float64(want[i]))) {
+			t.Errorf("GeluMul(%v, %v) = %v, want %v", gate[i], up[i], got[i], want[i])
+		}
+	}
+	// The generic path is the same function on machines without AVX2.
+	plain := append([]float32(nil), gate...)
+	geluMulGeneric(plain, up)
+	for i := range want {
+		if diff := math.Abs(float64(plain[i] - want[i])); diff > 3e-6*(1+math.Abs(float64(want[i]))) {
+			t.Errorf("geluMulGeneric(%v) = %v, want %v", gate[i], plain[i], want[i])
+		}
+	}
+}

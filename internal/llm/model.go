@@ -699,15 +699,11 @@ func swigluOAI(gate, up []float32) {
 }
 
 func activate(gate, up []float32, geglu bool) {
-	if !geglu {
-		tensai.SiluMul(gate, up)
+	if geglu {
+		tensai.GeluMul(gate, up)
 		return
 	}
-	const c = 0.7978845608028654 // sqrt(2/pi)
-	for i := range gate {
-		g := float64(gate[i])
-		gate[i] = float32(0.5*g*(1+math.Tanh(c*(g+0.044715*g*g*g)))) * up[i]
-	}
+	tensai.SiluMul(gate, up)
 }
 
 // moeFFN runs one token's activation through a block's sparse FFN: the
