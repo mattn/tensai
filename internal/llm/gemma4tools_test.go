@@ -147,3 +147,47 @@ func TestGemma4IsOfferedTools(t *testing.T) {
 		t.Errorf("callMarkers(hermes) = %v", got)
 	}
 }
+
+// A small model sampled at temperature writes the call body in the right
+// spelling and forgets the marker in front of it. The name it declared
+// is enough to recognize, and prose that merely mentions a tool is not.
+func TestParseLooseGemma4Calls(t *testing.T) {
+	tools := []toolDef{weatherToolG4(), {Type: "function", Function: toolFunc{Name: "web_search"}}}
+	for _, tt := range []struct {
+		name    string
+		in      string
+		content string
+		call    string // name(arguments), empty for none
+	}{
+		{"a call with no marker at all",
+			`web_search{query:<|"|>日本の総理大臣<|"|>}`, "", `web_search({"query":"日本の総理大臣"})`},
+		{"with something said first",
+			"調べます。\nweb_search{query:<|\"|>x<|\"|>}", "調べます。", `web_search({"query":"x"})`},
+		{"a tool merely talked about",
+			"web_search is the tool I would use for that.", "web_search is the tool I would use for that.", ""},
+		{"a name inside a word",
+			"my_web_search{query:<|\"|>x<|\"|>} is not it", "my_web_search{query:<|\"|>x<|\"|>} is not it", ""},
+		{"an undeclared name",
+			`delete_everything{path:<|"|>/<|"|>}`, `delete_everything{path:<|"|>/<|"|>}`, ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			content, calls := parseLooseGemma4Calls(tt.in, tools)
+			if content != tt.content {
+				t.Errorf("content = %q, want %q", content, tt.content)
+			}
+			got := ""
+			if len(calls) == 1 {
+				got = calls[0].Function.Name + "(" + calls[0].Function.Arguments + ")"
+			} else if len(calls) > 1 {
+				t.Fatalf("got %d calls", len(calls))
+			}
+			if got != tt.call {
+				t.Errorf("call = %q, want %q", got, tt.call)
+			}
+		})
+	}
+	// A properly marked call is not the loose parser's business.
+	if _, calls := parseGemma4ToolCalls(gemma4Call("web_search", `{"query":"x"}`)); len(calls) != 1 {
+		t.Error("the marked path stopped working")
+	}
+}

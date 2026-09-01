@@ -444,3 +444,61 @@ func gemma4ToolName(before []chatMessage, m chatMessage) string {
 	}
 	return "unknown"
 }
+
+// parseLooseGemma4Calls rescues a call the model wrote without its
+// markers. The body is in the convention's own spelling -- bare keys and
+// <|"|> strings -- but <|tool_call>call: never arrived, which a small
+// model sampled at any temperature does often enough to matter. Only a
+// name the caller declared counts, and only where the model was starting
+// a call rather than talking about one, so prose cannot become a call by
+// accident.
+func parseLooseGemma4Calls(s string, tools []toolDef) (string, []toolCall) {
+	var calls []toolCall
+	content := s
+	for {
+		name, at := "", -1
+		for _, t := range tools {
+			if i := looseCallAt(s, t.Function.Name); i >= 0 && (at < 0 || i < at) {
+				name, at = t.Function.Name, i
+			}
+		}
+		if at < 0 {
+			break
+		}
+		args, rest := g4parse(s[at+len(name):], true)
+		if len(calls) == 0 {
+			content = s[:at]
+		}
+		idx := len(calls)
+		calls = append(calls, toolCall{
+			Index:    &idx,
+			ID:       fmt.Sprintf("call_%d", idx),
+			Type:     "function",
+			Function: callFunc{Name: name, Arguments: args},
+		})
+		s = rest
+	}
+	if len(calls) == 0 {
+		return content, nil
+	}
+	return strings.TrimSpace(content), calls
+}
+
+// looseCallAt finds where the model starts writing name{...}, requiring
+// the name to open a line or a fragment rather than sit inside a word.
+func looseCallAt(s, name string) int {
+	if name == "" {
+		return -1
+	}
+	for off := 0; ; {
+		i := strings.Index(s[off:], name+"{")
+		if i < 0 {
+			return -1
+		}
+		i += off
+		if i == 0 || strings.ContainsRune(" \t\n>:*`\"'", rune(s[i-1])) {
+			return i
+		}
+		off = i + len(name)
+	}
+}
