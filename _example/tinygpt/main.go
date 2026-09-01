@@ -160,7 +160,7 @@ func (m *model) generate(seed []rune, n int, temperature float32, rng *rand.Rand
 	var sb strings.Builder
 	vocab := len(m.vocab)
 	for i := 0; i < n; i++ {
-		logits := m.forward(window, 1).Scale(1 / temperature).Softmax().Value
+		logits := m.forward(window, 1).Scale(1 / temperature).Softmax().Value()
 		// The next character is the distribution at the last position. It
 		// is read before the tape recycles the buffer it lives in.
 		next := sample(logits.Data[(seqLen-1)*vocab:], rng)
@@ -239,7 +239,7 @@ func main() {
 	params := m.params()
 	var count int
 	for _, p := range params {
-		count += len(p.Value.Data)
+		count += len(p.Value().Data)
 	}
 	fmt.Printf("corpus: %d chars, vocab: %d, parameters: %d\n", len(text), len(vocab), count)
 

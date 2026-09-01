@@ -20,11 +20,11 @@ func checkParamGrad(t *testing.T, param *tensai.Tensor, build func() (*Node, *No
 	// accumulates, so start from a clean gradient.
 	ZeroGrads(p)
 	loss.Backward()
-	if p.Grad == nil {
+	if p.grad == nil {
 		t.Fatalf("%s: no gradient computed", name)
 	}
-	analytic := make([]float64, len(p.Grad.Data))
-	for i, g := range p.Grad.Data {
+	analytic := make([]float64, len(p.grad.Data))
+	for i, g := range p.grad.Data {
 		analytic[i] = float64(g)
 	}
 
@@ -38,7 +38,7 @@ func checkParamGrad(t *testing.T, param *tensai.Tensor, build func() (*Node, *No
 		param.Data[i] = orig - h
 		lm, _ := build()
 		param.Data[i] = orig
-		num := float64(lp.Value.Data[0]-lm.Value.Data[0]) / (2 * h)
+		num := float64(lp.value.Data[0]-lm.value.Data[0]) / (2 * h)
 		if math.Abs(num-analytic[i]) > 2e-2*(1+math.Abs(num)) {
 			t.Errorf("%s grad %d: numeric=%.8f analytic=%.8f", name, i, num, analytic[i])
 		}
@@ -141,7 +141,7 @@ func TestAutogradTrainsXOR(t *testing.T) {
 	}
 	pred := forward(inputs)
 	for r := 0; r < 4; r++ {
-		got := pred.Value.At(r, 0)
+		got := pred.value.At(r, 0)
 		want := targets.At(r, 0)
 		if math.Abs(float64(got-want)) > 0.15 {
 			t.Errorf("sample %d: predicted %.3f, want %g", r, got, want)

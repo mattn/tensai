@@ -2,6 +2,7 @@ package autograd
 
 import (
 	"github.com/mattn/tensai"
+	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/internal/dims"
 )
 
@@ -33,6 +34,10 @@ import (
 type Tape struct {
 	free map[int][][]tensai.Float
 	used [][]tensai.Float
+
+	dev     *gpu.Device   // set by UseDevice; see device.go
+	devUsed []*gpu.Tensor // device buffers this step allocated
+	batch   bool          // a command batch is open on the device
 }
 
 // NewTape returns an empty tape.
@@ -60,6 +65,7 @@ func (t *Tape) Reset() {
 		t.free[len(buf)] = append(t.free[len(buf)], buf)
 	}
 	t.used = t.used[:0]
+	t.freeDevice()
 }
 
 // buffer returns a buffer of n elements. Its contents are whatever the

@@ -57,8 +57,8 @@ func TestTapeMatchesUntaped(t *testing.T) {
 		t.Fatalf("XOR did not converge: loss=%g", plainLoss)
 	}
 	for i := range plain {
-		for j, want := range plain[i].Value.Data {
-			if got := taped[i].Value.Data[j]; got != want {
+		for j, want := range plain[i].value.Data {
+			if got := taped[i].value.Data[j]; got != want {
 				t.Fatalf("param %d element %d: taped %g, plain %g", i, j, got, want)
 			}
 		}
@@ -117,7 +117,7 @@ func TestTapeReusesBuffers(t *testing.T) {
 	first := Input(x).MatMul(w)
 	tape2.Reset()
 	second := Input(x).MatMul(w)
-	if &first.Value.Data[0] != &second.Value.Data[0] {
+	if &first.value.Data[0] != &second.value.Data[0] {
 		t.Error("second step allocated a fresh buffer instead of reusing the first")
 	}
 }
@@ -126,22 +126,22 @@ func TestTapeReusesBuffers(t *testing.T) {
 // parameter's own value, which has to survive every Reset.
 func TestTapeLeavesParamsAlone(t *testing.T) {
 	w := Param(tensai.NewTensor(2, 2))
-	copy(w.Value.Data, []tensai.Float{1, 2, 3, 4})
+	copy(w.value.Data, []tensai.Float{1, 2, 3, 4})
 	tape := NewTape()
 	tape.Bind(w)
-	before := w.Value.Data
+	before := w.value.Data
 
 	for i := 0; i < 5; i++ {
 		w.Mul(w).Sum().Backward()
 		ZeroGrads(w)
 		tape.Reset()
 	}
-	if &before[0] != &w.Value.Data[0] {
+	if &before[0] != &w.value.Data[0] {
 		t.Fatal("parameter value was replaced")
 	}
 	for i, want := range []tensai.Float{1, 2, 3, 4} {
-		if w.Value.Data[i] != want {
-			t.Fatalf("parameter element %d = %g, want %g", i, w.Value.Data[i], want)
+		if w.value.Data[i] != want {
+			t.Fatalf("parameter element %d = %g, want %g", i, w.value.Data[i], want)
 		}
 	}
 }

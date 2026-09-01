@@ -20,9 +20,9 @@ for step := 0; step < 2000; step++ {
 
 `Param` wraps a value whose gradient should be tracked and updated; `Input` wraps data. Both accept a `*tensai.Matrix` or a `*tensai.Tensor` — a matrix becomes a 2-D tensor view sharing the same backing array, so a parameter built from a matrix keeps updating that matrix.
 
-For manual control, the pieces are public: `loss.Backward()`, `p.Grad`, and `autograd.ZeroGrads(params...)`. `Backward` starts from a single-element node and **accumulates** into `Grad`, which is why a training step clears the gradients afterwards (`Trainer.Step` does it for you).
+For manual control, the pieces are public: `loss.Backward()`, `p.Grad()`, and `autograd.ZeroGrads(params...)`. `Backward` starts from a single-element node and **accumulates** into the gradient, which is why a training step clears the gradients afterwards (`Trainer.Step` does it for you).
 
-On a node, `Value` and `Grad` are `*tensai.Tensor`. `Shape()` returns the shape, `Matrix()` returns a matrix view of a 2-D node, `Scalar()` reads a single-element node, and `Named("w1")` labels a leaf for `ToDot`.
+On a node, `Value()` and `Grad()` return `*tensai.Tensor`. They are methods rather than fields because a value does not have to live in host memory: on a device-resident graph they are where it comes back. `Shape()` returns the shape without fetching anything, `Matrix()` returns a matrix view of a 2-D node, `Scalar()` reads a single-element node, and `Named("w1")` labels a leaf for `ToDot`.
 
 ## Ops
 
@@ -87,6 +87,33 @@ The rule is the one a training loop already follows: **after `Reset`, nothing fr
 On `_example/charrnn`, which unrolls 32 time steps per iteration, the tape takes a training step from 22 MB of allocation to 0.75 MB and cuts about a quarter off its wall time.
 
 The same reuse is available one layer down: `MatMulInto`, `MatMulTNInto`, `MatMulNTInto`, `AddInto`, `SubInto`, `MulInto` and `DivInto` write into a tensor you already own, the way `DotInto` does for matrices.
+
+## Running the graph on a GPU
+
+A tape can put the whole graph on a device. Values, gradients and the Adam update stay there; only the loss comes home each step:
+
+```go
+dev, err := gpu.Open(gpu.HighPerformance)
+if err == nil {
+	defer dev.Close()
+	tape.UseDevice(dev)
+}
+tape.Bind(params...) // parameters upload once and stay resident
+```
+
+`Value()` and `Grad()` download on demand, so reading a node still works — that is what makes them methods. `Resident()` reports where a node's value currently is.
+
+Operations the device has kernels for (the three products, element-wise arithmetic with a repeating operand, ReLU/tanh/sigmoid/GELU and their gradients, the sum a broadcast collects, and Adam) run there; anything else falls back to the CPU, bringing home only what that operation needs. So a graph made of those ops never leaves the device, and one that uses `LayerNorm` or `Embed` — which have no kernels yet — pays a round trip at those points and continues.
+
+On an AMD 780M through `-tags wgpu24`, one step of `x @ w1 -> GELU -> @ w2 -> MSE`:
+
+| model width | CPU (AVX2) | accelerator hook | resident graph |
+|---|---|---|---|
+| 512 | 33.3ms | 31.8ms | **22.2ms** |
+| 1024 | 182.6ms | 146.1ms | **75.9ms** |
+| 2048 | 1786.6ms | 930.1ms | **521.3ms** |
+
+The hook (`tensai.UseAccelerator`) sends each product to the device on its own, so it pays a round trip per product; residency pays one upload per step for the batch and one download for the loss. Both are opt-in, and they compose: with a tape on a device the hook is not consulted.
 
 ## Visualizing the graph
 

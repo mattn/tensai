@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/mattn/tensai"
+	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/internal/dims"
 	"github.com/mattn/tensai/internal/kernels"
 	"github.com/mattn/tensai/loss"
@@ -20,9 +21,12 @@ import (
 // matrix dimensions and the leading axes broadcast, so (batch, m, k) times
 // (k, n) yields (batch, m, n).
 func (n *Node) MatMul(o *Node) *Node {
+	if out, ok := devMatMul(n, o, gemmNN); ok {
+		return out
+	}
 	tp := tapeOf(n, o)
-	v := tp.tensor(matmulShape(n.Value.Shape, o.Value.Shape, gemmNN))
-	if err := tensai.MatMulInto(v, n.Value, o.Value); err != nil {
+	v := tp.tensor(matmulShape(n.Shape(), o.Shape(), gemmNN))
+	if err := tensai.MatMulInto(v, n.Value(), o.Value()); err != nil {
 		panic(err.Error())
 	}
 	return newNode("matmul", v, n, o).withBack(func(out *Node) {
@@ -30,15 +34,15 @@ func (n *Node) MatMul(o *Node) *Node {
 		// transposed GEMM modes, so neither operand is copied into a
 		// transposed buffer first.
 		if n.requiresGrad {
-			d := tp.tensor(matmulShape(out.Grad.Shape, o.Value.Shape, gemmNT))
-			if err := tensai.MatMulNTInto(d, out.Grad, o.Value); err != nil {
+			d := tp.tensor(matmulShape(out.Grad().Shape, o.Shape(), gemmNT))
+			if err := tensai.MatMulNTInto(d, out.Grad(), o.Value()); err != nil {
 				panic(err.Error())
 			}
 			n.accum(d)
 		}
 		if o.requiresGrad {
-			d := tp.tensor(matmulShape(n.Value.Shape, out.Grad.Shape, gemmTN))
-			if err := tensai.MatMulTNInto(d, n.Value, out.Grad); err != nil {
+			d := tp.tensor(matmulShape(n.Shape(), out.Grad().Shape, gemmTN))
+			if err := tensai.MatMulTNInto(d, n.Value(), out.Grad()); err != nil {
 				panic(err.Error())
 			}
 			o.accum(d)
@@ -48,34 +52,40 @@ func (n *Node) MatMul(o *Node) *Node {
 
 // Add returns the element-wise sum n + o, broadcasting the operands.
 func (n *Node) Add(o *Node) *Node {
+	if out, ok := devBinary(gpu.OpAdd, n, o); ok {
+		return out
+	}
 	tp := tapeOf(n, o)
-	v := tp.tensor(binShape(n.Value.Shape, o.Value.Shape))
-	if err := tensai.AddInto(v, n.Value, o.Value); err != nil {
+	v := tp.tensor(binShape(n.Shape(), o.Shape()))
+	if err := tensai.AddInto(v, n.Value(), o.Value()); err != nil {
 		panic(err.Error())
 	}
 	return newNode("add", v, n, o).withBack(func(out *Node) {
 		if n.requiresGrad {
-			n.accum(out.Grad)
+			n.accum(out.Grad())
 		}
 		if o.requiresGrad {
-			o.accum(out.Grad)
+			o.accum(out.Grad())
 		}
 	})
 }
 
 // Sub returns the element-wise difference n - o, broadcasting the operands.
 func (n *Node) Sub(o *Node) *Node {
+	if out, ok := devBinary(gpu.OpSub, n, o); ok {
+		return out
+	}
 	tp := tapeOf(n, o)
-	v := tp.tensor(binShape(n.Value.Shape, o.Value.Shape))
-	if err := tensai.SubInto(v, n.Value, o.Value); err != nil {
+	v := tp.tensor(binShape(n.Shape(), o.Shape()))
+	if err := tensai.SubInto(v, n.Value(), o.Value()); err != nil {
 		panic(err.Error())
 	}
 	return newNode("sub", v, n, o).withBack(func(out *Node) {
 		if n.requiresGrad {
-			n.accum(out.Grad)
+			n.accum(out.Grad())
 		}
 		if o.requiresGrad {
-			o.accumScaled(out.Grad, -1)
+			o.accumScaled(out.Grad(), -1)
 		}
 	})
 }
@@ -83,22 +93,25 @@ func (n *Node) Sub(o *Node) *Node {
 // Mul returns the element-wise (Hadamard) product, broadcasting the
 // operands.
 func (n *Node) Mul(o *Node) *Node {
+	if out, ok := devBinary(gpu.OpMul, n, o); ok {
+		return out
+	}
 	tp := tapeOf(n, o)
-	v := tp.tensor(binShape(n.Value.Shape, o.Value.Shape))
-	if err := tensai.MulInto(v, n.Value, o.Value); err != nil {
+	v := tp.tensor(binShape(n.Shape(), o.Shape()))
+	if err := tensai.MulInto(v, n.Value(), o.Value()); err != nil {
 		panic(err.Error())
 	}
 	return newNode("mul", v, n, o).withBack(func(out *Node) {
 		if n.requiresGrad {
-			d := tp.tensor(binShape(out.Grad.Shape, o.Value.Shape))
-			if err := tensai.MulInto(d, out.Grad, o.Value); err != nil {
+			d := tp.tensor(binShape(out.Grad().Shape, o.Shape()))
+			if err := tensai.MulInto(d, out.Grad(), o.Value()); err != nil {
 				panic(err.Error())
 			}
 			n.accum(d)
 		}
 		if o.requiresGrad {
-			d := tp.tensor(binShape(out.Grad.Shape, n.Value.Shape))
-			if err := tensai.MulInto(d, out.Grad, n.Value); err != nil {
+			d := tp.tensor(binShape(out.Grad().Shape, n.Shape()))
+			if err := tensai.MulInto(d, out.Grad(), n.Value()); err != nil {
 				panic(err.Error())
 			}
 			o.accum(d)
@@ -112,26 +125,26 @@ func (n *Node) MulElem(o *Node) *Node { return n.Mul(o) }
 // Div returns the element-wise quotient n / o, broadcasting the operands.
 func (n *Node) Div(o *Node) *Node {
 	tp := tapeOf(n, o)
-	v := tp.tensor(binShape(n.Value.Shape, o.Value.Shape))
-	if err := tensai.DivInto(v, n.Value, o.Value); err != nil {
+	v := tp.tensor(binShape(n.Shape(), o.Shape()))
+	if err := tensai.DivInto(v, n.Value(), o.Value()); err != nil {
 		panic(err.Error())
 	}
 	return newNode("div", v, n, o).withBack(func(out *Node) {
 		if n.requiresGrad {
-			d := tp.tensor(binShape(out.Grad.Shape, o.Value.Shape))
-			if err := tensai.DivInto(d, out.Grad, o.Value); err != nil {
+			d := tp.tensor(binShape(out.Grad().Shape, o.Shape()))
+			if err := tensai.DivInto(d, out.Grad(), o.Value()); err != nil {
 				panic(err.Error())
 			}
 			n.accum(d)
 		}
 		if o.requiresGrad {
 			// d/db (a/b) = -a/b^2, and a/b^2 is the output over b again.
-			q := tp.tensor(binShape(out.Value.Shape, o.Value.Shape))
-			if err := tensai.DivInto(q, out.Value, o.Value); err != nil {
+			q := tp.tensor(binShape(out.Shape(), o.Shape()))
+			if err := tensai.DivInto(q, out.Value(), o.Value()); err != nil {
 				panic(err.Error())
 			}
-			d := tp.tensor(binShape(out.Grad.Shape, q.Shape))
-			if err := tensai.MulInto(d, out.Grad, q); err != nil {
+			d := tp.tensor(binShape(out.Grad().Shape, q.Shape))
+			if err := tensai.MulInto(d, out.Grad(), q); err != nil {
 				panic(err.Error())
 			}
 			o.accumScaled(d, -1)
@@ -141,11 +154,11 @@ func (n *Node) Div(o *Node) *Node {
 
 // Scale returns n multiplied by the scalar s.
 func (n *Node) Scale(s tensai.Float) *Node {
-	v := n.tape.tensor(n.Value.Shape) // overwritten by the copy below
-	copy(v.Data, n.Value.Data)
+	v := n.tape.tensor(n.Shape()) // overwritten by the copy below
+	copy(v.Data, n.Value().Data)
 	v.Scale(s)
 	return newNode("scale", v, n).withBack(func(out *Node) {
-		n.accumScaled(out.Grad, s)
+		n.accumScaled(out.Grad(), s)
 	})
 }
 
@@ -156,8 +169,8 @@ func (n *Node) Neg() *Node { return n.Scale(-1) }
 // so this only pins down the intent (and the shape check) for the
 // two-dimensional API.
 func (n *Node) AddRow(row *Node) *Node {
-	if len(row.Value.Shape) != 2 || row.Value.Shape[0] != 1 {
-		panic(fmt.Sprintf("tensai: addrow expects a 1xN row, got %s", shapeString(row.Value.Shape)))
+	if len(row.Shape()) != 2 || row.Shape()[0] != 1 {
+		panic(fmt.Sprintf("tensai: addrow expects a 1xN row, got %s", shapeString(row.Shape())))
 	}
 	return n.Add(row)
 }
@@ -166,16 +179,19 @@ func (n *Node) AddRow(row *Node) *Node {
 // bwd accumulates the input gradient given (grad, input, output).
 func (n *Node) unary(op string, fwd func(dst, src []tensai.Float), bwd func(dst, grad, src, out []tensai.Float)) *Node {
 	// fwd writes every element, so the buffer needs no clearing.
-	v := n.tape.tensor(n.Value.Shape)
-	fwd(v.Data, n.Value.Data)
+	v := n.tape.tensor(n.Shape())
+	fwd(v.Data, n.Value().Data)
 	return newNode(op, v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
-		bwd(g.Data, out.Grad.Data, n.Value.Data, v.Data)
+		bwd(g.Data, out.Grad().Data, n.Value().Data, v.Data)
 	})
 }
 
 // ReLU applies max(0, x) element-wise.
 func (n *Node) ReLU() *Node {
+	if out, ok := devActivate(gpu.ActReLU, "relu", n); ok {
+		return out
+	}
 	return n.unary("relu", kernels.ReluFwd, func(dst, grad, src, _ []tensai.Float) {
 		for i, gv := range grad {
 			if src[i] > 0 {
@@ -202,6 +218,9 @@ func (n *Node) LeakyReLU(alpha tensai.Float) *Node {
 
 // Sigmoid applies 1/(1+e^-x) element-wise.
 func (n *Node) Sigmoid() *Node {
+	if out, ok := devActivate(gpu.ActSigmoid, "sigmoid", n); ok {
+		return out
+	}
 	return n.unary("sigmoid", kernels.SigmoidFwd, func(dst, grad, _, out []tensai.Float) {
 		for i, gv := range grad {
 			y := out[i]
@@ -212,6 +231,9 @@ func (n *Node) Sigmoid() *Node {
 
 // Tanh applies tanh(x) element-wise.
 func (n *Node) Tanh() *Node {
+	if out, ok := devActivate(gpu.ActTanh, "tanh", n); ok {
+		return out
+	}
 	return n.unary("tanh", kernels.TanhFwd, func(dst, grad, _, out []tensai.Float) {
 		for i, gv := range grad {
 			y := out[i]
@@ -222,6 +244,9 @@ func (n *Node) Tanh() *Node {
 
 // GELU applies the Gaussian error linear unit element-wise.
 func (n *Node) GELU() *Node {
+	if out, ok := devActivate(gpu.ActGELU, "gelu", n); ok {
+		return out
+	}
 	return n.unary("gelu", kernels.GeluFwd, func(dst, grad, src, _ []tensai.Float) {
 		// GeluBwd writes rather than accumulates, so it needs a scratch row.
 		tmp := n.tape.buffer(len(grad))
@@ -263,19 +288,19 @@ func (n *Node) T() *Node { return n.Transpose() }
 // Transpose permutes the axes of n; perm must list every axis exactly once.
 // With no arguments it swaps the last two axes.
 func (n *Node) Transpose(perm ...int) *Node {
-	v, err := n.Value.Transpose(perm...)
+	v, err := n.Value().Transpose(perm...)
 	if err != nil {
 		panic(err.Error())
 	}
 	if len(perm) == 0 {
-		perm = swapLastTwo(len(n.Value.Shape))
+		perm = swapLastTwo(len(n.Shape()))
 	}
 	inv := make([]int, len(perm))
 	for i, p := range perm {
 		inv[p] = i
 	}
 	return newNode("transpose", v, n).withBack(func(out *Node) {
-		d, err := out.Grad.Transpose(inv...)
+		d, err := out.Grad().Transpose(inv...)
 		if err != nil {
 			panic(err.Error())
 		}
@@ -298,12 +323,12 @@ func swapLastTwo(n int) []int {
 // in the engine, node values are read-only once built -- so this is the
 // cheap way in and out of the per-head layout attention wants.
 func (n *Node) Reshape(shape ...int) *Node {
-	v, err := n.Value.Reshape(shape...)
+	v, err := n.Value().Reshape(shape...)
 	if err != nil {
 		panic(err.Error())
 	}
 	return newNode("reshape", v, n).withBack(func(o *Node) {
-		d, err := o.Grad.Reshape(n.Value.Shape...)
+		d, err := o.Grad().Reshape(n.Shape()...)
 		if err != nil {
 			panic(err.Error())
 		}
@@ -313,11 +338,11 @@ func (n *Node) Reshape(shape ...int) *Node {
 
 // Softmax normalizes the last axis of n into a probability distribution.
 func (n *Node) Softmax() *Node {
-	shape := n.Value.Shape
+	shape := n.Shape()
 	d := shape[len(shape)-1]
 	v := n.tape.tensor(shape) // every element is written below
 	for pos := 0; pos < len(v.Data); pos += d {
-		row := n.Value.Data[pos : pos+d]
+		row := n.Value().Data[pos : pos+d]
 		outRow := v.Data[pos : pos+d]
 		maxVal := row[0]
 		for _, x := range row {
@@ -335,22 +360,25 @@ func (n *Node) Softmax() *Node {
 	return newNode("softmax", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for pos := 0; pos < len(v.Data); pos += d {
-			kernels.SoftmaxBwdAdd(g.Data[pos:pos+d], out.Grad.Data[pos:pos+d], v.Data[pos:pos+d])
+			kernels.SoftmaxBwdAdd(g.Data[pos:pos+d], out.Grad().Data[pos:pos+d], v.Data[pos:pos+d])
 		}
 	})
 }
 
 // Sum reduces n to a single-element node by summing every element.
 func (n *Node) Sum() *Node {
+	if out, ok := devSum(n); ok {
+		return out
+	}
 	var total tensai.Float
-	for _, x := range n.Value.Data {
+	for _, x := range n.Value().Data {
 		total += x
 	}
 	v := n.tape.tensor(scalarShape)
 	v.Data[0] = total
 	return newNode("sum", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
-		gv := out.Grad.Data[0]
+		gv := out.Grad().Data[0]
 		for i := range g.Data {
 			g.Data[i] += gv
 		}
@@ -359,7 +387,7 @@ func (n *Node) Sum() *Node {
 
 // Mean reduces n to a single-element node averaging every element.
 func (n *Node) Mean() *Node {
-	return n.Sum().Scale(1 / tensai.Float(len(n.Value.Data)))
+	return n.Sum().Scale(1 / tensai.Float(len(n.Value().Data)))
 }
 
 // axisSpan splits a shape around one axis into (outer, dim, inner) element
@@ -378,19 +406,19 @@ func axisSpan(shape []int, axis int) (int, int, int, int) {
 // SumAxis sums n along one axis. With keepDims the axis stays as a
 // length-1 dimension; otherwise it is dropped.
 func (n *Node) SumAxis(axis int, keepDims bool) *Node {
-	outer, dim, inner, a := axisSpan(n.Value.Shape, axis)
-	v := n.tape.zeros(reducedShape(n.Value.Shape, a, keepDims)) // accumulated into
+	outer, dim, inner, a := axisSpan(n.Shape(), axis)
+	v := n.tape.zeros(reducedShape(n.Shape(), a, keepDims)) // accumulated into
 	for o := 0; o < outer; o++ {
 		dst := v.Data[o*inner : (o+1)*inner]
 		for d := 0; d < dim; d++ {
-			src := n.Value.Data[(o*dim+d)*inner : (o*dim+d+1)*inner]
+			src := n.Value().Data[(o*dim+d)*inner : (o*dim+d+1)*inner]
 			kernels.AddSlice(dst, src)
 		}
 	}
 	return newNode("sumaxis", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for o := 0; o < outer; o++ {
-			src := out.Grad.Data[o*inner : (o+1)*inner]
+			src := out.Grad().Data[o*inner : (o+1)*inner]
 			for d := 0; d < dim; d++ {
 				kernels.AddSlice(g.Data[(o*dim+d)*inner:(o*dim+d+1)*inner], src)
 			}
@@ -400,7 +428,7 @@ func (n *Node) SumAxis(axis int, keepDims bool) *Node {
 
 // MeanAxis averages n along one axis, following SumAxis for keepDims.
 func (n *Node) MeanAxis(axis int, keepDims bool) *Node {
-	_, dim, _, _ := axisSpan(n.Value.Shape, axis)
+	_, dim, _, _ := axisSpan(n.Shape(), axis)
 	return n.SumAxis(axis, keepDims).Scale(1 / tensai.Float(dim))
 }
 
@@ -427,19 +455,19 @@ func reducedShape(shape []int, a int, keepDims bool) []int {
 // be parameters, so a transformer block's normalization trains along with
 // the rest.
 func (n *Node) LayerNorm(gain, bias *Node, eps tensai.Float) *Node {
-	shape := n.Value.Shape
+	shape := n.Shape()
 	d := shape[len(shape)-1]
 	gamma := affineData(gain, d, 1, "gain")
 	beta := affineData(bias, d, 0, "bias")
 
-	rows := len(n.Value.Data) / d
+	rows := len(n.Value().Data) / d
 	tp := tapeOf(n, gain, bias)
 	v := tp.tensor(shape) // LnFwdRow writes every element
-	xhat := tp.buffer(len(n.Value.Data))
+	xhat := tp.buffer(len(n.Value().Data))
 	invStd := tp.buffer(rows)
 	for r := 0; r < rows; r++ {
 		lo, hi := r*d, (r+1)*d
-		invStd[r] = kernels.LnFwdRow(v.Data[lo:hi], xhat[lo:hi], n.Value.Data[lo:hi], gamma, beta, eps)
+		invStd[r] = kernels.LnFwdRow(v.Data[lo:hi], xhat[lo:hi], n.Value().Data[lo:hi], gamma, beta, eps)
 	}
 
 	parents := []*Node{n}
@@ -467,7 +495,7 @@ func (n *Node) LayerNorm(gain, bias *Node, eps tensai.Float) *Node {
 		for r := 0; r < rows; r++ {
 			lo, hi := r*d, (r+1)*d
 			// LnBwdRow writes dx and accumulates the parameter gradients.
-			kernels.LnBwdRow(dx, out.Grad.Data[lo:hi], xhat[lo:hi], gamma, gradGamma, gradBeta, invStd[r])
+			kernels.LnBwdRow(dx, out.Grad().Data[lo:hi], xhat[lo:hi], gamma, gradGamma, gradBeta, invStd[r])
 			if g != nil {
 				kernels.AddSlice(g.Data[lo:hi], dx)
 			}
@@ -485,10 +513,10 @@ func affineData(p *Node, d int, fill tensai.Float, what string) []tensai.Float {
 		}
 		return out
 	}
-	if len(p.Value.Data) != d {
-		panic(fmt.Sprintf("tensai: layernorm %s has %d elements, want %d", what, len(p.Value.Data), d))
+	if len(p.Value().Data) != d {
+		panic(fmt.Sprintf("tensai: layernorm %s has %d elements, want %d", what, len(p.Value().Data), d))
 	}
-	return p.Value.Data
+	return p.Value().Data
 }
 
 // Embed looks ids up in n, a (vocab, dim) embedding table, and returns the
@@ -496,10 +524,10 @@ func affineData(p *Node, d int, fill tensai.Float, what string) []tensai.Float {
 // is (batch, seq, dim). With no shape the result is (len(ids), dim).
 // Gradients scatter back into the table, so repeated ids accumulate.
 func (n *Node) Embed(ids []int, shape ...int) *Node {
-	if len(n.Value.Shape) != 2 {
-		panic(fmt.Sprintf("tensai: embed needs a (vocab, dim) table, got %s", shapeString(n.Value.Shape)))
+	if len(n.Shape()) != 2 {
+		panic(fmt.Sprintf("tensai: embed needs a (vocab, dim) table, got %s", shapeString(n.Shape())))
 	}
-	vocab, d := n.Value.Shape[0], n.Value.Shape[1]
+	vocab, d := n.Shape()[0], n.Shape()[1]
 	if len(shape) == 0 {
 		shape = []int{len(ids)}
 	}
@@ -511,12 +539,12 @@ func (n *Node) Embed(ids []int, shape ...int) *Node {
 		if id < 0 || id >= vocab {
 			panic(fmt.Sprintf("tensai: embed id %d out of range for vocab %d", id, vocab))
 		}
-		copy(v.Data[i*d:(i+1)*d], n.Value.Data[id*d:(id+1)*d])
+		copy(v.Data[i*d:(i+1)*d], n.Value().Data[id*d:(id+1)*d])
 	}
 	return newNode("embed", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
 		for i, id := range ids {
-			kernels.AddSlice(g.Data[id*d:(id+1)*d], out.Grad.Data[i*d:(i+1)*d])
+			kernels.AddSlice(g.Data[id*d:(id+1)*d], out.Grad().Data[i*d:(i+1)*d])
 		}
 	})
 }
@@ -524,9 +552,9 @@ func (n *Node) Embed(ids []int, shape ...int) *Node {
 // MSELoss returns the scalar mean squared error against a constant target
 // of the same shape.
 func (n *Node) MSELoss(target *tensai.Tensor) *Node {
-	if !dims.Same(n.Value.Shape, target.Shape) {
+	if !dims.Same(n.Shape(), target.Shape) {
 		panic(fmt.Sprintf("tensai: mse target is %s, want %s",
-			shapeString(target.Shape), shapeString(n.Value.Shape)))
+			shapeString(target.Shape), shapeString(n.Shape())))
 	}
 	diff := n.Sub(Input(target))
 	return diff.Mul(diff).Mean()
@@ -537,13 +565,13 @@ func (n *Node) MSELoss(target *tensai.Tensor) *Node {
 // by Sequential models. n holds logits shaped (..., classes) and target
 // holds one class index per row of that stack, in any shape.
 func (n *Node) SoftmaxCELoss(target *tensai.Tensor) *Node {
-	shape := n.Value.Shape
+	shape := n.Shape()
 	classes := shape[len(shape)-1]
-	rows := len(n.Value.Data) / classes
+	rows := len(n.Value().Data) / classes
 	if len(target.Data) != rows {
 		panic(fmt.Sprintf("tensai: softmax-ce target has %d labels, want %d", len(target.Data), rows))
 	}
-	logits := flatRows(n.Value, rows, classes)
+	logits := flatRows(n.Value(), rows, classes)
 	labels := flatRows(target, rows, 1)
 	lossVal, grad, err := loss.SoftmaxCrossEntropy{}.Loss(logits, labels)
 	if err != nil {
@@ -553,7 +581,7 @@ func (n *Node) SoftmaxCELoss(target *tensai.Tensor) *Node {
 	v.Data[0] = lossVal
 	return newNode("softmax_ce", v, n).withBack(func(out *Node) {
 		g := n.ensureGrad()
-		scale := out.Grad.Data[0]
+		scale := out.Grad().Data[0]
 		for i, gv := range grad.Data {
 			g.Data[i] += scale * gv
 		}
