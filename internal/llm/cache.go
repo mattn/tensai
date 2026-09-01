@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"unsafe"
 
@@ -28,7 +29,7 @@ const cacheMagic = "TSAICCH\x00"
 // cacheFormat names the serialized layouts and the walk order; bump it
 // whenever either changes so stale caches rewrite instead of decoding
 // garbage.
-const cacheFormat = 1
+const cacheFormat = 2
 
 // Record kinds, one per weight representation the model can hold.
 const (
@@ -84,6 +85,11 @@ func walkWeights(m *qwen, c weightCodec) {
 	c.vec(&m.normW)
 	c.mat(&m.lmT)
 	c.qmat(&m.qLmT)
+	// gemma4's per-layer embedding projection. The table itself is not
+	// here: it stays in the gguf and is read a row at a time.
+	c.mat(&m.wPleIn)
+	c.qmat(&m.qPleIn)
+	c.vec(&m.pleNorm)
 	for i := range m.blocks {
 		b := &m.blocks[i]
 		c.vec(&b.ln1)
@@ -108,6 +114,13 @@ func walkWeights(m *qwen, c weightCodec) {
 		c.qmat(&b.sharedGU)
 		c.qmat(&b.sharedDown)
 		c.vec(&b.sharedGate)
+		c.mat(&b.wPleGate)
+		c.qmat(&b.qPleGate)
+		c.mat(&b.wPleProj)
+		c.qmat(&b.qPleProj)
+		c.vec(&b.plePost)
+		c.vec(&b.outScale)
+		c.vec(&b.ropeFF)
 		for e := range b.experts {
 			x := &b.experts[e]
 			c.qmat(&x.qGU)
@@ -406,6 +419,15 @@ func loadWeightCache(cpath, src string, bits int, direct bool, cfg config, headS
 	}
 	if r.off != len(data) {
 		return bad(errCacheCorrupt)
+	}
+	// The per-layer embedding table is never copied into the cache: it
+	// is the largest tensor in the file and a step reads one row of it,
+	// so the model keeps reading it where it already sits.
+	if cfg.PLEDim > 0 {
+		m.embScale = float32(math.Sqrt(float64(cfg.HiddenSize)))
+		if m.ple, err = newPLETable(src, cfg); err != nil {
+			return bad(err)
+		}
 	}
 	m.initRopeFreqs()
 	cacheFiles = append(cacheFiles, f)

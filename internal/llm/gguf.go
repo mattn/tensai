@@ -1301,9 +1301,7 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 	}
 	// A valid repack cache stands in for the whole tensor load: the
 	// weights map straight from the cache file as clean pages.
-	// gemma4's per-layer embeddings, per-layer widths, and shared caches
-	// have no place in the repack cache format, so it sits that one out.
-	useCache := cache && bits != 0 && arch != "gemma4"
+	useCache := cache && bits != 0
 	// Requantization's per-column scales decode materially faster than
 	// the direct Q8_0 group scales. Once a user has paid its one-time
 	// conversion cost, prefer that valid cache on ordinary -q8 runs too.
@@ -1433,9 +1431,7 @@ func loadGGUF(path string, bits int, direct, cache bool) (*qwen, *tokenizer.Toke
 				b.wPleGate, b.qPleGate = linAuto([]string{p + "inp_gate.weight"}, []int{0})
 				b.wPleProj, b.qPleProj = linAuto([]string{p + "proj.weight"}, []int{0})
 				b.plePost = tensor(p + "post_norm.weight").Data
-				if s := vecOpt(p + "layer_output_scale.weight"); len(s) > 0 {
-					b.outScale = s[0]
-				}
+				b.outScale = vecOpt(p + "layer_output_scale.weight")
 				if !cfg.SWAPattern[i] {
 					b.ropeFF = ropeFF
 				}
