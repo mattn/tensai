@@ -97,6 +97,15 @@ back at the listing. A download lands in the user cache directory
 (`~/.cache/tensai` on Linux); to keep a model anywhere else, fetch it there and
 name its path. `-draft` takes the same forms, minus `.gguf`.
 
+Gated repositories -- Gemma and Llama among them -- serve 401 until their
+licence is accepted and a token is sent. tensai looks for one in `HF_TOKEN`,
+`HUGGING_FACE_HUB_TOKEN` or `HUGGINGFACE_TOKEN`, and then in the file
+`huggingface-cli login` writes (`$HF_HOME/token`, by default
+`~/.cache/huggingface/token`), so a machine that has logged in needs nothing
+further. A refused download says which of the two is missing rather than
+retrying: no token at all, or a token whose account has not accepted that
+repository's licence.
+
 A download that dies partway is kept and resumed rather than started over,
 which matters when the file is fifteen gigabytes: the partial sits beside the
 model as `<name>.tmp` and the next attempt asks for the rest. The resume is

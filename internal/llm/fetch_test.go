@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -188,5 +189,87 @@ func TestFetchGGUFRejectsBadRefs(t *testing.T) {
 		if _, err := FetchGGUF(ref); err == nil {
 			t.Errorf("FetchGGUF(%q): expected an error", ref)
 		}
+	}
+}
+
+// TestHFTokenSources checks where the token is looked for and in what
+// order, since a machine that has logged in with the huggingface tooling
+// should need no further setup.
+func TestHFTokenSources(t *testing.T) {
+	for _, env := range []string{"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACE_TOKEN", "HF_HOME"} {
+		t.Setenv(env, "")
+	}
+	home := t.TempDir()
+	t.Setenv("HF_HOME", home)
+	if err := os.WriteFile(filepath.Join(home, "token"), []byte("  file-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The file is the fallback; the environment wins over it.
+	reset := func() { hfTokenOnce, hfTokenValue = sync.Once{}, "" }
+	reset()
+	if got := hfToken(); got != "file-token" {
+		t.Errorf("token from the login file: got %q", got)
+	}
+	t.Setenv("HF_TOKEN", "env-token")
+	reset()
+	if got := hfToken(); got != "env-token" {
+		t.Errorf("token from the environment: got %q", got)
+	}
+	t.Setenv("HF_TOKEN", "")
+	t.Setenv("HUGGING_FACE_HUB_TOKEN", "alt-token")
+	reset()
+	if got := hfToken(); got != "alt-token" {
+		t.Errorf("token from the alternate variable: got %q", got)
+	}
+
+	// Nothing anywhere is not an error, just an empty token.
+	t.Setenv("HUGGING_FACE_HUB_TOKEN", "")
+	t.Setenv("HF_HOME", t.TempDir())
+	reset()
+	if got := hfToken(); got != "" {
+		t.Errorf("token with none configured: got %q", got)
+	}
+	reset()
+}
+
+// TestFetchSendsToken checks that a download carries the token, and that a
+// refused one says what to do about it instead of retrying.
+func TestFetchSendsToken(t *testing.T) {
+	t.Setenv("HF_TOKEN", "secret")
+	hfTokenOnce, hfTokenValue = sync.Once{}, ""
+	defer func() { hfTokenOnce, hfTokenValue = sync.Once{}, "" }()
+
+	var seen string
+	var gated bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Get("Authorization")
+		if gated {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Write([]byte("weights"))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path, err := fetch(srv.URL+"/", dir, "model.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seen != "Bearer secret" {
+		t.Errorf("Authorization header: got %q", seen)
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != "weights" {
+		t.Fatalf("downloaded %q, %v", b, err)
+	}
+
+	gated = true
+	_, err = fetch(srv.URL+"/", t.TempDir(), "gated.bin")
+	if err == nil {
+		t.Fatal("expected the refused download to fail")
+	}
+	if !strings.Contains(err.Error(), "licence") {
+		t.Errorf("error should say what to do about a gated repository: %v", err)
 	}
 }
