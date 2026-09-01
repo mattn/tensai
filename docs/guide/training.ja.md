@@ -76,6 +76,29 @@ net.LoadFile("model.json")
 
 Go の外へのデプロイには TFLite / ONNX エクスポートがあります — [モデルフォーマット](../formats.md)参照。
 
+## Sequential を自動微分エンジンで学習する
+
+`Fit` は各層の Forward と Backward を回します。CPU では最速で、最初からある道です。`net.Graph()` は同じモデルを autograd グラフとして組み立てます:
+
+```go
+g, err := net.Graph()
+trainer := autograd.NewTrainer(optim.NewAdam(0.01), g.Params()...)
+tape := autograd.NewTape()
+tape.UseDevice(dev) // 任意。GPU ガイド参照
+tape.Bind(g.Params()...)
+
+for step := 0; step < steps; step++ {
+	loss, _ := g.Loss(g.Forward(autograd.Input(x)), y)
+	trainer.Step(loss)
+	tape.Reset()
+}
+g.Sync() // デバイス上の重みを層に書き戻す
+```
+
+パラメータは層が持っている行列そのものなので、グラフで学習することはモデルを学習することです。`Predict` も `Save` もエクスポートもそのまま動き、グラフの順伝播は `Predict` と float32 の丸め誤差の範囲で一致します。増えるのは GPU です — グラフは tape が送った先で走りますが、手書きのスタックはそうはいきません。
+
+Dense、活性化、LayerNorm、Conv2D、MaxPool2D にはグラフ形があります。Dropout・BatchNorm・Embedding はまだ無く、それらを含むモデルは `Fit` と違う学習を黙って行うのではなくエラーになります。
+
 ## 低アロケーション学習
 
 レイヤーは順伝播/逆伝播のスクラッチバッファを学習ステップをまたいで再利用するので、MLP の 1 ステップは約 29 アロケーションで済み、GC は学習ループの外に留まります。`Predict` は常に新しくアロケートした結果を返すので、予測は保持しても安全です。

@@ -9,6 +9,10 @@ import (
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/autograd"
+	"github.com/mattn/tensai/gpu"
+	"github.com/mattn/tensai/layer"
+	"github.com/mattn/tensai/loss"
+	"github.com/mattn/tensai/model"
 	"github.com/mattn/tensai/optim"
 )
 
@@ -345,6 +349,87 @@ func TestGPUResidentShapes(t *testing.T) {
 		}
 		if v := s.node.Value(); len(v.Shape) != len(s.want) {
 			t.Fatalf("%s downloaded shape %v, want %v", s.name, v.Shape, s.want)
+		}
+	}
+}
+
+// TestGPUSequentialGraph trains a Sequential model through its graph form
+// on the device and checks the result against the same training on the
+// host. The model is an ordinary layer stack: it is the graph that puts it
+// on a GPU, which the hand-written Forward and Backward cannot.
+func TestGPUSequentialGraph(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+
+	build := func() (*model.Sequential, *tensai.Matrix, *tensai.Matrix) {
+		rng := rand.New(rand.NewSource(313))
+		x := randTensor(rng, 16, 24)
+		y := randTensor(rng, 16, 4)
+		xm, err := x.Matrix()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ym, err := y.Matrix()
+		if err != nil {
+			t.Fatal(err)
+		}
+		net := model.NewSequential()
+		net.Add(layer.NewDense(32))
+		net.Add(&layer.Tanh{})
+		net.Add(layer.NewDense(4))
+		// NewSequential seeds its own generator, so two models built the
+		// same way start from the same weights.
+		if err := net.Compile(24, loss.MeanSquaredError{}, optim.NewAdam(0.01)); err != nil {
+			t.Fatal(err)
+		}
+		return net, xm, ym
+	}
+
+	train := func(dev *gpu.Device) (*model.Sequential, tensai.Float) {
+		net, x, y := build()
+		graph, err := net.Graph()
+		if err != nil {
+			t.Fatal(err)
+		}
+		trainer := autograd.NewTrainer(optim.NewAdam(0.01), graph.Params()...)
+		tape := autograd.NewTape()
+		if dev != nil {
+			tape.UseDevice(dev)
+		}
+		tape.Bind(graph.Params()...)
+		var last tensai.Float
+		for i := 0; i < 60; i++ {
+			l, err := graph.Loss(graph.Forward(autograd.Input(x)), y)
+			if err != nil {
+				t.Fatal(err)
+			}
+			last = trainer.Step(l)
+			tape.Reset()
+		}
+		graph.Sync()
+		return net, last
+	}
+
+	cpuNet, cpuLoss := train(nil)
+	devNet, devLoss := train(g)
+	if diff := math.Abs(float64(cpuLoss - devLoss)); diff > 1e-3*(1+math.Abs(float64(cpuLoss))) {
+		t.Fatalf("loss differs: cpu=%g device=%g", cpuLoss, devLoss)
+	}
+
+	// Sync copied the device's weights back into the layers, so the model
+	// predicts with them.
+	_, x, _ := build()
+	want, err := cpuNet.Predict(x)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := devNet.Predict(x)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(want.Data[i] - got.Data[i])); diff > 1e-3*(1+math.Abs(float64(want.Data[i]))) {
+			t.Fatalf("prediction %d: cpu=%v device=%v", i, want.Data[i], got.Data[i])
 		}
 	}
 }

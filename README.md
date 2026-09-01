@@ -21,7 +21,7 @@
 - **Optimizers** - momentum `SGD`, `Adam`, and `AdamW` (decoupled weight decay)
 - **k-NN baseline** - a `knn.Classifier` whose distance matrix runs on the same SIMD matmul kernel; useful as a no-training baseline next to the networks
 - **Dataset utilities** - `Dataset` pairs inputs with targets and provides `Shuffle`, train/test `Split` (copy-free views), buffer-reusing mini-batch iteration with `Batches`, and `Standardize`/`StandardizeWith`
-- **Sequential models** - stack layers and run `Compile` -> `Fit` / `FitStep` -> `Predict`
+- **Sequential models** - stack layers and run `Compile` -> `Fit` / `FitStep` -> `Predict`; `Graph()` builds the same model as an autograd graph instead, which trains the very same weights and can run on a GPU
 - **Automatic differentiation** - a micrograd-style reverse-mode autograd engine over n-dimensional tensors (`Param` / `Input` / `Backward`), for models that don't fit the Sequential mold. Values are `Tensor`s, so the same ops run on (batch, seq, model) activations: broadcasting element-wise arithmetic, batched `MatMul`, `Transpose`/`Reshape`, last-axis `Softmax`, axis reductions, `LayerNorm`, embedding `Embed`, and `CrossEntropy` all carry gradients, and a `Matrix` is still accepted anywhere a leaf is built. `ToDot` renders the computation graph for Graphviz
 - **Recurrence and attention** - `rnn.Cell`, `rnn.LSTMCell`, and single-head `rnn.SelfAttention` built on the autograd engine, with backpropagation through time handled automatically
 - **Serialization** - `Save`/`Load` (and `SaveFile`/`LoadFile`) round-trip trained Sequential parameters as JSON, including BatchNorm running statistics; `SaveParams`/`LoadParams` do the same for autograd parameters (RNN/LSTM/attention cells)
