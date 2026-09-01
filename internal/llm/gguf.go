@@ -753,7 +753,6 @@ func blockShape(b *qblock, cfg config, i int) {
 	// SmolLM3 skips RoPE on every fourth layer; the GGUF carries no
 	// flag for it, matching llama.cpp's hardcoded rule.
 	b.noPE = arch == "smollm3" && i%4 == 3
-	b.kvFrom = -1
 	switch arch {
 	case "gemma3":
 		// Five of every six layers attend over a sliding window
@@ -785,6 +784,7 @@ func blockShape(b *qblock, cfg config, i int) {
 		// Past KVFromStart a layer projects queries only and attends
 		// against the last layer of its own kind that kept a cache.
 		if i >= cfg.KVFromStart {
+			b.kvShared = true
 			b.kvFrom = cfg.KVFromStart - 1
 			if cfg.SWAPattern[i] {
 				b.kvFrom = cfg.KVFromStart - 2
@@ -1461,7 +1461,7 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 				// Phi-3 ships q/k/v pre-fused in that order — the layout
 				// the runtime wants, no permutation (NEOX rope).
 				b.wQKV, b.qQKV = linAuto([]string{p + "attn_qkv.weight"}, []int{0})
-			} else if b.kvFrom >= 0 {
+			} else if b.kvShared {
 				// A layer that attends against an earlier layer's cache
 				// projects queries and nothing else.
 				b.wQKV, b.qQKV = linAuto([]string{p + "attn_q.weight"}, []int{qPerm})

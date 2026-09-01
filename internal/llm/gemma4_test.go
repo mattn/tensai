@@ -36,7 +36,7 @@ func TestGemma4BlockShape(t *testing.T) {
 		window int
 		theta  float64
 		ff     int
-		kvFrom int
+		kvFrom int // -1 for a layer that keeps its own
 	}{
 		{0, 256, 512, 10000, 6144, -1},   // local, its own cache
 		{4, 512, 0, 0, 6144, -1},         // global, its own cache
@@ -50,14 +50,18 @@ func TestGemma4BlockShape(t *testing.T) {
 			t.Errorf("layer %d: head %d window %d theta %v, want %d %d %v",
 				tt.layer, b.headSz, b.window, b.ropeTheta, tt.head, tt.window, tt.theta)
 		}
-		if b.ff != tt.ff || b.kvFrom != tt.kvFrom {
-			t.Errorf("layer %d: ff %d kvFrom %d, want %d %d", tt.layer, b.ff, b.kvFrom, tt.ff, tt.kvFrom)
+		kvFrom := -1
+		if b.kvShared {
+			kvFrom = b.kvFrom
+		}
+		if b.ff != tt.ff || kvFrom != tt.kvFrom {
+			t.Errorf("layer %d: ff %d kvFrom %d, want %d %d", tt.layer, b.ff, kvFrom, tt.ff, tt.kvFrom)
 		}
 		if !b.geglu || !b.vNorm || !b.unitQK {
 			t.Errorf("layer %d: geglu %v vNorm %v unitQK %v", tt.layer, b.geglu, b.vNorm, b.unitQK)
 		}
 		// A layer reusing a cache must find the same geometry there.
-		if b.kvFrom >= 0 && blocks[b.kvFrom].headSz != b.headSz {
+		if b.kvShared && blocks[b.kvFrom].headSz != b.headSz {
 			t.Errorf("layer %d reuses layer %d, whose head is %d not %d",
 				tt.layer, b.kvFrom, blocks[b.kvFrom].headSz, b.headSz)
 		}
@@ -67,8 +71,8 @@ func TestGemma4BlockShape(t *testing.T) {
 		cfg := config{ModelType: arch, Layers: 4, SlidingWin: 128}
 		var b qblock
 		blockShape(&b, cfg, 1)
-		if b.kvFrom != -1 || b.ff != 0 || b.unitQK {
-			t.Errorf("%s: kvFrom %d ff %d unitQK %v", arch, b.kvFrom, b.ff, b.unitQK)
+		if b.kvShared || b.ff != 0 || b.unitQK {
+			t.Errorf("%s: kvShared %v ff %d unitQK %v", arch, b.kvShared, b.ff, b.unitQK)
 		}
 	}
 }
@@ -167,10 +171,10 @@ func TestGemma4E4BShape(t *testing.T) {
 	// The layer the reuse rule picks has to be the same kind, which is
 	// what makes the shared cache the right shape.
 	for i, b := range blocks {
-		if (i < cfg.KVFromStart) != (b.kvFrom < 0) {
-			t.Fatalf("layer %d: kvFrom %d against a boundary at %d", i, b.kvFrom, cfg.KVFromStart)
+		if (i < cfg.KVFromStart) == b.kvShared {
+			t.Fatalf("layer %d: kvShared %v against a boundary at %d", i, b.kvShared, cfg.KVFromStart)
 		}
-		if b.kvFrom >= 0 && blocks[b.kvFrom].headSz != b.headSz {
+		if b.kvShared && blocks[b.kvFrom].headSz != b.headSz {
 			t.Errorf("layer %d (head %d) reuses layer %d (head %d)",
 				i, b.headSz, b.kvFrom, blocks[b.kvFrom].headSz)
 		}

@@ -45,8 +45,9 @@ type gpuLayer struct {
 	// The widths belong to the layer, not to the model: gemma4 alternates
 	// two head widths and two feed-forward widths, and its deeper layers
 	// project queries only and attend against an earlier layer's cache
-	// (kvFrom, -1 when the layer keeps its own).
+	// (kvFrom, meaningful only when kvShared).
 	headSz, qDim, kvDim, ff int
+	kvShared                bool
 	kvFrom                  int
 	// gemma4: its logits carry no 1/sqrt(head) (qScale folds that back
 	// into the queries), its values are normalized without a weight of
@@ -271,7 +272,7 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw, vlog io.Writer) (*gpuQwe
 		l.qDim = m.cfg.Heads * l.headSz
 		l.kvDim = m.cfg.KVHeads * l.headSz
 		l.ff = m.ffWidth(b)
-		l.kvFrom = b.kvFrom
+		l.kvShared, l.kvFrom = b.kvShared, b.kvFrom
 		hs, kvDim := l.qDim, l.kvDim
 		// A half-precision KV cache halves the resident cache when the
 		// device has shader-f16 and this layer's head grouping fits the
@@ -280,7 +281,7 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw, vlog io.Writer) (*gpuQwe
 		// A view onto the fused result needs a 256-byte aligned offset,
 		// so both the q and the q|k boundary have to sit on 64 floats.
 		fuseQKV := hs%64 == 0 && kvDim%64 == 0
-		if l.kvFrom >= 0 {
+		if l.kvShared {
 			// Nothing but queries comes out of the projection, so the
 			// views that would carve k and v out never happen.
 			fuseQKV = true
@@ -329,7 +330,7 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw, vlog io.Writer) (*gpuQwe
 		l.qGU = up(b.qGU)
 		l.qDown = up(b.qDown)
 		switch {
-		case l.kvFrom >= 0:
+		case l.kvShared:
 			// This layer writes no keys or values: it attends against
 			// the cache an earlier layer of its own kind already fills.
 			src := &gq.layers[l.kvFrom]
@@ -387,7 +388,7 @@ func (gq *gpuQwen) qkv(l *gpuLayer, x *gpu.Tensor, norm *gpu.Tensor, eps float64
 			must(l.qv.MatMulRMSNorm(x, norm, eps, l.bv, nil)), nil
 	}
 	f := must(l.qQKV.MatMulRMSNorm(x, norm, eps, l.bQKV, nil))
-	if l.kvFrom >= 0 {
+	if l.kvShared {
 		// Queries only: there is nothing else in the row.
 		return must(f.View(0, 1, l.qDim)), nil, nil, f
 	}
@@ -409,7 +410,7 @@ func (gq *gpuQwen) qkvRows(l *gpuLayer, a *gpu.Tensor) (q, k, v *gpu.Tensor) {
 	}
 	f := must(l.qQKV.MatMulOpts(a, l.bQKV, nil))
 	defer f.Free()
-	if l.kvFrom >= 0 {
+	if l.kvShared {
 		return must(f.SliceCols(0, l.qDim)), nil, nil
 	}
 	return must(f.SliceCols(0, l.qDim)),
