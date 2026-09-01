@@ -718,3 +718,83 @@ func devReshape(n *Node, shape []int) (*Node, bool) {
 		}
 	}), true
 }
+
+// devEmbed looks token ids up on the device and scatters the gradient back
+// into the table there, so an embedding no longer pulls a training step
+// home. The scatter accumulates straight into the table's gradient buffer,
+// which is what devAccum would otherwise do by hand.
+func devEmbed(n *Node, ids []int, shape []int) (*Node, bool) {
+	if n.device() == nil || len(n.Shape()) != 2 {
+		return nil, false
+	}
+	tp := n.tape
+	tp.openBatch()
+	table, ok := n.resident(tp)
+	if !ok {
+		return nil, false
+	}
+	gids, err := tp.dev.UploadIndices(ids)
+	if err != nil {
+		return nil, false
+	}
+	tp.track(gids)
+	gv, err := table.Embed(gids)
+	if err != nil {
+		return nil, false
+	}
+	out := devNode("embed", gv, shape, n)
+	return out.withBack(func(out *Node) {
+		grad, ok := out.residentGrad()
+		if !ok {
+			panic("tensai: no device gradient for a device embed")
+		}
+		dst, ok := n.residentGrad()
+		if !ok {
+			panic("tensai: no device gradient buffer for an embedding table")
+		}
+		if err := dst.EmbedGrad(grad, gids); err != nil {
+			panic("tensai: device embed backward: " + err.Error())
+		}
+		n.grad = nil
+	}), true
+}
+
+// devScale multiplies by a constant on the device: the kernels repeat a
+// single-element operand over the whole tensor, so no buffer of ones is
+// needed. Attention scales its scores this way, and those are the largest
+// tensors in a block.
+func devScale(n *Node, s tensai.Float) (*Node, bool) {
+	if n.device() == nil {
+		return nil, false
+	}
+	tp := n.tape
+	tp.openBatch()
+	gx, ok := n.resident(tp)
+	if !ok {
+		return nil, false
+	}
+	factor, err := tp.dev.Upload(scalarTensor(s))
+	if err != nil {
+		return nil, false
+	}
+	tp.track(factor)
+	gv, err := gx.Binary(gpu.OpMul, factor)
+	if err != nil {
+		return nil, false
+	}
+	out := devNode("scale", gv, n.Shape(), n)
+	return out.withBack(func(out *Node) {
+		grad, ok := out.residentGrad()
+		if !ok {
+			panic("tensai: no device gradient for a device scale")
+		}
+		d, err := grad.Binary(gpu.OpMul, factor)
+		if err != nil {
+			panic("tensai: device scale backward: " + err.Error())
+		}
+		out.tape.track(d)
+		if !devAccum(n, d, n.Shape()) {
+			panic("tensai: device scale cannot reduce its gradient")
+		}
+	}), true
+}

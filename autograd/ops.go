@@ -154,6 +154,9 @@ func (n *Node) Div(o *Node) *Node {
 
 // Scale returns n multiplied by the scalar s.
 func (n *Node) Scale(s tensai.Float) *Node {
+	if out, ok := devScale(n, s); ok {
+		return out
+	}
 	v := n.tape.tensor(n.Shape()) // overwritten by the copy below
 	copy(v.Data, n.Value().Data)
 	v.Scale(s)
@@ -550,11 +553,17 @@ func (n *Node) Embed(ids []int, shape ...int) *Node {
 	if dims.Prod(shape) != len(ids) {
 		panic(fmt.Sprintf("tensai: embed has %d ids for index shape %s", len(ids), shapeString(shape)))
 	}
-	v := n.tape.tensor(append(append(make([]int, 0, len(shape)+1), shape...), d))
-	for i, id := range ids {
+	for _, id := range ids {
 		if id < 0 || id >= vocab {
 			panic(fmt.Sprintf("tensai: embed id %d out of range for vocab %d", id, vocab))
 		}
+	}
+	outShape := append(append(make([]int, 0, len(shape)+1), shape...), d)
+	if out, ok := devEmbed(n, ids, outShape); ok {
+		return out
+	}
+	v := n.tape.tensor(outShape)
+	for i, id := range ids {
 		copy(v.Data[i*d:(i+1)*d], n.Value().Data[id*d:(id+1)*d])
 	}
 	return newNode("embed", v, n).withBack(func(out *Node) {

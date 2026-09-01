@@ -441,3 +441,68 @@ func TestGPUPermute(t *testing.T) {
 		t.Error("expected an unsupported-rank error")
 	}
 }
+
+// TestGPUEmbed checks the lookup and its scatter-add, with an index that
+// repeats so the atomic path is exercised.
+func TestGPUEmbed(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(67))
+
+	const vocab, dim = 7, 12
+	table := randTensor(rng, vocab, dim)
+	ids := []int{3, 0, 6, 0, 1, 5, 0}
+	gtable, err := g.Upload(table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gtable.Free()
+	gids, err := g.UploadIndices(ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gids.Free()
+
+	out, err := gtable.Embed(gids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Free()
+	got, err := out.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]tensai.Float, len(ids)*dim)
+	for i, id := range ids {
+		copy(want[i*dim:(i+1)*dim], table.Data[id*dim:(id+1)*dim])
+	}
+	checkClose(t, "embed", got, want, 0)
+
+	// The scatter adds into whatever the gradient buffer already holds.
+	grad := randTensor(rng, len(ids), dim)
+	ggrad, err := g.Upload(grad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ggrad.Free()
+	start := randTensor(rng, vocab, dim)
+	gdst, err := g.Upload(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gdst.Free()
+	if err := gdst.EmbedGrad(ggrad, gids); err != nil {
+		t.Fatal(err)
+	}
+	gotGrad, err := gdst.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantGrad := append([]tensai.Float(nil), start.Data...)
+	for i, id := range ids {
+		for j := 0; j < dim; j++ {
+			wantGrad[id*dim+j] += grad.Data[i*dim+j]
+		}
+	}
+	checkClose(t, "embed scatter", gotGrad, wantGrad, 1e-5)
+}

@@ -101,7 +101,7 @@ db, _ := gdelta.SumCols()           // the gradient of a row broadcast over a ba
 gw.AdamStep(ggrad, gm, gv, lr, b1, b2, rc1, rc2, eps, 0)
 ```
 
-`LayerNorm`, `LayerNormGrad` and `LayerNormXhat` normalize the last axis and take it apart again, `SoftmaxGrad` applies the softmax Jacobian in one pass, and `Permute` reorders up to four axes -- the reshape-and-transpose attention splits its heads with. `Activate` and `ActivateGrad` cover ReLU, tanh, sigmoid and GELU, and follow the CPU kernels exactly -- the GELU here is the error function, not the tanh approximation the inference path fuses into its FFN -- so a model can move between device and host mid-training. `AdamStep` matches the `optim` kernel the same way, moments included.
+`LayerNorm`, `LayerNormGrad` and `LayerNormXhat` normalize the last axis and take it apart again, `SoftmaxGrad` applies the softmax Jacobian in one pass, and `Permute` reorders up to four axes -- the reshape-and-transpose attention splits its heads with. `Embed` gathers table rows for a list of indices uploaded with `UploadIndices`, and `EmbedGrad` scatters the gradient back: WGSL has no atomic add for f32, so it is a compare-and-swap on the bit pattern, which lets a token that repeats in a batch accumulate correctly. `Activate` and `ActivateGrad` cover ReLU, tanh, sigmoid and GELU, and follow the CPU kernels exactly -- the GELU here is the error function, not the tanh approximation the inference path fuses into its FFN -- so a model can move between device and host mid-training. `AdamStep` matches the `optim` kernel the same way, moments included.
 
 ## Measuring the crossover
 
