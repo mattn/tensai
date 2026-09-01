@@ -21,11 +21,11 @@ func checkParamGrad(t *testing.T, param *tensai.Tensor, build func() (*autograd.
 	// accumulates, so start from a clean gradient.
 	autograd.ZeroGrads(p)
 	loss.Backward()
-	if p.Grad == nil {
+	if p.Grad() == nil {
 		t.Fatalf("%s: no gradient computed", name)
 	}
-	analytic := make([]float64, len(p.Grad.Data))
-	for i, g := range p.Grad.Data {
+	analytic := make([]float64, len(p.Grad().Data))
+	for i, g := range p.Grad().Data {
 		analytic[i] = float64(g)
 	}
 
@@ -39,7 +39,7 @@ func checkParamGrad(t *testing.T, param *tensai.Tensor, build func() (*autograd.
 		param.Data[i] = orig - h
 		lm, _ := build()
 		param.Data[i] = orig
-		num := float64(lp.Value.Data[0]-lm.Value.Data[0]) / (2 * h)
+		num := float64(lp.Value().Data[0]-lm.Value().Data[0]) / (2 * h)
 		if math.Abs(num-analytic[i]) > 2e-2*(1+math.Abs(num)) {
 			t.Errorf("%s grad %d: numeric=%.8f analytic=%.8f", name, i, num, analytic[i])
 		}
@@ -56,14 +56,14 @@ func TestRNNCellGradientThroughTime(t *testing.T) {
 	}
 	// Wh is used at every time step: this validates gradient accumulation
 	// through the unrolled graph (BPTT).
-	checkParamGrad(t, cell.Wh.Value, func() (*autograd.Node, *autograd.Node) {
+	checkParamGrad(t, cell.Wh.Value(), func() (*autograd.Node, *autograd.Node) {
 		h := cell.InitState(4)
 		for _, x := range steps {
 			h = cell.Step(autograd.Input(x), h)
 		}
 		return h.Sum(), cell.Wh
 	}, "rnn-Wh")
-	checkParamGrad(t, cell.Wx.Value, func() (*autograd.Node, *autograd.Node) {
+	checkParamGrad(t, cell.Wx.Value(), func() (*autograd.Node, *autograd.Node) {
 		h := cell.InitState(4)
 		for _, x := range steps {
 			h = cell.Step(autograd.Input(x), h)
@@ -87,7 +87,7 @@ func TestLSTMCellGradient(t *testing.T) {
 		{"lstm-Wxi", cell.Wxi},
 		{"lstm-Bg", cell.Bg},
 	} {
-		checkParamGrad(t, param.node.Value, func() (*autograd.Node, *autograd.Node) {
+		checkParamGrad(t, param.node.Value(), func() (*autograd.Node, *autograd.Node) {
 			h, c := cell.InitState(4)
 			for _, x := range steps {
 				h, c = cell.Step(autograd.Input(x), h, c)
@@ -110,7 +110,7 @@ func TestSelfAttentionGradient(t *testing.T) {
 		{"attn-Wk", attn.Wk},
 		{"attn-Wv", attn.Wv},
 	} {
-		checkParamGrad(t, param.node.Value, func() (*autograd.Node, *autograd.Node) {
+		checkParamGrad(t, param.node.Value(), func() (*autograd.Node, *autograd.Node) {
 			out := attn.Forward(autograd.Input(seq))
 			return out.MulElem(autograd.Input(weights)).Sum(), param.node
 		}, param.name)
@@ -162,7 +162,7 @@ func TestRNNLearnsParity(t *testing.T) {
 	logits := forward()
 	for s := 0; s < batch; s++ {
 		best := 0
-		if logits.Value.At(s, 1) > logits.Value.At(s, 0) {
+		if logits.Value().At(s, 1) > logits.Value().At(s, 0) {
 			best = 1
 		}
 		if best != int(targets.Data[s]) {
@@ -179,7 +179,7 @@ func TestSaveLoadParams(t *testing.T) {
 	forward := func(c *LSTMCell) *tensai.Tensor {
 		h, s := c.InitState(4)
 		h, _ = c.Step(autograd.Input(x), h, s)
-		return h.Value
+		return h.Value()
 	}
 	want := forward(cell)
 

@@ -26,6 +26,6 @@ func main() {
 
 	// Reverse-mode autodiff fills in the gradients.
 	z.Backward()
-	fmt.Printf("dz/dx = %v\n", x.Grad.Data[0])
-	fmt.Printf("dz/dy = %v\n", y.Grad.Data[0])
+	fmt.Printf("dz/dx = %v\n", x.Grad().Data[0])
+	fmt.Printf("dz/dy = %v\n", y.Grad().Data[0])
 }

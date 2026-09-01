@@ -174,7 +174,7 @@ func TestBroadcastGradientReduction(t *testing.T) {
 	p := Param(b)
 	x := tensai.NewTensor(2, 4, 3)
 	Input(x).Add(p).Sum().Backward()
-	for i, g := range p.Grad.Data {
+	for i, g := range p.grad.Data {
 		if g != 8 { // 2 x 4 positions share each bias element
 			t.Errorf("bias grad %d = %g, want 8", i, g)
 		}
@@ -188,7 +188,7 @@ func TestEmbedAccumulatesRepeats(t *testing.T) {
 	p := Param(table)
 	p.Embed([]int{1, 1, 2}).Sum().Backward()
 	want := []tensai.Float{0, 0, 2, 2, 1, 1}
-	for i, g := range p.Grad.Data {
+	for i, g := range p.grad.Data {
 		if g != want[i] {
 			t.Errorf("table grad %d = %g, want %g", i, g, want[i])
 		}
@@ -202,7 +202,7 @@ func TestLayerNormMatchesDefinition(t *testing.T) {
 	x := randTensor(rng, 2, 3, 4)
 	out := Input(x).LayerNorm(nil, nil, 1e-5)
 	for r := 0; r < 6; r++ {
-		row := out.Value.Data[r*4 : (r+1)*4]
+		row := out.value.Data[r*4 : (r+1)*4]
 		var mean, sq tensai.Float
 		for _, v := range row {
 			mean += v
@@ -250,9 +250,9 @@ func TestTensorParamsRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, p := range params {
-		for j, v := range p.Value.Data {
-			if restored[i].Value.Data[j] != v {
-				t.Fatalf("param %d element %d: got %g, want %g", i, j, restored[i].Value.Data[j], v)
+		for j, v := range p.value.Data {
+			if restored[i].value.Data[j] != v {
+				t.Fatalf("param %d element %d: got %g, want %g", i, j, restored[i].value.Data[j], v)
 			}
 		}
 	}
@@ -272,8 +272,8 @@ func TestLegacyParamsLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, want := range []tensai.Float{1, 2, 3, 4} {
-		if p.Value.Data[i] != want {
-			t.Errorf("element %d = %g, want %g", i, p.Value.Data[i], want)
+		if p.value.Data[i] != want {
+			t.Errorf("element %d = %g, want %g", i, p.value.Data[i], want)
 		}
 	}
 }
@@ -332,7 +332,7 @@ func TestAttentionTrainsBatched(t *testing.T) {
 
 	logits := forward()
 	for i, want := range labels {
-		row := logits.Value.Data[i*vocab : (i+1)*vocab]
+		row := logits.value.Data[i*vocab : (i+1)*vocab]
 		best := 0
 		for j, v := range row {
 			if v > row[best] {

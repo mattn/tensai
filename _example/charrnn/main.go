@@ -102,7 +102,7 @@ func (m *charModel) generate(prefix string, n int, temperature float32, rng *ran
 		feed(r)
 	}
 	for i := 0; i < n; i++ {
-		probs := logits.Scale(1 / temperature).Softmax().Value
+		probs := logits.Scale(1 / temperature).Softmax().Value()
 		r := m.vocab[sample(probs.Data, rng)]
 		sb.WriteRune(r)
 		feed(r)

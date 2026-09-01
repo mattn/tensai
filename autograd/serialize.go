@@ -39,10 +39,10 @@ type paramsSnapshot struct {
 func SaveParams(w io.Writer, params ...*Node) error {
 	snap := paramsSnapshot{Params: make([]paramJSON, len(params))}
 	for i, p := range params {
-		if p == nil || p.Value == nil {
+		if p == nil || p.Value() == nil {
 			return fmt.Errorf("tensai: save params: parameter %d is nil", i)
 		}
-		t := p.Value
+		t := p.Value()
 		if len(t.Shape) == 2 {
 			snap.Params[i] = paramJSON{Rows: t.Shape[0], Cols: t.Shape[1], Data: t.Data}
 			continue
@@ -71,14 +71,14 @@ func LoadParams(r io.Reader, params ...*Node) error {
 				i, shapeString(shape), len(saved.Data))
 		}
 		p := params[i]
-		if p == nil || p.Value == nil {
+		if p == nil || p.Value() == nil {
 			return fmt.Errorf("tensai: load params: parameter %d is nil", i)
 		}
-		if !dims.Same(p.Value.Shape, shape) {
+		if !dims.Same(p.Shape(), shape) {
 			return fmt.Errorf("tensai: load params %d shape mismatch: got %s, want %s",
-				i, shapeString(shape), shapeString(p.Value.Shape))
+				i, shapeString(shape), shapeString(p.Shape()))
 		}
-		copy(p.Value.Data, saved.Data)
+		copy(p.Value().Data, saved.Data)
 	}
 	return nil
 }
