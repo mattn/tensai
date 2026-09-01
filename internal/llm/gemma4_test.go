@@ -144,3 +144,42 @@ func TestGPUSupportsArch(t *testing.T) {
 		}
 	}
 }
+
+// E4B's geometry, which differs from E2B's in every way the loader has
+// to read rather than assume: 42 layers on a six-layer window cycle,
+// two KV heads, one feed-forward width for the whole model, and the KV
+// boundary in a different place.
+func TestGemma4E4BShape(t *testing.T) {
+	cfg := config{
+		ModelType: "gemma4", Layers: 42, Heads: 8, KVHeads: 2,
+		HiddenSize: 2560, HeadDim: 512, HeadDimSWA: 256,
+		SlidingWin: 512, RopeTheta: 1e6, RopeThetaSWA: 10000,
+		KVFromStart: 42 - 18, PLEDim: 256, LogitCap: 30, Intermediate: 10240,
+	}
+	for i := 0; i < cfg.Layers; i++ {
+		cfg.FFPerLayer = append(cfg.FFPerLayer, 10240)
+		cfg.SWAPattern = append(cfg.SWAPattern, (i+1)%6 != 0)
+	}
+	blocks := make([]qblock, cfg.Layers)
+	for i := range blocks {
+		blockShape(&blocks[i], cfg, i)
+	}
+	// The layer the reuse rule picks has to be the same kind, which is
+	// what makes the shared cache the right shape.
+	for i, b := range blocks {
+		if (i < cfg.KVFromStart) != (b.kvFrom < 0) {
+			t.Fatalf("layer %d: kvFrom %d against a boundary at %d", i, b.kvFrom, cfg.KVFromStart)
+		}
+		if b.kvFrom >= 0 && blocks[b.kvFrom].headSz != b.headSz {
+			t.Errorf("layer %d (head %d) reuses layer %d (head %d)",
+				i, b.headSz, b.kvFrom, blocks[b.kvFrom].headSz)
+		}
+		if b.ff != 10240 {
+			t.Errorf("layer %d: ff %d", i, b.ff)
+		}
+	}
+	if blocks[23].headSz != 512 || blocks[24].headSz != 256 {
+		t.Errorf("the window cycle is off: layer 23 head %d, layer 24 head %d",
+			blocks[23].headSz, blocks[24].headSz)
+	}
+}

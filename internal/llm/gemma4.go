@@ -19,7 +19,18 @@ import (
 // Everything here is stated per layer or not at all, so a missing array
 // is a file this loader cannot honestly claim to understand.
 func gemma4Config(g *gguf.File, cfg *config) error {
-	for _, n := range g.Ints("gemma4.feed_forward_length") {
+	ff := g.Ints("gemma4.feed_forward_length")
+	if len(ff) == 0 {
+		// E2B widens its feed-forward halfway down and states a width per
+		// layer; E4B keeps one width throughout and states it once.
+		if n, ok := g.Int("gemma4.feed_forward_length"); ok && n > 0 {
+			ff = make([]int64, cfg.Layers)
+			for i := range ff {
+				ff[i] = n
+			}
+		}
+	}
+	for _, n := range ff {
 		cfg.FFPerLayer = append(cfg.FFPerLayer, int(n))
 		cfg.Intermediate = max(cfg.Intermediate, int(n))
 	}
