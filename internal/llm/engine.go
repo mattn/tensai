@@ -196,8 +196,10 @@ func Open(o Options) (*Engine, error) {
 	if style == "" {
 		style = model.cfg.ModelType
 	}
+	// An empty system prompt is a request for no system turn at all, so
+	// only the sentinel means "the caller did not choose one".
 	system := o.System
-	if system == DefaultSystem || system == "" {
+	if system == DefaultSystem {
 		switch {
 		case style == "gpt-oss":
 			// The harmony system block: identity, reasoning effort, and
@@ -386,13 +388,11 @@ type RunResult struct {
 func (e *Engine) Generate(w io.Writer, prompt string, raw bool, n int) RunResult {
 	text := prompt
 	if !raw {
-		if e.tm.foldSystem {
-			text = e.tm.bos + e.tm.userOpen + e.system + "\n\n" + prompt + e.tm.userClose +
-				e.tm.asstOpen + e.tm.asstPrefill
-		} else {
-			text = e.tm.bos + e.tm.sysOpen + e.system + e.tm.sysClose +
-				e.tm.userOpen + prompt + e.tm.userClose + e.tm.asstOpen + e.tm.asstPrefill
+		text = e.tm.bos + e.systemTurn()
+		if e.tm.foldSystem && e.system != "" {
+			prompt = e.system + "\n\n" + prompt
 		}
+		text += e.tm.userOpen + prompt + e.tm.userClose + e.tm.asstOpen + e.tm.asstPrefill
 	}
 	ids := e.tok.Encode(text)
 	fmt.Fprintf(e.opts.Log, "prompt: %d tokens\n", len(ids))
@@ -412,10 +412,7 @@ func (e *Engine) Generate(w io.Writer, prompt string, raw bool, n int) RunResult
 // Chat runs an interactive multi-turn loop: one line of in per turn, the
 // KV cache carrying the conversation, until EOF or an empty line.
 func (e *Engine) Chat(in io.Reader, w io.Writer, n int) {
-	pre := e.tm.bos
-	if !e.tm.foldSystem {
-		pre += e.tm.sysOpen + e.system + e.tm.sysClose
-	}
+	pre := e.tm.bos + e.systemTurn()
 	if pre != "" {
 		e.feed(e.tok.Encode(pre))
 	}
@@ -428,7 +425,7 @@ func (e *Engine) Chat(in io.Reader, w io.Writer, n int) {
 			break
 		}
 		text := sc.Text()
-		if e.tm.foldSystem && first {
+		if e.tm.foldSystem && first && e.system != "" {
 			text = e.system + "\n\n" + text
 		}
 		first = false
@@ -1039,6 +1036,17 @@ type tmpl struct {
 	// What is between them is the model reasoning, not its reply, and the
 	// API keeps the two apart.
 	reasonOpen, reasonClose string
+}
+
+// systemTurn renders the system turn, or nothing at all: a family that
+// folds the system prompt into the first user turn has no turn to write,
+// and an empty prompt means the caller asked for none, which is not the
+// same as a turn with nothing in it.
+func (e *Engine) systemTurn() string {
+	if e.tm.foldSystem || e.system == "" {
+		return ""
+	}
+	return e.tm.sysOpen + e.system + e.tm.sysClose
 }
 
 func templateFor(modelType string, think bool) tmpl {

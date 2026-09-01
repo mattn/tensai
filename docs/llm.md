@@ -95,6 +95,8 @@ commands:
 
 All model commands share the same flags: `-model` (which model to run), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
 
+Each family gets a system prompt of its own when the caller does not choose one. `-system ""` sends no system turn at all rather than an empty one, which is what a model's own template writes when it is handed no system message: it is the flag to reach for when comparing against another runtime, since the system turn is otherwise the one thing in the prompt that differs.
+
 `-model` is the only thing that says which model to run, and it reads whichever
 form you hand it, in this order:
 

@@ -292,7 +292,8 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 		}
 	}
 	offered := hermes || qwenXML
-	if !tm.foldSystem {
+	// An empty system prompt means no system turn, not an empty one.
+	if !tm.foldSystem && system != "" {
 		b.WriteString(tm.sysOpen + system + tm.sysClose)
 	}
 	// A thinking family keeps the think block on the assistant turns
@@ -371,7 +372,7 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 			b.WriteString(tm.asstClose)
 		default:
 			text := m.Content
-			if tm.foldSystem && first {
+			if tm.foldSystem && first && system != "" {
 				text = system + "\n\n" + text
 			}
 			first = false
