@@ -934,6 +934,15 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// held is the text accepted but not yet streamed, kept only long
 	// enough to rule out the start of a call marker.
+	markers := callMarkers(s.tm.toolCalls)
+	if s.tm.toolCalls == "gemma4" {
+		// A gemma4 call sometimes arrives without its marker; the name
+		// and its brace are the next best thing to wait on, and no
+		// ordinary sentence writes one.
+		for _, t := range tools {
+			markers = append(markers, t.Function.Name+"{")
+		}
+	}
 	var held strings.Builder
 	answer := func(piece string, final bool) {
 		if len(tools) == 0 {
@@ -950,7 +959,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// ordinary content goes out after the final parse, via streamed.
 		// A bare fence streams as usual — a fenced code answer must not
 		// fall silent — and the final parse still rescues a call in one.
-		for _, marker := range callMarkers(s.tm.toolCalls) {
+		for _, marker := range markers {
 			if i := strings.Index(text, marker); i >= 0 {
 				sawCall = true
 				held.Reset()
@@ -962,7 +971,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		keep := 0
 		if !final {
-			for _, marker := range callMarkers(s.tm.toolCalls) {
+			for _, marker := range markers {
 				keep = max(keep, partialMarker(text, marker))
 			}
 		}
@@ -1144,6 +1153,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if len(tools) > 0 {
 		if s.tm.toolCalls == "gemma4" {
 			content, calls = parseGemma4ToolCalls(content)
+			if len(calls) == 0 {
+				content, calls = parseLooseGemma4Calls(content, tools)
+			}
 		} else if s.tm.toolCalls == "qwen3xml" {
 			content, calls = parseXMLToolCalls(content, tools)
 		} else {
