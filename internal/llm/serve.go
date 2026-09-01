@@ -16,6 +16,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math/rand"
 	"net/http"
 	"os"
@@ -748,6 +749,7 @@ type server struct {
 	prefill func([]int, int) []float32
 	step    func(int, int) []float32
 	reset   func()
+	vlog    io.Writer
 }
 
 // tokenizerIface is the slice of the tokenizer the server needs.
@@ -863,7 +865,13 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "this model's chat template has no tool-calling convention, so tools cannot be offered to it")
 		return
 	}
-	ids := s.tok.Encode(render(s.tm, req.Messages, s.system, tools))
+	prompt := render(s.tm, req.Messages, s.system, tools)
+	if s.vlog != nil {
+		fmt.Fprintf(s.vlog, "request: %d messages, %d tools, stream=%v, limit %d, temp %.2f\n",
+			len(req.Messages), len(tools), req.Stream, limit, temp)
+		fmt.Fprintf(s.vlog, "rendered prompt: %s\n", clip(prompt, 600))
+	}
+	ids := s.tok.Encode(prompt)
 	if len(ids) >= s.nCtx-1 {
 		httpError(w, http.StatusBadRequest, fmt.Sprintf("prompt of %d tokens exceeds the %d-token context", len(ids), s.nCtx))
 		return
@@ -1071,7 +1079,16 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		start = mark
 	}
+	if s.vlog != nil {
+		fmt.Fprintf(s.vlog, "prefilling %d tokens (%d already cached)\n", len(ids)-start, start)
+	}
+	prefillStart := time.Now()
 	logits := s.prefill(ids[start:], start)
+	if s.vlog != nil && len(ids) > start {
+		took := time.Since(prefillStart)
+		fmt.Fprintf(s.vlog, "prefilled in %v (%.1f tokens/s)\n",
+			took.Round(time.Millisecond), float64(len(ids)-start)/took.Seconds())
+	}
 	if s.draft != nil {
 		s.draft.prefill(ids, 0)
 	}

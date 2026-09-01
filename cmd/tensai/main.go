@@ -52,6 +52,8 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 	q8 := fs.Bool("q8", false, "decode against int8-quantized weights")
 	q4 := fs.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
 	fs.BoolVar(&o.GPU, "gpu", false, "decode on the GPU (requires -q8 or -q4 and a wgpu build tag)")
+	fs.BoolVar(&o.Verbose, "v", false, "narrate what the model is doing: what the file says it is, how it is read, the prompt it was handed, and where a request's time went")
+	fs.BoolVar(&o.Verbose, "verbose", false, "same as -v")
 	fs.BoolVar(&o.Requant, "requant", false, "requantize gguf weights through float32 instead of repacking their stored blocks")
 	fs.BoolVar(&o.NoCache, "nocache", false, "neither write nor reuse the repack cache file the first .gguf load leaves next to the model")
 	draft := fs.String("draft", "", "a smaller same-family model for speculative decoding, named the way -model is")

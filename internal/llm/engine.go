@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -63,11 +64,15 @@ func DefaultDataDir(repo string) string {
 // Options selects and configures a model. The zero value is not runnable:
 // fill Data or GGUF, and usually Bits.
 type Options struct {
-	Data    string // directory for downloaded model files
-	Repo    string // Hugging Face repo for missing files; DefaultRepo if empty
-	GGUF    string // load model and tokenizer from a single .gguf instead
-	Bits    int    // decode weights: 0 float32, 8 int8, 4 int4
-	GPU     bool   // decode on the GPU (needs Bits and a wgpu build tag)
+	Data string // directory for downloaded model files
+	Repo string // Hugging Face repo for missing files; DefaultRepo if empty
+	GGUF string // load model and tokenizer from a single .gguf instead
+	Bits int    // decode weights: 0 float32, 8 int8, 4 int4
+	GPU  bool   // decode on the GPU (needs Bits and a wgpu build tag)
+	// Verbose narrates what the model is doing to Log: what the file
+	// says it is, how it is being read, what prompt it was handed, and
+	// where a request's time went. Nothing here changes the output.
+	Verbose bool
 	Requant bool   // requantize gguf weights through float32
 	NoCache bool   // skip the gguf repack cache file
 	Draft   string // data directory of a smaller draft model (speculative decoding)
@@ -94,6 +99,7 @@ type Engine struct {
 	nCtx    int
 	g       *gpu.Device
 	gq      *gpuQwen
+	vlog    io.Writer
 	prefill func([]int, int) []float32
 	step    func(int, int) []float32
 	reset   func()
@@ -141,6 +147,10 @@ func Open(o Options) (*Engine, error) {
 	if o.Log == nil {
 		o.Log = io.Discard
 	}
+	vlog := io.Discard
+	if o.Verbose {
+		vlog = o.Log
+	}
 	base := "https://huggingface.co/" + o.Repo + "/resolve/main/"
 
 	var tok *tokenizer.Tokenizer
@@ -158,7 +168,7 @@ func Open(o Options) (*Engine, error) {
 				o.GPU = false
 			}
 		}
-		model, tok, err = loadGGUF(o.GGUF, o.Bits, !o.GPU && !o.Requant, !o.NoCache)
+		model, tok, err = loadGGUF(o.GGUF, o.Bits, !o.GPU && !o.Requant, !o.NoCache, vlog)
 		if err != nil {
 			return nil, err
 		}
@@ -270,7 +280,15 @@ func Open(o Options) (*Engine, error) {
 	e := &Engine{
 		opts: o, model: model, draft: draftM, tok: tok, tm: tm,
 		system: system, imEnd: stopID(0), eot: stopID(1),
-		rng: rand.New(rand.NewSource(o.Seed)),
+		rng:  rand.New(rand.NewSource(o.Seed)),
+		vlog: vlog,
+	}
+	fmt.Fprintf(vlog, "template: %s family, %d stop marker(s), tools=%s think=%v\n",
+		style, len(tm.stops), or(tm.toolCalls, "none"), tm.reasonOpen != "")
+	if system != "" {
+		fmt.Fprintf(vlog, "system prompt: %q\n", system)
+	} else {
+		fmt.Fprintln(vlog, "system prompt: none")
 	}
 	e.nCtx = model.cfg.MaxPos
 	if e.nCtx == 0 {
@@ -314,8 +332,10 @@ func Open(o Options) (*Engine, error) {
 			fmt.Fprintf(o.Log, "gpu cache limited to %d positions by device memory\n", maxCtx)
 			e.nCtx = maxCtx
 		}
+		fmt.Fprintf(vlog, "uploading %d layers and a %d-position kv cache to %s\n",
+			model.cfg.Layers, e.nCtx, g.Name())
 		start := time.Now()
-		gq, err := newGPUQwen(model, g, e.nCtx, o.Log)
+		gq, err := newGPUQwen(model, g, e.nCtx, o.Log, vlog)
 		if err != nil {
 			g.Close()
 			return nil, err
@@ -442,10 +462,16 @@ func (e *Engine) Generate(w io.Writer, prompt string, raw bool, n int) RunResult
 	}
 	ids := e.tok.Encode(text)
 	fmt.Fprintf(e.opts.Log, "prompt: %d tokens\n", len(ids))
+	fmt.Fprintf(e.vlog, "rendered prompt: %s\n", clip(text, 600))
+	fmt.Fprintf(e.vlog, "sampling: temp %.2f, top-p %.2f, seed %d, limit %d tokens\n",
+		e.opts.Temp, e.opts.TopP, e.opts.Seed, n)
 	start := time.Now()
 	e.feed(ids)
 	prefill := time.Since(start)
 	fmt.Fprintf(e.opts.Log, "prefill: %v\n", prefill.Round(time.Millisecond))
+	if secs := prefill.Seconds(); secs > 0 {
+		fmt.Fprintf(e.vlog, "prefill rate: %.1f tokens/s\n", float64(len(ids))/secs)
+	}
 	gen, finish := e.generate(w, n)
 	fmt.Fprintf(e.opts.Log, "%d tokens total in %v\n",
 		e.steps, time.Since(start).Round(time.Millisecond))
@@ -494,7 +520,7 @@ func (e *Engine) Serve(addr, apiKey string) error {
 		model:  e.model, tok: e.tok, system: e.system, nCtx: e.nCtx,
 		temp: e.opts.Temp, topP: e.opts.TopP, imEnd: e.imEnd, eot: e.eot,
 		tm: e.tm, prefill: e.prefill, step: e.step, reset: e.reset,
-		draft: e.draft, specK: e.opts.SpecK,
+		draft: e.draft, specK: e.opts.SpecK, vlog: e.vlog,
 	}
 	// An agent resends its system prompt and its tool definitions with
 	// every question; caching them is the difference between paying for
@@ -1082,6 +1108,24 @@ type tmpl struct {
 	// What is between them is the model reasoning, not its reply, and the
 	// API keeps the two apart.
 	reasonOpen, reasonClose string
+}
+
+// or is the first non-empty of two strings, for naming a setting that
+// may not be set.
+func or(s, alt string) string {
+	if s == "" {
+		return alt
+	}
+	return s
+}
+
+// clip shortens a string for a log line, counting bytes and saying how
+// much it dropped rather than leaving a silent truncation.
+func clip(s string, n int) string {
+	if len(s) <= n {
+		return strconv.Quote(s)
+	}
+	return fmt.Sprintf("%s... (%d bytes total)", strconv.Quote(s[:n]), len(s))
 }
 
 // systemTurn renders the system turn, or nothing at all: a family that
