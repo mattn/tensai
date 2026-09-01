@@ -132,17 +132,51 @@ func TestGraphTrainsTheModel(t *testing.T) {
 	}
 }
 
-// TestGraphRefusesUnsupportedLayers checks that a layer with no graph form
-// is reported rather than quietly skipped.
-func TestGraphRefusesUnsupportedLayers(t *testing.T) {
+// TestGraphEmbedding checks the lookup against the layer, forward and
+// backward: the ids arrive as an ordinary matrix of whole numbers and the
+// gradient scatters back into the rows they named.
+func TestGraphEmbedding(t *testing.T) {
+	rng := rand.New(rand.NewSource(17))
+	const vocab, dim, batch, tokens = 6, 4, 3, 5
+	ids := tensai.NewMatrix(batch, tokens)
+	for i := range ids.Data {
+		ids.Data[i] = tensai.Float(rng.Intn(vocab))
+	}
+	ids.Data[1] = ids.Data[0] // a repeat, so the scatter has to accumulate
+
 	net := NewSequential()
-	net.Add(layer.NewEmbedding(10, 4))
-	net.Add(layer.NewDense(4))
-	if err := net.Compile(3, loss.MeanSquaredError{}, optim.NewSGD(0.1, 0.9)); err != nil {
+	net.Add(layer.NewEmbedding(vocab, dim))
+	if err := net.Compile(tokens, loss.MeanSquaredError{}, optim.NewAdam(0.01)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := net.Graph(); err == nil {
-		t.Fatal("expected an error for a model holding an Embedding")
+	emb := net.Layers()[0].(*layer.Embedding)
+	want, err := emb.Forward(ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantOut := append([]tensai.Float(nil), want.Data...)
+	upstream := randMatrix(rng, batch, tokens*dim)
+	if _, err := emb.Backward(upstream); err != nil {
+		t.Fatal(err)
+	}
+	wantGrad, _ := emb.Grads()
+
+	g, err := net.Graph()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := g.Forward(autograd.Input(ids))
+	for i := range wantOut {
+		if out.Value().Data[i] != wantOut[i] {
+			t.Fatalf("output %d: graph=%v layer=%v", i, out.Value().Data[i], wantOut[i])
+		}
+	}
+	out.Mul(autograd.Input(upstream)).Sum().Backward()
+	table := g.Params()[0]
+	for i := range wantGrad.Data {
+		if diff := math.Abs(float64(table.Grad().Data[i] - wantGrad.Data[i])); diff > 1e-5 {
+			t.Fatalf("table gradient %d: graph=%v layer=%v", i, table.Grad().Data[i], wantGrad.Data[i])
+		}
 	}
 }
 

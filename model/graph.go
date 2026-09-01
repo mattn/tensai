@@ -26,10 +26,9 @@ import (
 //	}
 //	g.Sync() // only needed after training on a device
 //
-// Embedding has no graph form yet, so a model holding one is refused
-// rather than silently trained differently. Dropout and BatchNorm behave
-// as they do in the layer stack, and SetTraining switches between the two
-// halves of that behaviour.
+// Every layer has a graph form. Dropout and BatchNorm behave as they do in
+// the layer stack, and SetTraining switches between the two halves of that
+// behaviour.
 type Graph struct {
 	steps    []func(*autograd.Node) *autograd.Node
 	params   []*autograd.Node
@@ -118,6 +117,31 @@ func (g *Graph) add(l layer.Layer) (func(*autograd.Node) *autograd.Node, error) 
 		return func(x *autograd.Node) *autograd.Node {
 			img := x.Reshape(-1, ch, inH, inW)
 			return img.MaxPool2D(size).Reshape(-1, ch*outH*outW)
+		}, nil
+
+	case *layer.Embedding:
+		w, _ := v.Params()
+		table := g.param(w.Tensor())
+		vocab, dim := w.Rows, w.Cols
+		return func(x *autograd.Node) *autograd.Node {
+			// The ids arrive as an ordinary (batch, tokens) matrix of
+			// whole numbers, which the lookup wants as indices.
+			shape := x.Shape()
+			if len(shape) != 2 {
+				panic(fmt.Sprintf("tensai: embedding needs a (batch, tokens) input, got %v", shape))
+			}
+			batch, tokens := shape[0], shape[1]
+			ids := make([]int, batch*tokens)
+			for i, f := range x.Value().Data {
+				id := int(f)
+				if tensai.Float(id) != f || id < 0 || id >= vocab {
+					panic(fmt.Sprintf("tensai: embedding token id %g out of range [0,%d)", f, vocab))
+				}
+				ids[i] = id
+			}
+			// One row per token, then the row's tokens laid end to end,
+			// which is the layout the layer produces.
+			return table.Embed(ids, batch, tokens).Reshape(batch, tokens*dim)
 		}, nil
 
 	case *layer.Dropout:
