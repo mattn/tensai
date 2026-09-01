@@ -436,6 +436,9 @@ func (l *LayerNorm) Grads() (*tensai.Matrix, []tensai.Float) {
 	return l.gradGamma, l.gradBeta
 }
 
+// Eps returns the epsilon the normalization adds to the variance.
+func (l *LayerNorm) Eps() tensai.Float { return l.eps }
+
 func (l *LayerNorm) Params() (*tensai.Matrix, []tensai.Float) {
 	return l.gamma, l.beta
 }

@@ -76,6 +76,29 @@ The architecture itself is not serialized — reconstruct the same layer stack a
 
 For deployment beyond Go, trained models export to TFLite and ONNX — see [Model Formats](../formats.md).
 
+## Training a Sequential on the autograd engine
+
+`Fit` runs the layers' own Forward and Backward, which is the fastest path on a CPU and the only one that has been there from the start. `net.Graph()` builds the same model as an autograd graph instead:
+
+```go
+g, err := net.Graph()
+trainer := autograd.NewTrainer(optim.NewAdam(0.01), g.Params()...)
+tape := autograd.NewTape()
+tape.UseDevice(dev) // optional; see the GPU guide
+tape.Bind(g.Params()...)
+
+for step := 0; step < steps; step++ {
+	loss, _ := g.Loss(g.Forward(autograd.Input(x)), y)
+	trainer.Step(loss)
+	tape.Reset()
+}
+g.Sync() // brings a device's weights back into the layers
+```
+
+The parameters are the layers' own matrices, so training through the graph trains the model: `Predict`, `Save` and the exports keep working, and the graph's forward pass matches `Predict` to float32 rounding. What it adds is the GPU -- a graph runs wherever a tape sends it, which the hand-written stack cannot.
+
+Dense, the activations, LayerNorm, Conv2D and MaxPool2D have graph forms. Dropout, BatchNorm and Embedding do not yet, and a model holding one is refused rather than trained differently than it would be by `Fit`.
+
 ## Low-allocation training
 
 Layers reuse their forward/backward scratch buffers across training steps, so a full MLP step runs in ~29 allocations and GC stays out of the training loop. `Predict` always returns freshly allocated results, so predictions are safe to keep.
