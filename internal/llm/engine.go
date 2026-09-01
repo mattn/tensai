@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mattn/tensai/encoding/gguf"
 	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/tokenizer"
 )
@@ -102,6 +103,29 @@ type Engine struct {
 	logits []float32
 }
 
+// ggufArch reads just the architecture out of a gguf's metadata, which
+// is enough to know what the loader is about to be handed.
+func ggufArch(path string) (string, error) {
+	g, err := gguf.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer g.Close()
+	arch, ok := g.String("general.architecture")
+	if !ok {
+		return "", fmt.Errorf("gguf has no architecture")
+	}
+	return arch, nil
+}
+
+// gpuSupportsArch reports whether the device decoder has kernels for an
+// architecture. gemma4 varies its head and feed-forward widths from
+// layer to layer, shares KV caches between layers, and reads a per-layer
+// embedding off disk every token; the device path assumes none of that.
+func gpuSupportsArch(arch string) bool {
+	return arch != "gemma4"
+}
+
 // Open downloads (if needed) and loads the model, the optional draft
 // model, and the GPU residency, returning an Engine positioned at an
 // empty context.
@@ -124,6 +148,16 @@ func Open(o Options) (*Engine, error) {
 	var err error
 	start := time.Now()
 	if o.GGUF != "" {
+		// -gpu changes how the weights are repacked, so an architecture
+		// the device path cannot run has to be caught before the load
+		// rather than after it: reading one metadata key costs nothing
+		// next to repacking a few gigabytes the wrong way.
+		if o.GPU {
+			if arch, err := ggufArch(o.GGUF); err == nil && !gpuSupportsArch(arch) {
+				fmt.Fprintf(o.Log, "%s has no GPU decode path yet; decoding on the CPU\n", arch)
+				o.GPU = false
+			}
+		}
 		model, tok, err = loadGGUF(o.GGUF, o.Bits, !o.GPU && !o.Requant, !o.NoCache)
 		if err != nil {
 			return nil, err

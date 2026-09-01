@@ -131,3 +131,17 @@ func TestCapLogits(t *testing.T) {
 		t.Errorf("uncapped logit changed to %v", logits[0])
 	}
 }
+
+// -gpu on an architecture the device path cannot run has to be caught
+// before the load, because it changes how the weights are repacked: the
+// wrong answer costs a few gigabytes of pointless requantization.
+func TestGPUSupportsArch(t *testing.T) {
+	for _, arch := range []string{"llama", "qwen3", "gemma3", "gpt-oss"} {
+		if !gpuSupportsArch(arch) {
+			t.Errorf("%s should still take the device path", arch)
+		}
+	}
+	if gpuSupportsArch("gemma4") {
+		t.Error("gemma4 has no device kernels")
+	}
+}
