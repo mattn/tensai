@@ -39,7 +39,12 @@ func TestDotShape(t *testing.T) {
 
 func TestDotTAInto(t *testing.T) {
 	rng := rand.New(rand.NewSource(89))
-	for _, dims := range [][3]int{{5, 3, 4}, {8, 8, 8}, {17, 9, 13}, {64, 33, 5}} {
+	// The last three are tall and narrow, which is the shape a
+	// convolution's weight gradient has and the register-accumulating
+	// kernel takes: a k that is not a multiple of four, a b that is not a
+	// multiple of eight columns, and one wide enough to need two passes.
+	for _, dims := range [][3]int{{5, 3, 4}, {8, 8, 8}, {17, 9, 13}, {64, 33, 5},
+		{1024, 9, 8}, {600, 6, 5}, {1000, 7, 20}} {
 		r, i, j := dims[0], dims[1], dims[2]
 		a := RandomMatrix(r, i, rng)
 		b := RandomMatrix(r, j, rng)

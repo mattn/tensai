@@ -27,6 +27,13 @@ func dotWorkerCount(rows, inner, cols int) int {
 
 // dotTARows computes out rows lo..hi of out = a^T * b. Portable fallback;
 // see dot_simd.go for the AVX2 kernel.
+// dotTATall is the portable stand-in for the register-accumulating kernel
+// in dot_simd.go; without vectors there is nothing to gain, so it is the
+// general one.
+func dotTATall(out, a, b *Matrix, lo, hi int) {
+	dotTARowsGeneric(out, a, b, lo, hi)
+}
+
 func dotTARows(out, a, b *Matrix, lo, hi int) {
 	dotTARowsGeneric(out, a, b, lo, hi)
 }
