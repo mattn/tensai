@@ -12,7 +12,7 @@ Every example is runnable from the repository root with `go run`:
 | iris | `go run ./_example/iris` | Iris classification |
 | mnist | `go run ./_example/mnist` | MNIST classifier (`-model dense`, `cnn`, or `knn`) with save/load |
 | charrnn | `go run ./_example/charrnn` | Character-level LSTM text generation on the autograd engine |
-| tinygpt | `GOEXPERIMENT=simd go run ./_example/tinygpt` | Character-level transformer trained from scratch on the n-d autograd engine |
+| tinygpt | `GOEXPERIMENT=simd go run ./_example/tinygpt` | Character-level transformer trained from scratch on the n-d autograd engine (`-gpu` trains on the device) |
 | plasma | `go run ./_example/plasma` | Terminal plasma rendered by a neural network — a live SIMD benchmark |
 | dot | `go run ./_example/dot` | Graphviz DOT export of the z = x + y graph |
 | tensor | `go run ./_example/tensor` | Tour of the n-d Tensor: broadcasting, batched MatMul, attention |
@@ -40,7 +40,9 @@ Trains a character-level LSTM on an embedded public-domain text, saves the param
 
 ## tinygpt
 
-Trains a small character-level transformer -- token and position embeddings, two pre-norm blocks with four-head causal attention and a GELU feed-forward, a final norm and an output projection -- on the same embedded text charrnn uses, then samples from it. About 106k parameters and a minute of training with `GOEXPERIMENT=simd`, after which it reproduces whole sentences of the corpus. The whole model is written against the n-dimensional autograd engine: activations are `(batch, sequence, model)` tensors, the per-head split is a `Reshape` plus a `Transpose`, and a `Tape` recycles each step's buffers. Flags: `-iters`, `-lr`, `-temp`, `-n`, `-seed`.
+Trains a small character-level transformer -- token and position embeddings, two pre-norm blocks with four-head causal attention and a GELU feed-forward, a final norm and an output projection -- on the same embedded text charrnn uses, then samples from it. About 106k parameters and a minute of training with `GOEXPERIMENT=simd`, after which it reproduces whole sentences of the corpus. The whole model is written against the n-dimensional autograd engine: activations are `(batch, sequence, model)` tensors, the per-head split is a `Reshape` plus a `Transpose`, and a `Tape` recycles each step's buffers. Flags: `-iters`, `-lr`, `-temp`, `-n`, `-seed`, plus `-model`, `-heads`, `-blocks`, `-batch` and `-seq` to change the shape.
+
+`-gpu` (on a wgpu build) trains the whole block on the device: values, gradients and the Adam update stay there and only the loss comes back each step. Whether it is faster depends on the shape — at the default size the tensors are too small to keep a GPU busy and the AVX2 kernels win, while a wider model crosses over. On an AMD 780M, 23ms/step against 62ms with `-gpu` at the default size, and 282ms against 173ms at `-model 256 -heads 8 -batch 16 -seq 64`. The losses match to the digit either way.
 
 ## plasma
 
