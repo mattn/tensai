@@ -12,6 +12,7 @@
 | iris | `go run ./_example/iris` | Iris の分類 |
 | mnist | `go run ./_example/mnist` | MNIST 分類器 (`-model dense`, `cnn`, `knn`) と保存/読込 |
 | charrnn | `go run ./_example/charrnn` | 自動微分エンジン上の文字レベル LSTM テキスト生成 |
+| tinygpt | `GOEXPERIMENT=simd go run ./_example/tinygpt` | n 次元自動微分エンジンでゼロから学習する文字レベル transformer |
 | plasma | `go run ./_example/plasma` | ニューラルネットワークが描くターミナルプラズマ — 生きた SIMD ベンチマーク |
 | dot | `go run ./_example/dot` | z = x + y グラフの Graphviz DOT エクスポート |
 | tensor | `go run ./_example/tensor` | N 次元 Tensor ツアー: ブロードキャスト、バッチ MatMul、attention |
@@ -36,6 +37,10 @@ go run ./_example/mnist -model cnn -export mnist.tflite  # TFLite へエクス�
 ## charrnn
 
 埋め込みのパブリックドメインテキストで文字レベル LSTM を学習し、`SaveParamsFile` でパラメータを保存し、新しいモデルに復元して、再読込したパラメータからサンプルを生成します。
+
+## tinygpt
+
+charrnn と同じ埋め込みテキストで、小さな文字レベル transformer (トークン埋め込みと位置埋め込み、4 ヘッドの因果 attention と GELU の feed-forward を持つ pre-norm ブロック 2 段、最終 norm と出力射影) を学習し、そこからサンプリングします。パラメータは約 106k、`GOEXPERIMENT=simd` で 1 分ほど学習すれば、コーパスの文をそのまま再現するようになります。モデル全体が n 次元自動微分エンジンで書かれています: 活性は `(batch, sequence, model)` のテンソル、ヘッド分割は `Reshape` と `Transpose`、各ステップのバッファは `Tape` が再利用します。フラグは `-iters`, `-lr`, `-temp`, `-n`, `-seed`。
 
 ## plasma
 
