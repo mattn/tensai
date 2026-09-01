@@ -359,3 +359,77 @@ func TestGPUGroupedCausalAttentionF16Split(t *testing.T) {
 		}
 	}
 }
+
+// TestGPUCausalAttentionWideHead runs Gemma 4's global-layer shape:
+// eight query heads sharing one KV head, 512 wide. A whole group of
+// those does not fit the grouped kernel's workgroup memory, so the
+// per-head kernel takes it -- which is the widest head it stages.
+func TestGPUCausalAttentionWideHead(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewSource(11))
+
+	const heads, kvHeads, dh = 8, 1, 512
+	const d, kvDim = heads * dh, kvHeads * dh
+	const seq, seqKV = 6, 20
+	group := heads / kvHeads
+	k, v := randTensor(rng, seqKV, kvDim), randTensor(rng, seqKV, kvDim)
+	gk, err := g.Upload(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gk.Free()
+	gv, err := g.Upload(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gv.Free()
+	q := randTensor(rng, seq, d)
+	gq, err := g.Upload(q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gq.Free()
+	got, err := gq.GroupedCausalAttention(gk, gv, heads, kvHeads, seqKV, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Free()
+	out, err := got.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scale := 1 / math.Sqrt(dh)
+	for qi := 0; qi < seq; qi++ {
+		limit := qi + seqKV - seq + 1
+		for h := 0; h < heads; h++ {
+			kvOff := (h / group) * dh
+			scores := make([]float64, limit)
+			maxs := math.Inf(-1)
+			for j := 0; j < limit; j++ {
+				var s float64
+				for c := 0; c < dh; c++ {
+					s += float64(q.Data[qi*d+h*dh+c]) * float64(k.Data[j*kvDim+kvOff+c])
+				}
+				s *= scale
+				scores[j] = s
+				maxs = math.Max(maxs, s)
+			}
+			var sum float64
+			for j := range scores {
+				scores[j] = math.Exp(scores[j] - maxs)
+				sum += scores[j]
+			}
+			for c := 0; c < dh; c++ {
+				var acc float64
+				for j := 0; j < limit; j++ {
+					acc += scores[j] / sum * float64(v.Data[j*kvDim+kvOff+c])
+				}
+				if diff := math.Abs(acc - float64(out.Data[qi*d+h*dh+c])); diff > 2e-4 {
+					t.Fatalf("row %d head %d col %d: %v on the device, %v here", qi, h, c, out.Data[qi*d+h*dh+c], acc)
+				}
+			}
+		}
+	}
+}

@@ -48,8 +48,11 @@ that leaves resident is an ordinary transformer about the size of a 2B.
 Its layers alternate a 256-wide local head with a 512-wide global one,
 the deeper two thirds project queries only and attend against the last
 layer of their own kind that kept a cache, and the logits leave through a
-tanh cap. GPU decode sits this architecture out; the repack
-cache does not, and reopens it in about a second.
+tanh cap. It decodes on the device too: on a Radeon 780M
+about 15.7 tokens a second against 14.2 on the CPU, and the same in
+prefill. The two are close enough that the machine's power state decides
+it -- unplugged, that GPU falls to 3.1 tokens a second while the CPU
+holds 13.6.
 
 The DeepSeek-R1 distills are stock qwen2/llama blocks wearing DeepSeek's turn markers, which the loader spots in the embedded chat template and switches automatically, `<think>` reasoning included.
 

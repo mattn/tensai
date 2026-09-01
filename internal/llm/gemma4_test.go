@@ -134,14 +134,13 @@ func TestCapLogits(t *testing.T) {
 
 // -gpu on an architecture the device path cannot run has to be caught
 // before the load, because it changes how the weights are repacked: the
-// wrong answer costs a few gigabytes of pointless requantization.
+// wrong answer costs a few gigabytes of pointless requantization. Every
+// architecture the loader speaks has device kernels today, gemma4's
+// per-layer widths and per-layer embeddings included.
 func TestGPUSupportsArch(t *testing.T) {
-	for _, arch := range []string{"llama", "qwen3", "gemma3", "gpt-oss"} {
+	for _, arch := range []string{"llama", "qwen3", "gemma3", "gemma4", "gpt-oss"} {
 		if !gpuSupportsArch(arch) {
-			t.Errorf("%s should still take the device path", arch)
+			t.Errorf("%s should take the device path", arch)
 		}
-	}
-	if gpuSupportsArch("gemma4") {
-		t.Error("gemma4 has no device kernels")
 	}
 }
