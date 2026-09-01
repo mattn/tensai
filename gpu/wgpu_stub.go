@@ -26,6 +26,27 @@ const (
 
 var errNoWGPU = errors.New("tensai: built without wgpu support (rebuild with -tags wgpu)")
 
+// BinOp names an element-wise binary operation; unused in builds without
+// the wgpu tag.
+type BinOp uint32
+
+const (
+	OpAdd BinOp = iota
+	OpSub
+	OpMul
+	OpDiv
+)
+
+// Act names an activation; unused in builds without the wgpu tag.
+type Act uint32
+
+const (
+	ActReLU Act = iota
+	ActTanh
+	ActSigmoid
+	ActGELU
+)
+
 // Open always fails in builds without the wgpu tag.
 func Open(power ...Power) (*Device, error) { return nil, errNoWGPU }
 
@@ -68,6 +89,23 @@ func (t *Tensor) MatMulTN(o *Tensor) (*Tensor, error) { return nil, errNoWGPU }
 
 // Scale always fails in builds without the wgpu tag.
 func (t *Tensor) Scale(s tensai.Float) error { return errNoWGPU }
+
+// Binary is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) Binary(op BinOp, o *Tensor) (*Tensor, error) { return nil, errNoWGPU }
+
+// Activate is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) Activate(a Act) (*Tensor, error) { return nil, errNoWGPU }
+
+// ActivateGrad is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) ActivateGrad(a Act, grad *Tensor) (*Tensor, error) { return nil, errNoWGPU }
+
+// SumCols is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) SumCols() (*Tensor, error) { return nil, errNoWGPU }
+
+// AdamStep is a no-op stub; build with -tags wgpu or wgpu24.
+func (t *Tensor) AdamStep(grad, m, v *Tensor, lr, beta1, beta2, rc1, rc2, eps, decay tensai.Float) error {
+	return errNoWGPU
+}
 
 // Softmax always fails in builds without the wgpu tag.
 func (t *Tensor) Softmax() (*Tensor, error) { return nil, errNoWGPU }

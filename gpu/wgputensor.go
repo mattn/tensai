@@ -1126,6 +1126,147 @@ fn silu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
     }
 }
 
+// The training kernels. A backward pass needs the element-wise arithmetic
+// and activations an inference pass never runs on their own, the column
+// sums a broadcast operand's gradient reduces to, and the optimizer update
+// itself -- without them a training graph has to come back to the host
+// between every product.
+//
+// Operands broadcast cyclically: an operand shorter than the output
+// repeats, which covers the trailing-axis broadcasts training uses (a bias
+// over rows, a per-feature gain over a batch). Anything else is rejected
+// on the Go side.
+struct TrainParams {
+    count: u32, aCount: u32, bCount: u32, mode: u32,
+    rows: u32, lr: f32, beta1: f32, beta2: f32,
+    rc1: f32, rc2: f32, eps: f32, decay: f32,
+}
+@group(0) @binding(46) var<uniform> tp: TrainParams;
+@group(0) @binding(47) var<storage, read> ta: array<f32>;
+@group(0) @binding(48) var<storage, read> tb: array<f32>;
+@group(0) @binding(49) var<storage, read_write> tout: array<f32>;
+@group(0) @binding(50) var<storage, read_write> tm: array<f32>;
+@group(0) @binding(51) var<storage, read_write> tv: array<f32>;
+
+// erff matches the CPU kernels, which use the exact error function rather
+// than the tanh approximation the inference GELU takes: Abramowitz and
+// Stegun 7.1.26, good to about 1.5e-7.
+fn erff(x: f32) -> f32 {
+    let s = sign(x);
+    let ax = abs(x);
+    let t = 1.0 / (1.0 + 0.3275911 * ax);
+    let y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-ax * ax);
+    return s * y;
+}
+
+fn act_of(x: f32, mode: u32) -> f32 {
+    switch mode {
+        case 0u: { return max(x, 0.0); }                        // relu
+        case 1u: { return tanh(x); }
+        case 2u: { return 1.0 / (1.0 + exp(-x)); }              // sigmoid
+        default: { return 0.5 * x * (1.0 + erff(x * 0.7071067811865476)); } // gelu
+    }
+}
+
+fn act_grad_of(x: f32, mode: u32) -> f32 {
+    switch mode {
+        case 0u: {
+            if (x > 0.0) { return 1.0; }
+            return 0.0;
+        }
+        case 1u: {
+            let y = tanh(x);
+            return 1.0 - y * y;
+        }
+        case 2u: {
+            let y = 1.0 / (1.0 + exp(-x));
+            return y * (1.0 - y);
+        }
+        default: {
+            return 0.5 * (1.0 + erff(x * 0.7071067811865476)) +
+                x * 0.3989422804014327 * exp(-0.5 * x * x);
+        }
+    }
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn bin_op(@builtin(workgroup_id) wg: vec3<u32>,
+          @builtin(num_workgroups) nwg: vec3<u32>,
+          @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx >= tp.count) {
+        return;
+    }
+    let x = ta[idx % tp.aCount];
+    let y = tb[idx % tp.bCount];
+    switch tp.mode {
+        case 0u: { tout[idx] = x + y; }
+        case 1u: { tout[idx] = x - y; }
+        case 2u: { tout[idx] = x * y; }
+        default: { tout[idx] = x / y; }
+    }
+}
+
+@compute @workgroup_size(256, 1, 1)
+fn act_fwd(@builtin(workgroup_id) wg: vec3<u32>,
+           @builtin(num_workgroups) nwg: vec3<u32>,
+           @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx < tp.count) {
+        tout[idx] = act_of(ta[idx], tp.mode);
+    }
+}
+
+// act_bwd turns the output gradient in tb into the input gradient, given
+// the pre-activation input in ta.
+@compute @workgroup_size(256, 1, 1)
+fn act_bwd(@builtin(workgroup_id) wg: vec3<u32>,
+           @builtin(num_workgroups) nwg: vec3<u32>,
+           @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx < tp.count) {
+        tout[idx] = tb[idx] * act_grad_of(ta[idx], tp.mode);
+    }
+}
+
+// sum_cols reduces a (rows, cols) tensor to one row: the gradient of a
+// value that was broadcast over the rows. One thread per column.
+@compute @workgroup_size(256, 1, 1)
+fn sum_cols(@builtin(workgroup_id) wg: vec3<u32>,
+            @builtin(num_workgroups) nwg: vec3<u32>,
+            @builtin(local_invocation_id) lid: vec3<u32>) {
+    let col = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (col >= tp.count) {
+        return;
+    }
+    var sum = 0.0;
+    for (var r = 0u; r < tp.rows; r = r + 1u) {
+        sum = sum + ta[r * tp.count + col];
+    }
+    tout[col] = sum;
+}
+
+// adam_step applies one Adam update to the weights in tout, with the
+// gradient in ta and the moment estimates in tm and tv. decay is AdamW's
+// decoupled weight decay; the bias corrections rc1 and rc2 come from the
+// host, which counts the steps.
+@compute @workgroup_size(256, 1, 1)
+fn adam_step(@builtin(workgroup_id) wg: vec3<u32>,
+             @builtin(num_workgroups) nwg: vec3<u32>,
+             @builtin(local_invocation_id) lid: vec3<u32>) {
+    let idx = (wg.y * nwg.x + wg.x) * 256u + lid.x;
+    if (idx >= tp.count) {
+        return;
+    }
+    let g = ta[idx];
+    let m = tp.beta1 * tm[idx] + (1.0 - tp.beta1) * g;
+    let v = tp.beta2 * tv[idx] + (1.0 - tp.beta2) * g * g;
+    tm[idx] = m;
+    tv[idx] = v;
+    let w = tout[idx];
+    tout[idx] = w - tp.lr * (m * tp.rc1 / (sqrt(v * tp.rc2) + tp.eps) + tp.decay * w);
+}
+
 // slice_cols lifts a column window out of every row. The fused QKV
 // projection lands in one buffer and prefill wants q, k, and v as
 // tensors of their own; a bind offset cannot express that, because the
@@ -1909,6 +2050,9 @@ type gpuPipelines struct {
 	matmul, matmulT, matmulS, matmulTS             uintptr
 	matmulTN, matmulTNS                            uintptr
 	layMatmulTN, layMatmulTNS                      uintptr
+	binOp, actFwd, actBwd, sumCols, adamStep       uintptr
+	layBinOp, layActFwd, layActBwd                 uintptr
+	laySumCols, layAdamStep                        uintptr
 	scale, softmax, attn, qmatmul                  uintptr
 	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
 	geluMulIP, qmatmulB, attnG, qmatmulT           uintptr
@@ -1953,6 +2097,11 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.qmatmulT, &g.pipes.layQmatmulT, "qmatmul_t"},
 		{&g.pipes.sliceCols, &g.pipes.laySliceCols, "slice_cols"},
 		{&g.pipes.gluSplit, &g.pipes.layGluSplit, "glu_split"},
+		{&g.pipes.binOp, &g.pipes.layBinOp, "bin_op"},
+		{&g.pipes.actFwd, &g.pipes.layActFwd, "act_fwd"},
+		{&g.pipes.actBwd, &g.pipes.layActBwd, "act_bwd"},
+		{&g.pipes.sumCols, &g.pipes.laySumCols, "sum_cols"},
+		{&g.pipes.adamStep, &g.pipes.layAdamStep, "adam_step"},
 	} {
 		*x.pipe = g.makePipeline(x.entry)
 		if *x.pipe == 0 || uncapturedCB != "" {
@@ -3265,6 +3414,192 @@ func (q *Tensor) fusedCausalMHA(k, v *Tensor, heads, batch, seq, seqKV, d, dh, b
 // the result live in host memory; each call uploads the operands and reads
 // the product back, so it only pays off for large products — keep operands
 // resident with Upload / Tensor.MatMul to amortize the transfers.
+// BinOp names an element-wise binary operation the device can run.
+type BinOp uint32
+
+const (
+	OpAdd BinOp = iota
+	OpSub
+	OpMul
+	OpDiv
+)
+
+// Act names an activation the device can run, forward or backward.
+type Act uint32
+
+const (
+	ActReLU Act = iota
+	ActTanh
+	ActSigmoid
+	ActGELU
+)
+
+// trainParams is the uniform every training kernel reads.
+type trainParams struct {
+	count, aCount, bCount, mode uint32
+	rows                        uint32
+	lr, beta1, beta2            float32
+	rc1, rc2, eps, decay        float32
+}
+
+const trainParamBytes = 48
+
+// trainOp runs one element-wise training kernel over count elements,
+// allocating the (outShape) result it writes. a binds to 47, b -- which may
+// be nil -- to 48, and the result to 49.
+func (g *Device) trainOp(pipe, lay uintptr, p trainParams, count int, outShape []int, a, b *Tensor) (*Tensor, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+
+	outBytes := uint64(dims.Prod(outShape)) * 4
+	if err := g.checkSize(outBytes); err != nil {
+		return nil, err
+	}
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, trainParamBytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, trainParamBytes, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&p), trainParamBytes)
+	bufOut := g.takeOutBuffer(outBytes)
+
+	entries := make([]wgpuBindGroupEntry, 0, 4)
+	entries = append(entries,
+		wgpuBindGroupEntry{binding: 46, buffer: bufParams, size: trainParamBytes},
+		bind(47, a))
+	if b != nil {
+		entries = append(entries, bind(48, b))
+	}
+	entries = append(entries, wgpuBindGroupEntry{binding: 49, buffer: bufOut, size: outBytes})
+	bindGroup := g.cachedBindGroup(lay, entries)
+	runtime.KeepAlive(&entries)
+
+	x, y := split2D((count + 255) / 256)
+	if err := g.dispatch(pipe, bindGroup, x, y, 1); err != nil {
+		g.dropBuffer(bufOut)
+		return nil, err
+	}
+	return &Tensor{g: g, buf: bufOut, shape: append([]int(nil), outShape...)}, nil
+}
+
+// broadcastCount checks that n elements repeat cyclically into count, which
+// is the broadcast the kernels can express.
+func broadcastCount(count, n int) (uint32, error) {
+	if n == 0 || count%n != 0 {
+		return 0, fmt.Errorf("tensai: gpu cannot broadcast %d elements into %d", n, count)
+	}
+	return uint32(n), nil
+}
+
+// Binary returns t op o element-wise. o may be shorter than t as long as it
+// divides it, in which case it repeats -- the trailing-axis broadcast of a
+// bias or a per-feature scale.
+func (t *Tensor) Binary(op BinOp, o *Tensor) (*Tensor, error) {
+	if t.freed || o.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if t.g != o.g {
+		return nil, errors.New("tensai: gpu tensors belong to different GPUs")
+	}
+	count := t.Size()
+	bCount, err := broadcastCount(count, o.Size())
+	if err != nil {
+		return nil, err
+	}
+	p := trainParams{count: uint32(count), aCount: uint32(count), bCount: bCount, mode: uint32(op)}
+	return t.g.trainOp(t.g.pipes.binOp, t.g.pipes.layBinOp, p, count, t.shape, t, o)
+}
+
+// Activate applies an activation element-wise.
+func (t *Tensor) Activate(a Act) (*Tensor, error) {
+	if t.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	count := t.Size()
+	p := trainParams{count: uint32(count), aCount: uint32(count), bCount: uint32(count), mode: uint32(a)}
+	return t.g.trainOp(t.g.pipes.actFwd, t.g.pipes.layActFwd, p, count, t.shape, t, nil)
+}
+
+// ActivateGrad turns an output gradient into the input gradient of an
+// activation: t holds the pre-activation input the forward pass saw.
+func (t *Tensor) ActivateGrad(a Act, grad *Tensor) (*Tensor, error) {
+	if t.freed || grad.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if t.g != grad.g {
+		return nil, errors.New("tensai: gpu tensors belong to different GPUs")
+	}
+	count := t.Size()
+	if grad.Size() != count {
+		return nil, fmt.Errorf("tensai: activation gradient has %d elements, want %d", grad.Size(), count)
+	}
+	p := trainParams{count: uint32(count), aCount: uint32(count), bCount: uint32(count), mode: uint32(a)}
+	return t.g.trainOp(t.g.pipes.actBwd, t.g.pipes.layActBwd, p, count, t.shape, t, grad)
+}
+
+// SumCols reduces a (rows, cols) tensor to a (1, cols) row -- the gradient
+// a value broadcast over the rows collects.
+func (t *Tensor) SumCols() (*Tensor, error) {
+	if t.freed {
+		return nil, errors.New("tensai: gpu tensor already freed")
+	}
+	if len(t.shape) != 2 {
+		return nil, fmt.Errorf("tensai: sumcols needs a 2-D tensor, got %v", t.shape)
+	}
+	rows, cols := t.shape[0], t.shape[1]
+	p := trainParams{count: uint32(cols), aCount: uint32(rows * cols), bCount: uint32(cols), rows: uint32(rows)}
+	return t.g.trainOp(t.g.pipes.sumCols, t.g.pipes.laySumCols, p, cols, []int{1, cols}, t, nil)
+}
+
+// AdamStep applies one Adam update to t in place, with the gradient in
+// grad and the moment estimates in m and v (both the same size as t, and
+// both updated). rc1 and rc2 are the bias corrections for the step count,
+// and decay is AdamW's decoupled weight decay. The arithmetic matches the
+// CPU kernel, so a model can move between the two mid-training.
+func (t *Tensor) AdamStep(grad, m, v *Tensor, lr, beta1, beta2, rc1, rc2, eps, decay tensai.Float) error {
+	if t.freed || grad.freed || m.freed || v.freed {
+		return errors.New("tensai: gpu tensor already freed")
+	}
+	count := t.Size()
+	if grad.Size() != count || m.Size() != count || v.Size() != count {
+		return fmt.Errorf("tensai: adam operands must all hold %d elements", count)
+	}
+	p := trainParams{
+		count: uint32(count), aCount: uint32(count), bCount: uint32(count),
+		lr: float32(lr), beta1: float32(beta1), beta2: float32(beta2),
+		rc1: float32(rc1), rc2: float32(rc2), eps: float32(eps), decay: float32(decay),
+	}
+
+	t.g.mu.Lock()
+	defer t.g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if t.g.closed {
+		return errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+	g := t.g
+	bufParams := g.takeBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, trainParamBytes)
+	defer g.putBuffer(wgpuBufferUsageUniform|wgpuBufferUsageCopyDst, trainParamBytes, bufParams)
+	fnQueueWriteBuffer(g.queue, bufParams, 0, unsafe.Pointer(&p), trainParamBytes)
+
+	entries := [5]wgpuBindGroupEntry{
+		{binding: 46, buffer: bufParams, size: trainParamBytes},
+		bind(47, grad),
+		bind(49, t),
+		bind(50, m),
+		bind(51, v),
+	}
+	bindGroup := g.cachedBindGroup(g.pipes.layAdamStep, entries[:])
+	runtime.KeepAlive(&entries)
+
+	x, y := split2D((count + 255) / 256)
+	return g.dispatch(g.pipes.adamStep, bindGroup, x, y, 1)
+}
+
 func (g *Device) MatMul(a, b *tensai.Tensor) (*tensai.Tensor, error) {
 	return g.roundTrip(a, b, (*Tensor).MatMul)
 }
