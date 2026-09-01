@@ -9,6 +9,7 @@ import (
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/internal/kernels"
+	"github.com/mattn/tensai/layer"
 	"github.com/mattn/tensai/optim"
 )
 
@@ -343,4 +344,141 @@ func TestAttentionTrainsBatched(t *testing.T) {
 			t.Errorf("position %d: predicted %d, want %d", i, best, want)
 		}
 	}
+}
+
+// TestConvGradients differentiates the convolution and pooling ops against
+// finite differences, including the padded and strided cases where a pixel
+// lands in several windows or in none.
+func TestConvGradients(t *testing.T) {
+	rng := rand.New(rand.NewSource(4242))
+	x := randTensor(rng, 2, 3, 6, 6) // (batch, channels, height, width)
+	w := randTensor(rng, 3*3*3, 4)   // (channels*k*k, outChannels)
+	bias := randTensor(rng, 4)       // one per output channel
+	weights := randTensor(rng, 2, 4, 6, 6)
+	strided := randTensor(rng, 2, 4, 3, 3)
+	pooled := randTensor(rng, 2, 3, 3, 3)
+	patches := randTensor(rng, 2, 9, 27) // (batch, pixels, patch) for the strided case
+	spread := randTensor(rng, 2, 3, 6, 6)
+	for i := range spread.Data {
+		spread.Data[i] *= 10
+	}
+
+	cases := []struct {
+		name  string
+		param *tensai.Tensor
+		build func() (*Node, *Node)
+	}{
+		{"im2col", x, func() (*Node, *Node) {
+			p := Param(x)
+			return p.Im2Col(Conv{Kernel: 3, Pad: 1, Stride: 2}).Mul(Input(patches)).Sum(), p
+		}},
+		{"conv-input", x, func() (*Node, *Node) {
+			p := Param(x)
+			return p.Conv2D(Input(w), Input(bias), Conv{Kernel: 3, Pad: 1}).Mul(Input(weights)).Sum(), p
+		}},
+		{"conv-weights", w, func() (*Node, *Node) {
+			p := Param(w)
+			return Input(x).Conv2D(p, Input(bias), Conv{Kernel: 3, Pad: 1}).Mul(Input(weights)).Sum(), p
+		}},
+		{"conv-bias", bias, func() (*Node, *Node) {
+			p := Param(bias)
+			return Input(x).Conv2D(Input(w), p, Conv{Kernel: 3, Pad: 1}).Tanh().Sum(), p
+		}},
+		{"conv-strided", x, func() (*Node, *Node) {
+			p := Param(x)
+			return p.Conv2D(Input(w), nil, Conv{Kernel: 3, Pad: 1, Stride: 2}).Mul(Input(strided)).Sum(), p
+		}},
+		{"maxpool", spread, func() (*Node, *Node) {
+			// The finite-difference step must not be able to change which
+			// element of a window is the largest, so this one is scaled up
+			// until the gaps dwarf it.
+			p := Param(spread)
+			return p.MaxPool2D(2).Mul(Input(pooled)).Sum(), p
+		}},
+		{"avgpool", x, func() (*Node, *Node) {
+			p := Param(x)
+			return p.AvgPool2D(2).Mul(Input(pooled)).Sum(), p
+		}},
+	}
+	for _, tc := range cases {
+		checkParamGrad(t, tc.param, tc.build, tc.name)
+	}
+}
+
+// TestConvMatchesLayer checks the forward pass against the hand-written
+// convolution in the layer package, which is the reference implementation
+// the Sequential models use.
+func TestConvMatchesLayer(t *testing.T) {
+	rng := rand.New(rand.NewSource(4243))
+	const batch, inC, h, w, outC, k = 2, 3, 7, 7, 5, 3
+	conv := layer.NewConv2D(outC, k, 1, 1)
+	if _, err := conv.InitImage(layer.Image{H: h, W: w, C: inC}, rng); err != nil {
+		t.Fatal(err)
+	}
+	weights, bias := conv.Params()
+
+	x := randTensor(rng, batch, inC, h, w)
+	flat, err := x.Reshape(batch, inC*h*w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fm, err := flat.Matrix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := conv.Forward(fm)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b := tensai.NewTensor(outC)
+	copy(b.Data, bias)
+	got := Input(x).Conv2D(Param(weights), Param(b), Conv{Kernel: k, Pad: 1}).Value()
+	if len(got.Data) != len(want.Data) {
+		t.Fatalf("got %d elements, want %d", len(got.Data), len(want.Data))
+	}
+	for i := range want.Data {
+		if diff := math.Abs(float64(got.Data[i] - want.Data[i])); diff > 1e-4 {
+			t.Fatalf("element %d: autograd=%v layer=%v", i, got.Data[i], want.Data[i])
+		}
+	}
+}
+
+// TestMaxPoolRoutesToTheWinner checks the pooling gradient by construction
+// rather than numerically: only the position that won a window may receive
+// anything, which is the part finite differences cannot see when two
+// elements are nearly tied.
+func TestMaxPoolRoutesToTheWinner(t *testing.T) {
+	x := tensai.NewTensor(1, 1, 2, 4)
+	copy(x.Data, []tensai.Float{
+		1, 9, 3, 4,
+		5, 6, 7, 2,
+	})
+	p := Param(x)
+	out := p.MaxPool2D(2)
+	if got := out.Shape(); len(got) != 4 || got[2] != 1 || got[3] != 2 {
+		t.Fatalf("shape %v, want [1 1 1 2]", got)
+	}
+	if out.Value().Data[0] != 9 || out.Value().Data[1] != 7 {
+		t.Fatalf("pooled %v, want [9 7]", out.Value().Data)
+	}
+	out.Mul(Input(mustTensor(t, []tensai.Float{2, 3}, 1, 1, 1, 2))).Sum().Backward()
+	want := []tensai.Float{
+		0, 2, 0, 0,
+		0, 0, 3, 0,
+	}
+	for i, v := range want {
+		if p.Grad().Data[i] != v {
+			t.Fatalf("gradient %v, want %v", p.Grad().Data, want)
+		}
+	}
+}
+
+func mustTensor(t *testing.T, data []tensai.Float, shape ...int) *tensai.Tensor {
+	t.Helper()
+	out, err := tensai.NewTensorFromSlice(data, shape...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
 }

@@ -37,12 +37,27 @@ On a node, `Value()` and `Grad()` return `*tensai.Tensor`. They are methods rath
 | `Softmax()` | over the last axis |
 | `LayerNorm(gain, bias, eps)` | over the last axis; `gain` and `bias` hold one element per feature and may be `nil` or trainable |
 | `Embed(ids, shape...)` | `(vocab, d)` table plus `len(ids)` indices → `shape…, d`; repeated ids accumulate on backward |
+| `Conv2D(w, bias, cfg)` | `(batch, channels, h, w)` convolved with `(channels*k*k, outChannels)` weights → `(batch, outChannels, outH, outW)` |
+| `Im2Col(cfg)` | the patch expansion a convolution multiplies, on its own |
+| `MaxPool2D(size)`, `AvgPool2D(size)` | square windows over the last two axes, stride equal to the window |
 | `Sum()`, `Mean()` | reduce everything to one element |
 | `SumAxis(axis, keepDims)`, `MeanAxis(axis, keepDims)` | reduce one axis; a negative axis counts from the end |
 | `ReLU()`, `LeakyReLU(a)`, `Sigmoid()`, `Tanh()`, `GELU()`, `Exp()`, `Log()` | element-wise |
 | `MSELoss(target)`, `SoftmaxCELoss(target)`, `CrossEntropy(labels []int)` | scalar losses; the cross-entropies read the last axis as classes |
 
 Graphs are built dynamically per step and are single-use. Shape mismatches panic during construction rather than returning an error: chaining would be unusable otherwise, and a wrong shape is a programming mistake. Every op's gradient is verified against finite differences in the test suite.
+
+## Convolutions
+
+A convolution is an `Im2Col` and a product: the expansion turns each output pixel into a row of the patch that produced it, and the weights are one column per output channel.
+
+```go
+// x is (batch, channels, height, width); w is (channels*k*k, outChannels).
+h := x.Conv2D(w, bias, autograd.Conv{Kernel: 3, Pad: 1})
+h = h.ReLU().MaxPool2D(2)
+```
+
+`Conv2D` composes the pieces -- `x.Im2Col(cfg).MatMul(w).Transpose(0, 2, 1).Reshape(...)` plus the bias -- so the product it spends its time in is the same one the GPU accelerates. `Im2Col` is exposed on its own for anything the composition does not cover, and `MaxPool2D` and `AvgPool2D` route their gradients to the position that won and over the window respectively. The forward pass matches `layer.Conv2D`, which the Sequential models use.
 
 ## Broadcasting
 

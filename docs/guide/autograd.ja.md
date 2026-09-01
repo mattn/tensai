@@ -37,12 +37,27 @@ for step := 0; step < 2000; step++ {
 | `Softmax()` | 最終軸に対して |
 | `LayerNorm(gain, bias, eps)` | 最終軸に対して。`gain` と `bias` は特徴量ごとに 1 要素で、`nil` でも学習対象でも構いません |
 | `Embed(ids, shape...)` | `(vocab, d)` のテーブルと `len(ids)` 個の添字 → `shape…, d`。同じ id が複数あれば逆伝播で加算されます |
+| `Conv2D(w, bias, cfg)` | `(batch, channels, h, w)` を `(channels*k*k, outChannels)` の重みで畳み込み → `(batch, outChannels, outH, outW)` |
+| `Im2Col(cfg)` | 畳み込みが掛けるパッチ展開そのもの |
+| `MaxPool2D(size)`, `AvgPool2D(size)` | 最後の 2 軸を正方窓で。ストライドは窓と同じ |
 | `Sum()`, `Mean()` | 全体を 1 要素に集約 |
 | `SumAxis(axis, keepDims)`, `MeanAxis(axis, keepDims)` | 1 軸を集約。負の軸は末尾から数えます |
 | `ReLU()`, `LeakyReLU(a)`, `Sigmoid()`, `Tanh()`, `GELU()`, `Exp()`, `Log()` | 要素ごと |
 | `MSELoss(target)`, `SoftmaxCELoss(target)`, `CrossEntropy(labels []int)` | スカラー損失。交差エントロピーは最終軸をクラスとして読みます |
 
 グラフはステップごとに動的に組み立てる使い捨てです。形状の不一致はエラーではなく構築時の panic になります。エラーを返すとチェーンが書けなくなりますし、形状違いはプログラミングのミスだからです。すべての演算の勾配は、テストで数値微分と突き合わせて検証しています。
+
+## 畳み込み
+
+畳み込みは `Im2Col` と積です。展開が各出力ピクセルを「それを作ったパッチの 1 行」に変え、重みは出力チャネルごとに 1 列です。
+
+```go
+// x は (batch, channels, height, width)、w は (channels*k*k, outChannels)。
+h := x.Conv2D(w, bias, autograd.Conv{Kernel: 3, Pad: 1})
+h = h.ReLU().MaxPool2D(2)
+```
+
+`Conv2D` は部品を組み合わせているだけ (`x.Im2Col(cfg).MatMul(w).Transpose(0, 2, 1).Reshape(...)` にバイアス) なので、時間を使う積は GPU が速くするのと同じ積です。組み合わせで足りないときのために `Im2Col` は単体でも公開しています。`MaxPool2D` は勝った位置に、`AvgPool2D` は窓全体に勾配を配ります。順伝播は Sequential が使う `layer.Conv2D` と一致します。
 
 ## ブロードキャスト
 
