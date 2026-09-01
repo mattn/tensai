@@ -2,6 +2,7 @@ package model
 
 import (
 	"fmt"
+	"math/rand"
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/autograd"
@@ -25,13 +26,17 @@ import (
 //	}
 //	g.Sync() // only needed after training on a device
 //
-// Dropout, BatchNorm and Embedding have no graph form yet, so a model
-// holding one is refused rather than silently trained differently.
+// Embedding has no graph form yet, so a model holding one is refused
+// rather than silently trained differently. Dropout and BatchNorm behave
+// as they do in the layer stack, and SetTraining switches between the two
+// halves of that behaviour.
 type Graph struct {
-	steps  []func(*autograd.Node) *autograd.Node
-	params []*autograd.Node
-	hosts  []hostParam
-	loss   string
+	steps    []func(*autograd.Node) *autograd.Node
+	params   []*autograd.Node
+	hosts    []hostParam
+	loss     string
+	rng      *rand.Rand
+	training bool
 }
 
 // hostParam remembers where a parameter lives in its layer, so a value
@@ -46,7 +51,7 @@ func (s *Sequential) Graph() (*Graph, error) {
 	if len(s.layers) == 0 {
 		return nil, fmt.Errorf("tensai: cannot build a graph from a model with no layers")
 	}
-	g := &Graph{loss: s.lossName}
+	g := &Graph{loss: s.lossName, rng: s.rng, training: true}
 	for i, l := range s.layers {
 		step, err := g.add(l)
 		if err != nil {
@@ -64,6 +69,13 @@ func (g *Graph) param(t *tensai.Tensor) *autograd.Node {
 	g.params = append(g.params, n)
 	g.hosts = append(g.hosts, hostParam{node: n, data: t.Data})
 	return n
+}
+
+// scalar wraps one value as a tensor the element-wise ops broadcast.
+func scalar(v tensai.Float) *tensai.Tensor {
+	t := tensai.NewTensor(1)
+	t.Data[0] = v
+	return t
 }
 
 // rowVector views a bias slice as a 1 x n matrix without copying it.
@@ -108,6 +120,47 @@ func (g *Graph) add(l layer.Layer) (func(*autograd.Node) *autograd.Node, error) 
 			return img.MaxPool2D(size).Reshape(-1, ch*outH*outW)
 		}, nil
 
+	case *layer.Dropout:
+		rate := v.Rate
+		return func(x *autograd.Node) *autograd.Node {
+			if !g.training {
+				return x
+			}
+			return x.Dropout(rate, g.rng)
+		}, nil
+
+	case *layer.BatchNorm:
+		gamma, beta := v.Params()
+		gn := g.param(gamma.Tensor())
+		bn := g.param(rowVector(beta))
+		mean, variance := v.RunningStats()
+		eps, momentum := v.Eps, v.Momentum
+		epsNode := autograd.Input(scalar(eps))
+		return func(x *autograd.Node) *autograd.Node {
+			if !g.training {
+				// Inference normalizes with the running estimates, which
+				// are data rather than parameters: no gradient flows to
+				// them.
+				sd := autograd.Input(rowVector(variance)).Add(epsNode).Sqrt()
+				return x.Sub(autograd.Input(rowVector(mean))).Div(sd).Mul(gn).Add(bn)
+			}
+			// Training normalizes with this batch's own statistics, and
+			// the gradient flows through them -- which is the whole point
+			// of the layer, and comes out of the graph for free.
+			m := x.MeanAxis(0, true)
+			d := x.Sub(m)
+			varNode := d.Mul(d).MeanAxis(0, true)
+			out := d.Div(varNode.Add(epsNode).Sqrt()).Mul(gn).Add(bn)
+			// The running estimates are a side effect of the forward pass,
+			// exactly as in layer.BatchNorm.
+			mv, vv := m.Value().Data, varNode.Value().Data
+			for i := range mean {
+				mean[i] = momentum*mean[i] + (1-momentum)*mv[i]
+				variance[i] = momentum*variance[i] + (1-momentum)*vv[i]
+			}
+			return out
+		}, nil
+
 	case *layer.ReLU:
 		return (*autograd.Node).ReLU, nil
 	case *layer.Sigmoid:
@@ -124,6 +177,11 @@ func (g *Graph) add(l layer.Layer) (func(*autograd.Node) *autograd.Node, error) 
 	}
 	return nil, fmt.Errorf("%T has no graph form", l)
 }
+
+// SetTraining switches Dropout and BatchNorm between their training and
+// inference behaviour, the way Fit and Predict do for the layer stack. A
+// graph starts out training.
+func (g *Graph) SetTraining(v bool) { g.training = v }
 
 // Params returns the trainable nodes, in layer order, for a Trainer and a
 // Tape.

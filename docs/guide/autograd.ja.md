@@ -42,7 +42,8 @@ for step := 0; step < 2000; step++ {
 | `MaxPool2D(size)`, `AvgPool2D(size)` | 最後の 2 軸を正方窓で。ストライドは窓と同じ |
 | `Sum()`, `Mean()` | 全体を 1 要素に集約 |
 | `SumAxis(axis, keepDims)`, `MeanAxis(axis, keepDims)` | 1 軸を集約。負の軸は末尾から数えます |
-| `ReLU()`, `LeakyReLU(a)`, `Sigmoid()`, `Tanh()`, `GELU()`, `Exp()`, `Log()` | 要素ごと |
+| `ReLU()`, `LeakyReLU(a)`, `Sigmoid()`, `Tanh()`, `GELU()`, `Exp()`, `Log()`, `Sqrt()` | 要素ごと |
+| `Dropout(rate, rng)` | 要素を落として生き残りをスケール。マスクは 1 度引かれ、逆伝播も同じものを使います |
 | `MSELoss(target)`, `SoftmaxCELoss(target)`, `CrossEntropy(labels []int)` | スカラー損失。交差エントロピーは最終軸をクラスとして読みます |
 
 グラフはステップごとに動的に組み立てる使い捨てです。形状の不一致はエラーではなく構築時の panic になります。エラーを返すとチェーンが書けなくなりますし、形状違いはプログラミングのミスだからです。すべての演算の勾配は、テストで数値微分と突き合わせて検証しています。
