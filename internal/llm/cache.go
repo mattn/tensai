@@ -15,7 +15,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
 	"os"
 	"unsafe"
 
@@ -424,7 +423,6 @@ func loadWeightCache(cpath, src string, bits int, direct bool, cfg config, headS
 	// is the largest tensor in the file and a step reads one row of it,
 	// so the model keeps reading it where it already sits.
 	if cfg.PLEDim > 0 {
-		m.embScale = float32(math.Sqrt(float64(cfg.HiddenSize)))
 		if m.ple, err = newPLETable(src, cfg); err != nil {
 			return bad(err)
 		}

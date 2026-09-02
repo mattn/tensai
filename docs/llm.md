@@ -36,10 +36,12 @@ architecture allows would close most of that and is not implemented yet.
 | llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | the block everyone forked |
 | smollm3 | SmolLM3-3B | RoPE skipped every fourth layer |
 | gemma3 | Gemma 3 | sliding windows on 5/6 layers, sandwich norms, gelu-tanh gate, SentencePiece |
-| gemma4 | Gemma 4 E2B/E4B | per-layer embeddings read from disk a token at a time, two head widths, the deeper layers attending against an earlier layer's cache, logits through a tanh cap |
+| gemma4 | Gemma 4 E2B/E4B/12b | per-layer embeddings read from disk a token at a time, two head widths, the deeper layers attending against an earlier layer's cache, logits through a tanh cap |
 | phi3 | Phi-3/3.5-mini | q/k/v and gate/up shipped pre-fused |
 | qwen2moe / qwen3moe | Qwen1.5-MoE-A2.7B, Qwen3-30B-A3B | top-k routed experts, a shared expert on qwen2moe |
 | gpt-oss | gpt-oss-20b | MXFP4 experts, attention sinks, YaRN rope, harmony channels |
+
+The dense 12b differs from the E-series again: no per-layer embeddings, a kv head count stated per layer (eight on the local layers, one on the global), and no value projection on the layers that narrow, which take their values from their keys. GPU decode sits that last one out.
 
 Gemma 4 keeps most of its parameters in a per-layer embedding table — 2.3
 of E2B's 4.6 billion — that no step needs more than one row of, so the

@@ -42,22 +42,50 @@ func gemma4Config(g *gguf.File, cfg *config) error {
 	}
 	cfg.HeadDimSWA = int(mustInt(g, "gemma4.attention.key_length_swa"))
 	cfg.RopeThetaSWA, _ = g.Float("gemma4.rope.freq_base_swa")
+	// The E-series carries a per-layer embedding table; the dense models
+	// state a width of zero and have none.
 	cfg.PLEDim = int(mustInt(g, "gemma4.embedding_length_per_layer_input"))
 	cfg.LogitCap, _ = g.Float("gemma4.final_logit_softcapping")
+	// A dense model states one kv head count; the larger ones narrow
+	// their global layers and state one per layer.
+	for _, n := range g.Ints("gemma4.attention.head_count_kv") {
+		cfg.KVPerLayer = append(cfg.KVPerLayer, int(n))
+	}
+	if len(cfg.KVPerLayer) > 0 {
+		if len(cfg.KVPerLayer) != cfg.Layers {
+			return fmt.Errorf("gemma4 states %d kv head counts for %d layers", len(cfg.KVPerLayer), cfg.Layers)
+		}
+		// The rest of the loader reads one number where a layer says
+		// nothing of its own; the widest keeps every buffer big enough.
+		for _, n := range cfg.KVPerLayer {
+			cfg.KVHeads = max(cfg.KVHeads, n)
+		}
+	}
+	// Some layers ship no value projection and attend against their
+	// keys. Which ones is a fact about the file, and the repack cache
+	// keeps no tensors to ask, so it is read once here into the config
+	// every later load is rebuilt from.
+	for i := 0; i < cfg.Layers; i++ {
+		_, _, hasV := g.Info(fmt.Sprintf("blk.%d.attn_v.weight", i))
+		_, _, hasK := g.Info(fmt.Sprintf("blk.%d.attn_k.weight", i))
+		cfg.VFromK = append(cfg.VFromK, hasK && !hasV)
+	}
 	// The last shared_kv_layers layers keep no cache of their own.
 	shared := int(mustInt(g, "gemma4.attention.shared_kv_layers"))
 	cfg.KVFromStart = cfg.Layers - shared
-	if cfg.KVFromStart < 2 {
-		return fmt.Errorf("gemma4 shares the KV cache of %d layers among %d", shared, cfg.Layers)
+	if shared > 0 {
+		if cfg.KVFromStart < 2 {
+			return fmt.Errorf("gemma4 shares the KV cache of %d layers among %d", shared, cfg.Layers)
+		}
+		// The reuse rule picks the last global layer and the last local
+		// one that still keep a cache, which only works if those are the
+		// two layers immediately before the boundary.
+		if cfg.SWAPattern[cfg.KVFromStart-1] || !cfg.SWAPattern[cfg.KVFromStart-2] {
+			return fmt.Errorf("gemma4 layer %d is not the last global layer with a KV cache", cfg.KVFromStart-1)
+		}
 	}
-	// The reuse rule below picks the last global layer and the last
-	// local one that still keep a cache, which only works if those are
-	// the two layers immediately before the boundary.
-	if cfg.SWAPattern[cfg.KVFromStart-1] || !cfg.SWAPattern[cfg.KVFromStart-2] {
-		return fmt.Errorf("gemma4 layer %d is not the last global layer with a KV cache", cfg.KVFromStart-1)
-	}
-	if cfg.HeadDimSWA == 0 || cfg.RopeThetaSWA == 0 || cfg.PLEDim == 0 {
-		return fmt.Errorf("gemma4 is missing its local-attention or per-layer embedding dimensions")
+	if cfg.HeadDimSWA == 0 || cfg.RopeThetaSWA == 0 {
+		return fmt.Errorf("gemma4 is missing its local-attention dimensions")
 	}
 	return nil
 }

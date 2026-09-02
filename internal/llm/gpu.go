@@ -47,6 +47,7 @@ type gpuLayer struct {
 	// project queries only and attend against an earlier layer's cache
 	// (kvFrom, meaningful only when kvShared).
 	headSz, qDim, kvDim, ff int
+	kvHeads                 int
 	kvShared                bool
 	kvFrom                  int
 	// gemma4: its logits carry no 1/sqrt(head) (qScale folds that back
@@ -228,7 +229,6 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw, vlog io.Writer) (*gpuQwe
 		return must(g.Upload(&tensai.Tensor{Shape: []int{len(v)}, Data: v}))
 	}
 	gq := &gpuQwen{m: m, g: g, nCtx: nCtx, layers: make([]gpuLayer, len(m.blocks)), pleDim: m.cfg.PLEDim}
-	group := m.cfg.Heads / m.cfg.KVHeads
 	// A ones vector stands in for the weight gemma4's value norm does
 	// not have, so the ordinary per-head norm kernel can run it.
 	var vOnes *gpu.Tensor
@@ -269,14 +269,16 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw, vlog io.Writer) (*gpuQwe
 		l.ropeTheta = b.ropeTheta
 		l.geglu = b.geglu
 		l.headSz = m.headSize(b)
+		l.kvHeads = m.kvHeadCount(b)
 		l.qDim = m.cfg.Heads * l.headSz
-		l.kvDim = m.cfg.KVHeads * l.headSz
+		l.kvDim = l.kvHeads * l.headSz
 		l.ff = m.ffWidth(b)
 		l.kvShared, l.kvFrom = b.kvShared, b.kvFrom
 		hs, kvDim := l.qDim, l.kvDim
 		// A half-precision KV cache halves the resident cache when the
 		// device has shader-f16 and this layer's head grouping fits the
 		// f16 kernel; gemma4's two widths can land either way.
+		group := m.cfg.Heads / l.kvHeads
 		useF16 := g.HasF16() && group > 1 && group <= 8 && l.headSz <= 256
 		// A view onto the fused result needs a 256-byte aligned offset,
 		// so both the q and the q|k boundary have to sit on 64 floats.
@@ -501,9 +503,9 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 	for t, tk := range tokens {
 		copy(flat.Data[t*hs:], m.embed.Data[tk*hs:(tk+1)*hs])
 	}
-	if m.embScale != 0 {
+	if s := m.embedScale(); s != 0 {
 		for i := range flat.Data {
-			flat.Data[i] *= m.embScale
+			flat.Data[i] *= s
 		}
 	}
 	var pe *gpu.Tensor
@@ -565,7 +567,7 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 			k.Free()
 			v.Free()
 		}
-		attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, cfg.KVHeads, startPos+n, l.window))
+		attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, l.kvHeads, startPos+n, l.window))
 		q.Free()
 		// The residual add rides the projection's epilogue unless a
 		// sandwich norm (Gemma) has to run in between.
@@ -630,10 +632,10 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 	hs := cfg.HiddenSize
 	row := m.embed.Data[token*hs : (token+1)*hs]
 	var pe *gpu.Tensor
-	if m.embScale != 0 {
+	if s := m.embedScale(); s != 0 {
 		scaled := make([]float32, hs)
 		for i, v := range row {
-			scaled[i] = v * m.embScale
+			scaled[i] = v * s
 		}
 		row = scaled
 	}
@@ -742,16 +744,16 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 		// dependent dispatch fewer than reducing into a row first.
 		attnFused := false
 		if qo8, ok := l.qo.(*gpu.QMatrix); ok && l.postAttn == nil {
-			if scr, slabs, err := q.GroupedCausalAttentionParts(l.kc, l.vc, cfg.Heads, cfg.KVHeads, pos+1, l.window); err != nil {
+			if scr, slabs, err := q.GroupedCausalAttentionParts(l.kc, l.vc, cfg.Heads, l.kvHeads, pos+1, l.window); err != nil {
 				panic(err)
 			} else if scr != nil {
-				must(qo8.MatMulAttnCombine(scr, slabs, l.headSz, cfg.Heads/cfg.KVHeads, nil, x))
+				must(qo8.MatMulAttnCombine(scr, slabs, l.headSz, cfg.Heads/l.kvHeads, nil, x))
 				scr.Free()
 				attnFused = true
 			}
 		}
 		if !attnFused {
-			attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, cfg.KVHeads, pos+1, l.window))
+			attn := must(q.GroupedCausalAttention(l.kc, l.vc, cfg.Heads, l.kvHeads, pos+1, l.window))
 			// The residual add rides the projection's epilogue unless a
 			// sandwich norm (Gemma) has to run in between.
 			if l.postAttn == nil {

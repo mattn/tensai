@@ -124,13 +124,34 @@ func ggufArch(path string) (string, error) {
 	return arch, nil
 }
 
-// gpuSupportsArch reports whether the device decoder has kernels for an
-// architecture. Every architecture the loader speaks has them today; the
-// hook stays because the answer has to be known before the load, which
-// repacks the weights differently for -gpu -- an architecture that
-// arrives without device kernels belongs here, not in a failure after
-// gigabytes of the wrong repacking.
-func gpuSupportsArch(string) bool { return true }
+// gpuCannotRun says why the device decoder cannot take a gguf, or ""
+// when it can. The answer has to be known before the load, which repacks
+// the weights differently for -gpu: a model the device cannot run
+// belongs here, not in a failure after gigabytes of the wrong repacking.
+func gpuCannotRun(path string) string {
+	g, err := gguf.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer g.Close()
+	arch, _ := g.String("general.architecture")
+	if arch != "gemma4" {
+		return ""
+	}
+	// gemma4's larger models leave the value projection off some layers
+	// and attend against the keys; the device kernels have no copy for
+	// that yet.
+	layers, _ := g.Int("gemma4.block_count")
+	for i := int64(0); i < layers; i++ {
+		if _, _, ok := g.Info(fmt.Sprintf("blk.%d.attn_k.weight", i)); !ok {
+			continue
+		}
+		if _, _, ok := g.Info(fmt.Sprintf("blk.%d.attn_v.weight", i)); !ok {
+			return fmt.Sprintf("this %s takes its values from its keys, which the GPU path cannot do yet", arch)
+		}
+	}
+	return ""
+}
 
 // Open downloads (if needed) and loads the model, the optional draft
 // model, and the GPU residency, returning an Engine positioned at an
@@ -163,8 +184,8 @@ func Open(o Options) (*Engine, error) {
 		// rather than after it: reading one metadata key costs nothing
 		// next to repacking a few gigabytes the wrong way.
 		if o.GPU {
-			if arch, err := ggufArch(o.GGUF); err == nil && !gpuSupportsArch(arch) {
-				fmt.Fprintf(o.Log, "%s has no GPU decode path yet; decoding on the CPU\n", arch)
+			if why := gpuCannotRun(o.GGUF); why != "" {
+				fmt.Fprintf(o.Log, "%s; decoding on the CPU\n", why)
 				o.GPU = false
 			}
 		}
@@ -318,7 +339,7 @@ func Open(o Options) (*Engine, error) {
 			if b.kvShared {
 				continue
 			}
-			kvDim := model.cfg.KVHeads * model.headSize(b)
+			kvDim := model.kvHeadCount(b) * model.headSize(b)
 			total += kvDim
 			widest = max(widest, kvDim)
 		}
@@ -1202,10 +1223,13 @@ func templateFor(modelType string, think bool) tmpl {
 			// of anything to say, which is what a bare tool call is.
 			stops:     []string{"<turn|>", "<eos>"},
 			toolCalls: "gemma4",
+			// The channel is the model's to open: it writes one whether
+			// or not thinking was asked for, so what is inside is always
+			// reasoning and never the answer. -think only asks for it.
+			reasonOpen: "<|channel>thought\n", reasonClose: "<channel|>",
 		}
 		if think {
 			t.sysOpen += "<|think|>\n"
-			t.reasonOpen, t.reasonClose = "<|channel>thought\n", "<channel|>"
 		}
 		return t
 	}
