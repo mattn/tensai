@@ -818,6 +818,21 @@ func blockShape(b *qblock, cfg config, i int) {
 // grouped-int8 matrices — no dequantize/requantize round trip, and finer
 // (32-row) scales than the float path would produce. The GPU path has no
 // grouped kernel yet, so -gpu passes direct=false.
+// layoutName spells the quantized form a load produced. A gguf's own
+// blocks repack straight into the grouped layout, while the requantized
+// form goes through float32 for per-column scales; the two decode at
+// different speeds, and which one a run gets depends on the gpu flag and
+// on whether an earlier run left a requantized cache behind.
+func layoutName(bits int, direct bool) string {
+	if bits == 0 {
+		return "float32"
+	}
+	if direct {
+		return fmt.Sprintf("int%d, gguf blocks repacked", bits)
+	}
+	return fmt.Sprintf("int%d, requantized", bits)
+}
+
 func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen, *tokenizer.Tokenizer, error) {
 	g, err := gguf.Open(path)
 	if err != nil {
@@ -1354,6 +1369,7 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		fastPath := cachePath(path, bits, false)
 		if m, err := loadWeightCache(fastPath, path, bits, false, cfg, headSz); err == nil {
 			fmt.Fprintf(os.Stderr, "using faster requantized cache: %s\n", fastPath)
+			m.layout = layoutName(bits, false)
 			return m, tok, nil
 		}
 	}
@@ -1361,6 +1377,7 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	if useCache {
 		if m, err := loadWeightCache(cpath, path, bits, direct, cfg, headSz); err == nil {
 			fmt.Fprintln(vlog, "weights mapped from the repack cache")
+			m.layout = layoutName(bits, direct)
 			return m, tok, nil
 		} else if !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "repack cache unusable (%v); repacking\n", err)
@@ -1373,7 +1390,7 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	fmt.Fprintf(vlog, "%s into int%d weights, %d layers over %d workers\n",
 		how, bits, cfg.Layers, min(runtime.NumCPU(), 8))
 	repackStart := time.Now()
-	m := &qwen{cfg: cfg, headSz: headSz}
+	m := &qwen{cfg: cfg, headSz: headSz, layout: layoutName(bits, direct)}
 	m.embed = tensor("token_embd.weight")
 	var ropeFF []float32
 	if arch == "gemma4" {
