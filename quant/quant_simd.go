@@ -22,6 +22,13 @@ import (
 // penalties while the 256-bit registers are dirty, so integer scalar tails
 // run before ClearAVXUpperBits and float tails after.
 
+// qxQuad4 packs the four 7-bit activations of an exactly-four-long slice.
+// Taking the quad as a slice rather than indexing at a stride lets the
+// caller hoist the one bounds check out of the multiply-add loop.
+func qxQuad4(xu []uint8) uint32 {
+	return uint32(xu[0]) | uint32(xu[1])<<8 | uint32(xu[2])<<16 | uint32(xu[3])<<24
+}
+
 // qxQuad packs four consecutive 7-bit activations into the u32 a
 // broadcast turns into the unsigned multiply operand.
 func qxQuad(xu []uint8, i4 int) uint32 {
@@ -40,19 +47,28 @@ func qmatvecCols(out []tensai.Float, xu []uint8, sx tensai.Float, qw []int8, sca
 		tile := qw[(jt/q4Tile)*quads*4*q4Tile:]
 		var a0, a1, a2, a3 archsimd.Int32x8
 		for i4 := 0; i4 < quads; i4++ {
-			xp := archsimd.BroadcastUint32x8(qxQuad(xu, i4)).AsUint8x32()
-			row := tile[i4*4*q4Tile:]
+			xi := 4 * i4
+			xq := xu[xi : xi+4 : xi+4]
+			xp := archsimd.BroadcastUint32x8(qxQuad4(xq)).AsUint8x32()
+			i := i4 * 4 * q4Tile
+			row := tile[i : i+4*q4Tile : i+4*q4Tile]
 			a0 = a0.Add(xp.DotProductPairsSaturated(simd.LoadI8x32(row)).DotProductPairs(ones))
 			a1 = a1.Add(xp.DotProductPairsSaturated(simd.LoadI8x32(row[32:])).DotProductPairs(ones))
 			a2 = a2.Add(xp.DotProductPairsSaturated(simd.LoadI8x32(row[64:])).DotProductPairs(ones))
 			a3 = a3.Add(xp.DotProductPairsSaturated(simd.LoadI8x32(row[96:])).DotProductPairs(ones))
 		}
 		sxv := archsimd.BroadcastFloat32x8(sx)
-		for k, a := range [4]archsimd.Int32x8{a0, a1, a2, a3} {
-			j := jt + 8*k
-			f := a.Sub(simd.LoadI32x8(colSum64[j:])).ConvertToFloat32().Mul(simd.LoadF32x8(scale[j:])).Mul(sxv)
-			simd.StoreF32x8(f, out[j:])
-		}
+		o := out[jt : jt+32 : jt+32]
+		sc := scale[jt : jt+32 : jt+32]
+		cs := colSum64[jt : jt+32 : jt+32]
+		f := a0.Sub(simd.LoadI32x8(cs)).ConvertToFloat32().Mul(simd.LoadF32x8(sc)).Mul(sxv)
+		simd.StoreF32x8(f, o)
+		f = a1.Sub(simd.LoadI32x8(cs[8:])).ConvertToFloat32().Mul(simd.LoadF32x8(sc[8:])).Mul(sxv)
+		simd.StoreF32x8(f, o[8:])
+		f = a2.Sub(simd.LoadI32x8(cs[16:])).ConvertToFloat32().Mul(simd.LoadF32x8(sc[16:])).Mul(sxv)
+		simd.StoreF32x8(f, o[16:])
+		f = a3.Sub(simd.LoadI32x8(cs[24:])).ConvertToFloat32().Mul(simd.LoadF32x8(sc[24:])).Mul(sxv)
+		simd.StoreF32x8(f, o[24:])
 	}
 	archsimd.ClearAVXUpperBits()
 	if vecEnd < hi {
