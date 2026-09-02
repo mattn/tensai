@@ -28,7 +28,9 @@ type Q8GMatrix struct {
 
 // NewQ8GMatrix allocates the layout for rows x cols with `group` input
 // rows per scale (0 for the default 32); the caller fills Q (quad
-// layout), Scale, and ColSum64 — see the loaders in internal/llm.
+// layout), Scale, and ColSum64 — see the loaders in internal/llm. AVX2
+// decode computes with signed activations directly and does not read
+// ColSum64; the table remains the portable fallback's correction term.
 func NewQ8GMatrix(rows, cols, group int) *Q8GMatrix {
 	if group == 0 {
 		group = q8Group
