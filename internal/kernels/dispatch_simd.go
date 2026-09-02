@@ -1062,3 +1062,68 @@ func axpy8(ws []float32, v, outs []float32) {
 		o7[i] += ws[7] * v[i]
 	}
 }
+
+// AxpyRows accumulates out += sum over i of ws[i] * rows[i][off:off+d],
+// the value half of one attention head at decode. Called per position
+// instead, an Axpy over a 64-wide head is eight vector instructions
+// wrapped in a call and a VZEROUPPER, and the output row makes a round
+// trip to memory for every position; a context of a few hundred turns
+// that overhead into the cost of attention. Here the output block stays
+// in registers across every row, and the upper bits clear once.
+//
+// The rows accumulate in the order given, product by product, the same
+// order and the same fused multiply-add a per-position Axpy runs, so the
+// result matches it bit for bit.
+func AxpyRows(out, ws []float32, rows [][]float32, off int) {
+	d := len(out)
+	if !simd.HasAVX2 || d < 8 {
+		for i, w := range ws {
+			axpyGeneric(w, rows[i][off:off+d], out)
+		}
+		return
+	}
+	n := d &^ 7
+	// Eight accumulators is the register file's limit, and naming them
+	// keeps them there: an array indexed by the loop variable spills.
+	for b := 0; b+64 <= n; b += 64 {
+		o := out[b:]
+		a0, a1, a2, a3 := simd.LoadF32x8(o), simd.LoadF32x8(o[8:]), simd.LoadF32x8(o[16:]), simd.LoadF32x8(o[24:])
+		a4, a5, a6, a7 := simd.LoadF32x8(o[32:]), simd.LoadF32x8(o[40:]), simd.LoadF32x8(o[48:]), simd.LoadF32x8(o[56:])
+		for i, w := range ws {
+			av := archsimd.BroadcastFloat32x8(w)
+			r := rows[i][off+b:]
+			a0 = simd.LoadF32x8(r).MulAdd(av, a0)
+			a1 = simd.LoadF32x8(r[8:]).MulAdd(av, a1)
+			a2 = simd.LoadF32x8(r[16:]).MulAdd(av, a2)
+			a3 = simd.LoadF32x8(r[24:]).MulAdd(av, a3)
+			a4 = simd.LoadF32x8(r[32:]).MulAdd(av, a4)
+			a5 = simd.LoadF32x8(r[40:]).MulAdd(av, a5)
+			a6 = simd.LoadF32x8(r[48:]).MulAdd(av, a6)
+			a7 = simd.LoadF32x8(r[56:]).MulAdd(av, a7)
+		}
+		simd.StoreF32x8(a0, o)
+		simd.StoreF32x8(a1, o[8:])
+		simd.StoreF32x8(a2, o[16:])
+		simd.StoreF32x8(a3, o[24:])
+		simd.StoreF32x8(a4, o[32:])
+		simd.StoreF32x8(a5, o[40:])
+		simd.StoreF32x8(a6, o[48:])
+		simd.StoreF32x8(a7, o[56:])
+	}
+	// A head that is not a multiple of 64 finishes eight lanes at a time.
+	for b := n &^ 63; b < n; b += 8 {
+		o := out[b:]
+		acc := simd.LoadF32x8(o)
+		for i, w := range ws {
+			acc = simd.LoadF32x8(rows[i][off+b:]).MulAdd(archsimd.BroadcastFloat32x8(w), acc)
+		}
+		simd.StoreF32x8(acc, o)
+	}
+	archsimd.ClearAVXUpperBits()
+	for i, w := range ws {
+		r := rows[i][off:]
+		for k := n; k < d; k++ {
+			out[k] += w * r[k]
+		}
+	}
+}

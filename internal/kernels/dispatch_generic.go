@@ -49,3 +49,10 @@ func Axpy(a float32, x, y []float32) { axpyGeneric(a, x, y) }
 func DotVecs(qs, k []float32, out []float32) { dotVecsGeneric(qs, k, out) }
 
 func Axpys(ws []float32, v, outs []float32) { axpysGeneric(ws, v, outs) }
+
+// AxpyRows accumulates out += sum over i of ws[i] * rows[i][off:off+d].
+func AxpyRows(out, ws []float32, rows [][]float32, off int) {
+	for i, w := range ws {
+		axpyGeneric(w, rows[i][off:off+len(out)], out)
+	}
+}

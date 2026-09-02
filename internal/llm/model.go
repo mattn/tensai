@@ -889,13 +889,22 @@ func mmb(x, w *tensai.Matrix, q *qmat, bias []float32) *tensai.Matrix {
 }
 
 // attendHead runs one head of cached-KV attention: SIMD dot-product
-// scores over the cache, a float64 softmax, and SIMD weighted value
-// accumulation into attn's slot for the head. Heads touch disjoint
-// output ranges, so callers fan heads out across goroutines freely —
-// which is why decode uses it: at short and medium contexts the KV
-// rows sit in L3 anyway, so attendGroup's shared streaming buys
-// nothing there while head-level fan-out keeps every core busy.
-func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, scores []float64) {
+// scores over the cache, a float32 softmax on the vector kernel, and
+// SIMD weighted value accumulation into attn's slot for the head. Heads
+// touch disjoint output ranges, so callers fan heads out across
+// goroutines freely -- which is why decode uses it: at short and medium
+// contexts the KV rows sit in L3 anyway, so attendGroup's shared
+// streaming buys nothing there while head-level fan-out keeps every core
+// busy.
+//
+// The softmax runs the same way attendGroup's does: scores land in a
+// contiguous float32 row so the exponentials go through the vector
+// kernel, and the normalization is one reciprocal rather than a divide
+// per position. A scalar float64 exp per position costs about as much as
+// the head's whole share of the dot products, which at decode's one row
+// per token made the scalar tail, not the cache stream, the cost of
+// attention.
+func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, scores []float32) {
 	// Sliding-window layers (Gemma) see only the last window positions.
 	start := 0
 	if b.window > 0 && steps > b.window {
@@ -904,33 +913,35 @@ func (m *qwen) attendHead(b *qblock, q, attn []float32, h, group, steps int, sco
 	d := m.headSize(b)
 	qOff := h * d
 	kvOff := (h / group) * d
-	scale := m.qkScale(b, d)
+	scale := float32(m.qkScale(b, d))
 	qh := q[qOff : qOff+d]
-	maxs := math.Inf(-1)
+	si := scores[:steps-start]
+	maxs := float32(math.Inf(-1))
 	for t := start; t < steps; t++ {
-		s := float64(tensai.DotVec(qh, b.kc[t][kvOff:kvOff+d])) * scale
-		scores[t] = s
+		s := tensai.DotVec(qh, b.kc[t][kvOff:kvOff+d]) * scale
+		si[t-start] = s
 		if s > maxs {
 			maxs = s
 		}
 	}
-	if b.sinks != nil && float64(b.sinks[h]) > maxs {
-		maxs = float64(b.sinks[h])
+	if b.sinks != nil && b.sinks[h] > maxs {
+		maxs = b.sinks[h]
 	}
-	var sum float64
-	for t := start; t < steps; t++ {
-		scores[t] = math.Exp(scores[t] - maxs)
-		sum += scores[t]
+	kernels.ExpShift(si, si, maxs)
+	var sum float32
+	for _, v := range si {
+		sum += v
 	}
 	if b.sinks != nil {
 		// The sink is an extra softmax slot with no value: it only
 		// absorbs probability mass.
-		sum += math.Exp(float64(b.sinks[h]) - maxs)
+		sum += kernels.ExpF(b.sinks[h] - maxs)
 	}
-	out := attn[qOff : qOff+d]
-	for t := start; t < steps; t++ {
-		tensai.Axpy(float32(scores[t]/sum), b.vc[t][kvOff:kvOff+d], out)
+	inv := 1 / sum
+	for i := range si {
+		si[i] *= inv
 	}
+	kernels.AxpyRows(attn[qOff:qOff+d], si, b.vc[start:steps], kvOff)
 }
 
 // attendGroup runs one KV head's worth of cached-KV attention — the
@@ -1528,6 +1539,9 @@ func (m *qwen) step(token, pos int) []float32 {
 	for li := range m.blocks {
 		maxKV = max(maxKV, m.kvHeadCount(&m.blocks[li]))
 	}
+	// Attention scores for this token: one contiguous row per head,
+	// sized on first use and reused by every block below.
+	var headScores []float32
 	maxQ := cfg.Heads * maxHead
 	qkv := make([]float32, maxQ+2*maxKV*maxHead+cfg.Heads*maxHead)
 	attn := make([]float32, maxQ)
@@ -1615,17 +1629,21 @@ func (m *qwen) step(token, pos int) []float32 {
 		steps := len(b.kc)
 		// Short contexts run the heads serially; past that the dispatch
 		// cost disappears into the O(steps*headSz) work per head.
+		// One score row per head, grown once per token: a fresh buffer
+		// per worker per layer was an allocation for every head of every
+		// block, and the rows are disjoint so the heads stay independent.
+		if len(headScores) < cfg.Heads*steps {
+			headScores = make([]float32, cfg.Heads*steps)
+		}
 		if runtime.NumCPU() > 1 && cfg.Heads > 1 && steps >= 64 {
 			workpool.Run(cfg.Heads, 1, func(lo, hi int) {
-				scores := make([]float64, steps)
 				for h := lo; h < hi; h++ {
-					m.attendHead(b, q, att, h, group, steps, scores)
+					m.attendHead(b, q, att, h, group, steps, headScores[h*steps:(h+1)*steps])
 				}
 			})
 		} else {
-			scores := make([]float64, steps)
 			for h := 0; h < cfg.Heads; h++ {
-				m.attendHead(b, q, att, h, group, steps, scores)
+				m.attendHead(b, q, att, h, group, steps, headScores[h*steps:(h+1)*steps])
 			}
 		}
 		if cfg.AttnOutputGate {
