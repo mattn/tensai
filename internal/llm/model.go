@@ -1147,6 +1147,9 @@ func (m *qwen) rope(h []float32, pos int, b *qblock) {
 // batch instead of once per token. The lm_head runs only on the final
 // position.
 func (m *qwen) prefill(tokens []int, startPos int) []float32 {
+	if len(tokens) == 0 {
+		panic("tensai: prefill of no tokens; the caller must keep one to produce logits from")
+	}
 	x := m.forwardBatch(tokens, startPos)
 	hs := m.cfg.HiddenSize
 	last := x.Data[(len(tokens)-1)*hs : len(tokens)*hs]

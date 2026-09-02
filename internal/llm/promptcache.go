@@ -51,6 +51,11 @@ func (c *promptCache) plan(tokens []int) (start int, restore bool) {
 	} else if !c.hasDelta && n > 0 && n < len(tokens) {
 		// Rolling a KV cache back is just a shorter slice of it.
 		return n, false
+	} else if !c.hasDelta && n > 1 && n == len(tokens) {
+		// The same prompt again -- a retry, or a regenerate. Its logits
+		// come from the last token, so that one row rolls back and is
+		// computed again while everything before it stands.
+		return n - 1, false
 	}
 	if n := commonPrefix(c.ckpt, tokens); n > 0 && n == len(c.ckpt) && n < len(tokens) {
 		return n, true
