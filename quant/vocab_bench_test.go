@@ -46,6 +46,31 @@ func BenchmarkQ8GateUpProjection(b *testing.B) { benchmarkQ8Shape(b, 896, 9728) 
 func BenchmarkQ8DownProjection(b *testing.B)   { benchmarkQ8Shape(b, 4864, 896) }
 func BenchmarkQ8VocabProjection(b *testing.B)  { benchmarkQ8Shape(b, 896, 151936) }
 
+func benchmarkQ8GShape(b *testing.B, rows, cols int) {
+	q := NewQ8GMatrix(rows, cols, 0)
+	for i := range q.Q {
+		q.Q[i] = int8(i%127 - 63)
+	}
+	for i := range q.Scale {
+		q.Scale[i] = 1.0 / 127
+	}
+	x := make([]tensai.Float, rows)
+	for i := range x {
+		x[i] = tensai.Float(i%31-15) / 16
+	}
+	out := make([]tensai.Float, cols)
+	b.SetBytes(int64(rows * cols))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := q.MatVec(x, out); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQ8GGateUpProjection(b *testing.B) { benchmarkQ8GShape(b, 896, 9728) }
+func BenchmarkQ8GVocabProjection(b *testing.B)  { benchmarkQ8GShape(b, 896, 151936) }
+
 // Cold cycles through one down projection per transformer layer, matching
 // decode where the next matrix displaces the previous one from shared cache.
 func BenchmarkQ8DownProjectionCold(b *testing.B) {

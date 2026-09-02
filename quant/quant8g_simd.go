@@ -24,6 +24,7 @@ func q8gMatvecCols(out []tensai.Float, xu []uint8, sx tensai.Float, qw []int8, s
 	quads := len(xu) / 4
 	groups := (len(xu) + group - 1) / group
 	ones := archsimd.BroadcastInt16x16(1)
+	offset := archsimd.BroadcastInt8x32(64)
 	vecEnd := lo + ((hi - lo) &^ 31)
 	if vecEnd > lo {
 		clear(out[lo:vecEnd])
@@ -32,7 +33,6 @@ func q8gMatvecCols(out []tensai.Float, xu []uint8, sx tensai.Float, qw []int8, s
 		for jt := lo; jt < vecEnd; jt += 32 {
 			tile := qw[(jt/q4Tile)*quads*4*q4Tile:]
 			stab := scale[(jt/q4Tile)*groups*q4Tile:]
-			ctab := colSum64[(jt/q4Tile)*groups*q4Tile:]
 			d0 := out[jt : jt+8 : jt+8]
 			d1 := out[jt+8 : jt+16 : jt+16]
 			d2 := out[jt+16 : jt+24 : jt+24]
@@ -42,22 +42,31 @@ func q8gMatvecCols(out []tensai.Float, xu []uint8, sx tensai.Float, qw []int8, s
 				ie := min(ib+group/4, quads)
 				var a0, a1, a2, a3 archsimd.Int32x8
 				for i4 := ib; i4 < ie; i4++ {
-					xp := archsimd.BroadcastUint32x8(qxQuad(xu, i4)).AsUint8x32()
+					// VPMADDUBSW only accepts unsigned*signed bytes.  Keep the
+					// activation signed by taking the absolute value of each
+					// weight and applying its sign to the broadcast activation.
+					// This costs two cheap integer operations per weight vector,
+					// but removes the 4-byte column-sum stream from every 32-byte
+					// Q8_0 group -- decode is bandwidth-bound on real models.
+					xp := archsimd.BroadcastUint32x8(qxQuad(xu, i4)).AsInt8x32().Sub(offset)
 					row := tile[i4*4*q4Tile:]
-					a0 = a0.Add(xp.DotProductPairsSaturated(simd.LoadI8x32(row)).DotProductPairs(ones))
-					a1 = a1.Add(xp.DotProductPairsSaturated(simd.LoadI8x32(row[32:])).DotProductPairs(ones))
-					a2 = a2.Add(xp.DotProductPairsSaturated(simd.LoadI8x32(row[64:])).DotProductPairs(ones))
-					a3 = a3.Add(xp.DotProductPairsSaturated(simd.LoadI8x32(row[96:])).DotProductPairs(ones))
+					w := simd.LoadI8x32(row)
+					a0 = a0.Add(w.Abs().AsUint8x32().DotProductPairsSaturated(xp.MulSign(w)).DotProductPairs(ones))
+					w = simd.LoadI8x32(row[32:])
+					a1 = a1.Add(w.Abs().AsUint8x32().DotProductPairsSaturated(xp.MulSign(w)).DotProductPairs(ones))
+					w = simd.LoadI8x32(row[64:])
+					a2 = a2.Add(w.Abs().AsUint8x32().DotProductPairsSaturated(xp.MulSign(w)).DotProductPairs(ones))
+					w = simd.LoadI8x32(row[96:])
+					a3 = a3.Add(w.Abs().AsUint8x32().DotProductPairsSaturated(xp.MulSign(w)).DotProductPairs(ones))
 				}
 				sg := stab[g*q4Tile:]
-				cg := ctab[g*q4Tile:]
-				f := a0.Sub(simd.LoadI32x8(cg)).ConvertToFloat32().Mul(simd.LoadF32x8(sg))
+				f := a0.ConvertToFloat32().Mul(simd.LoadF32x8(sg))
 				simd.StoreF32x8(simd.LoadF32x8(d0).Add(f), d0)
-				f = a1.Sub(simd.LoadI32x8(cg[8:])).ConvertToFloat32().Mul(simd.LoadF32x8(sg[8:]))
+				f = a1.ConvertToFloat32().Mul(simd.LoadF32x8(sg[8:]))
 				simd.StoreF32x8(simd.LoadF32x8(d1).Add(f), d1)
-				f = a2.Sub(simd.LoadI32x8(cg[16:])).ConvertToFloat32().Mul(simd.LoadF32x8(sg[16:]))
+				f = a2.ConvertToFloat32().Mul(simd.LoadF32x8(sg[16:]))
 				simd.StoreF32x8(simd.LoadF32x8(d2).Add(f), d2)
-				f = a3.Sub(simd.LoadI32x8(cg[24:])).ConvertToFloat32().Mul(simd.LoadF32x8(sg[24:]))
+				f = a3.ConvertToFloat32().Mul(simd.LoadF32x8(sg[24:]))
 				simd.StoreF32x8(simd.LoadF32x8(d3).Add(f), d3)
 			}
 		}
