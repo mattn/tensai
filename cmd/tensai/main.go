@@ -27,7 +27,7 @@ import (
 	"github.com/mattn/tensai/internal/simd"
 )
 
-const version = "0.0.23"
+const version = "0.0.24"
 
 // revision is stamped by the release build (-X main.revision=...).
 var revision = "HEAD"
