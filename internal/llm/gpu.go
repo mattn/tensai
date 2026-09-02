@@ -339,8 +339,8 @@ func newGPUQwen(m *qwen, g *gpu.Device, nCtx int, logw, vlog io.Writer) (*gpuQwe
 			l.kc = must(g.NewF16Tensor(nCtx, kvDim))
 			l.vc = must(g.NewF16Tensor(nCtx, kvDim))
 		default:
-			l.kc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
-			l.vc = must(g.Upload(tensai.NewTensor(nCtx, kvDim)))
+			l.kc = must(g.NewZeroTensor(nCtx, kvDim))
+			l.vc = must(g.NewZeroTensor(nCtx, kvDim))
 		}
 	}
 	// The lm_head is the single biggest weight in a small model — for

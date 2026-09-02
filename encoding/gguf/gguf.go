@@ -30,9 +30,11 @@ import (
 	"math"
 	"os"
 	"sort"
+	"sync/atomic"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/internal/mmapfile"
+	"github.com/mattn/tensai/internal/workpool"
 )
 
 // Tensor encodings from the GGML type enum; only the ones this package
@@ -288,6 +290,131 @@ func (f *File) Float(key string) (float64, bool) {
 	return float64(n), ok
 }
 
+// parallelDequantMin is how many values a tensor needs before decoding
+// it is worth splitting; a var so a test can reach the parallel path
+// without a megabyte of fixture.
+var parallelDequantMin = 1 << 20
+
+// dequantBlocks fills dst from raw for one whole number of blocks. Every
+// case walks its blocks from the front, so a caller can hand it any
+// block-aligned window of a tensor and get that window decoded -- which
+// is what lets the big ones decode on several workers at once.
+func dequantBlocks(typ uint32, name string, dst []float32, raw []byte, n int64) error {
+	switch typ {
+	case typeF32:
+		for i := range dst {
+			dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:]))
+		}
+	case typeF16:
+		for i := range dst {
+			dst[i] = f16to32(binary.LittleEndian.Uint16(raw[2*i:]))
+		}
+	case typeBF16:
+		for i := range dst {
+			dst[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[2*i:])) << 16)
+		}
+	case typeQ8_0:
+		for b := int64(0); b < n/32; b++ {
+			blk := raw[b*34:]
+			s := f16to32(binary.LittleEndian.Uint16(blk))
+			for i := 0; i < 32; i++ {
+				dst[b*32+int64(i)] = s * float32(int8(blk[2+i]))
+			}
+		}
+	case typeQ4_0:
+		for b := int64(0); b < n/32; b++ {
+			blk := raw[b*18:]
+			s := f16to32(binary.LittleEndian.Uint16(blk))
+			for i := 0; i < 16; i++ {
+				q := blk[2+i]
+				dst[b*32+int64(i)] = s * (float32(q&0x0F) - 8)
+				dst[b*32+int64(i)+16] = s * (float32(q>>4) - 8)
+			}
+		}
+	case typeQ4_1:
+		for b := int64(0); b < n/32; b++ {
+			blk := raw[b*20:]
+			s := f16to32(binary.LittleEndian.Uint16(blk))
+			m := f16to32(binary.LittleEndian.Uint16(blk[2:]))
+			for i := 0; i < 16; i++ {
+				q := blk[4+i]
+				dst[b*32+int64(i)] = s*float32(q&0x0F) + m
+				dst[b*32+int64(i)+16] = s*float32(q>>4) + m
+			}
+		}
+	case typeQ5_0:
+		for b := int64(0); b < n/32; b++ {
+			blk := raw[b*22:]
+			s := f16to32(binary.LittleEndian.Uint16(blk))
+			qh := binary.LittleEndian.Uint32(blk[2:])
+			for i := 0; i < 16; i++ {
+				q := blk[6+i]
+				lo := uint32(q&0x0F) | qh>>i<<4&0x10
+				hi := uint32(q>>4) | qh>>(i+12)&0x10
+				dst[b*32+int64(i)] = s * (float32(lo) - 16)
+				dst[b*32+int64(i)+16] = s * (float32(hi) - 16)
+			}
+		}
+	case typeQ5_1:
+		for b := int64(0); b < n/32; b++ {
+			blk := raw[b*24:]
+			s := f16to32(binary.LittleEndian.Uint16(blk))
+			m := f16to32(binary.LittleEndian.Uint16(blk[2:]))
+			qh := binary.LittleEndian.Uint32(blk[4:])
+			for i := 0; i < 16; i++ {
+				q := blk[8+i]
+				lo := uint32(q&0x0F) | qh>>i<<4&0x10
+				hi := uint32(q>>4) | qh>>(i+12)&0x10
+				dst[b*32+int64(i)] = s*float32(lo) + m
+				dst[b*32+int64(i)+16] = s*float32(hi) + m
+			}
+		}
+	case typeIQ4NL:
+		for b := int64(0); b < n/32; b++ {
+			blk := raw[b*18:]
+			s := f16to32(binary.LittleEndian.Uint16(blk))
+			for i := 0; i < 16; i++ {
+				q := blk[2+i]
+				dst[b*32+int64(i)] = s * iq4nl[q&0x0F]
+				dst[b*32+int64(i)+16] = s * iq4nl[q>>4]
+			}
+		}
+	case typeMXFP4:
+		for b := int64(0); b < n/32; b++ {
+			blk := raw[b*17:]
+			// E8M0 exponent; the table carries twice the FP4 values, so
+			// the factor halves.
+			s := float32(math.Ldexp(1, int(blk[0])-128))
+			for i := 0; i < 16; i++ {
+				q := blk[1+i]
+				dst[b*32+int64(i)] = s * mxfp4[q&0x0F]
+				dst[b*32+int64(i)+16] = s * mxfp4[q>>4]
+			}
+		}
+	case typeQ2_K:
+		for b := int64(0); b < n/256; b++ {
+			dequantQ2K(raw[b*84:b*84+84], dst[b*256:b*256+256])
+		}
+	case typeQ3_K:
+		for b := int64(0); b < n/256; b++ {
+			dequantQ3K(raw[b*110:b*110+110], dst[b*256:b*256+256])
+		}
+	case typeQ4_K:
+		for b := int64(0); b < n/256; b++ {
+			dequantQ4K(raw[b*144:b*144+144], dst[b*256:b*256+256])
+		}
+	case typeQ5_K:
+		for b := int64(0); b < n/256; b++ {
+			dequantQ5K(raw[b*176:b*176+176], dst[b*256:b*256+256])
+		}
+	case typeQ6_K:
+		for b := int64(0); b < n/256; b++ {
+			dequantQ6K(raw[b*210:b*210+210], dst[b*256:b*256+256])
+		}
+	}
+	return nil
+}
+
 // Ints returns an integer array metadata value, whatever width the file
 // stored its elements at, or nil when the key is absent or not an array
 // of integers. Gemma 4 states its per-layer feed-forward widths this way.
@@ -468,117 +595,23 @@ func (f *File) TensorRows(name string, from, to int) (*tensai.Tensor, error) {
 	}
 	out := tensai.NewTensor(shape...)
 	dst := out.Data
-	switch t.typ {
-	case typeF32:
-		for i := range dst {
-			dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:]))
-		}
-	case typeF16:
-		for i := range dst {
-			dst[i] = f16to32(binary.LittleEndian.Uint16(raw[2*i:]))
-		}
-	case typeBF16:
-		for i := range dst {
-			dst[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(raw[2*i:])) << 16)
-		}
-	case typeQ8_0:
-		for b := int64(0); b < n/32; b++ {
-			blk := raw[b*34:]
-			s := f16to32(binary.LittleEndian.Uint16(blk))
-			for i := 0; i < 32; i++ {
-				dst[b*32+int64(i)] = s * float32(int8(blk[2+i]))
+	// A 400-million-value embedding is a second and a half of scalar
+	// decoding; block ranges are independent, so they split across the
+	// workers a decode step already keeps resident.
+	if blocks := n / spec.values; blocks >= 64 && len(dst) >= parallelDequantMin {
+		var ferr atomic.Pointer[error]
+		workpool.Run(int(blocks), 1, func(lo, hi int) {
+			w := int64(hi-lo) * spec.values
+			if err := dequantBlocks(t.typ, name, dst[int64(lo)*spec.values:int64(hi)*spec.values],
+				raw[int64(lo)*spec.bytes:int64(hi)*spec.bytes], w); err != nil {
+				ferr.CompareAndSwap(nil, &err)
 			}
+		})
+		if p := ferr.Load(); p != nil {
+			return nil, *p
 		}
-	case typeQ4_0:
-		for b := int64(0); b < n/32; b++ {
-			blk := raw[b*18:]
-			s := f16to32(binary.LittleEndian.Uint16(blk))
-			for i := 0; i < 16; i++ {
-				q := blk[2+i]
-				dst[b*32+int64(i)] = s * (float32(q&0x0F) - 8)
-				dst[b*32+int64(i)+16] = s * (float32(q>>4) - 8)
-			}
-		}
-	case typeQ4_1:
-		for b := int64(0); b < n/32; b++ {
-			blk := raw[b*20:]
-			s := f16to32(binary.LittleEndian.Uint16(blk))
-			m := f16to32(binary.LittleEndian.Uint16(blk[2:]))
-			for i := 0; i < 16; i++ {
-				q := blk[4+i]
-				dst[b*32+int64(i)] = s*float32(q&0x0F) + m
-				dst[b*32+int64(i)+16] = s*float32(q>>4) + m
-			}
-		}
-	case typeQ5_0:
-		for b := int64(0); b < n/32; b++ {
-			blk := raw[b*22:]
-			s := f16to32(binary.LittleEndian.Uint16(blk))
-			qh := binary.LittleEndian.Uint32(blk[2:])
-			for i := 0; i < 16; i++ {
-				q := blk[6+i]
-				lo := uint32(q&0x0F) | qh>>i<<4&0x10
-				hi := uint32(q>>4) | qh>>(i+12)&0x10
-				dst[b*32+int64(i)] = s * (float32(lo) - 16)
-				dst[b*32+int64(i)+16] = s * (float32(hi) - 16)
-			}
-		}
-	case typeQ5_1:
-		for b := int64(0); b < n/32; b++ {
-			blk := raw[b*24:]
-			s := f16to32(binary.LittleEndian.Uint16(blk))
-			m := f16to32(binary.LittleEndian.Uint16(blk[2:]))
-			qh := binary.LittleEndian.Uint32(blk[4:])
-			for i := 0; i < 16; i++ {
-				q := blk[8+i]
-				lo := uint32(q&0x0F) | qh>>i<<4&0x10
-				hi := uint32(q>>4) | qh>>(i+12)&0x10
-				dst[b*32+int64(i)] = s*float32(lo) + m
-				dst[b*32+int64(i)+16] = s*float32(hi) + m
-			}
-		}
-	case typeIQ4NL:
-		for b := int64(0); b < n/32; b++ {
-			blk := raw[b*18:]
-			s := f16to32(binary.LittleEndian.Uint16(blk))
-			for i := 0; i < 16; i++ {
-				q := blk[2+i]
-				dst[b*32+int64(i)] = s * iq4nl[q&0x0F]
-				dst[b*32+int64(i)+16] = s * iq4nl[q>>4]
-			}
-		}
-	case typeMXFP4:
-		for b := int64(0); b < n/32; b++ {
-			blk := raw[b*17:]
-			// E8M0 exponent; the table carries twice the FP4 values, so
-			// the factor halves.
-			s := float32(math.Ldexp(1, int(blk[0])-128))
-			for i := 0; i < 16; i++ {
-				q := blk[1+i]
-				dst[b*32+int64(i)] = s * mxfp4[q&0x0F]
-				dst[b*32+int64(i)+16] = s * mxfp4[q>>4]
-			}
-		}
-	case typeQ2_K:
-		for b := int64(0); b < n/256; b++ {
-			dequantQ2K(raw[b*84:b*84+84], dst[b*256:b*256+256])
-		}
-	case typeQ3_K:
-		for b := int64(0); b < n/256; b++ {
-			dequantQ3K(raw[b*110:b*110+110], dst[b*256:b*256+256])
-		}
-	case typeQ4_K:
-		for b := int64(0); b < n/256; b++ {
-			dequantQ4K(raw[b*144:b*144+144], dst[b*256:b*256+256])
-		}
-	case typeQ5_K:
-		for b := int64(0); b < n/256; b++ {
-			dequantQ5K(raw[b*176:b*176+176], dst[b*256:b*256+256])
-		}
-	case typeQ6_K:
-		for b := int64(0); b < n/256; b++ {
-			dequantQ6K(raw[b*210:b*210+210], dst[b*256:b*256+256])
-		}
+	} else if err := dequantBlocks(t.typ, name, dst, raw, n); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

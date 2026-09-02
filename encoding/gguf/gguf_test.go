@@ -304,3 +304,35 @@ func TestBadInput(t *testing.T) {
 		t.Fatal("expected error for IQ2_XXS")
 	}
 }
+
+// A big tensor decodes on several workers, one block range each. The
+// answer has to be the one the single-threaded walk gives, for every
+// encoding the reader knows.
+func TestParallelDequantMatchesSerial(t *testing.T) {
+	f, err := NewFile(bytes.NewReader(buildTestFile(t)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range f.Names() {
+		was := parallelDequantMin
+		parallelDequantMin = 1 << 30 // serial
+		serial, err := f.Tensor(name)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		parallelDequantMin = 1 // every block range its own chunk
+		split, err := f.Tensor(name)
+		parallelDequantMin = was
+		if err != nil {
+			t.Fatalf("%s split: %v", name, err)
+		}
+		if len(serial.Data) != len(split.Data) {
+			t.Fatalf("%s: %d values serial, %d split", name, len(serial.Data), len(split.Data))
+		}
+		for i := range serial.Data {
+			if serial.Data[i] != split.Data[i] {
+				t.Fatalf("%s[%d] = %v serial, %v split", name, i, serial.Data[i], split.Data[i])
+			}
+		}
+	}
+}

@@ -20,6 +20,7 @@ import (
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/internal/dims"
 	"github.com/mattn/tensai/internal/kernels"
+	"github.com/mattn/tensai/internal/workpool"
 	"github.com/mattn/tensai/quant"
 )
 
@@ -3348,6 +3349,33 @@ func (g *Device) HasF16() bool { return g.hasF16 }
 // NewF16Tensor allocates a zeroed half-precision Device tensor. Only the
 // attention cache kernels read and write f16 tensors: fill it with
 // CopyRowsInto, feed it to GroupedCausalAttention.
+// NewZeroTensor allocates a float32 tensor on the device without
+// sending anything: a buffer starts zeroed, so a KV cache -- which is
+// gigabytes of it, and every row written before it is read -- has no
+// reason to be uploaded from the host at all.
+func (g *Device) NewZeroTensor(shape ...int) (*Tensor, error) {
+	n := 1
+	for _, d := range shape {
+		n *= d
+	}
+	if n <= 0 {
+		return nil, errors.New("tensai: empty tensor")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	t := &Tensor{g: g, shape: append([]int(nil), shape...)}
+	t.buf = g.newBuffer(gpuTensorUsage, t.byteLen())
+	if t.buf == 0 {
+		return nil, errors.New("tensai: gpu buffer allocation failed")
+	}
+	return t, nil
+}
+
 func (g *Device) NewF16Tensor(shape ...int) (*Tensor, error) {
 	if !g.hasF16 {
 		return nil, errors.New("tensai: device has no shader-f16 support")
@@ -4657,13 +4685,17 @@ func (g *Device) UploadQ8(q *quant.QMatrix) (*QMatrix, error) {
 		return nil, errors.New("tensai: cannot upload an empty matrix")
 	}
 	words := (q.Cols + 3) / 4
+	// One row per stretch of packed words, so the walk splits across
+	// workers the way the int4 one does.
 	packed := make([]uint32, q.Rows*words)
-	for i := 0; i < q.Rows; i++ {
-		for j := 0; j < q.Cols; j++ {
-			b := uint32(uint8(q.Q[q.Index(i, j)]))
-			packed[i*words+j/4] |= b << (8 * (j % 4))
+	workpool.Run(q.Rows, 1, func(lo, hi int) {
+		for i := lo; i < hi; i++ {
+			for j := 0; j < q.Cols; j++ {
+				b := uint32(uint8(q.Q[q.Index(i, j)]))
+				packed[i*words+j/4] |= b << (8 * (j % 4))
+			}
 		}
-	}
+	})
 	scales := make([]float32, words*4)
 	for j, s := range q.Scale {
 		scales[j] = float32(s)
@@ -5640,20 +5672,27 @@ func (g *Device) UploadQ4(q *quant.Q4Matrix) (*Q4Matrix, error) {
 		}
 		return uint32(q.Q[q.Index(i, j)]>>(4*(i%2))) & 0x0F
 	}
+	// A row pair owns its stretch of the packed words, so the walk splits
+	// across workers cleanly. It is a billion iterations on a small model
+	// and was most of what -gpu spent getting started.
 	packed := make([]uint32, pairs*words)
-	for i2 := 0; i2 < pairs; i2++ {
-		for j := 0; j < q.Cols; j++ {
-			b := nib(2*i2, j) | nib(2*i2+1, j)<<4
-			packed[i2*words+j/4] |= b << (8 * (j % 4))
+	workpool.Run(pairs, 1, func(lo, hi int) {
+		for i2 := lo; i2 < hi; i2++ {
+			for j := 0; j < q.Cols; j++ {
+				b := nib(2*i2, j) | nib(2*i2+1, j)<<4
+				packed[i2*words+j/4] |= b << (8 * (j % 4))
+			}
 		}
-	}
+	})
 	groups := (q.Rows + 63) / 64 // q4Group
 	scales := make([]float32, groups*words*4)
-	for gi := 0; gi < groups; gi++ {
-		for j := 0; j < q.Cols; j++ {
-			scales[gi*words*4+j] = q.Scale[q.TableIndex(gi, j)]
+	workpool.Run(groups, 1, func(lo, hi int) {
+		for gi := lo; gi < hi; gi++ {
+			for j := 0; j < q.Cols; j++ {
+				scales[gi*words*4+j] = q.Scale[q.TableIndex(gi, j)]
+			}
 		}
-	}
+	})
 
 	g.mu.Lock()
 	defer g.mu.Unlock()
