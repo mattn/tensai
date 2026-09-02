@@ -624,6 +624,14 @@ func (e *Engine) toolRounds(w io.Writer, msgs []chatMessage, n int) ([]chatMessa
 		if visible != "" {
 			fmt.Fprintln(w, visible)
 		}
+		// A turn that spent its whole budget without saying anything
+		// leaves an empty screen, which reads as a broken model rather
+		// than as a limit that was reached: a thinking model can fill
+		// the default budget with thought alone, and the round after a
+		// tool result is the one where it does.
+		if visible == "" && len(calls) == 0 && finish == "length" {
+			fmt.Fprintf(e.opts.Log, "(nothing to show: the turn reached the %d-token limit before it answered; raise -n)\n", n)
+		}
 		msgs = append(msgs, chatMessage{Role: "assistant", Content: content, ToolCalls: calls})
 		if len(calls) == 0 || round == maxToolRounds {
 			total.Content = strings.TrimSpace(content)
