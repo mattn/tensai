@@ -262,16 +262,12 @@ tensai run -q4 -model unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf \
 ```
 
 ```
-<|tool_call>call:wikipedia{query:<|"|>Linus Torvalds<|"|>}<tool_call|>
-[wikipedia {"query":"Linus Torvalds"}] Linus Torvalds (en.wikipedia.org)
-Linus Benedict Torvalds (born 28 December 1969) is a Finnish and American...
-
 Linus Torvalds is a Finnish and American software engineer, best known as the
 creator and lead developer of the Linux kernel since 1991.
 ```
 
-呼び出し自体も画面を流れていきますが、これは読み手にではなくツールに向けた
-発話です。`-json` は答えだけを返します。ツール結果は呼び出したターンの中に
+呼び出しは読み手ではなくツールに向けた発話なので、標準出力には流しません。
+`-json` も答えだけを返します。ツール結果は呼び出したターンの中に
 書き戻す必要があるため、各ラウンドで会話全体を描き直してプレフィルし直します。
 モデルが呼び出せるのは最大 4 往復までで、その後は答える必要があります。`-n`
 には余裕を持たせてください。思考するモデルは、呼び出しに、結果を読むのに、

@@ -273,16 +273,12 @@ tensai run -q4 -model unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf \
 ```
 
 ```
-<|tool_call>call:wikipedia{query:<|"|>Linus Torvalds<|"|>}<tool_call|>
-[wikipedia {"query":"Linus Torvalds"}] Linus Torvalds (en.wikipedia.org)
-Linus Benedict Torvalds (born 28 December 1969) is a Finnish and American...
-
 Linus Torvalds is a Finnish and American software engineer, best known as the
 creator and lead developer of the Linux kernel since 1991.
 ```
 
-The call itself streams past, which is the model talking to the tool rather
-than to the reader; `-json` reports only the answer. Every round re-renders the
+Calls are kept off standard output because they are addressed to the tool, not
+the reader; `-json` likewise reports only the answer. Every round re-renders the
 whole conversation and prefills it again, since a tool result has to be written
 into the turn that asked for it, and the model may go around at most four times
 before it has to answer. Leave room in `-n`: a thinking model spends tokens on

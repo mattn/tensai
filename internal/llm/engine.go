@@ -606,39 +606,24 @@ func (e *Engine) toolRounds(w io.Writer, msgs []chatMessage, n int) ([]chatMessa
 		start := time.Now()
 		e.feed(ids)
 		total.Prefill += time.Since(start)
-		// The reader sees the turn with its thinking taken out, while
-		// the loop reads it whole: a call the model wrote is a call
-		// wherever it wrote it.
+		// Hold the whole turn until calls have been parsed. A call is for
+		// the tool, not the reader, and must not leak into the answer.
 		inReasoning := e.tm.reasonOpen != "" && strings.HasSuffix(text, e.tm.reasonOpen)
 		var out strings.Builder
-		shown := w
-		f := e.thoughtFilter(w, inReasoning)
-		if f != nil {
-			shown = f
-		}
-		gen, finish := e.sample(io.MultiWriter(shown, &out), n)
-		if f != nil {
-			f.flush()
-		}
+		gen, finish := e.sample(&out, n)
 		// The prompt opened the reasoning block, so put the marker back
 		// before reading the turn: what follows then parses the way a
 		// turn the model wrote whole does.
 		turn := out.String()
-		if inReasoning {
-			turn = e.tm.reasonOpen + turn
-		}
-		// Thinking is the model talking to itself: the calls and the
-		// answer are what is left once it is out, which is how the
-		// server reads a turn too.
-		if e.tm.reasonOpen != "" {
-			_, turn = splitReasoning(turn, e.tm.reasonOpen, e.tm.reasonClose)
-		}
 		total.PromptTokens += len(ids)
 		total.CompletionTokens += gen
 		total.Finish = finish
 
-		fmt.Fprintf(e.vlog, "turn %d: %s\n", round, clip(turn, 600))
-		content, calls := e.parseCalls(turn)
+		content, visible, calls := e.finishToolTurn(turn, inReasoning)
+		fmt.Fprintf(e.vlog, "turn %d: %s\n", round, clip(content, 600))
+		if visible != "" {
+			fmt.Fprintln(w, visible)
+		}
 		msgs = append(msgs, chatMessage{Role: "assistant", Content: content, ToolCalls: calls})
 		if len(calls) == 0 || round == maxToolRounds {
 			total.Content = strings.TrimSpace(content)
@@ -650,6 +635,26 @@ func (e *Engine) toolRounds(w io.Writer, msgs []chatMessage, n int) ([]chatMessa
 			msgs = append(msgs, chatMessage{Role: "tool", ToolCallID: c.ID, Name: c.Function.Name, Content: result})
 		}
 	}
+}
+
+// finishToolTurn separates a generated tool turn into the conversation's
+// answer, the text a terminal reader may see, and calls to execute. Calls are
+// deliberately absent from visible; generation cannot safely stream until it
+// knows whether a marker is ordinary prose or the start of a real call.
+func (e *Engine) finishToolTurn(turn string, inReasoning bool) (content, visible string, calls []toolCall) {
+	if inReasoning {
+		turn = e.tm.reasonOpen + turn
+	}
+	reason := ""
+	if e.tm.reasonOpen != "" {
+		reason, turn = splitReasoning(turn, e.tm.reasonOpen, e.tm.reasonClose)
+	}
+	content, calls = e.parseCalls(turn)
+	visible = content
+	if e.opts.Think && reason != "" {
+		visible = e.tm.reasonOpen + reason + e.tm.reasonClose + visible
+	}
+	return
 }
 
 // parseCalls reads whatever calls the turn holds, in the convention the
