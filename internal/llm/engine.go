@@ -6,6 +6,7 @@ package llm
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -78,11 +79,14 @@ type Options struct {
 	Draft   string // data directory of a smaller draft model (speculative decoding)
 	SpecK   int    // draft tokens per speculative step
 	Think   bool   // let Qwen3-family models reason in a <think> block
-	System  string // system prompt; DefaultSystem adapts per model family
-	Temp    float64
-	TopP    float64
-	Seed    int64
-	Log     io.Writer // load/timing chatter; nil silences it
+	// Tools names the tools the model may call, comma-separated;
+	// ToolNames lists what those can be. Empty offers none.
+	Tools  string
+	System string // system prompt; DefaultSystem adapts per model family
+	Temp   float64
+	TopP   float64
+	Seed   int64
+	Log    io.Writer // load/timing chatter; nil silences it
 }
 
 // Engine is a loaded model ready to generate: the tokenizer, the chat
@@ -100,6 +104,7 @@ type Engine struct {
 	g       *gpu.Device
 	gq      *gpuQwen
 	vlog    io.Writer
+	tools   []toolDef
 	prefill func([]int, int) []float32
 	step    func(int, int) []float32
 	reset   func()
@@ -304,6 +309,9 @@ func Open(o Options) (*Engine, error) {
 		rng:  rand.New(rand.NewSource(o.Seed)),
 		vlog: vlog,
 	}
+	if e.tools, err = resolveTools(o.Tools); err != nil {
+		return nil, err
+	}
 	fmt.Fprintf(vlog, "template: %s family, %d stop marker(s), tools=%s think=%v\n",
 		style, len(tm.stops), or(tm.toolCalls, "none"), tm.reasonOpen != "")
 	if system != "" {
@@ -426,16 +434,32 @@ func (e *Engine) feed(ids []int) {
 // draft model is loaded, and reports throughput to the Log writer. It
 // returns the token count and why generation ended.
 func (e *Engine) generate(w io.Writer, limit int) (int, string) {
-	start := time.Now()
-	gen := 0
 	// A gemma4 opens its thinking channel whether or not thinking was
 	// asked for, and an empty one in front of every answer is noise.
 	// -think puts it back, since then it is what the reader wanted.
-	if e.tm.reasonOpen != "" && !e.opts.Think {
-		f := &thoughtFilter{w: w, open: e.tm.reasonOpen, close: e.tm.reasonClose}
+	if f := e.thoughtFilter(w, false); f != nil {
 		defer f.flush()
 		w = f
 	}
+	return e.sample(w, limit)
+}
+
+// thoughtFilter wraps w so the reasoning block does not reach it, or
+// returns nil when there is nothing to take out. inReasoning says the
+// prompt already opened the block, which is how a turn continuing after
+// a tool result starts.
+func (e *Engine) thoughtFilter(w io.Writer, inReasoning bool) *thoughtFilter {
+	if e.tm.reasonOpen == "" || e.opts.Think {
+		return nil
+	}
+	return &thoughtFilter{w: w, open: e.tm.reasonOpen, close: e.tm.reasonClose, inside: inReasoning}
+}
+
+// sample emits up to limit tokens to w, whatever they are: the caller
+// decides what the reader sees.
+func (e *Engine) sample(w io.Writer, limit int) (int, string) {
+	start := time.Now()
+	gen := 0
 	if e.draft != nil {
 		var stats specStats
 		var finish string
@@ -527,6 +551,154 @@ type RunResult struct {
 	Finish           string // "stop" or "length"
 	Prefill          time.Duration
 	Total            time.Duration
+	// Content is the answer alone, set when tool calls were in play:
+	// the rounds before the last one are the model talking to the
+	// tools, and a caller collecting the stream would keep those too.
+	Content string
+}
+
+// GenerateTools answers one question with tools in reach: the model may
+// call one, the call runs here, its result goes back into the same
+// conversation, and the model carries on. It renders and parses through
+// the same code the server uses, so a family's turn structure and its
+// convention for calls are whatever they already were.
+func (e *Engine) GenerateTools(w io.Writer, prompt string, n int) RunResult {
+	began := time.Now()
+	_, res := e.toolRounds(w, []chatMessage{{Role: "user", Content: prompt}}, n)
+	res.Total = time.Since(began)
+	return res
+}
+
+// ChatTools is Chat with tools in reach. It keeps the conversation as
+// messages rather than as a growing KV cache, since a tool result has to
+// be written into the turn that called for it, and re-renders the whole
+// thing each turn.
+func (e *Engine) ChatTools(in io.Reader, w io.Writer, n int) {
+	fmt.Fprintln(e.opts.Log, "chat mode: type a message, empty line or Ctrl-D to quit")
+	sc := bufio.NewScanner(in)
+	var msgs []chatMessage
+	for {
+		fmt.Fprint(w, "> ")
+		if !sc.Scan() || strings.TrimSpace(sc.Text()) == "" {
+			break
+		}
+		msgs = append(msgs, chatMessage{Role: "user", Content: sc.Text()})
+		msgs, _ = e.toolRounds(w, msgs, n)
+	}
+}
+
+// maxToolRounds caps how many times one question may go around the call
+// loop, so a model that keeps asking for the same lookup stops.
+const maxToolRounds = 4
+
+// toolRounds generates until the model answers instead of calling,
+// running every call it makes and appending both the call and its result
+// to the conversation. It returns the conversation with the exchange in
+// it.
+func (e *Engine) toolRounds(w io.Writer, msgs []chatMessage, n int) ([]chatMessage, RunResult) {
+	var total RunResult
+	for round := 0; ; round++ {
+		text := render(e.tm, msgs, e.system, e.tools)
+		ids := e.tok.Encode(text)
+		fmt.Fprintf(e.opts.Log, "prompt: %d tokens\n", len(ids))
+		fmt.Fprintf(e.vlog, "rendered prompt: %s\n", clip(text, 600))
+		e.Reset()
+		start := time.Now()
+		e.feed(ids)
+		total.Prefill += time.Since(start)
+		// Hold the whole turn until calls have been parsed. A call is for
+		// the tool, not the reader, and must not leak into the answer.
+		inReasoning := e.tm.reasonOpen != "" && strings.HasSuffix(text, e.tm.reasonOpen)
+		var out strings.Builder
+		gen, finish := e.sample(&out, n)
+		// The prompt opened the reasoning block, so put the marker back
+		// before reading the turn: what follows then parses the way a
+		// turn the model wrote whole does.
+		turn := out.String()
+		total.PromptTokens += len(ids)
+		total.CompletionTokens += gen
+		total.Finish = finish
+
+		content, visible, calls := e.finishToolTurn(turn, inReasoning)
+		fmt.Fprintf(e.vlog, "turn %d: %s\n", round, clip(content, 600))
+		if visible != "" {
+			fmt.Fprintln(w, visible)
+		}
+		msgs = append(msgs, chatMessage{Role: "assistant", Content: content, ToolCalls: calls})
+		if len(calls) == 0 || round == maxToolRounds {
+			total.Content = strings.TrimSpace(content)
+			return msgs, total
+		}
+		for _, c := range calls {
+			result := e.runTool(c)
+			fmt.Fprintf(e.opts.Log, "[%s %s] %s\n", c.Function.Name, c.Function.Arguments, clip(result, 160))
+			msgs = append(msgs, chatMessage{Role: "tool", ToolCallID: c.ID, Name: c.Function.Name, Content: result})
+		}
+	}
+}
+
+// finishToolTurn separates a generated tool turn into the conversation's
+// answer, the text a terminal reader may see, and calls to execute. Calls are
+// deliberately absent from visible; generation cannot safely stream until it
+// knows whether a marker is ordinary prose or the start of a real call.
+func (e *Engine) finishToolTurn(turn string, inReasoning bool) (content, visible string, calls []toolCall) {
+	if inReasoning {
+		turn = e.tm.reasonOpen + turn
+	}
+	reason := ""
+	if e.tm.reasonOpen != "" {
+		reason, turn = splitReasoning(turn, e.tm.reasonOpen, e.tm.reasonClose)
+	}
+	content, calls = e.parseCalls(turn)
+	visible = content
+	if e.opts.Think && reason != "" {
+		visible = e.tm.reasonOpen + reason + e.tm.reasonClose + visible
+	}
+	return
+}
+
+// parseCalls reads whatever calls the turn holds, in the convention the
+// family speaks. A model that wrote the arguments but forgot the markers
+// around them still gets its call, which the small ones need.
+func (e *Engine) parseCalls(s string) (string, []toolCall) {
+	switch e.tm.toolCalls {
+	case "gemma4":
+		content, calls := parseGemma4ToolCalls(s)
+		if len(calls) == 0 {
+			return parseLooseGemma4Calls(content, e.tools)
+		}
+		return content, calls
+	case "qwen3xml":
+		return parseXMLToolCalls(s, e.tools)
+	}
+	content, calls := parseToolCalls(s)
+	if len(calls) == 0 {
+		return parseLooseToolCalls(content, e.tools)
+	}
+	return content, calls
+}
+
+// runTool executes one call and returns what the model should read, an
+// error included: a failure is something it can react to, and hiding it
+// only makes it call again.
+func (e *Engine) runTool(c toolCall) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	switch c.Function.Name {
+	case "wikipedia":
+		var args struct {
+			Query string `json:"query"`
+		}
+		if err := json.Unmarshal([]byte(c.Function.Arguments), &args); err != nil || args.Query == "" {
+			return "The call needs a query string."
+		}
+		out, err := wikipediaLookup(ctx, args.Query)
+		if err != nil {
+			return "The lookup failed: " + err.Error()
+		}
+		return out
+	}
+	return "No tool by that name is available."
 }
 
 // Generate runs one completion: the prompt goes through the model's chat

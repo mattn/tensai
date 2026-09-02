@@ -414,9 +414,15 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 	}
 	// An open gemma4 turn is where the answer goes: opening another one
 	// would tell the model its own call and result belong to somebody
-	// else's turn.
+	// else's turn. What it does need is the channel it opens for itself
+	// at the top of a turn and cannot open here, because the turn is
+	// already running: without it E4B answers a tool result with an
+	// immediate stop, and with it the same prompt is answered. The
+	// model's own template hands it over the same way.
 	if !openTurn {
 		b.WriteString(tm.asstOpen)
+	} else {
+		b.WriteString(tm.reasonOpen)
 	}
 	b.WriteString(tm.asstPrefill)
 	return b.String()
@@ -866,6 +872,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prompt := render(s.tm, req.Messages, s.system, tools)
+	// A turn continuing after a tool result was handed the reasoning
+	// marker in the prompt, so what the model writes now starts inside
+	// the block rather than in front of it.
+	inReasoning := s.tm.reasonOpen != "" && strings.HasSuffix(prompt, s.tm.reasonOpen)
 	if s.vlog != nil {
 		fmt.Fprintf(s.vlog, "request: %d messages, %d tools, stream=%v, limit %d, temp %.2f\n",
 			len(req.Messages), len(tools), req.Stream, limit, temp)
@@ -996,6 +1006,9 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// that could still grow into the one being awaited.
 	var reasonHeld strings.Builder
 	reasonState := 0 // 0 before the block, 1 inside it, 2 past it
+	if inReasoning {
+		reasonState = 1
+	}
 	emit := func(piece string, final bool) {
 		if s.tm.reasonOpen == "" || reasonState == 2 {
 			answer(piece, final)
@@ -1166,6 +1179,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	content := s.tok.Decode(out)
+	if inReasoning {
+		// Put back what the prompt already said, so the turn splits the
+		// way one the model opened itself does.
+		content = s.tm.reasonOpen + content
+	}
 	reasoning := ""
 	if s.tm.reasonOpen != "" {
 		reasoning, content = splitReasoning(content, s.tm.reasonOpen, s.tm.reasonClose)

@@ -96,7 +96,7 @@ commands:
   version  print the version
 ```
 
-All model commands share the same flags: `-model` (which model to run), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
+All model commands share the same flags: `-model` (which model to run), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-tool`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
 
 `-v` narrates what is otherwise a silent wait. It says what the file claims to be (architecture, layer and head counts, context, vocabulary), how the weights are being read (repacked or mapped from the cache, and how long each took), which template family and system prompt were chosen, and — the one thing a caller cannot otherwise see — the prompt as rendered, markers and all. Under `serve` each request announces itself on arrival with its message and tool counts, then reports how many tokens it prefilled and how fast. It adds lines and changes nothing else.
 
@@ -248,7 +248,7 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
 
 Send the result back as a `tool` message naming the call it answers, alongside the assistant turn that made it, and the model writes the reply. Streaming works the same way: text streams as usual, the calls arrive as `tool_calls` deltas indexed from zero, and the turn ends with `finish_reason: "tool_calls"`.
 
-The signatures are handed to the model in the convention its own family was trained on. For the ChatML families — qwen2, qwen3, their MoE variants, llama, and SmolLM — that is a `<tools>` block appended to the system turn and calls written as `<tool_call>` JSON. Qwen3.5 left that behind: its `<tools>` block leads the system turn instead, and a call is a `<function=name>` element with one `<parameter=key>` per argument, which carries no types, so the tool's own JSON Schema decides what each value means. Whether a particular checkpoint was prepared for it is not a guess: its own chat template either branches on the tool definitions it may be handed or it does not, and that answer overrides the family. A GGUF carries the template in its metadata; a downloaded checkpoint gets it from `tokenizer_config.json` (or `chat_template.jinja`, where newer ones keep it). A model named by a path or a cached name is read where it sits and never fetched from, so a checkpoint cached before this existed falls back to its family until the file is there. Gemma 4 speaks a fourth, which is neither JSON nor XML: the signatures go into the system turn as `<|tool>declaration:name{...}<tool|>` blocks written in a brace DSL where a string is wrapped in `<|"|>` rather than quoted, a call comes back as `<|tool_call>call:name{key:value}<tool_call|>`, and the result answering it goes back inside the same model turn as `<|tool_response>response:name{value:...}<tool_response|>` — the model then carries on in that turn rather than opening another. A small model sampled at temperature sometimes writes the call body and forgets the marker in front of it, so a bare `name{...}` whose name the caller declared is read as the call it plainly is. Families with no such convention (gemma3, phi3, mistral, deepseek, gpt-oss), and checkpoints whose template never mentions tools (SmolLM2, say), answer a request carrying `tools` with 400 rather than dropping them silently. Nothing constrains the sampler, so a call is the model's choice: `tool_choice: "none"` withholds the signatures, but `"required"` cannot force what only a grammar could, and it reads as `"auto"`. Bigger models call far more reliably than the 0.5B default.
+The signatures are handed to the model in the convention its own family was trained on. For the ChatML families — qwen2, qwen3, their MoE variants, llama, and SmolLM — that is a `<tools>` block appended to the system turn and calls written as `<tool_call>` JSON. Qwen3.5 left that behind: its `<tools>` block leads the system turn instead, and a call is a `<function=name>` element with one `<parameter=key>` per argument, which carries no types, so the tool's own JSON Schema decides what each value means. Whether a particular checkpoint was prepared for it is not a guess: its own chat template either branches on the tool definitions it may be handed or it does not, and that answer overrides the family. A GGUF carries the template in its metadata; a downloaded checkpoint gets it from `tokenizer_config.json` (or `chat_template.jinja`, where newer ones keep it). A model named by a path or a cached name is read where it sits and never fetched from, so a checkpoint cached before this existed falls back to its family until the file is there. Gemma 4 speaks a fourth, which is neither JSON nor XML: the signatures go into the system turn as `<|tool>declaration:name{...}<tool|>` blocks written in a brace DSL where a string is wrapped in `<|"|>` rather than quoted, a call comes back as `<|tool_call>call:name{key:value}<tool_call|>`, and the result answering it goes back inside the same model turn as `<|tool_response>response:name{value:...}<tool_response|>` — the model then carries on in that turn rather than opening another. Carrying on needs one more thing: the thought channel a gemma4 opens for itself at the top of every turn, which it cannot open here because the turn is already running, so the prompt hands it the marker. Without it E4B answers a tool result by stopping immediately; with it the same prompt is answered. The thinking that follows is separated as usual, so `-think` and `reasoning_content` decide who sees it. A small model sampled at temperature sometimes writes the call body and forgets the marker in front of it, so a bare `name{...}` whose name the caller declared is read as the call it plainly is. Families with no such convention (gemma3, phi3, mistral, deepseek, gpt-oss), and checkpoints whose template never mentions tools (SmolLM2, say), answer a request carrying `tools` with 400 rather than dropping them silently. Nothing constrains the sampler, so a call is the model's choice: `tool_choice: "none"` withholds the signatures, but `"required"` cannot force what only a grammar could, and it reads as `"auto"`. Bigger models call far more reliably than the 0.5B default.
 
 - The default bind is loopback only (`127.0.0.1:8080`, or `$TENSAI_ADDR`); widen it explicitly if you mean to
 - `-api-key` (or `$TENSAI_API_KEY`) requires a bearer token on the `/v1` routes; the demo page stays open
@@ -259,3 +259,37 @@ The signatures are handed to the model in the convention its own family was trai
   them diverge. On a 744-token prompt that is 12s for the first question and
   under 2s for the rest. The GPU path keeps its own resident cache and does not
   take part
+
+### Tools without a server
+
+`serve` waits for a client to bring the tools. `run` and `chat` can carry one
+themselves: `-tool wikipedia` offers the model a Wikipedia lookup, and when it
+calls, the call runs here, its result goes back into the conversation, and the
+model answers from what it read.
+
+```bash
+tensai run -q4 -model unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf \
+  -tool wikipedia -n 400 "Who is Linus Torvalds?"
+```
+
+```
+Linus Torvalds is a Finnish and American software engineer, best known as the
+creator and lead developer of the Linux kernel since 1991.
+```
+
+Calls are kept off standard output because they are addressed to the tool, not
+the reader; `-json` likewise reports only the answer. Every round re-renders the
+whole conversation and prefills it again, since a tool result has to be written
+into the turn that asked for it, and the model may go around at most four times
+before it has to answer. Leave room in `-n`: a thinking model spends tokens on
+the call, on reading the result, and only then on the reply.
+
+`wikipedia` is the one tool that needs no key and no account. It searches, then
+reads the opening of the best match, so a call costs one round trip rather than
+two, and the alternative titles come back with it in case the model picked the
+wrong one. A query written in Japanese is looked up on `ja.wikipedia.org`, and
+anything else on `en.wikipedia.org`. It is an encyclopedia and not a search
+engine: it answers who or what something is, and is weak on this week's news.
+Wikimedia asks that a client name itself, which is what the `tensai` user agent
+does; a run behind a proxy that strips it gets 403 back as the tool's answer,
+which the model reads and can say so.
