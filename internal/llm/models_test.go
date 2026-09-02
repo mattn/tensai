@@ -45,8 +45,11 @@ func TestModelInvariants(t *testing.T) {
 			checkPrefillMatchesDecode(t, m, 4)
 			// A float32 load has to stay float32. Q6_K tensors used to
 			// take the direct int4 repack whatever the caller asked for,
-			// which is only visible from the weights themselves.
-			if st.Size() < 700<<20 || all {
+			// which is only visible from the weights themselves. One
+			// small model covers that, and only a small one can: four
+			// bits expand eightfold, so a 2.5 GiB file would want twenty
+			// gigabytes of memory to check.
+			if st.Size() < 700<<20 {
 				plain, _, err := loadGGUF(path, 0, true, false, io.Discard)
 				if err != nil {
 					t.Fatalf("float32 load: %v", err)
