@@ -1051,7 +1051,7 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	// allQ6K gates the Q6_K repacks; the requested bit width picks the
 	// destination (lossless int8 for -q8, narrowed int4 for -q4).
 	allQ6K := func(names ...string) bool {
-		if !direct {
+		if bits == 0 || !direct {
 			return false
 		}
 		for _, name := range names {
