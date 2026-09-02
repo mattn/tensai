@@ -60,6 +60,14 @@ $(GOBIN)/goxz:
 test:
 	go test ./...
 
+# The model matrix: every checkpoint in the cache, both loaders, through
+# the invariants a unit test with a hand-built model cannot reach. Needs
+# models on the machine and several minutes; `make test` runs the small
+# end of the same thing.
+.PHONY: check-models
+check-models:
+	TENSAI_ALL_MODELS=1 go test -count=1 -timeout 30m -run TestModelInvariants -v ./internal/llm/
+
 .PHONY: clean
 clean:
 	-rm -f $(BIN)$(EXE)
