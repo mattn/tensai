@@ -1141,13 +1141,13 @@ func (m *qwen) rope(h []float32, pos int, b *qblock) {
 
 // prefill feeds a batch of tokens starting at startPos, extending the KV
 // cache, and returns the next-token logits after the last one. It streams
-// each weight matrix once per batch instead of once per token, and in
-// float32 and int8 it computes exactly what feeding the tokens through
-// step one by one would: the batched matmul quantizes each activation row
-// the way the matvec does and the attention loops match. int4 rounds a
-// batched row and a single one differently, so the two paths part by
-// about a tenth of the logit span there -- neither closer to a float32
-// run than the other. The lm_head runs only on the final position.
+// each weight matrix once per batch instead of once per token. In float32
+// it lands within a part in a hundred thousand of feeding the tokens
+// through step one by one. Quantized, the batched matmul and the matvec
+// round an activation row differently -- a millionth at the layer it
+// starts, which a deep model amplifies into about a tenth of the logit
+// span by the end, without either being closer to a float32 run than the
+// other. The lm_head runs only on the final position.
 func (m *qwen) prefill(tokens []int, startPos int) []float32 {
 	if len(tokens) == 0 {
 		panic("tensai: prefill of no tokens; the caller must keep one to produce logits from")
