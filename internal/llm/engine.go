@@ -428,6 +428,14 @@ func (e *Engine) feed(ids []int) {
 func (e *Engine) generate(w io.Writer, limit int) (int, string) {
 	start := time.Now()
 	gen := 0
+	// A gemma4 opens its thinking channel whether or not thinking was
+	// asked for, and an empty one in front of every answer is noise.
+	// -think puts it back, since then it is what the reader wanted.
+	if e.tm.reasonOpen != "" && !e.opts.Think {
+		f := &thoughtFilter{w: w, open: e.tm.reasonOpen, close: e.tm.reasonClose}
+		defer f.flush()
+		w = f
+	}
 	if e.draft != nil {
 		var stats specStats
 		var finish string
@@ -459,6 +467,57 @@ func (e *Engine) generate(w io.Writer, limit int) (int, string) {
 	fmt.Fprintf(e.opts.Log, "(%d tokens, %.1f tok/s)\n",
 		gen, float64(gen)/time.Since(start).Seconds())
 	return gen, finish
+}
+
+// thoughtFilter passes a stream through with the reasoning block taken
+// out: everything between the family's two markers is dropped, and a
+// tail that could still grow into one is held until it is settled.
+type thoughtFilter struct {
+	w           io.Writer
+	open, close string
+	held        strings.Builder
+	inside      bool
+}
+
+func (f *thoughtFilter) Write(p []byte) (int, error) {
+	f.held.WriteString(string(p))
+	for {
+		text := f.held.String()
+		marker := f.open
+		if f.inside {
+			marker = f.close
+		}
+		if i := strings.Index(text, marker); i >= 0 {
+			if !f.inside {
+				if _, err := io.WriteString(f.w, text[:i]); err != nil {
+					return 0, err
+				}
+			}
+			f.held.Reset()
+			f.held.WriteString(text[i+len(marker):])
+			f.inside = !f.inside
+			continue
+		}
+		keep := partialMarker(text, marker)
+		out := text[:len(text)-keep]
+		f.held.Reset()
+		f.held.WriteString(text[len(text)-keep:])
+		if !f.inside && out != "" {
+			if _, err := io.WriteString(f.w, out); err != nil {
+				return 0, err
+			}
+		}
+		return len(p), nil
+	}
+}
+
+// flush writes what is left, which is the answer unless the model was
+// still inside a block it never closed.
+func (f *thoughtFilter) flush() {
+	if !f.inside && f.held.Len() > 0 {
+		io.WriteString(f.w, f.held.String())
+	}
+	f.held.Reset()
 }
 
 // RunResult reports what one Generate call did.
