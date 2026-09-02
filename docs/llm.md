@@ -96,7 +96,7 @@ commands:
   version  print the version
 ```
 
-All model commands share the same flags: `-model` (which model to run), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
+All model commands share the same flags: `-model` (which model to run), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-tool`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
 
 `-v` narrates what is otherwise a silent wait. It says what the file claims to be (architecture, layer and head counts, context, vocabulary), how the weights are being read (repacked or mapped from the cache, and how long each took), which template family and system prompt were chosen, and — the one thing a caller cannot otherwise see — the prompt as rendered, markers and all. Under `serve` each request announces itself on arrival with its message and tool counts, then reports how many tokens it prefilled and how fast. It adds lines and changes nothing else.
 
@@ -259,3 +259,41 @@ The signatures are handed to the model in the convention its own family was trai
   them diverge. On a 744-token prompt that is 12s for the first question and
   under 2s for the rest. The GPU path keeps its own resident cache and does not
   take part
+
+### Tools without a server
+
+`serve` waits for a client to bring the tools. `run` and `chat` can carry one
+themselves: `-tool wikipedia` offers the model a Wikipedia lookup, and when it
+calls, the call runs here, its result goes back into the conversation, and the
+model answers from what it read.
+
+```bash
+tensai run -q4 -model unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf \
+  -tool wikipedia -n 400 "Who is Linus Torvalds?"
+```
+
+```
+<|tool_call>call:wikipedia{query:<|"|>Linus Torvalds<|"|>}<tool_call|>
+[wikipedia {"query":"Linus Torvalds"}] Linus Torvalds (en.wikipedia.org)
+Linus Benedict Torvalds (born 28 December 1969) is a Finnish and American...
+
+Linus Torvalds is a Finnish and American software engineer, best known as the
+creator and lead developer of the Linux kernel since 1991.
+```
+
+The call itself streams past, which is the model talking to the tool rather
+than to the reader; `-json` reports only the answer. Every round re-renders the
+whole conversation and prefills it again, since a tool result has to be written
+into the turn that asked for it, and the model may go around at most four times
+before it has to answer. Leave room in `-n`: a thinking model spends tokens on
+the call, on reading the result, and only then on the reply.
+
+`wikipedia` is the one tool that needs no key and no account. It searches, then
+reads the opening of the best match, so a call costs one round trip rather than
+two, and the alternative titles come back with it in case the model picked the
+wrong one. A query written in Japanese is looked up on `ja.wikipedia.org`, and
+anything else on `en.wikipedia.org`. It is an encyclopedia and not a search
+engine: it answers who or what something is, and is weak on this week's news.
+Wikimedia asks that a client name itself, which is what the `tensai` user agent
+does; a run behind a proxy that strips it gets 403 back as the tool's answer,
+which the model reads and can say so.

@@ -93,7 +93,7 @@ commands:
   version  print the version
 ```
 
-モデルを使うコマンドは同じフラグを共有します: `-model` (どのモデルを実行するか)、`-q8`/`-q4`、`-gpu`、`-draft`、`-think`、`-system`、`-temp`、`-topp`、`-seed` など — 完全なリストは `tensai <command> -h` で。
+モデルを使うコマンドは同じフラグを共有します: `-model` (どのモデルを実行するか)、`-q8`/`-q4`、`-gpu`、`-draft`、`-think`、`-tool`、`-system`、`-temp`、`-topp`、`-seed` など — 完全なリストは `tensai <command> -h` で。
 
 `-v` は、黙って待つだけだった時間に何をしているかを喋らせます。ファイルが名乗る内容 (アーキテクチャ、層数とヘッド数、コンテキスト、語彙)、重みの読み方 (repack したのかキャッシュから mmap したのか、それぞれ何秒かかったか)、選ばれたテンプレートファミリーとシステムプロンプト、そして他の手段では見えない**実際に組み上がったプロンプト**をマーカーごと出します。`serve` ではリクエストが着いた時点でメッセージ数とツール数を報告し、続けてプレフィルしたトークン数と速度を出します。行が増えるだけで、他は何も変わりません。
 
@@ -248,3 +248,40 @@ curl localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '
   共通なら 2 つが分かれた地点から再開します (その地点は、最初に分岐を見たときに
   チェックポイントとして控えます)。744 トークンのプロンプトで、初回 12 秒・
   以降 2 秒未満になります。GPU パスは自前の常駐キャッシュを持つので対象外です
+
+### サーバーなしでツールを使う
+
+`serve` はクライアントがツールを持ってくるのを待ちますが、`run` と `chat` は
+自分で 1 つ持てます。`-tool wikipedia` を渡すとモデルに Wikipedia の検索が
+提供され、モデルが呼び出したらその場で実行し、結果を会話に戻し、モデルは
+読んだ内容から答えます。
+
+```bash
+tensai run -q4 -model unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf \
+  -tool wikipedia -n 400 "Who is Linus Torvalds?"
+```
+
+```
+<|tool_call>call:wikipedia{query:<|"|>Linus Torvalds<|"|>}<tool_call|>
+[wikipedia {"query":"Linus Torvalds"}] Linus Torvalds (en.wikipedia.org)
+Linus Benedict Torvalds (born 28 December 1969) is a Finnish and American...
+
+Linus Torvalds is a Finnish and American software engineer, best known as the
+creator and lead developer of the Linux kernel since 1991.
+```
+
+呼び出し自体も画面を流れていきますが、これは読み手にではなくツールに向けた
+発話です。`-json` は答えだけを返します。ツール結果は呼び出したターンの中に
+書き戻す必要があるため、各ラウンドで会話全体を描き直してプレフィルし直します。
+モデルが呼び出せるのは最大 4 往復までで、その後は答える必要があります。`-n`
+には余裕を持たせてください。思考するモデルは、呼び出しに、結果を読むのに、
+そして最後に返答にトークンを使います。
+
+`wikipedia` は、キーもアカウントも要らない唯一のツールです。検索してから
+最良一致の冒頭を読むので、1 回の呼び出しで済み (2 往復になりません)、モデルが
+別の記事を狙っていた場合に備えて他の候補タイトルも一緒に返します。日本語で
+書かれたクエリは `ja.wikipedia.org`、それ以外は `en.wikipedia.org` を引きます。
+これは検索エンジンではなく百科事典です。何者か・何であるかには答えますが、
+今週のニュースには弱いままです。Wikimedia はクライアントが名乗ることを求めて
+おり、`tensai` の User-Agent がそれにあたります。プロキシがそれを落とす環境では
+403 がツールの答えとしてモデルに渡り、モデルはそう言えます。

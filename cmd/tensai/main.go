@@ -58,6 +58,7 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 	fs.BoolVar(&o.NoCache, "nocache", false, "neither write nor reuse the repack cache file the first .gguf load leaves next to the model")
 	draft := fs.String("draft", "", "a smaller same-family model for speculative decoding, named the way -model is")
 	fs.IntVar(&o.SpecK, "spec", 3, "draft tokens proposed per speculative step")
+	fs.StringVar(&o.Tools, "tool", "", "tools the model may call, comma-separated: "+strings.Join(llm.ToolNames(), ", "))
 	fs.BoolVar(&o.Think, "think", false, "let Qwen3 models reason in a <think> block before answering")
 	fs.StringVar(&o.System, "system", llm.DefaultSystem, `system message for the chat template; empty ("") sends no system turn at all`)
 	fs.Float64Var(&o.Temp, "temp", 0, "sampling temperature; 0 = greedy")
@@ -218,15 +219,31 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usage: tensai run [flags] <prompt>")
 			os.Exit(2)
 		}
+		if *raw && o.Tools != "" {
+			fmt.Fprintln(os.Stderr, "-raw skips the chat template, which is where a tool call lives; drop one of the two")
+			os.Exit(2)
+		}
 		e := openEngine(o, finish)
 		defer e.Close()
 		stop := profileTo(*cpuprofile)
 		defer stop()
+		generate := func(w io.Writer) llm.RunResult {
+			if o.Tools != "" {
+				return e.GenerateTools(w, text, *n)
+			}
+			return e.Generate(w, text, *raw, *n)
+		}
 		if *jsonOut {
 			var sb strings.Builder
-			res := e.Generate(&sb, text, *raw, *n)
+			res := generate(&sb)
+			content := strings.TrimSuffix(sb.String(), "\n")
+			if res.Content != "" {
+				// A tool run streamed its calls through the same writer;
+				// what the caller asked for is the answer.
+				content = res.Content
+			}
 			out, _ := json.Marshal(map[string]any{
-				"content":           strings.TrimSuffix(sb.String(), "\n"),
+				"content":           content,
 				"finish":            res.Finish,
 				"prompt_tokens":     res.PromptTokens,
 				"completion_tokens": res.CompletionTokens,
@@ -236,7 +253,7 @@ func main() {
 			})
 			fmt.Println(string(out))
 		} else {
-			e.Generate(os.Stdout, text, *raw, *n)
+			generate(os.Stdout)
 		}
 	case "chat":
 		fs := flag.NewFlagSet("tensai chat", flag.ExitOnError)
@@ -245,6 +262,10 @@ func main() {
 		fs.Parse(args)
 		e := openEngine(o, finish)
 		defer e.Close()
+		if o.Tools != "" {
+			e.ChatTools(os.Stdin, os.Stdout, *n)
+			return
+		}
 		e.Chat(os.Stdin, os.Stdout, *n)
 	case "serve":
 		fs := flag.NewFlagSet("tensai serve", flag.ExitOnError)
