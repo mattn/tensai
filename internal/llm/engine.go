@@ -395,6 +395,23 @@ func (e *Engine) Reset() {
 // GPUName reports the adapter the engine is running on, empty when
 // decoding on the CPU. Backend names the binding generation the binary
 // was built with.
+// WeightLayout names the quantized form the decode kernels ran on. The
+// same flags reach different layouts — the gpu path requantizes where
+// the cpu path repacks a gguf's own blocks, and a requantized cache an
+// earlier run left behind is preferred once it exists — so anything
+// reporting a speed should report this beside it.
+func (e *Engine) WeightLayout() string {
+	if e.model == nil {
+		return ""
+	}
+	if e.model.layout != "" {
+		return e.model.layout
+	}
+	// A safetensors checkpoint has no stored blocks to repack: its
+	// weights quantize from float32, which is the requantized form.
+	return layoutName(e.opts.Bits, false)
+}
+
 func (e *Engine) GPUName() string {
 	if e.g == nil {
 		return ""

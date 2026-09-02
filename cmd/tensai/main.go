@@ -381,13 +381,16 @@ func benchCmd(o *llm.Options, p, n, reps int) {
 	} else {
 		fmt.Printf("gpu build: %s\n", tag)
 	}
+	// Each side names the layout it measured: the two sides do not always
+	// run the same one, and a cache an earlier run wrote can change which
+	// one the next run gets, which is invisible in the numbers alone.
 	row := func(name string, r benchResult) {
-		fmt.Printf("%-8s %9.1f %-14s %8.1f %s\n", name,
+		fmt.Printf("%-8s %9.1f %-14s %8.1f %-10s %s\n", name,
 			median(r.Prefill), spread(r.Prefill),
-			median(r.Decode), spread(r.Decode))
+			median(r.Decode), spread(r.Decode), r.Layout)
 	}
 	fmt.Printf("\nmedian of %d runs after one warm-up, tokens/sec\n\n", reps)
-	fmt.Printf("%-8s %9s %-14s %8s\n", "", "prefill", "", "decode")
+	fmt.Printf("%-8s %9s %-14s %8s %-10s %s\n", "", "prefill", "", "decode", "", "weights")
 	row("cpu", cpu)
 	if gpuErr != nil {
 		fmt.Printf("%-8s unavailable: %v\n", "gpu", gpuErr)
@@ -410,6 +413,7 @@ type benchResult struct {
 	Prefill []float64 // one sample per repetition
 	Decode  []float64
 	Adapter string `json:",omitempty"`
+	Layout  string `json:",omitempty"`
 	Err     string `json:",omitempty"`
 }
 
@@ -449,6 +453,7 @@ func benchChild(side string) {
 	} else {
 		defer e.Close()
 		r.Adapter = e.GPUName()
+		r.Layout = e.WeightLayout()
 		// The model stays loaded across repetitions and the first pass is
 		// discarded, so the samples describe steady state rather than a
 		// cold cache and a ramping clock — the same thing llama-bench

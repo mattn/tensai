@@ -219,6 +219,10 @@ type expertFFN struct {
 type qwen struct {
 	cfg    config
 	headSz int
+	// layout names the quantized form the decode kernels run on, for
+	// anything that reports a measurement: the same flags reach
+	// different layouts, so a number without one cannot be compared.
+	layout string
 	embed  *tensai.Tensor // [vocab, hidden]
 	lmT    *tensai.Matrix // [hidden, vocab]
 	qLmT   *qmat
