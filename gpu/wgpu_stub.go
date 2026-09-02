@@ -265,6 +265,9 @@ func (g *Device) IntDot() bool { return false }
 // NewF16Tensor always fails in builds without the wgpu tag.
 func (g *Device) NewF16Tensor(shape ...int) (*Tensor, error) { return nil, errNoWGPU }
 
+// NewZeroTensor always fails in builds without the wgpu tag.
+func (g *Device) NewZeroTensor(shape ...int) (*Tensor, error) { return nil, errNoWGPU }
+
 // MatMul always fails in builds without the wgpu tag.
 func (q *Q4Matrix) MatMul(x *Tensor) (*Tensor, error) { return nil, errNoWGPU }
 
