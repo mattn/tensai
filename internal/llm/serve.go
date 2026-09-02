@@ -1080,7 +1080,11 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Where two prompts part company is worth a checkpoint: the next one
 	// to share this opening starts from there instead of from nothing.
 	// The KV rows need no copy; only a recurrent state does.
-	if mark := commonPrefix(s.cache.live, ids); s.cache.enabled && start == 0 && mark > 0 && mark > len(s.cache.ckpt) {
+	// The last token always stays to be fed: its logits are the answer,
+	// and a prompt the cache already holds whole -- the same question
+	// asked twice -- would otherwise leave nothing to prefill at all.
+	if mark := commonPrefix(s.cache.live, ids); s.cache.enabled && start == 0 &&
+		mark > 0 && mark < len(ids) && mark > len(s.cache.ckpt) {
 		s.prefill(ids[:mark], 0)
 		s.cache.ckpt = append(s.cache.ckpt[:0], ids[:mark]...)
 		if s.cache.hasDelta {

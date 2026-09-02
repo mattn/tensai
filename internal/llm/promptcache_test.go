@@ -43,9 +43,13 @@ func TestPlan(t *testing.T) {
 		{"diverges, recurrent, checkpointed", promptCache{enabled: true, hasDelta: true,
 			live: append(append([]int{}, sys...), 9), ckpt: sys},
 			append(append([]int{}, sys...), 5), 4, true},
-		// An identical prompt has nothing left to prefill and must not
-		// claim the whole thing is already done.
-		{"identical", promptCache{enabled: true, live: sys}, sys, 0, false},
+		// An identical prompt -- a retry, or a regenerate -- keeps
+		// everything but its last token, whose logits are the answer.
+		// It must never claim the whole thing is already done: that
+		// leaves nothing to prefill.
+		{"identical", promptCache{enabled: true, live: sys}, sys, len(sys) - 1, false},
+		// A recurrent state cannot roll that one row back, so it starts over.
+		{"identical, recurrent", promptCache{enabled: true, hasDelta: true, live: sys}, sys, 0, false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			start, restore := tt.c.plan(tt.tokens)
@@ -85,5 +89,34 @@ func TestDeltaSnapshotRoundTrip(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("after restore out[%d] = %v, want %v", i, got[i], want[i])
 		}
+	}
+}
+
+// The same question asked twice: the cache holds the whole prompt, and
+// what is left to prefill must still be a token, since its logits are
+// the answer. It used to be nothing, and the slice ran off the front.
+func TestCachedWholePromptStillFeedsALastToken(t *testing.T) {
+	ids := []int{1, 2, 3, 4}
+	var c promptCache
+	c.enabled = true
+	c.live = append(c.live, ids...)
+
+	start, restore := c.plan(ids)
+	if restore || start != len(ids)-1 {
+		t.Fatalf("plan(identical) = %d, restore %v; want %d, the last token re-fed",
+			start, restore, len(ids)-1)
+	}
+	// The checkpoint step runs after the plan and used to push start to
+	// the end of the prompt on its own.
+	if mark := commonPrefix(c.live, ids); mark > 0 && mark < len(ids) {
+		start = mark
+	}
+	if start >= len(ids) {
+		t.Fatalf("start %d leaves nothing of a %d-token prompt to prefill", start, len(ids))
+	}
+	// A prompt that merely extends the cached one keeps its whole tail.
+	longer := []int{1, 2, 3, 4, 5}
+	if start, _ := c.plan(longer); start != len(ids) {
+		t.Errorf("plan(extended) = %d, want %d", start, len(ids))
 	}
 }
