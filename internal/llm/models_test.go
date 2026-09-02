@@ -2,6 +2,9 @@ package llm
 
 import (
 	"fmt"
+
+	"github.com/mattn/tensai/gpu"
+	"github.com/mattn/tensai/tokenizer"
 	"io"
 	"math"
 	"os"
@@ -38,11 +41,12 @@ func TestModelInvariants(t *testing.T) {
 			continue
 		}
 		t.Run("gguf/"+filepath.Base(path), func(t *testing.T) {
-			m, _, err := loadGGUF(path, 4, true, false, io.Discard)
+			m, tok, err := loadGGUF(path, 4, true, false, io.Discard)
 			if err != nil {
 				t.Skip(err)
 			}
-			checkPrefillMatchesDecode(t, m, 4)
+			tokens := promptTokens(t, tok)
+			checkPrefillMatchesDecode(t, m, tokens, 4)
 			// A float32 load has to stay float32. Q6_K tensors used to
 			// take the direct int4 repack whatever the caller asked for,
 			// which is only visible from the weights themselves. One
@@ -60,7 +64,7 @@ func TestModelInvariants(t *testing.T) {
 						t.Fatalf("layer %d holds quantized weights after a float32 load", i)
 					}
 				}
-				checkPrefillMatchesDecode(t, plain, 0)
+				checkPrefillMatchesDecode(t, plain, tokens, 0)
 			}
 			// The repack cache stores the repacked bytes, so a cached
 			// load holds the same weights and must answer identically.
@@ -68,7 +72,7 @@ func TestModelInvariants(t *testing.T) {
 			if err != nil {
 				t.Fatalf("cached load: %v", err)
 			}
-			a, b := logitsFor(m, []int{1, 2, 3}), logitsFor(cached, []int{1, 2, 3})
+			a, b := logitsFor(m, tokens), logitsFor(cached, tokens)
 			for i := range a {
 				if a[i] != b[i] {
 					t.Fatalf("logit %d differs with the repack cache: %v vs %v", i, a[i], b[i])
@@ -92,11 +96,96 @@ func TestModelInvariants(t *testing.T) {
 			if err != nil {
 				t.Skip(err) // an architecture this loader does not speak
 			}
-			checkPrefillMatchesDecode(t, m, 4)
+			tk, err := tokenizer.Load(filepath.Join(dir, "tokenizer.json"))
+			if err != nil {
+				t.Skip(err)
+			}
+			tokens := promptTokens(t, tk)
+			checkPrefillMatchesDecode(t, m, tokens, 4)
 			if q8, err := loadQwen(filepath.Join(dir, "config.json"), weights, 8); err == nil {
-				checkPrefillMatchesDecode(t, q8, 8)
+				checkPrefillMatchesDecode(t, q8, tokens, 8)
 			}
 		})
+	}
+}
+
+// The device has to answer what the CPU answers. It reads the same
+// weights -- the requantized ones, since that is what -gpu loads -- so
+// the two differ only in the order their kernels accumulate, and a
+// wrong head width or a cache bound to the wrong layer shows up as a
+// different token rather than a rounding difference. Skips wherever no
+// device opens, which includes every build without a wgpu tag.
+func TestDeviceMatchesCPU(t *testing.T) {
+	root := CacheRoot()
+	ggufs, _ := findModels(t, root)
+	if len(ggufs) == 0 {
+		t.Skipf("no models under %s", root)
+	}
+	g, err := gpu.Open(gpu.HighPerformance)
+	if err != nil {
+		t.Skip(err)
+	}
+	defer g.Close()
+	all := os.Getenv("TENSAI_ALL_MODELS") != ""
+	for _, path := range ggufs {
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !all && st.Size() > 1500<<20 {
+			continue
+		}
+		t.Run(filepath.Base(path), func(t *testing.T) {
+			// -gpu loads with direct off, so the cpu side has to as
+			// well or the two would be comparing different weights.
+			m, tok, err := loadGGUF(path, 4, false, false, io.Discard)
+			if err != nil {
+				t.Skip(err)
+			}
+			// A real sentence, so the top token is a decision the model
+			// actually made rather than two logits a rounding apart.
+			tokens := tok.Encode("The capital of France is")
+			if len(tokens) < 2 {
+				t.Skip("tokenizer produced nothing to feed")
+			}
+			m.reset()
+			want := append([]float32(nil), m.prefill(tokens, 0)...)
+
+			gq, err := newGPUQwen(m, g, 512, io.Discard, io.Discard)
+			if err != nil {
+				t.Skip(err) // no kernels for this shape, or no room
+			}
+			got := append([]float32(nil), gq.prefill(tokens, 0)...)
+			compareLogits(t, "prefill", want, got)
+
+			// And the device's own two paths have to agree, which is
+			// where a cache written at the wrong width would show.
+			gq.gpuLen = 0
+			var one []float32
+			for i, tok := range tokens {
+				one = gq.step(tok, i)
+			}
+			compareLogits(t, "device decode", want, one)
+		})
+	}
+}
+
+func compareLogits(t *testing.T, what string, want, got []float32) {
+	t.Helper()
+	if len(want) != len(got) {
+		t.Fatalf("%s: %d logits, want %d", what, len(got), len(want))
+	}
+	if argmax(want) != argmax(got) {
+		t.Fatalf("%s picks token %d, the cpu picks %d", what, argmax(got), argmax(want))
+	}
+	var worst float64
+	for i := range want {
+		if d := math.Abs(float64(want[i] - got[i])); d > worst {
+			worst = d
+		}
+	}
+	if span := logitSpan(want); worst > 0.25*span {
+		t.Errorf("%s differs from the cpu by %v, %.1f%% of the logit span", what, worst, 100*worst/span)
 	}
 }
 
@@ -105,9 +194,8 @@ func TestModelInvariants(t *testing.T) {
 // wrong width: a batch and the same tokens one at a time have to end up
 // in the same place. It is what a first message does, and what nothing
 // covered when a zero-valued block claimed to share layer 0's cache.
-func checkPrefillMatchesDecode(t *testing.T, m *qwen, bits int) {
+func checkPrefillMatchesDecode(t *testing.T, m *qwen, tokens []int, bits int) {
 	t.Helper()
-	tokens := []int{1, 2, 3, 4, 5}
 	batch := logitsFor(m, tokens)
 
 	m.reset()
@@ -127,19 +215,33 @@ func checkPrefillMatchesDecode(t *testing.T, m *qwen, bits int) {
 			worst = d
 		}
 	}
-	// In float32 and int8 the two paths are the same arithmetic in a
-	// different order and agree to rounding. int4 quantizes the
-	// activations, and the batch and the single row round differently --
-	// measured against a float32 run, neither is the better of the two,
-	// so the bar there is only that they still answer the same token.
-	limit := 0.001
-	if bits == 4 {
-		limit = 0.25
+	// In float32 the two paths are the same arithmetic in a different
+	// order and land within a part in a hundred thousand of each other.
+	// Quantized, they round an activation row differently -- a
+	// millionth at the layer it starts, which a deep model amplifies
+	// into about a tenth of the logit span by the end, without either
+	// being closer to a float32 run than the other. So the bar there is
+	// that they still answer the same token.
+	limit, width := 0.25, fmt.Sprintf("int%d", bits)
+	if bits == 0 {
+		limit, width = 1e-4, "float32"
 	}
 	if span := logitSpan(batch); worst > limit*span {
-		t.Errorf("int%d prefill and decode differ by %v, %.1f%% of the logit span (limit %.1f%%)",
-			bits, worst, 100*worst/span, 100*limit)
+		t.Errorf("%s prefill and decode differ by %v, %.4f%% of the logit span (limit %.4f%%)",
+			width, worst, 100*worst/span, 100*limit)
 	}
+}
+
+// promptTokens is a sentence rather than a handful of ids: the top
+// logit has to be a decision the model made, or comparing which token
+// two paths pick compares two numbers a rounding apart.
+func promptTokens(t *testing.T, tok interface{ Encode(string) []int }) []int {
+	t.Helper()
+	ids := tok.Encode("The capital of France is")
+	if len(ids) < 2 {
+		t.Skip("tokenizer produced nothing to feed")
+	}
+	return ids
 }
 
 func logitsFor(m *qwen, tokens []int) []float32 {
