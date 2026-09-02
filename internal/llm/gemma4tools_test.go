@@ -52,9 +52,14 @@ func TestGemma4ToolRoundTrip(t *testing.T) {
 		{Role: "tool", ToolCallID: "call_0", Content: `{"temp_c":22}`},
 	}
 	got := render(gemma4Tmpl(), msgs, "", []toolDef{weatherToolG4()})
+	// The thought channel closes the prompt: the model opens one for
+	// itself at the top of a turn, and this turn is already running, so
+	// the marker has to be handed over. E4B answers a tool result with
+	// an immediate stop without it.
 	want := `<|turn>model
 <|tool_call>call:get_weather{city:<|"|>Tokyo<|"|>,days:2,metric:true}<tool_call|>` +
-		`<|tool_response>response:get_weather{value:<|"|>{"temp_c":22}<|"|>}<tool_response|>`
+		`<|tool_response>response:get_weather{value:<|"|>{"temp_c":22}<|"|>}<tool_response|>` +
+		"<|channel>thought\n"
 	if len(got) < len(want) || got[len(got)-len(want):] != want {
 		t.Errorf("render() ends %q, want %q", got, want)
 	}
