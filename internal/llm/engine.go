@@ -124,13 +124,34 @@ func ggufArch(path string) (string, error) {
 	return arch, nil
 }
 
-// gpuSupportsArch reports whether the device decoder has kernels for an
-// architecture. Every architecture the loader speaks has them today; the
-// hook stays because the answer has to be known before the load, which
-// repacks the weights differently for -gpu -- an architecture that
-// arrives without device kernels belongs here, not in a failure after
-// gigabytes of the wrong repacking.
-func gpuSupportsArch(string) bool { return true }
+// gpuCannotRun says why the device decoder cannot take a gguf, or ""
+// when it can. The answer has to be known before the load, which repacks
+// the weights differently for -gpu: a model the device cannot run
+// belongs here, not in a failure after gigabytes of the wrong repacking.
+func gpuCannotRun(path string) string {
+	g, err := gguf.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer g.Close()
+	arch, _ := g.String("general.architecture")
+	if arch != "gemma4" {
+		return ""
+	}
+	// gemma4's larger models leave the value projection off some layers
+	// and attend against the keys; the device kernels have no copy for
+	// that yet.
+	layers, _ := g.Int("gemma4.block_count")
+	for i := int64(0); i < layers; i++ {
+		if _, _, ok := g.Info(fmt.Sprintf("blk.%d.attn_k.weight", i)); !ok {
+			continue
+		}
+		if _, _, ok := g.Info(fmt.Sprintf("blk.%d.attn_v.weight", i)); !ok {
+			return fmt.Sprintf("this %s takes its values from its keys, which the GPU path cannot do yet", arch)
+		}
+	}
+	return ""
+}
 
 // Open downloads (if needed) and loads the model, the optional draft
 // model, and the GPU residency, returning an Engine positioned at an
@@ -163,8 +184,8 @@ func Open(o Options) (*Engine, error) {
 		// rather than after it: reading one metadata key costs nothing
 		// next to repacking a few gigabytes the wrong way.
 		if o.GPU {
-			if arch, err := ggufArch(o.GGUF); err == nil && !gpuSupportsArch(arch) {
-				fmt.Fprintf(o.Log, "%s has no GPU decode path yet; decoding on the CPU\n", arch)
+			if why := gpuCannotRun(o.GGUF); why != "" {
+				fmt.Fprintf(o.Log, "%s; decoding on the CPU\n", why)
 				o.GPU = false
 			}
 		}
@@ -318,7 +339,7 @@ func Open(o Options) (*Engine, error) {
 			if b.kvShared {
 				continue
 			}
-			kvDim := model.cfg.KVHeads * model.headSize(b)
+			kvDim := model.kvHeadCount(b) * model.headSize(b)
 			total += kvDim
 			widest = max(widest, kvDim)
 		}
@@ -407,6 +428,14 @@ func (e *Engine) feed(ids []int) {
 func (e *Engine) generate(w io.Writer, limit int) (int, string) {
 	start := time.Now()
 	gen := 0
+	// A gemma4 opens its thinking channel whether or not thinking was
+	// asked for, and an empty one in front of every answer is noise.
+	// -think puts it back, since then it is what the reader wanted.
+	if e.tm.reasonOpen != "" && !e.opts.Think {
+		f := &thoughtFilter{w: w, open: e.tm.reasonOpen, close: e.tm.reasonClose}
+		defer f.flush()
+		w = f
+	}
 	if e.draft != nil {
 		var stats specStats
 		var finish string
@@ -438,6 +467,57 @@ func (e *Engine) generate(w io.Writer, limit int) (int, string) {
 	fmt.Fprintf(e.opts.Log, "(%d tokens, %.1f tok/s)\n",
 		gen, float64(gen)/time.Since(start).Seconds())
 	return gen, finish
+}
+
+// thoughtFilter passes a stream through with the reasoning block taken
+// out: everything between the family's two markers is dropped, and a
+// tail that could still grow into one is held until it is settled.
+type thoughtFilter struct {
+	w           io.Writer
+	open, close string
+	held        strings.Builder
+	inside      bool
+}
+
+func (f *thoughtFilter) Write(p []byte) (int, error) {
+	f.held.WriteString(string(p))
+	for {
+		text := f.held.String()
+		marker := f.open
+		if f.inside {
+			marker = f.close
+		}
+		if i := strings.Index(text, marker); i >= 0 {
+			if !f.inside {
+				if _, err := io.WriteString(f.w, text[:i]); err != nil {
+					return 0, err
+				}
+			}
+			f.held.Reset()
+			f.held.WriteString(text[i+len(marker):])
+			f.inside = !f.inside
+			continue
+		}
+		keep := partialMarker(text, marker)
+		out := text[:len(text)-keep]
+		f.held.Reset()
+		f.held.WriteString(text[len(text)-keep:])
+		if !f.inside && out != "" {
+			if _, err := io.WriteString(f.w, out); err != nil {
+				return 0, err
+			}
+		}
+		return len(p), nil
+	}
+}
+
+// flush writes what is left, which is the answer unless the model was
+// still inside a block it never closed.
+func (f *thoughtFilter) flush() {
+	if !f.inside && f.held.Len() > 0 {
+		io.WriteString(f.w, f.held.String())
+	}
+	f.held.Reset()
 }
 
 // RunResult reports what one Generate call did.
@@ -1202,10 +1282,13 @@ func templateFor(modelType string, think bool) tmpl {
 			// of anything to say, which is what a bare tool call is.
 			stops:     []string{"<turn|>", "<eos>"},
 			toolCalls: "gemma4",
+			// The channel is the model's to open: it writes one whether
+			// or not thinking was asked for, so what is inside is always
+			// reasoning and never the answer. -think only asks for it.
+			reasonOpen: "<|channel>thought\n", reasonClose: "<channel|>",
 		}
 		if think {
 			t.sysOpen += "<|think|>\n"
-			t.reasonOpen, t.reasonClose = "<|channel>thought\n", "<channel|>"
 		}
 		return t
 	}

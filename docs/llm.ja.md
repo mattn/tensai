@@ -35,10 +35,12 @@ greedy の続きは GPT-2 のよく知られたリファレンス出力とトー
 | llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | みんながフォークしたブロック |
 | smollm3 | SmolLM3-3B | 4 層ごとに RoPE をスキップ |
 | gemma3 | Gemma 3 | 5/6 層のスライディングウィンドウ、サンドイッチ norm、gelu-tanh ゲート、SentencePiece |
-| gemma4 | Gemma 4 E2B/E4B | トークンごとにディスクから読む per-layer embedding、2 種類のヘッド幅、深い層は前の層の KV キャッシュに attend、logits は tanh でキャップ |
+| gemma4 | Gemma 4 E2B/E4B/12b | トークンごとにディスクから読む per-layer embedding、2 種類のヘッド幅、深い層は前の層の KV キャッシュに attend、logits は tanh でキャップ |
 | phi3 | Phi-3/3.5-mini | q/k/v と gate/up が融合済みで配布 |
 | qwen2moe / qwen3moe | Qwen1.5-MoE-A2.7B, Qwen3-30B-A3B | top-k ルーティングのエキスパート、qwen2moe は共有エキスパートも |
 | gpt-oss | gpt-oss-20b | MXFP4 エキスパート、attention sinks、YaRN rope、harmony チャンネル |
+
+密モデルの 12b はまた別で、per-layer embedding を持たず、KV ヘッド数を層ごとに宣言し (ローカル層 8、グローバル層 1)、狭くなる層には V の射影がありません。その層は K を V として使います。最後の 1 点だけ GPU デコードは対象外です。
 
 Gemma 4 はパラメータの大半 — E2B の 46 億のうち 23 億 — を per-layer
 embedding テーブルに置いています。1 ステップで必要なのはそのうち 1 行だけな

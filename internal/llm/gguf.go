@@ -775,6 +775,12 @@ func blockShape(b *qblock, cfg config, i int) {
 		b.vNorm = true
 		b.unitQK = true
 		b.ff = cfg.FFPerLayer[i]
+		if len(cfg.KVPerLayer) == cfg.Layers {
+			b.kvHeads = cfg.KVPerLayer[i]
+		}
+		if len(cfg.VFromK) == cfg.Layers {
+			b.vFromK = cfg.VFromK[i]
+		}
 		b.headSz = cfg.HeadDim
 		if cfg.SWAPattern[i] {
 			b.window = cfg.SlidingWin
@@ -848,13 +854,15 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	if cfg.RopeTheta == 0 {
 		cfg.RopeTheta = 10000
 	}
-	if cfg.HiddenSize == 0 || cfg.Layers == 0 || cfg.Heads == 0 || cfg.KVHeads == 0 {
-		return nil, nil, fmt.Errorf("gguf is missing %s.* dimensions", arch)
-	}
 	if arch == "gemma4" {
+		// gemma4 states several of its dimensions per layer, kv head
+		// counts included, so it fills them in before the check below.
 		if err := gemma4Config(g, &cfg); err != nil {
 			return nil, nil, err
 		}
+	}
+	if cfg.HiddenSize == 0 || cfg.Layers == 0 || cfg.Heads == 0 || cfg.KVHeads == 0 {
+		return nil, nil, fmt.Errorf("gguf is missing %s.* dimensions", arch)
 	}
 	if arch == "qwen2moe" || arch == "qwen3moe" || arch == "gpt-oss" {
 		cfg.NExpert = int(meta("expert_count"))
@@ -1372,13 +1380,16 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		// Gemma scales embeddings by sqrt(hidden). Doing it per token
 		// rather than to the table leaves the tied lm head the values it
 		// was trained with.
-		m.embScale = float32(math.Sqrt(float64(cfg.HiddenSize)))
-		m.pleNorm = tensor("per_layer_proj_norm.weight").Data
-		m.wPleIn, m.qPleIn = linAuto([]string{"per_layer_model_proj.weight"}, []int{0})
 		ropeFF = tensor("rope_freqs.weight").Data
-		m.ple, err = newPLETable(path, cfg)
-		if err != nil {
-			return nil, nil, err
+		// Only the E-series carries per-layer embeddings; the dense
+		// models state a width of zero and ship none of the tensors.
+		if cfg.PLEDim > 0 {
+			m.pleNorm = tensor("per_layer_proj_norm.weight").Data
+			m.wPleIn, m.qPleIn = linAuto([]string{"per_layer_model_proj.weight"}, []int{0})
+			m.ple, err = newPLETable(path, cfg)
+			if err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 	if arch == "gemma3" {
@@ -1465,15 +1476,23 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 				// A layer that attends against an earlier layer's cache
 				// projects queries and nothing else.
 				b.wQKV, b.qQKV = linAuto([]string{p + "attn_q.weight"}, []int{qPerm})
+			} else if b.vFromK {
+				// gemma4's larger models leave the value projection off
+				// some layers and attend against the keys instead.
+				b.wQKV, b.qQKV = linAuto(
+					[]string{p + "attn_q.weight", p + "attn_k.weight"},
+					[]int{qPerm, kPerm})
 			} else {
 				b.wQKV, b.qQKV = linAuto(
 					[]string{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"},
 					[]int{qPerm, kPerm, 0})
 			}
 			if arch == "gemma4" {
-				b.wPleGate, b.qPleGate = linAuto([]string{p + "inp_gate.weight"}, []int{0})
-				b.wPleProj, b.qPleProj = linAuto([]string{p + "proj.weight"}, []int{0})
-				b.plePost = tensor(p + "post_norm.weight").Data
+				if cfg.PLEDim > 0 {
+					b.wPleGate, b.qPleGate = linAuto([]string{p + "inp_gate.weight"}, []int{0})
+					b.wPleProj, b.qPleProj = linAuto([]string{p + "proj.weight"}, []int{0})
+					b.plePost = tensor(p + "post_norm.weight").Data
+				}
 				b.outScale = vecOpt(p + "layer_output_scale.weight")
 				if !cfg.SWAPattern[i] {
 					b.ropeFF = ropeFF

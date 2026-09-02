@@ -93,6 +93,8 @@ type config struct {
 	// layer's slice of the per-layer embedding table, and LogitCap the
 	// tanh the final logits pass through.
 	FFPerLayer   []int   `json:"-"`
+	KVPerLayer   []int   `json:"-"`
+	VFromK       []bool  `json:"-"`
 	SWAPattern   []bool  `json:"-"`
 	HeadDimSWA   int     `json:"-"`
 	RopeThetaSWA float64 `json:"-"`
@@ -158,9 +160,11 @@ type qblock struct {
 	noPE         bool           // smollm3: every fourth layer skips RoPE
 	headSz       int            // this layer's head width; gemma4 alternates 256 and 512
 	ff           int            // this layer's feed-forward width; 0 = cfg.Intermediate
+	kvHeads      int            // this layer's kv head count; 0 = cfg.KVHeads
 	kvShared     bool           // gemma4: this layer keeps no cache of its own
 	kvFrom       int            // the layer whose cache it attends against, when kvShared
 	vNorm        bool           // gemma4: RMS-normalize V with no weight of its own
+	vFromK       bool           // gemma4: this layer projects no values and attends against its keys
 	unitQK       bool           // gemma4: attention logits are not divided by sqrt(head)
 	ropeFF       []float32      // gemma4 global layers: per-pair rope frequency divisor
 	window       int            // gemma3: sliding-attention span; 0 = full
@@ -222,14 +226,11 @@ type qwen struct {
 	blocks []qblock
 	// gemma4's per-layer embeddings: ple reads one token's row of the
 	// table, too large to dequantize whole, and pleIn projects the token
-	// embedding into the same space to be averaged with it. embScale is
-	// Gemma's sqrt(hidden) on the way in, applied per token so the tied
-	// lm head keeps the embedding's own values.
-	ple      *pleTable
-	wPleIn   *tensai.Matrix
-	qPleIn   *qmat
-	pleNorm  []float32
-	embScale float32
+	// embedding into the same space to be averaged with it.
+	ple     *pleTable
+	wPleIn  *tensai.Matrix
+	qPleIn  *qmat
+	pleNorm []float32
 	// dscratch is one token's working set for the delta layers, which all
 	// share the same shapes; nil until a delta layer runs.
 	dscratch *deltaScratch
@@ -1020,6 +1021,29 @@ func (m *qwen) qkScale(b *qblock, d int) float64 {
 	return 1 / math.Sqrt(float64(d))
 }
 
+// embedScale is what a token's embedding is multiplied by on the way in.
+// Gemma scales by the square root of the hidden size; applying it per
+// token rather than to the table leaves the tied lm head the values it
+// was trained with. Derived rather than stored, because a model reaches
+// the decoder through three loaders and two of them once forgot.
+func (m *qwen) embedScale() float32 {
+	if m.cfg.ModelType != "gemma4" {
+		return 0
+	}
+	return float32(math.Sqrt(float64(m.cfg.HiddenSize)))
+}
+
+// kvHeadCount is the layer's kv head count. gemma4's larger models
+// narrow their global layers to a single kv head and leave the local
+// ones wide, so the group a query head sits in changes from layer to
+// layer; everything else here leaves the field zero.
+func (m *qwen) kvHeadCount(b *qblock) int {
+	if b.kvHeads > 0 {
+		return b.kvHeads
+	}
+	return m.cfg.KVHeads
+}
+
 // ffWidth is the layer's feed-forward width. Only gemma4 varies it from
 // layer to layer; the rest leave the field zero.
 func (m *qwen) ffWidth(b *qblock) int {
@@ -1192,16 +1216,15 @@ func (m *qwen) truncate(n int) {
 func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 	cfg := m.cfg
 	hs := cfg.HiddenSize
-	group := cfg.Heads / cfg.KVHeads
 	n := len(tokens)
 
 	x := tensai.NewMatrix(n, hs)
 	for t, tk := range tokens {
 		copy(x.Data[t*hs:(t+1)*hs], m.embed.Data[tk*hs:(tk+1)*hs])
 	}
-	if m.embScale != 0 {
+	if s := m.embedScale(); s != 0 {
 		for i := range x.Data {
-			x.Data[i] *= m.embScale
+			x.Data[i] *= s
 		}
 	}
 	// gemma4 hands every block its own slice of each token's per-layer
@@ -1232,13 +1255,18 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 		// gemma4 alternates head widths from layer to layer, so the
 		// projection geometry belongs to the block rather than the model.
 		headSz := m.headSize(b)
-		kvDim := cfg.KVHeads * headSz
+		kvHeads := m.kvHeadCount(b)
+		group := cfg.Heads / kvHeads
+		kvDim := kvHeads * headSz
 		qDim := cfg.Heads * headSz
 		qProjW := m.qProjWidth(b)
 		qkvW := qProjW + 2*kvDim
-		if b.kvShared {
+		switch {
+		case b.kvShared:
 			// This layer projects queries only.
 			qkvW = qProjW
+		case b.vFromK:
+			qkvW = qProjW + kvDim
 		}
 		norm(b.ln1)
 		if b.delta != nil {
@@ -1293,12 +1321,18 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 				}
 				kr := row[qProjW : qProjW+kvDim]
 				vr := row[qProjW+kvDim:]
+				if b.vFromK {
+					// No value projection: the keys are the values,
+					// taken before the key norm and the rotation.
+					vr = vb[t*kvDim : (t+1)*kvDim : (t+1)*kvDim]
+					copy(vr, kr)
+				}
 				m.qkNorm(kr, b.kNorm, headSz)
 				if b.vNorm {
 					m.vRMSNorm(vr, headSz)
 				}
 				if !b.noPE {
-					for h := 0; h < cfg.KVHeads; h++ {
+					for h := 0; h < kvHeads; h++ {
 						m.rope(kr[h*headSz:(h+1)*headSz], pos, b)
 					}
 				}
@@ -1359,13 +1393,13 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 								steps := startPos + t + 1
 								qr := qrow(t)
 								ar := attn.Data[t*qDim : (t+1)*qDim]
-								for kh := 0; kh < cfg.KVHeads; kh++ {
+								for kh := 0; kh < kvHeads; kh++ {
 									m.attendGroup(b, qr, ar, kh, group, steps, scores, ws)
 								}
 							}
 							continue
 						}
-						for kh := 0; kh < cfg.KVHeads; kh++ {
+						for kh := 0; kh < kvHeads; kh++ {
 							qOff := kh * group * dh
 							for r := 0; r < qb; r++ {
 								qrs[r] = qrow(t0 + r)[qOff : qOff+group*dh]
@@ -1453,13 +1487,12 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 func (m *qwen) step(token, pos int) []float32 {
 	cfg := m.cfg
 	hs := cfg.HiddenSize
-	group := cfg.Heads / cfg.KVHeads
 
 	x := make([]float32, hs)
 	copy(x, m.embed.Data[token*hs:(token+1)*hs])
-	if m.embScale != 0 {
+	if s := m.embedScale(); s != 0 {
 		for i := range x {
-			x[i] *= m.embScale
+			x[i] *= s
 		}
 	}
 	a := make([]float32, hs)
@@ -1487,8 +1520,12 @@ func (m *qwen) step(token, pos int) []float32 {
 			maxHead = h
 		}
 	}
+	maxKV := cfg.KVHeads
+	for li := range m.blocks {
+		maxKV = max(maxKV, m.kvHeadCount(&m.blocks[li]))
+	}
 	maxQ := cfg.Heads * maxHead
-	qkv := make([]float32, maxQ+2*cfg.KVHeads*maxHead+cfg.Heads*maxHead)
+	qkv := make([]float32, maxQ+2*maxKV*maxHead+cfg.Heads*maxHead)
 	attn := make([]float32, maxQ)
 	var qbuf, gbuf []float32
 	if cfg.AttnOutputGate {
@@ -1501,13 +1538,18 @@ func (m *qwen) step(token, pos int) []float32 {
 	for li := range m.blocks {
 		b := &m.blocks[li]
 		headSz := m.headSize(b)
-		kvDim := cfg.KVHeads * headSz
+		kvHeads := m.kvHeadCount(b)
+		group := cfg.Heads / kvHeads
+		kvDim := kvHeads * headSz
 		qDim := cfg.Heads * headSz
 		qProjW := m.qProjWidth(b)
 		qkvW := qProjW + 2*kvDim
-		if b.kvShared {
+		switch {
+		case b.kvShared:
 			// This layer projects queries only.
 			qkvW = qProjW
+		case b.vFromK:
+			qkvW = qProjW + kvDim
 		}
 		rmsnormInto(a, x, b.ln1, cfg.RMSEps)
 		if b.delta != nil {
@@ -1541,13 +1583,20 @@ func (m *qwen) step(token, pos int) []float32 {
 			m.kvCache(b)
 		} else {
 			k := row[qProjW : qProjW+kvDim]
-			v := row[qProjW+kvDim:]
+			v := qkv[qProjW+kvDim : qProjW+2*kvDim]
+			if b.vFromK {
+				// No value projection: the keys are the values, taken
+				// before the key norm and the rotation touch them.
+				copy(v, k)
+			} else {
+				v = row[qProjW+kvDim:]
+			}
 			m.qkNorm(k, b.kNorm, headSz)
 			if b.vNorm {
 				m.vRMSNorm(v, headSz)
 			}
 			if !b.noPE {
-				for h := 0; h < cfg.KVHeads; h++ {
+				for h := 0; h < kvHeads; h++ {
 					m.rope(k[h*headSz:(h+1)*headSz], pos, b)
 				}
 			}

@@ -1,6 +1,9 @@
 package llm
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 // gemma4TestConfig is Gemma 4 E2B's geometry as the GGUF states it:
 // 35 layers, every fifth attending globally with the wide head, the
@@ -136,16 +139,13 @@ func TestCapLogits(t *testing.T) {
 	}
 }
 
-// -gpu on an architecture the device path cannot run has to be caught
-// before the load, because it changes how the weights are repacked: the
-// wrong answer costs a few gigabytes of pointless requantization. Every
-// architecture the loader speaks has device kernels today, gemma4's
-// per-layer widths and per-layer embeddings included.
-func TestGPUSupportsArch(t *testing.T) {
-	for _, arch := range []string{"llama", "qwen3", "gemma3", "gemma4", "gpt-oss"} {
-		if !gpuSupportsArch(arch) {
-			t.Errorf("%s should take the device path", arch)
-		}
+// -gpu on a model the device path cannot run has to be caught before the
+// load, because it changes how the weights are repacked: the wrong
+// answer costs a few gigabytes of pointless requantization. A file that
+// is not there answers nothing, which leaves the load to report it.
+func TestGPUCannotRun(t *testing.T) {
+	if why := gpuCannotRun(filepath.Join(t.TempDir(), "absent.gguf")); why != "" {
+		t.Errorf("a missing file should not decide the question: %q", why)
 	}
 }
 
