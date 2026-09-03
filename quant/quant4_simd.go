@@ -371,3 +371,10 @@ func q4matmulCols8(out *tensai.Matrix, xus [][]uint8, xqs [][]uint32, sxs []tens
 		q4matmulCols4Generic(out, xus[4:8], sxs[4:8], gsums[4:8], r0+4, qw, scale, sm, group, cols, vecEnd, hi)
 	}
 }
+
+// packQuad packs a re-centered activation quad in weight-layout order:
+// the nibble unpack lands rows 0..3 in four consecutive u8 lanes, so the
+// broadcast operand is just the quad in row order.
+func packQuad(x []uint8) uint32 {
+	return recenter(x[0]) | recenter(x[1])<<8 | recenter(x[2])<<16 | recenter(x[3])<<24
+}

@@ -168,17 +168,19 @@ func quantize4Columns(m *tensai.Matrix, q *Q4Matrix, groups, colLo, colHi int) {
 
 // packQuads re-centers the 7-bit activations to signed bytes and packs
 // each quad into the u32 the kernels broadcast, so the scalar assembly
-// runs once per call instead of once per column tile.
+// runs once per call instead of once per column tile. The lane order is
+// the kernel's own: packQuad ships next to each build's kernels.
 func packQuads(xu []uint8) []uint32 {
 	xq := make([]uint32, len(xu)/4)
 	for i := range xq {
-		x0 := uint32(uint8(int8(int(xu[4*i]) - 64)))
-		x1 := uint32(uint8(int8(int(xu[4*i+1]) - 64)))
-		x2 := uint32(uint8(int8(int(xu[4*i+2]) - 64)))
-		x3 := uint32(uint8(int8(int(xu[4*i+3]) - 64)))
-		xq[i] = x0 | x1<<8 | x2<<16 | x3<<24
+		xq[i] = packQuad(xu[4*i : 4*i+4 : 4*i+4])
 	}
 	return xq
+}
+
+// recenter maps one 7-bit offset-binary activation to its signed byte.
+func recenter(u uint8) uint32 {
+	return uint32(uint8(int8(int(u) - 64)))
 }
 
 // MatVec computes out = x @ Q for a single activation row: len(x) must be

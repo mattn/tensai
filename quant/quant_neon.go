@@ -9,8 +9,10 @@ import (
 	"github.com/mattn/tensai/internal/simd"
 )
 
-// 128-bit NEON kernels for the int8 matvec over the quad-row layout, the
-// arm64 counterpart of quant_simd.go. NEON has no unsigned-by-signed
+// 128-bit NEON kernels for the int8 matvec and the batched matmul over
+// the quad-row layout, the arm64 counterpart of quant_simd.go. The two
+// fold differently, so each carries its own note; this one covers the
+// matvec. NEON has no unsigned-by-signed
 // pairwise multiply-add (VPMADDUBSW) and no widening pair-add (VPMADDWD),
 // so the fold is built by hand: sign-extend the bytes to int16, multiply,
 // and let two pairwise adds (VADDP) collapse a column's four rows into
@@ -21,7 +23,7 @@ import (
 // rather than carrying the +64 bias the u8-by-s8 multiply forces on
 // amd64. That drops the column-sum correction: the accumulator is already
 // the value the amd64 kernel reaches only after subtracting it, so the
-// two agree exactly and this side never reads the table.
+// two agree exactly and the matvec never reads colSum64.
 //
 // Overflow: |activation| <= 63 and |weight| <= 127, so a product fits
 // 8001, a pair 16002, and a column's four rows 32004 -- inside int16 with
@@ -86,9 +88,75 @@ func qmatvecCols(out []tensai.Float, xu []uint8, sx tensai.Float, qw []int8, sca
 	}
 }
 
-// qmatmulRows8 keeps the portable body for now: prefill amortizes the
-// weight stream over eight rows already, and the batched fold wants a
-// different shape from the matvec's. See PERF-INVESTIGATION.md.
+// The batched prefill form below folds differently. Its weight load is
+// shared by eight activation rows, so the multiply runs eight times per
+// load and the cheaper operand matters more than the bias: the signed
+// widening multiply (SMULL/SMULL2) takes the weight bytes as they are,
+// where the matvec above first sign-extends them. Activations stay in
+// their 7-bit offset-binary form, which the +64 correction in colSum64
+// folds back out, exactly as the amd64 kernel does.
+//
+// Overflow: products reach 127*127, so a column's four rows can hit
+// 64516. The i16 pair-add still holds the two-row partials, but the sums
+// widen to i32 before the second one.
+
+// qxSpread broadcasts a packed activation quad across all sixteen byte
+// lanes so both halves of a weight load meet the same four activations.
+func qxSpread(quad uint32) archsimd.Int8x16 {
+	return archsimd.BroadcastUint32x4(quad).ReshapeToUint8s().BitsToInt8()
+}
+
+// qdot4Hi folds one 16-byte weight load -- four columns four rows deep --
+// against a spread activation quad into four per-column i32 sums. The
+// load's high half arrives already shifted down so a row block pays that
+// shift once for all eight rows.
+func qdot4Hi(xp, w, wh archsimd.Int8x16) archsimd.Int32x4 {
+	p := xp.MulWidenLo(w).ConcatAddPairs(xp.MulWidenLo(wh))
+	return p.ExtendLo4ToInt32().ConcatAddPairs(p.HiToLo().ExtendLo4ToInt32())
+}
+
+// qscale turns a column's accumulated i32 sums into the output floats:
+// the +64 activation offset folds out through colSum64, and the two
+// scales bring the product back to the original units.
+func qscale(a archsimd.Int32x4, cs []int32, sc []tensai.Float, sxv archsimd.Float32x4, out []tensai.Float) {
+	f := a.Sub(simd.LoadI32x4(cs)).ConvertToFloat32().Mul(simd.LoadF32x4(sc)).Mul(sxv)
+	simd.StoreF32x4(f, out)
+}
+
+// qmatmulRows8 is the eight-row batched form: per four-column tile each
+// 16-byte weight load feeds eight spread activation quads, so the weight
+// stream that dominates a single matvec amortizes eightfold.
 func qmatmulRows8(out *tensai.Matrix, xus [][]uint8, xq []uint32, sxs []tensai.Float, r0 int, qw []int8, scale []tensai.Float, colSum64 []int32, cols, lo, hi int) {
-	qmatmulRows8Generic(out, xus, sxs, r0, qw, scale, colSum64, cols, lo, hi)
+	quads := len(xus[0]) / 4
+	// xq holds the caller-packed activation quads, interleaved per quad
+	// row so the inner loop walks one contiguous stream.
+	vecEnd := lo + ((hi - lo) &^ 3)
+	for jt := lo; jt < vecEnd; jt += 4 {
+		tile := qw[(jt/q4Tile)*quads*4*q4Tile+(jt%q4Tile)*4:]
+		// Eight named accumulators, one per row: an array of SIMD values
+		// would live on the stack and turn every multiply-add into a
+		// load-op-store round trip.
+		var a0, a1, a2, a3, a4, a5, a6, a7 archsimd.Int32x4
+		for i4 := 0; i4 < quads; i4++ {
+			w := simd.LoadI8x16(tile[i4*4*q4Tile:])
+			wh := w.HiToLo()
+			xf := xq[i4*8 : i4*8+8 : i4*8+8]
+			a0 = a0.Add(qdot4Hi(qxSpread(xf[0]), w, wh))
+			a1 = a1.Add(qdot4Hi(qxSpread(xf[1]), w, wh))
+			a2 = a2.Add(qdot4Hi(qxSpread(xf[2]), w, wh))
+			a3 = a3.Add(qdot4Hi(qxSpread(xf[3]), w, wh))
+			a4 = a4.Add(qdot4Hi(qxSpread(xf[4]), w, wh))
+			a5 = a5.Add(qdot4Hi(qxSpread(xf[5]), w, wh))
+			a6 = a6.Add(qdot4Hi(qxSpread(xf[6]), w, wh))
+			a7 = a7.Add(qdot4Hi(qxSpread(xf[7]), w, wh))
+		}
+		cs := colSum64[jt:]
+		sc := scale[jt:]
+		for r, a := range [8]archsimd.Int32x4{a0, a1, a2, a3, a4, a5, a6, a7} {
+			qscale(a, cs, sc, archsimd.BroadcastFloat32x4(sxs[r]), out.Data[(r0+r)*cols+jt:])
+		}
+	}
+	if vecEnd < hi {
+		qmatmulRows8Generic(out, xus, sxs, r0, qw, scale, colSum64, cols, vecEnd, hi)
+	}
 }
