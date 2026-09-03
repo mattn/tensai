@@ -47,14 +47,20 @@ var (
 // Re-sweeping on the full Qwen decode path put the knee at about 100us.
 const spinFor = 100 * time.Microsecond
 
+// maxWorkers caps the resident pool. Decode matvecs stream weights from
+// memory, and beyond eight workers the extra SMT siblings contend for the
+// same cores and memory channels: on the 8C/16T reference machine the
+// full complement costs about 7% of end-to-end decode. The cost is the
+// spinning as much as the work, so the cap is on the residents rather
+// than on the chunks a call hands out -- which is why bulk work that
+// wants every core, like a repack or a weight upload, goes through Bulk
+// instead of borrowing this pool.
+const maxWorkers = 8
+
 func setup() {
 	workers = runtime.GOMAXPROCS(0)
-	// Decode matvecs stream weights from memory. Beyond eight workers the
-	// extra SMT siblings contend for the same cores and memory channels;
-	// on the 8C/16T Zen 3 reference machine they reduce end-to-end decode
-	// by about 8%. This also matches the cap used by the dense CPU kernels.
-	if workers > 8 {
-		workers = 8
+	if workers > maxWorkers {
+		workers = maxWorkers
 	}
 	if workers < 2 {
 		workers = 0
@@ -159,4 +165,34 @@ func Run(n, align int, body func(lo, hi int)) {
 		}
 	}
 	busy.Store(false)
+}
+
+// Bulk splits [0, n) into align-rounded chunks across GOMAXPROCS fresh
+// goroutines, the caller taking the first chunk. It is the counterpart
+// to Run for work that happens once rather than a hundred times per
+// token: a repack, a dequantization, a weight upload. There the goroutine
+// wake this package exists to avoid is noise against the work itself, and
+// what matters instead is using every core -- including the ones the
+// decode pool deliberately leaves alone.
+func Bulk(n, align int, body func(lo, hi int)) {
+	parts := runtime.GOMAXPROCS(0)
+	if parts < 2 || n <= align {
+		body(0, n)
+		return
+	}
+	chunk := ((n+parts-1)/parts + align - 1) &^ (align - 1)
+	if chunk <= 0 {
+		chunk = align
+	}
+	var wg sync.WaitGroup
+	for lo := chunk; lo < n; lo += chunk {
+		hi := min(lo+chunk, n)
+		wg.Add(1)
+		go func(lo, hi int) {
+			defer wg.Done()
+			body(lo, hi)
+		}(lo, hi)
+	}
+	body(0, min(chunk, n))
+	wg.Wait()
 }

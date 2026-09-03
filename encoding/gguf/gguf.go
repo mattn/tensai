@@ -600,7 +600,7 @@ func (f *File) TensorRows(name string, from, to int) (*tensai.Tensor, error) {
 	// workers a decode step already keeps resident.
 	if blocks := n / spec.values; blocks >= 64 && len(dst) >= parallelDequantMin {
 		var ferr atomic.Pointer[error]
-		workpool.Run(int(blocks), 1, func(lo, hi int) {
+		workpool.Bulk(int(blocks), 1, func(lo, hi int) {
 			w := int64(hi-lo) * spec.values
 			if err := dequantBlocks(t.typ, name, dst[int64(lo)*spec.values:int64(hi)*spec.values],
 				raw[int64(lo)*spec.bytes:int64(hi)*spec.bytes], w); err != nil {
