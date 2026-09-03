@@ -52,6 +52,13 @@ func quadCols(row []int8, xv archsimd.Int16x8) archsimd.Int32x4 {
 func qmatvecCols(out []tensai.Float, xu []uint8, sx tensai.Float, qw []int8, scale []tensai.Float, colSum64 []int32, cols, lo, hi int) {
 	quads := len(xu) / 4
 	vecEnd := lo + ((hi - lo) &^ 31)
+	if hasDotProd && quads > 0 && vecEnd > lo {
+		qmatvecColsDot(out, xu, sx, qw, scale, quads, lo, vecEnd)
+		if vecEnd < hi {
+			qmatvecColsGeneric(out, xu, sx, qw, scale, colSum64, cols, vecEnd, hi)
+		}
+		return
+	}
 	for jt := lo; jt < vecEnd; jt += 32 {
 		tile := qw[(jt/q4Tile)*quads*4*q4Tile:]
 		var a0, a1, a2, a3, a4, a5, a6, a7 archsimd.Int32x4
@@ -85,6 +92,28 @@ func qmatvecCols(out []tensai.Float, xu []uint8, sx tensai.Float, qw []int8, sca
 	}
 	if vecEnd < hi {
 		qmatvecColsGeneric(out, xu, sx, qw, scale, colSum64, cols, vecEnd, hi)
+	}
+}
+
+// qmatvecColsDot is the same matvec over SDOT, which closes a column's
+// four rows in one instruction where the widening path above spends a
+// sign-extend, a multiply and two pair-adds. The weights walk a tile
+// exactly as the loop above does, so the two produce the same integers:
+// SDOT accumulates the four products of a lane in one step, and the
+// widening path adds them pairwise, which for exact integers is the same
+// sum. The float epilogue is shared, byte for byte.
+func qmatvecColsDot(out []tensai.Float, xu []uint8, sx tensai.Float, qw []int8, scale []tensai.Float, quads, lo, vecEnd int) {
+	sxv := archsimd.BroadcastFloat32x4(sx)
+	var acc [32]int32
+	for jt := lo; jt < vecEnd; jt += 32 {
+		tile := qw[(jt/q4Tile)*quads*4*q4Tile:]
+		sdotTile32(&acc[0], &tile[0], &xu[0], quads)
+		o := out[jt : jt+32 : jt+32]
+		sc := scale[jt : jt+32 : jt+32]
+		for k := 0; k < 32; k += 4 {
+			f := simd.LoadI32x4(acc[k:]).ConvertToFloat32().Mul(simd.LoadF32x4(sc[k:])).Mul(sxv)
+			simd.StoreF32x4(f, o[k:])
+		}
 	}
 }
 
