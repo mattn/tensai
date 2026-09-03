@@ -1,4 +1,4 @@
-//go:build goexperiment.simd && arm64
+//go:build goexperiment.simd && arm64 && go1.27
 
 package kernels
 

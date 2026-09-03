@@ -1,4 +1,4 @@
-//go:build !(goexperiment.simd && (amd64 || arm64))
+//go:build !(goexperiment.simd && (amd64 || (arm64 && go1.27)))
 
 // Package simd wraps the experimental simd/archsimd load/store calls whose
 // spellings changed between Go releases, so the kernels can target one set
