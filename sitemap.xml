@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">
+    <url>
+        <loc>https://mattn.github.io/tensai/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/examples/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/examples/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/examples/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/formats/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/formats/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/formats/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/getting-started/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/getting-started/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/getting-started/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/llm/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/llm/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/llm/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/tokenizers/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/tokenizers/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/tokenizers/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/guide/autograd/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/autograd/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/autograd/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/guide/gpu/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/gpu/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/gpu/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/guide/layers/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/layers/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/layers/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/guide/platforms/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/platforms/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/platforms/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/guide/quantization/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/quantization/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/quantization/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/guide/simd/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/simd/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/simd/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/guide/tensors/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/tensors/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/tensors/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/guide/training/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/training/"/>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/training/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/examples/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/examples/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/examples/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/formats/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/formats/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/formats/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/getting-started/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/getting-started/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/getting-started/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/llm/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/llm/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/llm/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/tokenizers/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/tokenizers/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/tokenizers/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/guide/autograd/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/autograd/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/autograd/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/guide/gpu/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/gpu/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/gpu/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/guide/layers/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/layers/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/layers/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/guide/platforms/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/platforms/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/platforms/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/guide/quantization/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/quantization/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/quantization/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/guide/simd/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/simd/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/simd/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/guide/tensors/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/tensors/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/tensors/"/>
+    </url>
+    <url>
+        <loc>https://mattn.github.io/tensai/ja/guide/training/</loc>
+        <lastmod>2026-09-03</lastmod>
+        <changefreq>daily</changefreq>
+        <xhtml:link rel="alternate" hreflang="ja" href="https://mattn.github.io/tensai/ja/guide/training/"/>
+        <xhtml:link rel="alternate" hreflang="en" href="https://mattn.github.io/tensai/guide/training/"/>
+    </url>
+</urlset>

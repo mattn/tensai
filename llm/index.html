@@ -1,0 +1,1444 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A tiny machine-learning framework in pure Go">
+      
+      
+      
+        <link rel="canonical" href="https://mattn.github.io/tensai/llm/">
+      
+      
+        <link rel="prev" href="../tokenizers/">
+      
+      
+        <link rel="next" href="../examples/">
+      
+      
+        
+          <link rel="alternate" href="./" hreflang="en">
+        
+          <link rel="alternate" href="../ja/llm/" hreflang="ja">
+        
+      
+      
+      <link rel="icon" href="../assets/logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>LLM Inference - tensai</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#llm-inference" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="tensai" class="md-header__button md-logo" aria-label="tensai" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            tensai
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              LLM Inference
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+      <div class="md-header__option">
+  <div class="md-select">
+    
+    <button class="md-header__button md-icon" aria-label="Select language">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m12.87 15.07-2.54-2.51.03-.03A17.5 17.5 0 0 0 14.07 6H17V4h-7V2H8v2H1v2h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2zm-2.62 7 1.62-4.33L19.12 17z"/></svg>
+    </button>
+    <div class="md-select__inner">
+      <ul class="md-select__list">
+        
+          <li class="md-select__item">
+            <a href="./" hreflang="en" class="md-select__link">
+              English
+            </a>
+          </li>
+        
+          <li class="md-select__item">
+            <a href="../ja/llm/" hreflang="ja" class="md-select__link">
+              日本語
+            </a>
+          </li>
+        
+      </ul>
+    </div>
+  </div>
+</div>
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/mattn/tensai" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    mattn/tensai
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="tensai" class="md-nav__button md-logo" aria-label="tensai" data-md-component="logo">
+      
+  <img src="../assets/logo.svg" alt="logo">
+
+    </a>
+    tensai
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/mattn/tensai" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    mattn/tensai
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../guide/tensors/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tensors and Matrices
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../guide/layers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Layers, Losses, Optimizers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../guide/training/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Training Models
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../guide/autograd/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Automatic Differentiation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../guide/quantization/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quantization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../guide/simd/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SIMD Acceleration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../guide/gpu/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    GPU (WebGPU)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../guide/platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../formats/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Model Formats
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../tokenizers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tokenizers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LLM Inference
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LLM Inference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#gpt-2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        GPT-2
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#qwen-and-friends-ten-model-families" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Qwen and friends: ten model families
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#quantized-loading" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quantized loading
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#prefill-speculative-decoding-sampling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Prefill, speculative decoding, sampling
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-tensai-command" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The tensai command
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="The tensai command">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#measuring-cpu-against-gpu" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Measuring CPU against GPU
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#serving-an-openai-compatible-api" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Serving an OpenAI-compatible API
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#thinking" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Thinking
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tool-calling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tool calling
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tools-without-a-server" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tools without a server
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../examples/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#gpt-2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        GPT-2
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#qwen-and-friends-ten-model-families" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Qwen and friends: ten model families
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#quantized-loading" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quantized loading
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#prefill-speculative-decoding-sampling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Prefill, speculative decoding, sampling
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#the-tensai-command" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        The tensai command
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="The tensai command">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#measuring-cpu-against-gpu" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Measuring CPU against GPU
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#serving-an-openai-compatible-api" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Serving an OpenAI-compatible API
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#thinking" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Thinking
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tool-calling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tool calling
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#tools-without-a-server" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tools without a server
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="llm-inference">LLM Inference<a class="headerlink" href="#llm-inference" title="Permanent link">&para;</a></h1>
+<p>The same kernels that train a XOR network run real language models. <code>_example/gpt2</code> is a complete inference engine in pure Go, and the <code>tensai</code> command runs ten model families over the same kernels.</p>
+<h2 id="gpt-2">GPT-2<a class="headerlink" href="#gpt-2" title="Permanent link">&para;</a></h2>
+<p><code>_example/gpt2</code> downloads the published GPT-2 small (124M) checkpoint from Hugging Face, loads the weights through <code>encoding/safetensors</code>, tokenizes with a from-scratch byte-level BPE, and decodes with a KV cache — every matvec running on the same <code>Dot</code> kernel as the rest of tensai, at ~30 tok/s with the AVX2 build:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>$ GOEXPERIMENT=simd go run ./_example/gpt2 -n 20
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>Hello, I'm a language model, not a programming language. I'm a language model. ...
+</code></pre></div>
+<p>The greedy continuation matches GPT-2's well-known reference output token for token, which pins the whole pipeline — reader, tokenizer, and forward pass — in one check.</p>
+<ul>
+<li><code>-q8</code> quantizes the decode-path weights to int8 and doubles generation (23 → 46 tok/s on the same machine), because decode streams the whole checkpoint per token</li>
+<li><code>-gpu</code> (built with <code>-tags wgpu</code> or <code>wgpu24</code>) runs every block's causal multi-head attention as a single masked dispatch on the GPU</li>
+</ul>
+<h2 id="qwen-and-friends-ten-model-families">Qwen and friends: ten model families<a class="headerlink" href="#qwen-and-friends-ten-model-families" title="Permanent link">&para;</a></h2>
+<p>The <code>tensai</code> command runs modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file. One runtime speaks ten architectures:</p>
+<table>
+<thead>
+<tr>
+<th>family</th>
+<th>models</th>
+<th>what it adds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>qwen2</td>
+<td>Qwen 1.5/2/2.5, Qwen2.5-Coder, the R1-Distill-Qwen line</td>
+<td>attention biases</td>
+</tr>
+<tr>
+<td>qwen3</td>
+<td>Qwen3 dense</td>
+<td>per-head QK-norm, explicit head_dim, <code>-think</code></td>
+</tr>
+<tr>
+<td>qwen3_5</td>
+<td>Qwen3.5, Qwen3.6, Qwen3.8</td>
+<td>a gated delta rule on three layers in four, ordinary attention on the fourth; norms scale by 1 + w, RoPE turns a quarter of each head, and the queries carry a gate for the attention output. CPU only, and no <code>-draft</code></td>
+</tr>
+</tbody>
+</table>
+<p>A <code>qwen3_5</code> prompt costs more to prefill than its size suggests: the delta
+layers carry state token by token, so only the projections around the
+recurrence batch, and a long prompt is closer to decoding it than to
+prefilling one. Roughly ten milliseconds a token on an AVX2 machine for the
+0.8B, against four for a qwen3 of the same size — enough that a couple of
+thousand tokens of system prompt is a wait. The chunked formulation the
+architecture allows would close most of that and is not implemented yet.
+| llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | the block everyone forked |
+| smollm3 | SmolLM3-3B | RoPE skipped every fourth layer |
+| gemma3 | Gemma 3 | sliding windows on 5/6 layers, sandwich norms, gelu-tanh gate, SentencePiece |
+| gemma4 | Gemma 4 E2B/E4B/12b | per-layer embeddings read from disk a token at a time, two head widths, the deeper layers attending against an earlier layer's cache, logits through a tanh cap |
+| phi3 | Phi-3/3.5-mini | q/k/v and gate/up shipped pre-fused |
+| qwen2moe / qwen3moe | Qwen1.5-MoE-A2.7B, Qwen3-30B-A3B | top-k routed experts, a shared expert on qwen2moe |
+| gpt-oss | gpt-oss-20b | MXFP4 experts, attention sinks, YaRN rope, harmony channels |</p>
+<p>The dense 12b differs from the E-series again: no per-layer embeddings, a kv head count stated per layer (eight on the local layers, one on the global), and no value projection on the layers that narrow, which take their values from their keys. GPU decode sits that last one out.</p>
+<p>Gemma 4 keeps most of its parameters in a per-layer embedding table — 2.3
+of E2B's 4.6 billion — that no step needs more than one row of, so the
+table stays in the file and every token reads its own row on demand. What
+that leaves resident is an ordinary transformer about the size of a 2B.
+Its layers alternate a 256-wide local head with a 512-wide global one,
+the deeper two thirds project queries only and attend against the last
+layer of their own kind that kept a cache, and the logits leave through a
+tanh cap. It decodes on the device too, at about the same
+speed the CPU manages: on a Radeon 780M 19.4 tokens a second against
+19.6, prefill about even. The two are close enough that the machine's
+power state decides it. Unplugged, that GPU falls to a fifth of itself
+while the CPU barely moves.</p>
+<p>The DeepSeek-R1 distills are stock qwen2/llama blocks wearing DeepSeek's turn markers, which the loader spots in the embedded chat template and switches automatically, <code>&lt;think&gt;</code> reasoning included.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>$ tensai run -q8 "What is the capital of France?"
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>The capital of France is Paris.
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>43 tokens in 1.3s (33.1 tok/s)
+</code></pre></div>
+<h2 id="quantized-loading">Quantized loading<a class="headerlink" href="#quantized-loading" title="Permanent link">&para;</a></h2>
+<p>With <code>-q8</code>/<code>-q4</code> each weight quantizes as it loads and its float32 copy dies immediately, so the full-precision model never has to fit in memory. Quantized GGUF checkpoints skip the float32 detour entirely: Q8_0, Q4_0, Q5_0, the Q4_K/Q5_K/Q6_K K-quant family, and MXFP4 repack straight from the memory-mapped file, keeping llama.cpp's own quantization intact. A 1.5B Q4_K_M loads in about 3 seconds instead of 8; a 3B Q8_0 opens in 5 seconds instead of 32 (<code>-requant</code> restores the float detour, trading a much slower load for about 10% more decode speed).</p>
+<p>The first <code>.gguf</code> load also writes the repacked weights to a cache file next to the model (<code>-nocache</code> opts out), and every later load just memory-maps it: the 1.5B Q4_K_M reopens in ~0.3 seconds, a Mistral 7B in well under a second, and gpt-oss-20b in under two. Mapped weights are clean file-backed pages the kernel can drop and re-read at will — on a machine where the model barely fits, that replaces swap thrashing with ordinary page cache behavior.</p>
+<p>On a 15GB machine the ladder looks like: a 0.5B at ~40 tok/s with <code>-q8</code>, a 1.5B Q4_K_M at ~25 tok/s with <code>-q4</code> (tiled integer kernels, native Windows), and Qwen2.5-<strong>7B</strong>-Instruct — 15GB of BF16 shards, int4-quantized on the fly during a two-minute load into ~6GB resident — answering correctly at 3.5 tok/s.</p>
+<h2 id="prefill-speculative-decoding-sampling">Prefill, speculative decoding, sampling<a class="headerlink" href="#prefill-speculative-decoding-sampling" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Batched prefill</strong> — prompts feed through the model in blocks of eight token rows, streaming the weights once per block instead of once per token, cutting time-to-first-token by around 6x</li>
+<li><strong>Speculative decoding</strong> — <code>-draft</code> points at a smaller same-family model (greedy only): the draft proposes a few tokens, one batched pass of the big model verifies them, and rejections roll the caches back, so the output is exactly what the big model alone would produce</li>
+<li><strong>Sampling</strong> — <code>-temp</code> above 0 samples from the nucleus: <code>-topp 0.9</code> keeps the smallest probability-sorted set of tokens holding 90% of the mass, so the long tail where repetition loops live never gets a lottery ticket</li>
+</ul>
+<h2 id="the-tensai-command">The <code>tensai</code> command<a class="headerlink" href="#the-tensai-command" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nv">GOEXPERIMENT</span><span class="o">=</span>simd<span class="w"> </span>go<span class="w"> </span>install<span class="w"> </span>github.com/mattn/tensai/cmd/tensai@latest
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>usage: tensai &lt;command&gt; [flags]
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>commands:
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>  run      generate a completion for a prompt
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>  chat     interactive multi-turn chat on stdin
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>  serve    OpenAI-compatible /v1/chat/completions server
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>  bench    compare CPU and GPU prefill and decode speed
+<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>  models   list cached models; "models rm &lt;name&gt;" deletes one
+<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>  version  print the version
+</code></pre></div>
+<p>All model commands share the same flags: <code>-model</code> (which model to run), <code>-q8</code>/<code>-q4</code>, <code>-gpu</code>, <code>-draft</code>, <code>-think</code>, <code>-tool</code>, <code>-system</code>, <code>-temp</code>, <code>-topp</code>, <code>-seed</code>, and more — run <code>tensai &lt;command&gt; -h</code> for the full list.</p>
+<p><code>-v</code> narrates what is otherwise a silent wait. It says what the file claims to be (architecture, layer and head counts, context, vocabulary), how the weights are being read (repacked or mapped from the cache, and how long each took), which template family and system prompt were chosen, and — the one thing a caller cannot otherwise see — the prompt as rendered, markers and all. Under <code>serve</code> each request announces itself on arrival with its message and tool counts, then reports how many tokens it prefilled and how fast. It adds lines and changes nothing else.</p>
+<p>Each family gets a system prompt of its own when the caller does not choose one. <code>-system ""</code> sends no system turn at all rather than an empty one, which is what a model's own template writes when it is handed no system message: it is the flag to reach for when comparing against another runtime, since the system turn is otherwise the one thing in the prompt that differs.</p>
+<p><code>-model</code> is the only thing that says which model to run, and it reads whichever
+form you hand it, in this order:</p>
+<table>
+<thead>
+<tr>
+<th>Form</th>
+<th>Example</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>a name from <code>tensai models</code></td>
+<td><code>-model Qwen3-0.6B</code>, <code>-model qwen2.5-0.5b-instruct-q8_0</code></td>
+</tr>
+<tr>
+<td>a path to a directory or <code>.gguf</code></td>
+<td><code>-model ./model.gguf</code>, <code>-model /srv/checkpoints/qwen</code></td>
+</tr>
+<tr>
+<td>a Hugging Face repo, downloaded on first use</td>
+<td><code>-model Qwen/Qwen3-4B-Instruct-2507</code></td>
+</tr>
+</tbody>
+</table>
+<p>Omit it for the default checkpoint. A local reference never downloads: a name
+that is not cached, and carries no org to fetch it from, is an error pointing
+back at the listing. A download lands in the user cache directory
+(<code>~/.cache/tensai</code> on Linux); to keep a model anywhere else, fetch it there and
+name its path. <code>-draft</code> takes the same forms, minus <code>.gguf</code>.</p>
+<p>Gated repositories -- Gemma and Llama among them -- serve 401 until their
+licence is accepted and a token is sent. tensai looks for one in <code>HF_TOKEN</code>,
+<code>HUGGING_FACE_HUB_TOKEN</code> or <code>HUGGINGFACE_TOKEN</code>, and then in the file
+<code>huggingface-cli login</code> writes (<code>$HF_HOME/token</code>, by default
+<code>~/.cache/huggingface/token</code>), so a machine that has logged in needs nothing
+further. A refused download says which of the two is missing rather than
+retrying: no token at all, or a token whose account has not accepted that
+repository's licence.</p>
+<p>A download that dies partway is kept and resumed rather than started over,
+which matters when the file is fifteen gigabytes: the partial sits beside the
+model as <code>&lt;name&gt;.tmp</code> and the next attempt asks for the rest. The resume is
+guarded against the ETag recorded with it, so a checkpoint that changed
+upstream restarts instead of splicing two versions together. Transport errors
+and a server's 5xx are retried a few times with a widening pause; a 404 is
+not.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>tensai<span class="w"> </span>run<span class="w"> </span>-q8<span class="w"> </span><span class="s2">"What is the capital of France?"</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>tensai<span class="w"> </span>run<span class="w"> </span>-q8<span class="w"> </span>-model<span class="w"> </span>Qwen3-0.6B<span class="w"> </span><span class="s2">"Explain RoPE briefly"</span><span class="w">   </span><span class="c1"># a name from "tensai models"</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>tensai<span class="w"> </span>run<span class="w"> </span>-q8<span class="w"> </span>-json<span class="w"> </span><span class="s2">"Explain RoPE briefly"</span><span class="w">      </span><span class="c1"># one JSON object with usage counts</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>tensai<span class="w"> </span>chat<span class="w"> </span>-q8<span class="w"> </span>-model<span class="w"> </span>./model.gguf<span class="w">              </span><span class="c1"># multi-turn; the KV cache carries the dialogue</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>tensai<span class="w"> </span>models<span class="w">                                    </span><span class="c1"># list the cache; "models rm &lt;name&gt;" deletes</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>tensai<span class="w"> </span>bench<span class="w"> </span>-q8<span class="w">                                 </span><span class="c1"># CPU vs GPU, prefill and decode</span>
+</code></pre></div>
+<h3 id="measuring-cpu-against-gpu">Measuring CPU against GPU<a class="headerlink" href="#measuring-cpu-against-gpu" title="Permanent link">&para;</a></h3>
+<p><code>bench</code> prefills a synthetic prompt and decodes a few tokens twice — once on
+the CPU, once on the GPU — and prints both with the ratio. Each side runs in
+its own child process, so a freed model's pages never distort the other
+measurement. The header names the kernels and the adapter each side is using, which
+matters:
+the two binding generations reach different adapters (only <code>wgpu24</code> sees
+non-conformant drivers such as Mesa's dozen inside WSL2), so a build without
+that tag may silently fall back to a CPU Vulkan implementation, and a binary
+built without <code>GOEXPERIMENT=simd</code> measures the portable kernels, an order of
+magnitude below the AVX2 ones.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>$ GOEXPERIMENT=simd go run -tags wgpu24 ./cmd/tensai bench -q8
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>prefill 401 tokens, decode 32 tokens, int8 weights
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>cpu: AVX2 kernels
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>gpu: Microsoft Direct3D12 (AMD Radeon(TM) Graphics) (integrated) via -tags wgpu24
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>median of 5 runs after one warm-up, tokens/sec
+<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>
+<a id="__codelineno-5-8" name="__codelineno-5-8" href="#__codelineno-5-8"></a>           prefill                  decode
+<a id="__codelineno-5-9" name="__codelineno-5-9" href="#__codelineno-5-9"></a>cpu          430.7 (357-446)          38.3 (38-39)
+<a id="__codelineno-5-10" name="__codelineno-5-10" href="#__codelineno-5-10"></a>gpu         2241.5 (1663-2295)        28.7 (25-29)
+<a id="__codelineno-5-11" name="__codelineno-5-11" href="#__codelineno-5-11"></a>gpu/cpu      5.20x                   0.75x
+</code></pre></div>
+<p><code>-p</code> sets the approximate prompt length, <code>-n</code> the tokens to decode, and <code>-r</code>
+the timed repetitions. Without a GPU build tag the GPU row reports why it is
+unavailable. The model stays loaded across repetitions and the first pass is
+discarded, so the samples describe steady state — a cold prefill on this path
+can read 30% low, which is what makes an unwarmed number unfair to compare
+against a tool that reports steady state. Prefill throughput still falls as
+the prompt grows, since attention is quadratic, so compare at one length.</p>
+<h3 id="serving-an-openai-compatible-api">Serving an OpenAI-compatible API<a class="headerlink" href="#serving-an-openai-compatible-api" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>tensai<span class="w"> </span>serve<span class="w"> </span>-q8<span class="w"> </span>-addr<span class="w"> </span><span class="m">127</span>.0.0.1:8080
+</code></pre></div>
+<p><code>models</code> lists only what <code>run</code>, <code>chat</code>, and <code>serve</code> can load — a directory
+with a <code>config.json</code>, or a <code>.gguf</code> file. The examples cache their datasets in
+the same place, and those are counted separately rather than listed as models;
+<code>models rm</code> still removes them by name.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>Qwen/Qwen3-4B-Instruct-2507                 7.5GB  qwen3    tools think 2026-08-27
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>Qwen2.5-1.5B-Instruct                       2.9GB  qwen2    tools       2026-08-23
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>SmolLM2-360M-Instruct                       692MB  llama    -           2026-08-24
+<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>qwen2.5-0.5b-instruct-q8_0.gguf             531MB  gguf     tools       2026-08-25
+</code></pre></div>
+<p>A model downloaded from a repo is named by that repo, organization included,
+because the cache directory drops it — and without it the listing cannot say
+what to type on a machine that does not have the model yet. Either form works
+against a cache that already holds it, and <code>models rm</code> takes either as well.
+Checkpoints cached before this, or placed by hand, keep their bare directory
+name until something downloads them again.</p>
+<p>The fourth column says what <code>serve</code> will do with the model — accept a request
+offering <code>tools</code>, and give <code>-think</code> a block to reason in — not how well it will
+do it: a 0.5B checkpoint is listed as taking tools because it will be offered
+them, not because its calls are reliable. The answers follow the loader exactly,
+family fallback included, so a checkpoint whose own template is not on disk is
+listed the way it will be treated. Reading it costs a <code>.gguf</code> about 80ms of
+metadata parsing; directories are free.</p>
+<p><code>serve</code> exposes <code>/v1/chat/completions</code> (messages array, SSE streaming, usage counts), so any OpenAI client pointed at it chats with a pure-Go model. A built-in chat demo page is served on <code>GET /</code>.</p>
+<h3 id="thinking">Thinking<a class="headerlink" href="#thinking" title="Permanent link">&para;</a></h3>
+<p>With <code>-think</code>, a model that reasons before it answers keeps the two apart on the wire: the block it writes first arrives as <code>reasoning_content</code> and only the reply is <code>content</code>, streaming as its own deltas, so a client can show the thinking as thinking or drop it. Reasoning never goes back into the prompt — replayed history keeps the answer and loses the thinking, as the model's own template does.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="nt">"message"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a><span class="w">  </span><span class="nt">"role"</span><span class="p">:</span><span class="w"> </span><span class="s2">"assistant"</span><span class="p">,</span>
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a><span class="w">  </span><span class="nt">"reasoning_content"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Okay, the user is asking for 17 multiplied by 3..."</span><span class="p">,</span>
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a><span class="w">  </span><span class="nt">"content"</span><span class="p">:</span><span class="w"> </span><span class="s2">"17 multiplied by 3 is 51."</span>
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a><span class="p">}</span>
+</code></pre></div>
+<p>Without <code>-think</code> the qwen3 and smollm3 families open the turn with an empty block, so there is nothing to separate. gpt-oss reasons in harmony channels instead, which this does not cover.</p>
+<h3 id="tool-calling">Tool calling<a class="headerlink" href="#tool-calling" title="Permanent link">&para;</a></h3>
+<p>Pass <code>tools</code> and the model can answer with <code>tool_calls</code> instead of prose, which is what an agent needs to drive a loop:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>curl<span class="w"> </span>localhost:8080/v1/chat/completions<span class="w"> </span>-H<span class="w"> </span><span class="s1">'Content-Type: application/json'</span><span class="w"> </span>-d<span class="w"> </span><span class="s1">'{</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="s1">  "messages": [{"role": "user", "content": "What is the weather in Tokyo?"}],</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="s1">  "tools": [{"type": "function", "function": {</span>
+<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a><span class="s1">    "name": "get_weather",</span>
+<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a><span class="s1">    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}]}'</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="nt">"finish_reason"</span><span class="p">:</span><span class="w"> </span><span class="s2">"tool_calls"</span><span class="p">,</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="nt">"message"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"role"</span><span class="p">:</span><span class="w"> </span><span class="s2">"assistant"</span><span class="p">,</span><span class="w"> </span><span class="nt">"content"</span><span class="p">:</span><span class="w"> </span><span class="s2">""</span><span class="p">,</span><span class="w"> </span><span class="nt">"tool_calls"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a><span class="w">  </span><span class="p">{</span><span class="nt">"index"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="nt">"id"</span><span class="p">:</span><span class="w"> </span><span class="s2">"call_0"</span><span class="p">,</span><span class="w"> </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"function"</span><span class="p">,</span>
+<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a><span class="w">   </span><span class="nt">"function"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">"name"</span><span class="p">:</span><span class="w"> </span><span class="s2">"get_weather"</span><span class="p">,</span><span class="w"> </span><span class="nt">"arguments"</span><span class="p">:</span><span class="w"> </span><span class="s2">"{\"city\": \"Tokyo\"}"</span><span class="p">}}]}</span>
+</code></pre></div>
+<p>Send the result back as a <code>tool</code> message naming the call it answers, alongside the assistant turn that made it, and the model writes the reply. Streaming works the same way: text streams as usual, the calls arrive as <code>tool_calls</code> deltas indexed from zero, and the turn ends with <code>finish_reason: "tool_calls"</code>.</p>
+<p>The signatures are handed to the model in the convention its own family was trained on. For the ChatML families — qwen2, qwen3, their MoE variants, llama, and SmolLM — that is a <code>&lt;tools&gt;</code> block appended to the system turn and calls written as <code>&lt;tool_call&gt;</code> JSON. Qwen3.5 left that behind: its <code>&lt;tools&gt;</code> block leads the system turn instead, and a call is a <code>&lt;function=name&gt;</code> element with one <code>&lt;parameter=key&gt;</code> per argument, which carries no types, so the tool's own JSON Schema decides what each value means. Whether a particular checkpoint was prepared for it is not a guess: its own chat template either branches on the tool definitions it may be handed or it does not, and that answer overrides the family. A GGUF carries the template in its metadata; a downloaded checkpoint gets it from <code>tokenizer_config.json</code> (or <code>chat_template.jinja</code>, where newer ones keep it). A model named by a path or a cached name is read where it sits and never fetched from, so a checkpoint cached before this existed falls back to its family until the file is there. Gemma 4 speaks a fourth, which is neither JSON nor XML: the signatures go into the system turn as <code>&lt;|tool&gt;declaration:name{...}&lt;tool|&gt;</code> blocks written in a brace DSL where a string is wrapped in <code>&lt;|"|&gt;</code> rather than quoted, a call comes back as <code>&lt;|tool_call&gt;call:name{key:value}&lt;tool_call|&gt;</code>, and the result answering it goes back inside the same model turn as <code>&lt;|tool_response&gt;response:name{value:...}&lt;tool_response|&gt;</code> — the model then carries on in that turn rather than opening another. Carrying on needs one more thing: the thought channel a gemma4 opens for itself at the top of every turn, which it cannot open here because the turn is already running, so the prompt hands it the marker. Without it E4B answers a tool result by stopping immediately; with it the same prompt is answered. The thinking that follows is separated as usual, so <code>-think</code> and <code>reasoning_content</code> decide who sees it. A small model sampled at temperature sometimes writes the call body and forgets the marker in front of it, so a bare <code>name{...}</code> whose name the caller declared is read as the call it plainly is. Families with no such convention (gemma3, phi3, mistral, deepseek, gpt-oss), and checkpoints whose template never mentions tools (SmolLM2, say), answer a request carrying <code>tools</code> with 400 rather than dropping them silently. Nothing constrains the sampler, so a call is the model's choice: <code>tool_choice: "none"</code> withholds the signatures, but <code>"required"</code> cannot force what only a grammar could, and it reads as <code>"auto"</code>. Bigger models call far more reliably than the 0.5B default.</p>
+<ul>
+<li>The default bind is loopback only (<code>127.0.0.1:8080</code>, or <code>$TENSAI_ADDR</code>); widen it explicitly if you mean to</li>
+<li><code>-api-key</code> (or <code>$TENSAI_API_KEY</code>) requires a bearer token on the <code>/v1</code> routes; the demo page stays open</li>
+<li>The prompt an agent resends every turn — its system message and its tool
+  definitions — is prefilled once and kept. A request that extends what came
+  before continues from it, and one that only shares the opening restarts from
+  the point the two parted, which the server checkpoints the first time it sees
+  them diverge. On a 744-token prompt that is 12s for the first question and
+  under 2s for the rest. The GPU path keeps its own resident cache and does not
+  take part</li>
+</ul>
+<h3 id="tools-without-a-server">Tools without a server<a class="headerlink" href="#tools-without-a-server" title="Permanent link">&para;</a></h3>
+<p><code>serve</code> waits for a client to bring the tools. <code>run</code> and <code>chat</code> can carry one
+themselves: <code>-tool wikipedia</code> offers the model a Wikipedia lookup, and when it
+calls, the call runs here, its result goes back into the conversation, and the
+model answers from what it read.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>tensai<span class="w"> </span>run<span class="w"> </span>-q4<span class="w"> </span>-model<span class="w"> </span>unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="w">  </span>-tool<span class="w"> </span>wikipedia<span class="w"> </span>-n<span class="w"> </span><span class="m">400</span><span class="w"> </span><span class="s2">"Who is Linus Torvalds?"</span>
+</code></pre></div>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>Linus Torvalds is a Finnish and American software engineer, best known as the
+<a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>creator and lead developer of the Linux kernel since 1991.
+</code></pre></div>
+<p>Calls are kept off standard output because they are addressed to the tool, not
+the reader; <code>-json</code> likewise reports only the answer. Every round re-renders the
+whole conversation and prefills it again, since a tool result has to be written
+into the turn that asked for it, and the model may go around at most four times
+before it has to answer. Leave room in <code>-n</code>: a thinking model spends tokens on
+the call, on reading the result, and only then on the reply.</p>
+<p><code>wikipedia</code> is the one tool that needs no key and no account. It searches, then
+reads the opening of the best match, so a call costs one round trip rather than
+two, and the alternative titles come back with it in case the model picked the
+wrong one. A query written in Japanese is looked up on <code>ja.wikipedia.org</code>, and
+anything else on <code>en.wikipedia.org</code>. It is an encyclopedia and not a search
+engine: it answers who or what something is, and is weak on this week's news.
+Wikimedia asks that a client name itself, which is what the <code>tensai</code> user agent
+does; a run behind a proxy that strips it gets 403 back as the tool's answer,
+which the model reads and can say so.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../tokenizers/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Tokenizers">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Tokenizers
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../examples/" class="md-footer__link md-footer__link--next" aria-label="Next: Examples">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Examples
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      MIT License &mdash; Yasuhiro Matsumoto (a.k.a. mattn)
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/mattn" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "search.suggest", "search.highlight"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

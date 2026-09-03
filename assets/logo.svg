@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 150" width="520" height="150" role="img" aria-label="tensai">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#00ADD8"/>
+      <stop offset="1" stop-color="#6C63FF"/>
+    </linearGradient>
+  </defs>
+
+  <!-- mark: the kanji 天 drawn as a 2-3-2 neural network -->
+  <g transform="translate(15,15)">
+    <!-- inter-layer connections (thin) -->
+    <g stroke="url(#g)" stroke-width="2" opacity="0.35" stroke-linecap="round">
+      <line x1="35" y1="22" x2="10" y2="60"/>
+      <line x1="35" y1="22" x2="60" y2="60"/>
+      <line x1="85" y1="22" x2="60" y2="60"/>
+      <line x1="85" y1="22" x2="110" y2="60"/>
+      <line x1="10" y1="60" x2="30" y2="105"/>
+      <line x1="110" y1="60" x2="90" y2="105"/>
+    </g>
+    <!-- strokes of 天 (thick) -->
+    <g stroke="url(#g)" stroke-width="9" stroke-linecap="round">
+      <line x1="35" y1="22" x2="85" y2="22"/>
+      <line x1="10" y1="60" x2="110" y2="60"/>
+      <line x1="60" y1="60" x2="30" y2="105"/>
+      <line x1="60" y1="60" x2="90" y2="105"/>
+    </g>
+    <!-- neurons -->
+    <g fill="url(#g)">
+      <circle cx="35" cy="22" r="9"/>
+      <circle cx="85" cy="22" r="9"/>
+      <circle cx="10" cy="60" r="9"/>
+      <circle cx="60" cy="60" r="9"/>
+      <circle cx="110" cy="60" r="9"/>
+      <circle cx="30" cy="105" r="9"/>
+      <circle cx="90" cy="105" r="9"/>
+    </g>
+    <!-- neuron cores -->
+    <g fill="#ffffff" opacity="0.85">
+      <circle cx="35" cy="22" r="3.2"/>
+      <circle cx="85" cy="22" r="3.2"/>
+      <circle cx="10" cy="60" r="3.2"/>
+      <circle cx="60" cy="60" r="3.2"/>
+      <circle cx="110" cy="60" r="3.2"/>
+      <circle cx="30" cy="105" r="3.2"/>
+      <circle cx="90" cy="105" r="3.2"/>
+    </g>
+  </g>
+
+  <!-- wordmark -->
+  <text x="165" y="95" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+        font-size="64" font-weight="700" letter-spacing="1" fill="url(#g)">tensai</text>
+  <text x="168" y="122" font-family="'Segoe UI', 'Helvetica Neue', Arial, sans-serif"
+        font-size="16" letter-spacing="6" fill="#8A93A5">天才 — TENSORS + AI</text>
+</svg>

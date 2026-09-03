@@ -1,0 +1,1396 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A tiny machine-learning framework in pure Go">
+      
+      
+      
+        <link rel="canonical" href="https://mattn.github.io/tensai/guide/autograd/">
+      
+      
+        <link rel="prev" href="../training/">
+      
+      
+        <link rel="next" href="../quantization/">
+      
+      
+        
+          <link rel="alternate" href="./" hreflang="en">
+        
+          <link rel="alternate" href="../../ja/guide/autograd/" hreflang="ja">
+        
+      
+      
+      <link rel="icon" href="../../assets/logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Automatic Differentiation - tensai</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#automatic-differentiation" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="tensai" class="md-header__button md-logo" aria-label="tensai" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            tensai
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Automatic Differentiation
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+      <div class="md-header__option">
+  <div class="md-select">
+    
+    <button class="md-header__button md-icon" aria-label="Select language">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m12.87 15.07-2.54-2.51.03-.03A17.5 17.5 0 0 0 14.07 6H17V4h-7V2H8v2H1v2h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2zm-2.62 7 1.62-4.33L19.12 17z"/></svg>
+    </button>
+    <div class="md-select__inner">
+      <ul class="md-select__list">
+        
+          <li class="md-select__item">
+            <a href="./" hreflang="en" class="md-select__link">
+              English
+            </a>
+          </li>
+        
+          <li class="md-select__item">
+            <a href="../../ja/guide/autograd/" hreflang="ja" class="md-select__link">
+              日本語
+            </a>
+          </li>
+        
+      </ul>
+    </div>
+  </div>
+</div>
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/mattn/tensai" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    mattn/tensai
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="tensai" class="md-nav__button md-logo" aria-label="tensai" data-md-component="logo">
+      
+  <img src="../../assets/logo.svg" alt="logo">
+
+    </a>
+    tensai
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/mattn/tensai" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    mattn/tensai
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../tensors/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tensors and Matrices
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../layers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Layers, Losses, Optimizers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../training/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Training Models
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Automatic Differentiation
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Automatic Differentiation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#params-inputs-and-the-trainer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Params, Inputs, and the Trainer
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#ops" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Ops
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#convolutions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Convolutions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#broadcasting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Broadcasting
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#building-attention" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Building attention
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reusing-buffers-with-a-tape" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reusing buffers with a tape
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#running-the-graph-on-a-gpu" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Running the graph on a GPU
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#visualizing-the-graph" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Visualizing the graph
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#recurrent-networks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Recurrent networks
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#saving-parameters" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Saving parameters
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../quantization/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quantization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../simd/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SIMD Acceleration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../gpu/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    GPU (WebGPU)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Platforms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../formats/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Model Formats
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tokenizers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tokenizers
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../llm/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LLM Inference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#params-inputs-and-the-trainer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Params, Inputs, and the Trainer
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#ops" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Ops
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#convolutions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Convolutions
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#broadcasting" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Broadcasting
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#building-attention" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Building attention
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reusing-buffers-with-a-tape" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reusing buffers with a tape
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#running-the-graph-on-a-gpu" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Running the graph on a GPU
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#visualizing-the-graph" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Visualizing the graph
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#recurrent-networks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Recurrent networks
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#saving-parameters" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Saving parameters
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="automatic-differentiation">Automatic Differentiation<a class="headerlink" href="#automatic-differentiation" title="Permanent link">&para;</a></h1>
+<p>When a model doesn't fit the Sequential mold (weight sharing, custom losses, exotic architectures), build the computation directly and let reverse-mode autodiff derive the gradients. The engine is micrograd-style: a dynamically built graph of <code>Node</code>s, define-by-run, single-use.</p>
+<p>A <code>Node</code> holds an n-dimensional <code>Tensor</code>, so the same ops that run on a <code>(rows, cols)</code> matrix run on a <code>(batch, sequence, model)</code> activation: element-wise arithmetic broadcasts NumPy-style and <code>MatMul</code> multiplies whole stacks of matrices. A <code>Matrix</code> is taken as a zero-copy 2-D view wherever a leaf is built, so two-dimensional code reads the way it always did.</p>
+<h2 id="params-inputs-and-the-trainer">Params, Inputs, and the Trainer<a class="headerlink" href="#params-inputs-and-the-trainer" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nx">w1</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Param</span><span class="p">(</span><span class="nx">tensai</span><span class="p">.</span><span class="nx">RandomMatrix</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="nx">rng</span><span class="p">))</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nx">b1</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Param</span><span class="p">(</span><span class="nx">tensai</span><span class="p">.</span><span class="nx">NewMatrix</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">8</span><span class="p">))</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="nx">w2</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Param</span><span class="p">(</span><span class="nx">tensai</span><span class="p">.</span><span class="nx">RandomMatrix</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nx">rng</span><span class="p">))</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="nx">trainer</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">NewTrainer</span><span class="p">(</span><span class="nx">optim</span><span class="p">.</span><span class="nx">NewAdam</span><span class="p">(</span><span class="mf">0.05</span><span class="p">),</span><span class="w"> </span><span class="nx">w1</span><span class="p">,</span><span class="w"> </span><span class="nx">b1</span><span class="p">,</span><span class="w"> </span><span class="nx">w2</span><span class="p">)</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="k">for</span><span class="w"> </span><span class="nx">step</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="nx">step</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">2000</span><span class="p">;</span><span class="w"> </span><span class="nx">step</span><span class="o">++</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">    </span><span class="nx">loss</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Input</span><span class="p">(</span><span class="nx">x</span><span class="p">).</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">w1</span><span class="p">).</span><span class="nx">AddRow</span><span class="p">(</span><span class="nx">b1</span><span class="p">).</span><span class="nx">Tanh</span><span class="p">().</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">w2</span><span class="p">).</span><span class="nx">Sigmoid</span><span class="p">().</span><span class="nx">MSELoss</span><span class="p">(</span><span class="nx">y</span><span class="p">.</span><span class="nx">Tensor</span><span class="p">())</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span><span class="nx">trainer</span><span class="p">.</span><span class="nx">Step</span><span class="p">(</span><span class="nx">loss</span><span class="p">)</span><span class="w"> </span><span class="c1">// backward + update + zero grads, returns the loss value</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="p">}</span>
+</code></pre></div>
+<p><code>Param</code> wraps a value whose gradient should be tracked and updated; <code>Input</code> wraps data. Both accept a <code>*tensai.Matrix</code> or a <code>*tensai.Tensor</code> — a matrix becomes a 2-D tensor view sharing the same backing array, so a parameter built from a matrix keeps updating that matrix.</p>
+<p>For manual control, the pieces are public: <code>loss.Backward()</code>, <code>p.Grad()</code>, and <code>autograd.ZeroGrads(params...)</code>. <code>Backward</code> starts from a single-element node and <strong>accumulates</strong> into the gradient, which is why a training step clears the gradients afterwards (<code>Trainer.Step</code> does it for you).</p>
+<p>On a node, <code>Value()</code> and <code>Grad()</code> return <code>*tensai.Tensor</code>. They are methods rather than fields because a value does not have to live in host memory: on a device-resident graph they are where it comes back. <code>Shape()</code> returns the shape without fetching anything, <code>Matrix()</code> returns a matrix view of a 2-D node, <code>Scalar()</code> reads a single-element node, and <code>Named("w1")</code> labels a leaf for <code>ToDot</code>.</p>
+<h2 id="ops">Ops<a class="headerlink" href="#ops" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Op</th>
+<th>Shapes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MatMul(o)</code></td>
+<td><code>(…, m, k) * (…, k, n)</code> → <code>(…, m, n)</code>; the leading axes broadcast, so one 2-D weight applies to a whole batch</td>
+</tr>
+<tr>
+<td><code>Add</code>, <code>Sub</code>, <code>Mul</code> (<code>MulElem</code>), <code>Div</code></td>
+<td>element-wise, NumPy broadcasting</td>
+</tr>
+<tr>
+<td><code>Scale(s)</code>, <code>Neg()</code></td>
+<td>element-wise by a scalar</td>
+</tr>
+<tr>
+<td><code>AddRow(row)</code></td>
+<td><code>(m, n) + (1, n)</code>; <code>Add</code> already broadcasts, this only states the intent</td>
+</tr>
+<tr>
+<td><code>T()</code>, <code>Transpose(perm...)</code></td>
+<td>swap the last two axes / permute every axis</td>
+</tr>
+<tr>
+<td><code>Reshape(shape...)</code></td>
+<td>one dimension may be <code>-1</code>; shares the buffer</td>
+</tr>
+<tr>
+<td><code>Softmax()</code></td>
+<td>over the last axis</td>
+</tr>
+<tr>
+<td><code>LayerNorm(gain, bias, eps)</code></td>
+<td>over the last axis; <code>gain</code> and <code>bias</code> hold one element per feature and may be <code>nil</code> or trainable</td>
+</tr>
+<tr>
+<td><code>Embed(ids, shape...)</code></td>
+<td><code>(vocab, d)</code> table plus <code>len(ids)</code> indices → <code>shape…, d</code>; repeated ids accumulate on backward</td>
+</tr>
+<tr>
+<td><code>Conv2D(w, bias, cfg)</code></td>
+<td><code>(batch, channels, h, w)</code> convolved with <code>(channels*k*k, outChannels)</code> weights → <code>(batch, outChannels, outH, outW)</code></td>
+</tr>
+<tr>
+<td><code>Im2Col(cfg)</code></td>
+<td>the patch expansion a convolution multiplies, on its own</td>
+</tr>
+<tr>
+<td><code>MaxPool2D(size)</code>, <code>AvgPool2D(size)</code></td>
+<td>square windows over the last two axes, stride equal to the window</td>
+</tr>
+<tr>
+<td><code>Sum()</code>, <code>Mean()</code></td>
+<td>reduce everything to one element</td>
+</tr>
+<tr>
+<td><code>SumAxis(axis, keepDims)</code>, <code>MeanAxis(axis, keepDims)</code></td>
+<td>reduce one axis; a negative axis counts from the end</td>
+</tr>
+<tr>
+<td><code>ReLU()</code>, <code>LeakyReLU(a)</code>, <code>Sigmoid()</code>, <code>Tanh()</code>, <code>GELU()</code>, <code>Exp()</code>, <code>Log()</code>, <code>Sqrt()</code></td>
+<td>element-wise</td>
+</tr>
+<tr>
+<td><code>Dropout(rate, rng)</code></td>
+<td>zeroes elements and scales the survivors; the mask is drawn once and the backward pass reuses it</td>
+</tr>
+<tr>
+<td><code>MSELoss(target)</code>, <code>SoftmaxCELoss(target)</code>, <code>CrossEntropy(labels []int)</code></td>
+<td>scalar losses; the cross-entropies read the last axis as classes</td>
+</tr>
+</tbody>
+</table>
+<p>Graphs are built dynamically per step and are single-use. Shape mismatches panic during construction rather than returning an error: chaining would be unusable otherwise, and a wrong shape is a programming mistake. Every op's gradient is verified against finite differences in the test suite.</p>
+<h2 id="convolutions">Convolutions<a class="headerlink" href="#convolutions" title="Permanent link">&para;</a></h2>
+<p>A convolution is an <code>Im2Col</code> and a product: the expansion turns each output pixel into a row of the patch that produced it, and the weights are one column per output channel.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1">// x is (batch, channels, height, width); w is (channels*k*k, outChannels).</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nx">h</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">x</span><span class="p">.</span><span class="nx">Conv2D</span><span class="p">(</span><span class="nx">w</span><span class="p">,</span><span class="w"> </span><span class="nx">bias</span><span class="p">,</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Conv</span><span class="p">{</span><span class="nx">Kernel</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="nx">Pad</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">})</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="nx">h</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">h</span><span class="p">.</span><span class="nx">ReLU</span><span class="p">().</span><span class="nx">MaxPool2D</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+</code></pre></div>
+<p><code>Conv2D</code> composes the pieces -- <code>x.Im2Col(cfg).MatMul(w).Transpose(0, 2, 1).Reshape(...)</code> plus the bias -- so the product it spends its time in is the same one the GPU accelerates. <code>Im2Col</code> is exposed on its own for anything the composition does not cover, and <code>MaxPool2D</code> and <code>AvgPool2D</code> route their gradients to the position that won and over the window respectively. The forward pass matches <code>layer.Conv2D</code>, which the Sequential models use.</p>
+<h2 id="broadcasting">Broadcasting<a class="headerlink" href="#broadcasting" title="Permanent link">&para;</a></h2>
+<p>An element-wise op aligns shapes at their trailing axes and stretches any axis of length 1, so a <code>(1, 1, d)</code> bias adds to a <code>(batch, seq, d)</code> activation. Gradients follow the same rule in reverse: whatever axes an operand was stretched along, its gradient is summed back over. That is why a bias, a per-feature <code>LayerNorm</code> gain, and a weight shared across a batch all collect the contributions of every position that used them without any special case in the op.</p>
+<h2 id="building-attention">Building attention<a class="headerlink" href="#building-attention" title="Permanent link">&para;</a></h2>
+<p>Multi-head attention is a reshape, a transpose, and two batched products:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1">// x is (batch, seq, model); wq, wk, wv, wo are (model, model).</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="nx">heads</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="kd">func</span><span class="p">(</span><span class="nx">t</span><span class="w"> </span><span class="o">*</span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Node</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Node</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">    </span><span class="c1">// (batch, seq, model) -&gt; (batch, head, seq, headDim)</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">t</span><span class="p">.</span><span class="nx">Reshape</span><span class="p">(</span><span class="nx">batch</span><span class="p">,</span><span class="w"> </span><span class="nx">seq</span><span class="p">,</span><span class="w"> </span><span class="nx">nHeads</span><span class="p">,</span><span class="w"> </span><span class="nx">headDim</span><span class="p">).</span><span class="nx">Transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">)</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="p">}</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="nx">q</span><span class="p">,</span><span class="w"> </span><span class="nx">k</span><span class="p">,</span><span class="w"> </span><span class="nx">v</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">heads</span><span class="p">(</span><span class="nx">x</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">wq</span><span class="p">)),</span><span class="w"> </span><span class="nx">heads</span><span class="p">(</span><span class="nx">x</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">wk</span><span class="p">)),</span><span class="w"> </span><span class="nx">heads</span><span class="p">(</span><span class="nx">x</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">wv</span><span class="p">))</span>
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="c1">// (batch, head, seq, seq) scores for every head of every sequence at once.</span>
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="nx">att</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">q</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">k</span><span class="p">.</span><span class="nx">T</span><span class="p">()).</span><span class="nx">Scale</span><span class="p">(</span><span class="mi">1</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="kt">float32</span><span class="p">(</span><span class="nx">math</span><span class="p">.</span><span class="nx">Sqrt</span><span class="p">(</span><span class="nx">headDim</span><span class="p">))).</span><span class="nx">Add</span><span class="p">(</span><span class="nx">mask</span><span class="p">).</span><span class="nx">Softmax</span><span class="p">()</span>
+<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>
+<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="nx">y</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">att</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">v</span><span class="p">).</span><span class="nx">Transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">).</span><span class="nx">Reshape</span><span class="p">(</span><span class="nx">batch</span><span class="p">,</span><span class="w"> </span><span class="nx">seq</span><span class="p">,</span><span class="w"> </span><span class="nx">model</span><span class="p">).</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">wo</span><span class="p">)</span>
+</code></pre></div>
+<p><code>mask</code> is a constant <code>Input</code> of shape <code>(1, 1, seq, seq)</code> holding <code>0</code> on and below the diagonal and <code>math.Inf(-1)</code> above it, broadcast over batch and head; softmax then gives future positions no weight. <code>_example/tinygpt</code> puts exactly this into a working character-level transformer — pre-norm blocks, a GELU feed-forward, and next-character cross-entropy — that memorizes a page of text in about a minute.</p>
+<h2 id="reusing-buffers-with-a-tape">Reusing buffers with a tape<a class="headerlink" href="#reusing-buffers-with-a-tape" title="Permanent link">&para;</a></h2>
+<p>A graph is built and thrown away every step, so by default every step asks the allocator for every intermediate value and gradient it touches. A <code>Tape</code> recycles them. Bind the parameters once, then reset it at the end of each step:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nx">tape</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">NewTape</span><span class="p">()</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="nx">tape</span><span class="p">.</span><span class="nx">Bind</span><span class="p">(</span><span class="nx">w1</span><span class="p">,</span><span class="w"> </span><span class="nx">b1</span><span class="p">,</span><span class="w"> </span><span class="nx">w2</span><span class="p">,</span><span class="w"> </span><span class="nx">b2</span><span class="p">)</span><span class="w"> </span><span class="c1">// ops inherit the tape from their parents</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="k">for</span><span class="w"> </span><span class="nx">step</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="nx">step</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="nx">steps</span><span class="p">;</span><span class="w"> </span><span class="nx">step</span><span class="o">++</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">    </span><span class="nx">trainer</span><span class="p">.</span><span class="nx">Step</span><span class="p">(</span><span class="nx">forward</span><span class="p">(</span><span class="nx">x</span><span class="p">).</span><span class="nx">MSELoss</span><span class="p">(</span><span class="nx">y</span><span class="p">))</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">    </span><span class="nx">tape</span><span class="p">.</span><span class="nx">Reset</span><span class="p">()</span><span class="w"> </span><span class="c1">// hands this step's buffers back to the pool</span>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="p">}</span>
+</code></pre></div>
+<p>The rule is the one a training loop already follows: <strong>after <code>Reset</code>, nothing from the finished step may be read</strong> — no node's <code>Value</code>, no node's <code>Grad</code>. Parameter values are never recycled (the tape only owns what operations produce), so trained weights are always safe to keep; copy anything else with <code>Clone</code> before resetting. A <code>Tape</code> is not safe for concurrent use, so give each training goroutine its own.</p>
+<p>On <code>_example/charrnn</code>, which unrolls 32 time steps per iteration, the tape takes a training step from 22 MB of allocation to 0.75 MB and cuts about a quarter off its wall time.</p>
+<p>The same reuse is available one layer down: <code>MatMulInto</code>, <code>MatMulTNInto</code>, <code>MatMulNTInto</code>, <code>AddInto</code>, <code>SubInto</code>, <code>MulInto</code> and <code>DivInto</code> write into a tensor you already own, the way <code>DotInto</code> does for matrices.</p>
+<h2 id="running-the-graph-on-a-gpu">Running the graph on a GPU<a class="headerlink" href="#running-the-graph-on-a-gpu" title="Permanent link">&para;</a></h2>
+<p>A tape can put the whole graph on a device. Values, gradients and the Adam update stay there; only the loss comes home each step:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nx">dev</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">gpu</span><span class="p">.</span><span class="nx">Open</span><span class="p">(</span><span class="nx">gpu</span><span class="p">.</span><span class="nx">HighPerformance</span><span class="p">)</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">    </span><span class="k">defer</span><span class="w"> </span><span class="nx">dev</span><span class="p">.</span><span class="nx">Close</span><span class="p">()</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">    </span><span class="nx">tape</span><span class="p">.</span><span class="nx">UseDevice</span><span class="p">(</span><span class="nx">dev</span><span class="p">)</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="p">}</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="nx">tape</span><span class="p">.</span><span class="nx">Bind</span><span class="p">(</span><span class="nx">params</span><span class="p">...)</span><span class="w"> </span><span class="c1">// parameters upload once and stay resident</span>
+</code></pre></div>
+<p><code>Value()</code> and <code>Grad()</code> download on demand, so reading a node still works — that is what makes them methods. <code>Resident()</code> reports where a node's value currently is.</p>
+<p>Operations the device has kernels for run there; anything else falls back to the CPU, bringing home only what that operation needs. That covers the three products, element-wise arithmetic with a repeating operand, <code>Scale</code>, ReLU/tanh/sigmoid/GELU and their gradients, <code>LayerNorm</code>, <code>Softmax</code>, <code>Transpose</code>, <code>Reshape</code>, <code>Embed</code> (its scatter-add included), the sum a broadcast collects, and the Adam update — so a whole transformer block stays resident, and only the loss crosses the bus.</p>
+<p>On an AMD 780M through <code>-tags wgpu24</code>, one step of <code>x @ w1 -&gt; GELU -&gt; @ w2 -&gt; MSE</code>:</p>
+<table>
+<thead>
+<tr>
+<th>model width</th>
+<th>CPU (AVX2)</th>
+<th>accelerator hook</th>
+<th>resident graph</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>512</td>
+<td>31.1ms</td>
+<td>30.8ms</td>
+<td><strong>13.1ms</strong></td>
+</tr>
+<tr>
+<td>1024</td>
+<td>172.8ms</td>
+<td>93.2ms</td>
+<td><strong>33.3ms</strong></td>
+</tr>
+<tr>
+<td>2048</td>
+<td>1382ms</td>
+<td>442ms</td>
+<td><strong>193ms</strong></td>
+</tr>
+</tbody>
+</table>
+<p>A transformer block -- pre-norm attention with a causal mask and a GELU feed-forward, batch 8, sequence 128, vocabulary 512 -- trains at:</p>
+<table>
+<thead>
+<tr>
+<th>model width</th>
+<th>CPU (AVX2)</th>
+<th>resident graph</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>256</td>
+<td>83.5ms</td>
+<td><strong>47.0ms</strong></td>
+</tr>
+<tr>
+<td>512</td>
+<td>209.3ms</td>
+<td><strong>54.3ms</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The hook (<code>tensai.UseAccelerator</code>) sends each product to the device on its own, so it pays a round trip per product; residency pays one upload per step for the batch and one download for the loss. Both are opt-in, and they compose: with a tape on a device the hook is not consulted.</p>
+<h2 id="visualizing-the-graph">Visualizing the graph<a class="headerlink" href="#visualizing-the-graph" title="Permanent link">&para;</a></h2>
+<p><code>loss.ToDot()</code> returns Graphviz DOT (label leaves with <code>.Named("w1")</code>):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>go<span class="w"> </span>run<span class="w"> </span>./_example/dot<span class="w"> </span><span class="p">|</span><span class="w"> </span>dot<span class="w"> </span>-Tsvg<span class="w"> </span>&gt;<span class="w"> </span>graph.svg
+</code></pre></div>
+<h2 id="recurrent-networks">Recurrent networks<a class="headerlink" href="#recurrent-networks" title="Permanent link">&para;</a></h2>
+<p><code>rnn.Cell</code> and <code>rnn.LSTMCell</code> are built on the autograd engine, so unrolling a sequence is a plain Go loop and backpropagation through time comes for free:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nx">cell</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">rnn</span><span class="p">.</span><span class="nx">NewLSTMCell</span><span class="p">(</span><span class="nx">inSize</span><span class="p">,</span><span class="w"> </span><span class="nx">hidden</span><span class="p">,</span><span class="w"> </span><span class="nx">rng</span><span class="p">)</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="nx">wOut</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Param</span><span class="p">(</span><span class="nx">tensai</span><span class="p">.</span><span class="nx">RandomMatrix</span><span class="p">(</span><span class="nx">hidden</span><span class="p">,</span><span class="w"> </span><span class="nx">numClasses</span><span class="p">,</span><span class="w"> </span><span class="nx">rng</span><span class="p">))</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="nx">bOut</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Param</span><span class="p">(</span><span class="nx">tensai</span><span class="p">.</span><span class="nx">NewMatrix</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nx">numClasses</span><span class="p">))</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="nx">trainer</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">NewTrainer</span><span class="p">(</span><span class="nx">optim</span><span class="p">.</span><span class="nx">NewAdam</span><span class="p">(</span><span class="mf">0.01</span><span class="p">),</span><span class="w"> </span><span class="nb">append</span><span class="p">(</span><span class="nx">cell</span><span class="p">.</span><span class="nx">Params</span><span class="p">(),</span><span class="w"> </span><span class="nx">wOut</span><span class="p">,</span><span class="w"> </span><span class="nx">bOut</span><span class="p">)...)</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="k">for</span><span class="w"> </span><span class="nx">step</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="nx">step</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="nx">epochs</span><span class="p">;</span><span class="w"> </span><span class="nx">step</span><span class="o">++</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="w">    </span><span class="nx">h</span><span class="p">,</span><span class="w"> </span><span class="nx">c</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">cell</span><span class="p">.</span><span class="nx">InitState</span><span class="p">(</span><span class="nx">batch</span><span class="p">)</span>
+<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="nx">x</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">steps</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="c1">// one (batch x inSize) matrix per time step</span>
+<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="w">        </span><span class="nx">h</span><span class="p">,</span><span class="w"> </span><span class="nx">c</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">cell</span><span class="p">.</span><span class="nx">Step</span><span class="p">(</span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Input</span><span class="p">(</span><span class="nx">x</span><span class="p">),</span><span class="w"> </span><span class="nx">h</span><span class="p">,</span><span class="w"> </span><span class="nx">c</span><span class="p">)</span>
+<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="w">    </span><span class="nx">logits</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">h</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">wOut</span><span class="p">).</span><span class="nx">AddRow</span><span class="p">(</span><span class="nx">bOut</span><span class="p">)</span>
+<a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a><span class="w">    </span><span class="nx">trainer</span><span class="p">.</span><span class="nx">Step</span><span class="p">(</span><span class="nx">logits</span><span class="p">.</span><span class="nx">CrossEntropy</span><span class="p">(</span><span class="nx">labels</span><span class="p">))</span><span class="w"> </span><span class="c1">// labels is a []int of class indices</span>
+<a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a><span class="p">}</span>
+</code></pre></div>
+<p><code>_example/charrnn</code> trains a character-level LSTM on an embedded public-domain text and generates samples from the reloaded parameters.</p>
+<p><code>rnn.SelfAttention</code> is the single-head, one-sequence form: <code>attn.Forward(x)</code> computes <code>softmax(Q*K^T/sqrt(d))*V</code> on a <code>(seqLen, inSize)</code> node with learned projections, and the raw <code>rnn.Attention(q, k, v)</code> is also exposed. For batches and heads, write the block above.</p>
+<h2 id="saving-parameters">Saving parameters<a class="headerlink" href="#saving-parameters" title="Permanent link">&para;</a></h2>
+<p>Autograd parameters are saved and restored positionally:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="nx">autograd</span><span class="p">.</span><span class="nx">SaveParamsFile</span><span class="p">(</span><span class="s">"cell.json"</span><span class="p">,</span><span class="w"> </span><span class="nx">cell</span><span class="p">.</span><span class="nx">Params</span><span class="p">()...)</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="c1">// build the same cell, then</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="nx">autograd</span><span class="p">.</span><span class="nx">LoadParamsFile</span><span class="p">(</span><span class="s">"cell.json"</span><span class="p">,</span><span class="w"> </span><span class="nx">cell</span><span class="p">.</span><span class="nx">Params</span><span class="p">()...)</span>
+</code></pre></div>
+<p>Parameters of any rank round-trip; two-dimensional ones keep the encoding earlier checkpoints used, so files written before the engine went n-dimensional still load.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="Footer" >
+        
+          
+          <a href="../training/" class="md-footer__link md-footer__link--prev" aria-label="Previous: Training Models">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Previous
+              </span>
+              <div class="md-ellipsis">
+                Training Models
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../quantization/" class="md-footer__link md-footer__link--next" aria-label="Next: Quantization">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                Next
+              </span>
+              <div class="md-ellipsis">
+                Quantization
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      MIT License &mdash; Yasuhiro Matsumoto (a.k.a. mattn)
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/mattn" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "search.suggest", "search.highlight"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
