@@ -51,13 +51,13 @@ func q8gMatvecCols(out []tensai.Float, xu []uint8, sx tensai.Float, qw []int8, s
 					xp := archsimd.BroadcastUint32x8(qxQuad(xu, i4)).AsInt8x32().Sub(offset)
 					row := tile[i4*4*q4Tile:]
 					w := simd.LoadI8x32(row)
-					a0 = a0.Add(w.Abs().AsUint8x32().DotProductPairsSaturated(xp.MulSign(w)).DotProductPairs(ones))
+					a0 = a0.Add(w.Abs().AsUint8x32().DotProductPairsSaturated(simd.MulSignI8x32(xp, w)).DotProductPairs(ones))
 					w = simd.LoadI8x32(row[32:])
-					a1 = a1.Add(w.Abs().AsUint8x32().DotProductPairsSaturated(xp.MulSign(w)).DotProductPairs(ones))
+					a1 = a1.Add(w.Abs().AsUint8x32().DotProductPairsSaturated(simd.MulSignI8x32(xp, w)).DotProductPairs(ones))
 					w = simd.LoadI8x32(row[64:])
-					a2 = a2.Add(w.Abs().AsUint8x32().DotProductPairsSaturated(xp.MulSign(w)).DotProductPairs(ones))
+					a2 = a2.Add(w.Abs().AsUint8x32().DotProductPairsSaturated(simd.MulSignI8x32(xp, w)).DotProductPairs(ones))
 					w = simd.LoadI8x32(row[96:])
-					a3 = a3.Add(w.Abs().AsUint8x32().DotProductPairsSaturated(xp.MulSign(w)).DotProductPairs(ones))
+					a3 = a3.Add(w.Abs().AsUint8x32().DotProductPairsSaturated(simd.MulSignI8x32(xp, w)).DotProductPairs(ones))
 				}
 				sg := stab[g*q4Tile:]
 				f := a0.ConvertToFloat32().Mul(simd.LoadF32x8(sg))
