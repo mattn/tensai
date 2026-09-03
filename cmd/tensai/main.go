@@ -365,10 +365,13 @@ func benchCmd(o *llm.Options, p, n, reps int) {
 	// A binary built without GOEXPERIMENT=simd runs the portable kernels
 	// and measures an order of magnitude slower, which is easy to mistake
 	// for a slow machine.
-	if simd.HasAVX2 {
+	switch {
+	case simd.HasAVX2:
 		fmt.Println("cpu: AVX2 kernels")
-	} else {
-		fmt.Println("cpu: portable kernels (rebuild with GOEXPERIMENT=simd on amd64 for AVX2)")
+	case simd.HasNEON:
+		fmt.Println("cpu: NEON kernels")
+	default:
+		fmt.Println("cpu: portable kernels (rebuild with GOEXPERIMENT=simd on amd64 or arm64 to vectorize)")
 	}
 	// The two binding generations reach different adapters and differ in
 	// speed on the same one, so the table names which build measured.

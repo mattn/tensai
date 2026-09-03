@@ -6,3 +6,6 @@ import "simd/archsimd"
 
 // HasAVX2 gates the vector kernels on the CPU actually supporting AVX2+FMA.
 var HasAVX2 = archsimd.X86.AVX2() && archsimd.X86.FMA()
+
+// HasNEON is the arm64 counterpart; false here.
+const HasNEON = false
