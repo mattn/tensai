@@ -7,7 +7,7 @@ import "simd/archsimd"
 // Thin wrappers over the archsimd calls whose names changed between Go
 // releases; the experimental package is not covered by the compatibility
 // promise. This file targets the Go 1.27 API, compat_go126.go the
-// older one. The kernels in dot_simd.go and mathvec_simd.go use only these
+// older one. The kernels in dot_simd.go and dispatch_simd.go use only these
 // names for loads, stores, and rounding.
 
 func LoadF32x8(s []float32) archsimd.Float32x8 {
