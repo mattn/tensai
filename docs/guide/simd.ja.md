@@ -1,6 +1,6 @@
 # SIMD アクセラレーション
 
-tensai の高速カーネルは amd64 では AVX2、arm64 では NEON で、Go の実験的な `simd/archsimd` パッケージで書かれています — 純 Go のまま、cgo なし、アセンブリファイルなしです。
+tensai の高速カーネルは amd64 では AVX2、arm64 では NEON (ARM の Advanced SIMD) で、Go の実験的な `simd/archsimd` パッケージで書かれています — 純 Go のまま、cgo なし、アセンブリファイルなしです。
 
 ```bash
 GOEXPERIMENT=simd go build ./...

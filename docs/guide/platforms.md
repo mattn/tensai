@@ -29,11 +29,33 @@ package, and they turn on with `GOEXPERIMENT=simd` at build time. A build
 without it, or on a combination not listed below, uses the portable bodies
 and computes the same results, an order of magnitude slower.
 
+AVX2 and NEON (ARM's Advanced SIMD) are instruction set extensions, so the
+architecture and the Go version decide which one a build gets. The operating
+system does not enter into it: the same NEON kernels serve arm64 on Linux,
+macOS and Windows alike.
+
 | Arch | Go | Kernels | Notes |
 |---|---|---|---|
 | amd64 | 1.26, 1.27 | AVX2 | Checked at runtime; a CPU without AVX2 and FMA falls back |
-| arm64 | 1.27 | NEON | Go 1.26's `simd/archsimd` has no arm64 half, so 1.26 falls back |
+| arm64 | 1.27 | NEON | Mandatory on AArch64, so there is nothing to check. Go 1.26's `simd/archsimd` has no arm64 half, so 1.26 falls back |
 | others | any | portable | |
+
+Which of those has actually been run is a separate question from which the
+build system selects, and worth keeping separate:
+
+| Platform | Kernels selected | Verified |
+|---|---|---|
+| linux/amd64 | AVX2 | Yes, this is where the kernels are developed and benchmarked |
+| linux/arm64 | NEON | Yes, tests and a generation run under emulation |
+| darwin/arm64 | NEON | Not yet: no measurement on the hardware |
+| windows/amd64 | AVX2 | Yes |
+| windows/arm64 | NEON | Not yet |
+
+The emulated run is the reason to trust the arm64 arithmetic and not its
+speed: every package's tests pass, a quantized matvec checksums identically
+against both the portable bodies and AVX2, and a 0.5B produces the same text
+as it does on amd64. None of that says how fast the kernels are on real
+silicon, which only a run on the hardware can answer.
 
 What the NEON build vectorizes today is narrower than the AVX2 one:
 
