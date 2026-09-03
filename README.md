@@ -12,7 +12,7 @@
 
 - **Matrix operations** - `Matrix` plus basic operations such as `Dot`, `Add`, `T`, and `AddBias`. Tensors are float32 (`tensai.Float`)
 - **N-dimensional tensors** - `Tensor` generalizes `Matrix` to any rank: element-wise `Add`/`Sub`/`Mul`/`Div` with NumPy-style broadcasting, batched `MatMul` (the leading axes broadcast, the per-matrix products run on the same kernel as `Dot`, parallelized across the batch) plus its transposed forms `MatMulTN` and `MatMulNT`, so a backward pass never materializes a transposed copy, axis-permuting `Transpose`, `Reshape` with `-1` inference, and zero-copy views to and from `Matrix`
-- **SIMD acceleration** - AVX2 kernels written with Go's experimental `simd/archsimd` package: still pure Go, no cgo, no assembly files. Matmul, ReLU/LeakyReLU, Sigmoid/Tanh/Softmax (via a vectorized polynomial `exp`), GELU (via a vectorized `erf`), LayerNorm, and the Adam update are all 8-lane vectorized. Build with `GOEXPERIMENT=simd` on amd64 (Go 1.26 and 1.27 APIs both supported via build tags); every other build uses the portable fallbacks automatically
+- **SIMD acceleration** - AVX2 kernels on amd64 and NEON (ARM's Advanced SIMD) kernels on arm64, written with Go's experimental `simd/archsimd` package: still pure Go, no cgo, no assembly files. Matmul, ReLU/LeakyReLU, Sigmoid/Tanh/Softmax (via a vectorized polynomial `exp`), GELU (via a vectorized `erf`), LayerNorm, and the Adam update are all 8-lane vectorized on AVX2; the arm64 half covers the decode path so far. Build with `GOEXPERIMENT=simd` on amd64 with Go 1.26 or 1.27, or on arm64 with Go 1.27 (the first release whose `simd/archsimd` has an arm64 half); every other build uses the portable fallbacks automatically, with identical results. [Platforms](docs/guide/platforms.md) has the per-kernel and per-OS breakdown
 - **Low-allocation training** - layers reuse their forward/backward scratch buffers across training steps (a full MLP step runs in ~29 allocations), so GC stays out of the training loop; `Predict` always returns freshly allocated results
 - **Layers** - `Embedding`, `Dense`, `Conv2D`, `MaxPool2D`, `BatchNorm`, `LayerNorm`, `Dropout`, plus `ReLU`, `LeakyReLU`, `GELU`, `Sigmoid`, `Tanh`, and `Softmax` activations
 - **WebGPU backend (experimental)** - build with `-tags wgpu` (linux, macOS, Windows) and `gpu.Open()` runs batched `MatMul` as a WGSL compute shader on any GPU wgpu-native reaches (Vulkan, Metal, D3D12 — AMD, Intel, Apple, NVIDIA). The bindings go through `ebitengine/purego`, so there is still no cgo and no C compiler: the wgpu-native shared library is dlopen-ed at runtime. A `Device` also satisfies `tensai.Accelerator`: `tensai.UseAccelerator(dev)` moves every product above 4e8 multiply-accumulates — including both transposed products a backward pass needs — onto the GPU, so an autograd training step of a 2048-wide block runs 1.4x faster with nothing else changed. Resident tensors also carry the rest of a backward pass — element-wise `Binary`, `Activate`/`ActivateGrad` (ReLU, tanh, sigmoid, and the error-function GELU the CPU kernels use), `SumCols`, and an in-place `AdamStep` — so a training graph has the kernels to stay on the device. `tape.UseDevice(dev)` does exactly that — values, gradients and the Adam update all stay resident, and one step of a 2048-wide block runs 1382ms on the CPU, 442ms with products offloaded one at a time, and 193ms resident. LayerNorm, softmax, the permutes attention needs, and the embedding scatter-add have kernels too, so a whole transformer block trains without leaving the device — 209ms per step on the CPU against 54ms resident, at model width 512
@@ -449,7 +449,7 @@ go run -tags wgpu ./_example/wgpu          # needs wgpu-native, see above
 go run -tags wgpu ./_example/wgpu -sweep  # GPU vs CPU across sizes
 go test ./...
 
-# With the AVX2 SIMD kernel (Go 1.26+ / 1.27, amd64):
+# With the vector kernels (amd64 + Go 1.26 or 1.27, arm64 + Go 1.27):
 GOEXPERIMENT=simd go test ./...
 GOEXPERIMENT=simd go test -bench=Dot .
 ```
@@ -480,6 +480,33 @@ The charrnn example trains a character-level LSTM on an embedded public-domain t
 The plasma example animates a demoscene-style plasma in the terminal where the plasma function is a randomly weighted network (a CPPN) evaluated for every pixel of every frame as one batch. The status line shows the per-frame network time, which makes it a live SIMD benchmark: 120x90 pixels runs at ~32 fps on the portable build and ~100 fps with `GOEXPERIMENT=simd` on the same machine. Try different `-seed` values for different effects.
 
 Both raw IDX files and `.gz` variants are accepted.
+
+## Platforms
+
+Nothing below is required: tensai builds and runs wherever Go does, with the
+portable kernels and no GPU. What a platform adds is vector kernels and a GPU
+backend, and the two are decided independently. [Platforms](docs/guide/platforms.md)
+has the full breakdown; the short version:
+
+| | Vector kernels | GPU | Verified |
+|---|---|---|---|
+| linux/amd64 | AVX2 | Vulkan | yes, this is where the kernels are developed and benchmarked |
+| linux/arm64 | NEON | Vulkan | tests and a generation run, under emulation |
+| darwin/amd64 | AVX2 | Metal | — |
+| darwin/arm64 | NEON | Metal | not yet on the hardware |
+| windows/amd64 | AVX2 | D3D12, Vulkan | yes |
+| windows/arm64 | NEON | D3D12, Vulkan | not yet |
+| others | portable | none | — |
+
+The vector kernels come from the architecture and the Go version, never the
+OS: AVX2 and NEON are instruction set extensions. AVX2 is checked at runtime
+and falls back on a CPU without it; NEON is mandatory on AArch64, so there is
+nothing to check. The GPU comes from a build tag and a wgpu-native shared
+library loaded at runtime.
+
+The arm64 kernels are newer and narrower than the amd64 ones: they vectorize
+the decode path, not yet the 4-bit and grouped-int8 matvecs, the batched
+prefill, or the dense float matmul.
 
 ## SIMD Coverage
 
