@@ -50,3 +50,7 @@ func StoreF32x8Part(v archsimd.Float32x8, s []float32) {
 func RoundEven(v archsimd.Float32x8) archsimd.Float32x8 {
 	return v.RoundToEven()
 }
+
+// MulSignI8x32 multiplies x by the sign of y (VPSIGNB); Go 1.26 spells
+// the method CopySign.
+func MulSignI8x32(x, y archsimd.Int8x32) archsimd.Int8x32 { return x.CopySign(y) }
