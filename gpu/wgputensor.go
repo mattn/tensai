@@ -4688,7 +4688,7 @@ func (g *Device) UploadQ8(q *quant.QMatrix) (*QMatrix, error) {
 	// One row per stretch of packed words, so the walk splits across
 	// workers the way the int4 one does.
 	packed := make([]uint32, q.Rows*words)
-	workpool.Run(q.Rows, 1, func(lo, hi int) {
+	workpool.Bulk(q.Rows, 1, func(lo, hi int) {
 		for i := lo; i < hi; i++ {
 			for j := 0; j < q.Cols; j++ {
 				b := uint32(uint8(q.Q[q.Index(i, j)]))
@@ -5676,7 +5676,7 @@ func (g *Device) UploadQ4(q *quant.Q4Matrix) (*Q4Matrix, error) {
 	// across workers cleanly. It is a billion iterations on a small model
 	// and was most of what -gpu spent getting started.
 	packed := make([]uint32, pairs*words)
-	workpool.Run(pairs, 1, func(lo, hi int) {
+	workpool.Bulk(pairs, 1, func(lo, hi int) {
 		for i2 := lo; i2 < hi; i2++ {
 			for j := 0; j < q.Cols; j++ {
 				b := nib(2*i2, j) | nib(2*i2+1, j)<<4
@@ -5686,7 +5686,7 @@ func (g *Device) UploadQ4(q *quant.Q4Matrix) (*Q4Matrix, error) {
 	})
 	groups := (q.Rows + 63) / 64 // q4Group
 	scales := make([]float32, groups*words*4)
-	workpool.Run(groups, 1, func(lo, hi int) {
+	workpool.Bulk(groups, 1, func(lo, hi int) {
 		for gi := lo; gi < hi; gi++ {
 			for j := 0; j < q.Cols; j++ {
 				scales[gi*words*4+j] = q.Scale[q.TableIndex(gi, j)]
