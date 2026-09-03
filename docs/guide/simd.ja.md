@@ -1,13 +1,13 @@
 # SIMD アクセラレーション
 
-tensai の高速カーネルは AVX2 で、Go の実験的な `simd/archsimd` パッケージで書かれています — 純 Go のまま、cgo なし、アセンブリファイルなしです。
+tensai の高速カーネルは amd64 では AVX2、arm64 では NEON で、Go の実験的な `simd/archsimd` パッケージで書かれています — 純 Go のまま、cgo なし、アセンブリファイルなしです。
 
 ```bash
 GOEXPERIMENT=simd go build ./...
 GOEXPERIMENT=simd go test -bench=Dot .
 ```
 
-要件は amd64 と Go 1.26 または 1.27 (両世代の `simd` API にビルドタグで対応)。それ以外のビルド — 他アーキテクチャ、古い Go、`GOEXPERIMENT` 未設定 — は自動的にポータブル実装へフォールバックし、結果は同一です。
+要件は amd64 + Go 1.26 または 1.27 (両世代の `simd` API にビルドタグで対応)、あるいは arm64 + Go 1.27 (`simd/archsimd` に arm64 が入った最初の版)。それ以外のビルド — 他アーキテクチャ、古い Go、`GOEXPERIMENT` 未設定 — は自動的にポータブル実装へフォールバックし、結果は同一です。カーネルごとの対応状況は [対応プラットフォーム](platforms.md) にあります。NEON 版はデコード経路をベクトル化していますが、4bit と grouped int8 の matvec、プレフィルのバッチ畳み込み、密行列積はまだです。
 
 ## ベクトル化の範囲
 

@@ -67,6 +67,7 @@ plugins:
             Home: ホーム
             Getting Started: はじめに
             Guide: ガイド
+            Platforms: 対応プラットフォーム
             Tensors and Matrices: テンソルと行列
             Layers, Losses, Optimizers: レイヤー・損失・最適化
             Training Models: モデルの学習
@@ -90,6 +91,7 @@ nav:
       - Quantization: guide/quantization.md
       - SIMD Acceleration: guide/simd.md
       - GPU (WebGPU): guide/gpu.md
+      - Platforms: guide/platforms.md
   - Model Formats: formats.md
   - Tokenizers: tokenizers.md
   - LLM Inference: llm.md
