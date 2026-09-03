@@ -3,14 +3,14 @@
 // A decode step is ~100 short parallel regions (~200us each) per token,
 // and spawning goroutines puts a sleep/wake on every one of them: the
 // wake cost, not memory access, is what keeps the cycled-weight
-// bandwidth at 62% of a single sweep (see PERF-INVESTIGATION.md). ggml
-// hides it with a resident thread pool that spins on PAUSE between
-// regions. Earlier Go attempts substituted Gosched or a bare busy loop
-// for PAUSE and lost — a yielded P gets rescheduled, and a bare spin
-// starves the sibling hyperthread. This pool spins on the real PAUSE
-// instruction, briefly, then parks: within a token the next region
-// arrives in microseconds, so the spin window almost always absorbs it,
-// and the park bounds the burn between tokens and after decode ends.
+// bandwidth at 62% of a single sweep. ggml hides it with a resident
+// thread pool that spins on PAUSE between regions. Earlier Go attempts
+// substituted Gosched or a bare busy loop for PAUSE and lost — a yielded
+// P gets rescheduled, and a bare spin starves the sibling hyperthread.
+// This pool spins on the real PAUSE instruction, briefly, then parks:
+// within a token the next region arrives in microseconds, so the spin
+// window almost always absorbs it, and the park bounds the burn between
+// tokens and after decode ends.
 package workpool
 
 import (
