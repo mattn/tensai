@@ -4,6 +4,24 @@ Nothing here is required: tensai builds and runs everywhere Go does, with the
 portable kernels and no GPU. The table says what each platform adds on top,
 and what it is still missing.
 
+## By operating system
+
+The CPU kernels do not depend on the operating system at all: what decides
+them is the architecture and the Go version, in the next table. What the OS
+decides is the GPU backend and how the weight cache is read.
+
+| OS | GPU | Weight cache | Freeing mapped pages |
+|---|---|---|---|
+| Linux | Vulkan, `dlopen` | Memory-mapped | `madvise(MADV_DONTNEED)` |
+| macOS | Metal, `dlopen` | Memory-mapped | `madvise`, issued as a raw syscall |
+| Windows | D3D12 or Vulkan, `LoadLibrary` | Memory-mapped, through a file mapping | Not available, pages stay until unmap |
+| Other (BSD, illumos, ...) | Not built | Read through `ReadAt` instead | Not available |
+
+Released binaries cover linux, macOS and Windows on both amd64 and arm64.
+Anywhere else, `go build` still produces a working tensai: it loses the
+mapping (a load reads the cache file instead, which costs time and memory
+but changes nothing else) and the GPU tags.
+
 ## CPU kernels
 
 The vector kernels are Go, written against the experimental `simd/archsimd`
@@ -58,8 +76,10 @@ layers take their values from their keys runs its decode on the CPU, on every
 platform, because the device kernels have no copy for that shape yet. The
 runtime says so and continues rather than failing.
 
-## Model download and cache
+## What none of this changes
 
-Neither of the above changes what a model needs. Weights repack once into a
-cache file beside the gguf and memory-map on every later load, which is the
-same on all platforms.
+A model is fetched, repacked and cached the same way everywhere, and the
+numbers a run produces are the same: the vector kernels are written to match
+the portable ones, and a quantized matvec gives bit-identical results under
+AVX2, under NEON, and under neither. A platform can make tensai slower. It
+does not make it answer differently.
