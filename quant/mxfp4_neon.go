@@ -1,11 +1,10 @@
-//go:build !goexperiment.simd || (!amd64 && (!arm64 || !go1.27))
+//go:build goexperiment.simd && arm64 && go1.27
 
 package quant
 
 import "github.com/mattn/tensai"
 
-// Portable dispatchers for the MXFP4 kernels; build with
-// GOEXPERIMENT=simd on amd64 for the AVX2 versions in mxfp4_simd.go.
+// gpt-oss's MXFP4 keeps the portable bodies on arm64.
 
 func mxfp4MatvecCols(out []tensai.Float, xu []uint8, sx tensai.Float, qw []uint8, scale []tensai.Float, colSum64 []int32, cols, lo, hi int) {
 	mxfp4MatvecColsGeneric(out, xu, sx, qw, scale, colSum64, cols, lo, hi)

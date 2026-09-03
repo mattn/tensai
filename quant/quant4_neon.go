@@ -1,11 +1,13 @@
-//go:build !goexperiment.simd || (!amd64 && (!arm64 || !go1.27))
+//go:build goexperiment.simd && arm64 && go1.27
 
 package quant
 
 import "github.com/mattn/tensai"
 
-// Portable dispatcher for the 4-bit matvec kernel; build with
-// GOEXPERIMENT=simd on amd64 for the AVX2 version in quant4_simd.go.
+// The 4-bit kernels keep the portable bodies on arm64 for now. Unpacking
+// nibbles into the quad layout is the same shape of work the int8 kernel
+// in quant_neon.go does, one mask and shift ahead of it; it is the next
+// one to vectorize here.
 
 func q4matvecCols(out []tensai.Float, xu []uint8, xq []uint32, sx tensai.Float, gsum []int32, qw []uint8, scale []tensai.Float, sm []uint32, group, cols, lo, hi int) {
 	q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, sm, group, cols, lo, hi)

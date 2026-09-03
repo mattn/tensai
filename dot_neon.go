@@ -1,12 +1,13 @@
-//go:build !goexperiment.simd || (!amd64 && (!arm64 || !go1.27))
+//go:build goexperiment.simd && arm64 && go1.27
 
 package tensai
 
 import "runtime"
 
-// dotRows computes rows lo..hi of out = a * b. This is the portable
-// fallback; build with GOEXPERIMENT=simd on amd64 to get the AVX2 kernel in
-// dot_simd.go.
+// The dense float matmuls keep the portable bodies on arm64. They are the
+// training path; the decode kernels that carry a chat are in quant and
+// internal/kernels, which do have NEON here.
+
 func dotRows(out, a, b *Matrix, lo, hi int) {
 	dotRowsGeneric(out, a, b, lo, hi)
 }
@@ -25,11 +26,6 @@ func dotWorkerCount(rows, inner, cols int) int {
 	return workers
 }
 
-// dotTARows computes out rows lo..hi of out = a^T * b. Portable fallback;
-// see dot_simd.go for the AVX2 kernel.
-// dotTATall is the portable stand-in for the register-accumulating kernel
-// in dot_simd.go; without vectors there is nothing to gain, so it is the
-// general one.
 func dotTATall(out, a, b *Matrix, lo, hi int) {
 	dotTARowsGeneric(out, a, b, lo, hi)
 }
