@@ -42,12 +42,20 @@ var (
 // spinFor is how long a worker spins on PAUSE waiting for the next
 // region before parking. Regions inside one token are microseconds
 // apart; sampling between tokens is longer and should park. Swept over
-// 5us-2ms: shorter loses regions to parking mid-token, longer burns the
-// hyperthread siblings through the serial stretches for nothing.
-const spinFor = 20 * time.Microsecond
+// 5us-2ms: shorter loses regions to parking mid-token, while millisecond
+// windows begin burning through the serial stretches for no further gain.
+// Re-sweeping on the full Qwen decode path put the knee at about 100us.
+const spinFor = 100 * time.Microsecond
 
 func setup() {
 	workers = runtime.GOMAXPROCS(0)
+	// Decode matvecs stream weights from memory. Beyond eight workers the
+	// extra SMT siblings contend for the same cores and memory channels;
+	// on the 8C/16T Zen 3 reference machine they reduce end-to-end decode
+	// by about 8%. This also matches the cap used by the dense CPU kernels.
+	if workers > 8 {
+		workers = 8
+	}
 	if workers < 2 {
 		workers = 0
 		return
