@@ -1,6 +1,6 @@
 # SIMD Acceleration
 
-tensai's fast kernels are AVX2 on amd64 and NEON on arm64, written with Go's experimental `simd/archsimd` package — still pure Go, no cgo, no assembly files.
+tensai's fast kernels are AVX2 on amd64 and NEON (ARM's Advanced SIMD) on arm64, written with Go's experimental `simd/archsimd` package — still pure Go, no cgo, no assembly files.
 
 ```bash
 GOEXPERIMENT=simd go build ./...
