@@ -1,13 +1,13 @@
 # SIMD Acceleration
 
-tensai's fast kernels are AVX2, written with Go's experimental `simd/archsimd` package — still pure Go, no cgo, no assembly files.
+tensai's fast kernels are AVX2 on amd64 and NEON on arm64, written with Go's experimental `simd/archsimd` package — still pure Go, no cgo, no assembly files.
 
 ```bash
 GOEXPERIMENT=simd go build ./...
 GOEXPERIMENT=simd go test -bench=Dot .
 ```
 
-Requirements: amd64 and Go 1.26 or 1.27 (both `simd` API generations are supported via build tags). Every other build — other architectures, older Go, or `GOEXPERIMENT` unset — uses the portable fallbacks automatically, with identical results.
+Requirements: amd64 with Go 1.26 or 1.27 (both `simd` API generations are supported via build tags), or arm64 with Go 1.27, whose `simd/archsimd` is the first to carry an arm64 half. Every other build — other architectures, older Go, or `GOEXPERIMENT` unset — uses the portable fallbacks automatically, with identical results. [Platforms](platforms.md) has the per-kernel breakdown: the NEON build vectorizes the decode path but not yet the 4-bit and grouped-int8 matvecs, the batched prefill, or the dense float matmul.
 
 ## What is vectorized
 
