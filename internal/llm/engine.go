@@ -1505,6 +1505,24 @@ func templateFor(modelType string, think bool) tmpl {
 		stops:     []string{"<|im_end|>", "<|endoftext|>"},
 		toolCalls: "hermes",
 	}
+	// K2-Horizon (IFM) uses pipe-delimited markers: <|ifm|im_start|> /
+	// <|ifm|im_end|> for turns, <ifm|think> for reasoning.  Tool-call
+	// payload follows the same nested-XML convention as Qwen3.5.
+	if modelType == "k2-horizon" {
+		t = tmpl{
+			sysOpen: "<|ifm|im_start|>system\n", sysClose: "<|ifm|im_end|>\n",
+			userOpen: "<|ifm|im_start|>user\n", userClose: "<|ifm|im_end|>\n",
+			asstOpen: "<|ifm|im_start|>assistant\n", asstClose: "<|ifm|im_end|>\n",
+			stops:     []string{"<|ifm|im_end|>"},
+			toolCalls: "qwen3xml",
+		}
+		if think {
+			t.reasonOpen, t.reasonClose = "<ifm|think>", "</ifm|think>"
+		} else {
+			t.asstPrefill = "<ifm|think>\n</ifm|think>\n\n"
+		}
+		return t
+	}
 	// Qwen3 and SmolLM3 disable their thinking mode by opening the
 	// assistant turn with an empty think block; -think leaves it open.
 	if modelType == "qwen3" || modelType == "qwen3_5" || modelType == "smollm3" {

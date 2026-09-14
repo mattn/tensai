@@ -284,7 +284,7 @@ func loadConfig(path string) (config, error) {
 	}
 	c.PartialRotary = outer.RopeArgs.Partial
 	switch c.ModelType {
-	case "qwen2", "qwen3", "llama", "smollm3":
+	case "qwen2", "qwen3", "k2-horizon", "llama", "smollm3":
 	case "qwen3_5":
 		if len(c.LayerTypes) != c.Layers {
 			return c, fmt.Errorf("qwen3_5 config lists %d layer types for %d layers", len(c.LayerTypes), c.Layers)
@@ -301,7 +301,7 @@ func loadConfig(path string) (config, error) {
 		// without this the harmony channels leak into the answer.
 		c.ChatStyle = "gpt-oss"
 	default:
-		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2, qwen3, qwen3_5, llama, smollm3, and gpt_oss)", c.ModelType)
+		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2, qwen3, qwen3_5, k2-horizon, llama, smollm3, and gpt_oss)", c.ModelType)
 	}
 	return c, nil
 }
