@@ -765,6 +765,13 @@ func (e *Engine) runTool(c toolCall) string {
 	return "No tool by that name is available."
 }
 
+// Question is one multiple-choice question for ScoreMany: the text the
+// model reads and the options it chooses among.
+type Question struct {
+	Text    string   `json:"question"`
+	Options []string `json:"options"`
+}
+
 // Score answers a question by measuring rather than generating. The
 // question goes through the chat template exactly as Generate's would,
 // and each option is scored as the log-likelihood the model assigns to
@@ -779,46 +786,140 @@ func (e *Engine) runTool(c toolCall) string {
 // scored in the form given: "yes" and "Yes" are different tokens, and
 // which one a model reaches for is a property of the model.
 func (e *Engine) Score(question string, options []string) ([]float64, error) {
-	if len(options) == 0 {
-		return nil, errors.New("tensai: no options to score")
+	probs, err := e.ScoreMany("", []Question{{Text: question, Options: options}}, false)
+	if err != nil {
+		return nil, err
 	}
-	prompt := question
+	return probs[0], nil
+}
+
+// ScoreMany answers several questions about one state. The state opens
+// the user turn and is prefilled once; each question is then appended
+// to that cached prefix, scored the way Score scores, and rolled back,
+// so N questions cost one prefill of the state plus one of each
+// question, not N of the state. A question with no state is Score.
+//
+// With label set, the options are listed under the question lettered A,
+// B, C and the model is asked for the letter, so every option costs one
+// token however long its text: the answer is one read of the logits
+// after the question, restricted to the letters. That is the form a
+// classifier wants; the unlabeled form scores the option text itself,
+// which is what a question that asks for a word in a particular form
+// wants.
+func (e *Engine) ScoreMany(state string, qs []Question, label bool) ([][]float64, error) {
+	if len(qs) == 0 {
+		return nil, errors.New("tensai: no questions to score")
+	}
+	for _, q := range qs {
+		if len(q.Options) == 0 {
+			return nil, errors.New("tensai: no options to score")
+		}
+		if label && len(q.Options) > len(labels) {
+			return nil, fmt.Errorf("tensai: %d options, and only %d labels", len(q.Options), len(labels))
+		}
+	}
 	if e.tm.foldSystem && e.system != "" {
-		prompt = e.system + "\n\n" + prompt
+		if state != "" {
+			state = e.system + "\n\n" + state
+		} else {
+			state = e.system
+		}
 	}
-	text := e.tm.bos + e.systemTurn() + e.tm.userOpen + prompt + e.tm.userClose + e.tm.asstOpen + e.tm.asstPrefill
-	ids := e.tok.Encode(text)
-	fmt.Fprintf(e.vlog, "rendered prompt: %s\n", clip(text, 600))
+	prefix := e.tm.bos + e.systemTurn() + e.tm.userOpen
+	if state != "" {
+		prefix += state + "\n\n"
+	}
+	pids := e.tok.Encode(prefix)
 	e.Reset()
 	start := time.Now()
-	base := e.prefill(ids, 0)
-	e.steps = len(ids)
-	fmt.Fprintf(e.opts.Log, "prompt: %d tokens, prefill: %v\n", len(ids), time.Since(start).Round(time.Millisecond))
-	// The prefix logits and any recurrent state are what every option
-	// starts from; the KV cache rolls back by truncation.
-	first := append([]float32(nil), base...)
-	snap := snapshotDelta(e.model)
-	ll := make([]float64, len(options))
-	for i, opt := range options {
-		toks := e.tok.Encode(opt)
-		if len(toks) == 0 {
-			return nil, fmt.Errorf("tensai: option %q tokenizes to nothing", opt)
-		}
-		logits := first
-		for j, id := range toks {
-			ll[i] += logProb(logits, id)
-			if j+1 < len(toks) {
-				logits = e.step(id, e.steps)
-				e.steps++
-			}
-		}
-		fmt.Fprintf(e.vlog, "option %q: %d tokens, log-likelihood %.3f\n", opt, len(toks), ll[i])
-		e.truncate(len(ids))
-		e.steps = len(ids)
-		restoreDelta(e.model, snap)
+	var live []int // what the cache holds
+	if len(pids) > 0 {
+		e.prefill(pids, 0)
+		live = pids
 	}
-	e.logits = first
-	return softmax64(ll), nil
+	e.steps = len(pids)
+	snap := snapshotDelta(e.model)
+	fmt.Fprintf(e.opts.Log, "state: %d tokens, prefill: %v\n", len(pids), time.Since(start).Round(time.Millisecond))
+	out := make([][]float64, len(qs))
+	for qi, q := range qs {
+		text := prefix + q.Text
+		options := q.Options
+		if label {
+			text += renderLabels(q.Options)
+			options = labels[:len(q.Options)]
+		}
+		text += e.tm.userClose + e.tm.asstOpen + e.tm.asstPrefill
+		ids := e.tok.Encode(text)
+		if qi == 0 {
+			fmt.Fprintf(e.vlog, "rendered prompt: %s\n", clip(text, 600))
+		}
+		// The question extends the state's cache when the tokens agree
+		// that far, which they do unless the tokenizer merged across
+		// the boundary; then the whole prompt is prefilled, and the
+		// next question finds the state's rows gone and does the same.
+		// Two questions opening with the same words agree further, but
+		// the recurrent state was only kept at the boundary.
+		n := min(commonPrefix(live, ids), len(pids))
+		if n == len(pids) && n < len(ids) {
+			e.truncate(n)
+			restoreDelta(e.model, snap)
+		} else {
+			e.Reset()
+			n = 0
+		}
+		start = time.Now()
+		base := e.prefill(ids[n:], n)
+		e.steps = len(ids)
+		live = ids
+		fmt.Fprintf(e.opts.Log, "question %d: %d tokens, %d prefilled in %v\n",
+			qi+1, len(ids), len(ids)-n, time.Since(start).Round(time.Millisecond))
+		// The question's logits and any recurrent state are what every
+		// option starts from; the KV cache rolls back by truncation.
+		first := append([]float32(nil), base...)
+		qsnap := snapshotDelta(e.model)
+		ll := make([]float64, len(options))
+		for i, opt := range options {
+			toks := e.tok.Encode(opt)
+			if len(toks) == 0 {
+				return nil, fmt.Errorf("tensai: option %q tokenizes to nothing", opt)
+			}
+			logits := first
+			for j, id := range toks {
+				ll[i] += logProb(logits, id)
+				if j+1 < len(toks) {
+					logits = e.step(id, e.steps)
+					e.steps++
+				}
+			}
+			fmt.Fprintf(e.vlog, "option %q: %d tokens, log-likelihood %.3f\n", opt, len(toks), ll[i])
+			e.truncate(len(ids))
+			e.steps = len(ids)
+			restoreDelta(e.model, qsnap)
+		}
+		e.logits = first
+		out[qi] = softmax64(ll)
+	}
+	return out, nil
+}
+
+// labels are what the options are called when the model answers by
+// label: the letters, the form a multiple-choice question takes in the
+// text a model was trained on, and one token each in every tokenizer
+// tried.
+var labels = []string{
+	"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+	"N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+}
+
+// renderLabels lists the options under a question, one per line behind
+// its letter, and asks for the letter back.
+func renderLabels(options []string) string {
+	var sb strings.Builder
+	for i, o := range options {
+		sb.WriteString("\n" + labels[i] + ". " + o)
+	}
+	sb.WriteString("\nAnswer with the letter only.")
+	return sb.String()
 }
 
 // logProb is log softmax of logits at id, in float64 for the sum.

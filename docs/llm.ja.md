@@ -205,6 +205,28 @@ tensai ask -q8 -json -choice "spam,ham" "Classify: 'You have won a prize'. One w
 経歴を自信ありげに捏造しますが、ここでは候補すべてを 50% 付近に置きます。それが散文では
 言えない正直な答えです。
 
+#### 1 つの状況にいくつも聞く
+
+分類器は同じ状況についていくつも聞きます。メッセージの感情、何を求めているか、人が対応
+すべきか。`-batch` はその質問群を標準入力から 1 行 1 JSON で読み、すべて同じ `-state` に
+ついて順に答えます:
+
+```bash
+tensai ask -q8 -batch -label -json -state "Customer message: 'Third time my package arrived broken. Refund me now.'" <<'EOF'
+{"question": "What is the customer's mood?", "options": ["angry", "happy", "neutral"]}
+{"question": "What is the customer asking for?", "options": ["a refund", "a replacement", "information"]}
+{"question": "Should this be escalated to a human?", "options": ["yes", "no"]}
+EOF
+```
+
+状況は 1 回だけプレフィルされ、各質問はそのキャッシュを延長するので、N 問のコストは
+状況 1 回と各質問 1 回ぶんのプレフィルで、状況を N 回読み直しません。`-label` は選択肢を
+質問の下に A, B, C と並べ、選択肢の本文ではなく文字を採点します。本文がどれだけ長くても
+選択肢 1 つは 1 トークンで、答えは質問直後の logits を 1 回読むだけです。分類器向けの形は
+こちらで、一語で答えさせてその語を見たい質問にはラベルなしの形が向きます。小さいモデルは
+質問によらず A に寄るので、0.5B では 1 つの値を鵜呑みにせず文字同士を比べるか、本文の
+形を使ってください。
+
 ### OpenAI 互換 API の提供
 
 ```bash

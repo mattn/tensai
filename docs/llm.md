@@ -220,6 +220,32 @@ biases in mind. Asked about something it does not know, the same 7B that
 confidently invents a biography under `run` puts every candidate near fifty
 percent here, which is the honest answer it cannot give in prose.
 
+#### Many questions about one state
+
+A classifier asks the same situation several things: the mood of a message,
+what it wants, whether it needs a human. `-batch` reads those questions from
+stdin, one JSON object per line, all about the same `-state`, and answers
+each in turn:
+
+```bash
+tensai ask -q8 -batch -label -json -state "Customer message: 'Third time my package arrived broken. Refund me now.'" <<'EOF'
+{"question": "What is the customer's mood?", "options": ["angry", "happy", "neutral"]}
+{"question": "What is the customer asking for?", "options": ["a refund", "a replacement", "information"]}
+{"question": "Should this be escalated to a human?", "options": ["yes", "no"]}
+EOF
+```
+
+The state is prefilled once and each question extends that cache, so N
+questions cost one prefill of the state plus one of each question rather
+than N of the state. `-label` lists the options under the question lettered
+A, B, C and scores the letter instead of the option text, so every option
+costs a single token however long its text, and the answer is one read of
+the logits after the question. That is the form a classifier wants; the
+unlabeled form is for a question that asks for a word and cares which word.
+Small models lean on A whatever the question, so with a 0.5B compare the
+letters against each other rather than trusting one in isolation, or use
+the text form.
+
 ### Serving an OpenAI-compatible API
 
 ```bash
