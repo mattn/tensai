@@ -619,7 +619,7 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 	// flushes the batch.
 	last := must(x.DownloadRange((n-1)*hs, hs))
 	a := make([]float32, hs)
-	rmsnormInto(a, last.Data, m.normW, cfg.RMSEps)
+	m.rmsnorm(a, last.Data, m.normW)
 	return m.capLogits(mv(a, m.lmT, m.qLmT, nil))
 }
 
@@ -824,6 +824,6 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 	}
 	xt := must(x.Download())
 	a := make([]float32, hs)
-	rmsnormInto(a, xt.Data, m.normW, cfg.RMSEps)
+	m.rmsnorm(a, xt.Data, m.normW)
 	return m.capLogits(mv(a, m.lmT, m.qLmT, nil))
 }

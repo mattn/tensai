@@ -18,7 +18,7 @@ greedy の続きは GPT-2 のよく知られたリファレンス出力とトー
 
 ## Qwen とその仲間たち: 10 のモデルファミリー
 
-`tensai` コマンドは現代の instruction-tuned モデルを動かします: RMSNorm、RoPE、grouped-query attention、SwiGLU MLP。safetensors から (config.json が次元を決め、シャーディングされたチェックポイントは index.json 経由) でも、config・トークナイザ・重みを 1 ファイルに収めた llama.cpp の GGUF からでもロードできます。1 つのランタイムが 10 のアーキテクチャを話します:
+`tensai` コマンドは現代の instruction-tuned モデルを動かします: RMSNorm、RoPE、grouped-query attention、SwiGLU MLP。safetensors から (config.json が次元を決め、シャーディングされたチェックポイントは index.json 経由) でも、config・トークナイザ・重みを 1 ファイルに収めた llama.cpp の GGUF からでもロードできます。1 つのランタイムが 11 のアーキテクチャを話します:
 
 | ファミリー | モデル | 何が加わるか |
 |---|---|---|
@@ -39,6 +39,7 @@ greedy の続きは GPT-2 のよく知られたリファレンス出力とトー
 | phi3 | Phi-3/3.5-mini | q/k/v と gate/up が融合済みで配布 |
 | qwen2moe / qwen3moe | Qwen1.5-MoE-A2.7B, Qwen3-30B-A3B | top-k ルーティングのエキスパート、qwen2moe は共有エキスパートも |
 | gpt-oss | gpt-oss-20b | MXFP4 エキスパート、attention sinks、YaRN rope、harmony チャンネル |
+| k2-horizon | K2-Horizon-7B | 行を 4 グループに分けて取る RMSNorm、結合文字と ZWJ を語に含める分割、512K の文脈。GGUF のみ、CPU のみ |
 
 密モデルの 12b はまた別で、per-layer embedding を持たず、KV ヘッド数を層ごとに宣言し (ローカル層 8、グローバル層 1)、狭くなる層には V の射影がありません。その層は K を V として使います。最後の 1 点だけ GPU デコードは対象外です。
 

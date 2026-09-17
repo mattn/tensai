@@ -203,7 +203,7 @@ The prompt runs through the model as one batched pass; with `-gpu` (built with `
 
 `-q8` quantizes the decode-path weights to int8 (weight-only, per-column scales) and doubles generation — 23 to 46 tok/s on the same machine — because decode streams the whole checkpoint per token and int8 pulls a quarter of the bytes. The text stays coherent but greedy decoding no longer reproduces the float32 reference tokens exactly; use the default float32 path for the reference check.
 
-The `tensai` command does the same for modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file — `-model ./qwen2.5-0.5b-instruct-q8_0.gguf -q8` chats with nothing else on disk. One runtime speaks ten architectures, each contributing its own twist:
+The `tensai` command does the same for modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file — `-model ./qwen2.5-0.5b-instruct-q8_0.gguf -q8` chats with nothing else on disk. One runtime speaks eleven architectures, each contributing its own twist:
 
 | family | models | what it adds |
 |---|---|---|
@@ -213,9 +213,11 @@ The `tensai` command does the same for modern instruction-tuned models: RMSNorm,
 | llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | the block everyone forked |
 | smollm3 | SmolLM3-3B | RoPE skipped every fourth layer |
 | gemma3 | Gemma 3 | sliding windows on 5/6 layers, sandwich norms, gelu-tanh gate, SentencePiece |
+| gemma4 | Gemma 4 E2B/E4B/12b | per-layer embeddings read from disk a token at a time, two head widths, the deeper layers attending against an earlier layer's cache, logits through a tanh cap |
 | phi3 | Phi-3/3.5-mini | q/k/v and gate/up shipped pre-fused |
 | qwen2moe / qwen3moe | Qwen1.5-MoE-A2.7B, Qwen3-30B-A3B | top-k routed experts, a shared expert on qwen2moe |
 | gpt-oss | gpt-oss-20b | MXFP4 experts, attention sinks, YaRN rope, harmony channels |
+| k2-horizon | K2-Horizon-7B | RMSNorm taken over four groups of the row, a word class that keeps combining marks and joiners together, a 512K context. GGUF only, and CPU only |
 
 The DeepSeek-R1 distills need no family of their own — they are stock qwen2/llama blocks wearing DeepSeek's turn markers, which the loader spots in the embedded chat template and switches automatically, `<think>` reasoning included. Mixture-of-experts blocks route each token through its top-k experts, repacked per expert straight from the GGUF's 3D tensors: Qwen1.5-MoE-A2.7B (14B total, 2.7B active) answers at ~9 tok/s from a 20-second load, and gpt-oss-20b — its experts kept in their native MXFP4 blocks, expanded through a one-shuffle table-lookup kernel — reasons in its harmony analysis channel and answers on the same 15GB machine.
 
