@@ -63,6 +63,7 @@ _example/dot        Graphviz DOT export of the z = x + y graph
 _example/tensor     Tour of the n-d Tensor: broadcasting, batched MatMul, attention
 _example/wgpu       WebGPU MatMul: adapter info, CPU cross-check, GPU vs CPU sweep
 _example/gpt2       The published GPT-2 (124M) checkpoint generating text in pure Go
+_example/flappy     Flappy Bird played by scoring a yes/no question each step: what a scored token can and cannot decide
 cmd/tensai          The tensai command: run, chat, and serve subcommands over internal/llm
 ```
 

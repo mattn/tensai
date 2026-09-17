@@ -18,6 +18,7 @@
 | tensor | `go run ./_example/tensor` | N 次元 Tensor ツアー: ブロードキャスト、バッチ MatMul、attention |
 | wgpu | `go run -tags wgpu ./_example/wgpu` | WebGPU MatMul: アダプタ情報、CPU との照合、GPU vs CPU スイープ |
 | gpt2 | `GOEXPERIMENT=simd go run ./_example/gpt2` | 公開 GPT-2 (124M) チェックポイントが純 Go でテキスト生成 |
+| flappy | `GOEXPERIMENT=simd go run ./_example/flappy` | Flappy Bird を、毎ステップ `Engine.Score` で yes/no を採点して遊ばせる。ランダムと 1 行のヒューリスティックと並べて、採点された質問に決められることと決められないことを測る |
 
 gpt2 サンプルは初回に GPT-2 チェックポイント (~550MB) をダウンロードします。instruction-tuned モデル (Qwen2.5-0.5B から 7B まで 9 ファミリー) は `tensai` コマンドを使ってください: [LLM 推論](llm.md)を参照。
 
@@ -43,6 +44,39 @@ go run ./_example/mnist -model cnn -export mnist.tflite  # TFLite へエクス�
 charrnn と同じ埋め込みテキストで、小さな文字レベル transformer (トークン埋め込みと位置埋め込み、4 ヘッドの因果 attention と GELU の feed-forward を持つ pre-norm ブロック 2 段、最終 norm と出力射影) を学習し、そこからサンプリングします。パラメータは約 106k、`GOEXPERIMENT=simd` で 1 分ほど学習すれば、コーパスの文をそのまま再現するようになります。モデル全体が n 次元自動微分エンジンで書かれています: 活性は `(batch, sequence, model)` のテンソル、ヘッド分割は `Reshape` と `Transpose`、各ステップのバッファは `Tape` が再利用します。フラグは `-iters`, `-lr`, `-temp`, `-n`, `-seed`、それに形を変える `-model`, `-heads`, `-blocks`, `-batch`, `-seq`。
 
 `-gpu` (wgpu ビルド時) はブロック全体をデバイスで学習します。値も勾配も Adam の更新もデバイスに留まり、毎ステップ帰ってくるのは損失だけです。速くなるかは形次第で、既定のサイズではテンソルが小さすぎて GPU が埋まらず AVX2 カーネルが勝ち、モデルを広げるとクロスオーバーします。AMD 780M では既定サイズで 24ms/step に対し `-gpu` が 72ms/step、`-model 256 -heads 8 -batch 16 -seq 64` では 282ms に対し 129ms でした。損失はどちらでも桁まで一致します。
+
+## flappy
+
+画面なしの Flappy Bird を 3 通りで遊ばせます。ランダムに羽ばたくもの、1 行のヒューリスティック
+(隙間の中心より下なら羽ばたく)、そして毎ステップ「今羽ばたくべきか」を聞かれる言語モデル。
+モデルには state を文章にして渡し、答えは `Engine.Score` の P(yes) で読みます。学習は
+一切しません。`-hint` は隙間に対する相対位置を state に明記した変種、`-compare` は
+「鳥は隙間の中心より下にいるか」という比較だけを聞いてコード側で yes を羽ばたきに変える変種です。
+
+結果そのものが要点です。Ryzen 7735HS、400 ステップで勝ち:
+
+| プレイヤー | パイプ | ステップ | 1 手 |
+|---|---|---|---|
+| ランダム | 0.3 | 16 | 0 |
+| ヒューリスティック | 20 (勝ち) | 400 | 0 |
+| Qwen2.5-0.5B | 0 | 12 | 265ms |
+| Qwen2.5-0.5B, hint | 0.3 | 19 | 291ms |
+| K2-Horizon-7B | 0 | 9 | 4.7s |
+| K2-Horizon-7B, hint | 0 | 9 | 5.6s |
+| K2-Horizon-7B, 比較のみ | 0 | 11 | 2.8s |
+
+どちらのモデルも、ヒントの有無にかかわらず遊べません。最後の行が理由です。「65 は 63 より
+下か」に 7B は yes 98%、「87 は 63 より下か」に yes 88% と答えます。採点された 1 トークンが
+運ぶのは質問の癖 (ここでは yes) であって、数値比較ではなく、まして物理ではありません。
+仕事終わりにコーヒーよりビールを選ぶのと同じ仕組み、つまり言葉の連想は、数には何も
+言えません。言語モデルが反射ゲームを遊ぶデモは、そのために学習したか、判断を state に
+書き込んでモデルに復唱させているかのどちらかです。
+
+```bash
+GOEXPERIMENT=simd go run ./_example/flappy -episodes 3 -hint -compare
+GOEXPERIMENT=simd go run ./_example/flappy -show        # P(yes) つきで全手を表示
+GOEXPERIMENT=simd go run ./_example/flappy -nomodel     # ベースライン 2 つだけ
+```
 
 ## plasma
 

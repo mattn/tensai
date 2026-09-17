@@ -18,6 +18,7 @@ Every example is runnable from the repository root with `go run`:
 | tensor | `go run ./_example/tensor` | Tour of the n-d Tensor: broadcasting, batched MatMul, attention |
 | wgpu | `go run -tags wgpu ./_example/wgpu` | WebGPU MatMul: adapter info, CPU cross-check, GPU vs CPU sweep |
 | gpt2 | `GOEXPERIMENT=simd go run ./_example/gpt2` | The published GPT-2 (124M) checkpoint generating text in pure Go |
+| flappy | `GOEXPERIMENT=simd go run ./_example/flappy` | Flappy Bird played by asking a model yes or no each step through `Engine.Score`, against a random flapper and a one-line heuristic: a measurement of what a scored question can and cannot decide |
 
 The gpt2 example downloads the GPT-2 checkpoint (~550MB) on first run. For instruction-tuned models — nine families, from Qwen2.5-0.5B up to 7B — use the `tensai` command: see [LLM Inference](llm.md).
 
@@ -43,6 +44,42 @@ Trains a character-level LSTM on an embedded public-domain text, saves the param
 Trains a small character-level transformer -- token and position embeddings, two pre-norm blocks with four-head causal attention and a GELU feed-forward, a final norm and an output projection -- on the same embedded text charrnn uses, then samples from it. About 106k parameters and a minute of training with `GOEXPERIMENT=simd`, after which it reproduces whole sentences of the corpus. The whole model is written against the n-dimensional autograd engine: activations are `(batch, sequence, model)` tensors, the per-head split is a `Reshape` plus a `Transpose`, and a `Tape` recycles each step's buffers. Flags: `-iters`, `-lr`, `-temp`, `-n`, `-seed`, plus `-model`, `-heads`, `-blocks`, `-batch` and `-seq` to change the shape.
 
 `-gpu` (on a wgpu build) trains the whole block on the device: values, gradients and the Adam update stay there and only the loss comes back each step. Whether it is faster depends on the shape — at the default size the tensors are too small to keep a GPU busy and the AVX2 kernels win, while a wider model crosses over. On an AMD 780M, 24ms/step against 72ms with `-gpu` at the default size, and 282ms against 129ms at `-model 256 -heads 8 -batch 16 -seq 64`. The losses match to the digit either way.
+
+## flappy
+
+A headless Flappy Bird, played three ways: a random flapper, a one-line
+heuristic (flap when below the middle of the opening), and a language model
+asked each step whether to flap, its state written out as a sentence and the
+answer read from `Engine.Score` as P(yes). Nothing is trained. `-hint` also
+plays a variant whose state says outright where the bird is relative to the
+opening, and `-compare` one asked only that comparison, "is the bird below
+the middle", with the code turning yes into a flap.
+
+The result is the point. On a Ryzen 7735HS, 400 steps to a win:
+
+| player | pipes | steps | per step |
+|---|---|---|---|
+| random | 0.3 | 16 | 0 |
+| heuristic | 20 (win) | 400 | 0 |
+| Qwen2.5-0.5B | 0 | 12 | 265ms |
+| Qwen2.5-0.5B, hint | 0.3 | 19 | 291ms |
+| K2-Horizon-7B | 0 | 9 | 4.7s |
+| K2-Horizon-7B, hint | 0 | 9 | 5.6s |
+| K2-Horizon-7B, comparison only | 0 | 11 | 2.8s |
+
+Neither model plays, hinted or not, and the last row says why: asked whether
+65 is below 63 the 7B answers yes at 98%, and 87 below 63 at 88%. A single
+scored token carries the question's bias (yes, here) and not a numeric
+comparison, let alone physics. The same mechanism that picks beer over
+coffee after work, a word association, has nothing to say about a number.
+A demo of a language model playing a reflex game either trained the model
+for it, or wrote the decision into the state and let the model repeat it.
+
+```bash
+GOEXPERIMENT=simd go run ./_example/flappy -episodes 3 -hint -compare
+GOEXPERIMENT=simd go run ./_example/flappy -show        # every decision, with P(yes)
+GOEXPERIMENT=simd go run ./_example/flappy -nomodel     # the two baselines only
+```
 
 ## plasma
 
