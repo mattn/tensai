@@ -140,6 +140,11 @@ func gpuCannotRun(path string) string {
 	}
 	defer g.Close()
 	arch, _ := g.String("general.architecture")
+	// K2-Horizon normalizes a row in groups, and the device kernels fold
+	// one whole-row RMS into every projection's prologue.
+	if n, _ := g.Int(arch + ".attention.group_norm_groups"); n > 1 {
+		return fmt.Sprintf("this %s normalizes in %d groups, which the GPU path cannot do yet", arch, n)
+	}
 	if arch != "gemma4" {
 		return ""
 	}
@@ -1453,6 +1458,30 @@ func templateFor(modelType string, think bool) tmpl {
 			reasonOpen:  "<think>",
 			reasonClose: "</think>",
 		}
+	}
+	if modelType == "k2-horizon" || modelType == "k2_horizon" {
+		// K2-Horizon speaks ChatML with an ifm| prefix on the turn
+		// markers and nothing between turns. Its template opens every
+		// answer with a thinking block: <ifm|think> for the model to fill
+		// when thinking is wanted, an empty one when it is not, exactly
+		// the way Qwen3 is switched. The tags are plain text, not tokens.
+		t := tmpl{
+			bos:     "<|ifm|begin_of_text|>",
+			sysOpen: "<|ifm|im_start|>system\n", sysClose: "<|ifm|im_end|>",
+			userOpen: "<|ifm|im_start|>user\n", userClose: "<|ifm|im_end|>",
+			asstOpen: "<|ifm|im_start|>assistant\n", asstClose: "<|ifm|im_end|>",
+			stops: []string{"<|ifm|im_end|>", "<|ifm|endoftext|>"},
+		}
+		if think {
+			// The open tag comes from the prompt, newline included, so
+			// the turn starts inside the block; the marker carries the
+			// newline so a prompt ending in it reads as opened.
+			t.reasonOpen, t.reasonClose = "<ifm|think>\n", "</ifm|think>"
+			t.asstPrefill = t.reasonOpen
+		} else {
+			t.asstPrefill = "<ifm|think>\n</ifm|think>\n"
+		}
+		return t
 	}
 	if modelType == "phi3" {
 		// Phi-3's template has no system role either; its official

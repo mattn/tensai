@@ -56,6 +56,10 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 		preJSON = `{"type":"Sequence","pretokenizers":[{"type":"Digits","individual_digits":true},{"type":"ByteLevel","use_regex":true}]}`
 	case "qwen2", "llama-bpe", "llama3", "smaug-bpe", "deepseek-r1-qwen":
 		preJSON = `{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}}`
+	case "k2-horizon":
+		// Llama 3's split with the word run widened to take combining
+		// marks and the zero-width joiners along with the letters.
+		preJSON = `{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?(?:\\p{L}|\\p{M}|\\u200C|\\u200D)+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}}`
 	case "gpt-4o":
 		preJSON = `{"type":"Split","pattern":{"Regex":"[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}}`
 	case "gpt-2", "olmo", "":
@@ -845,9 +849,9 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	}
 	arch, _ := g.String("general.architecture")
 	switch arch {
-	case "llama", "qwen2", "qwen3", "smollm3", "gemma3", "gemma4", "phi3", "qwen2moe", "qwen3moe", "gpt-oss":
+	case "llama", "qwen2", "qwen3", "smollm3", "gemma3", "gemma4", "phi3", "qwen2moe", "qwen3moe", "gpt-oss", "k2-horizon":
 	default:
-		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2(+moe), qwen3(+moe), llama, smollm3, gemma3, gemma4, and phi3)", arch)
+		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2(+moe), qwen3(+moe), llama, smollm3, gemma3, gemma4, phi3, gpt-oss, and k2-horizon)", arch)
 	}
 	meta := func(key string) int64 {
 		n, _ := g.Int(arch + "." + key)
@@ -865,6 +869,9 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	cfg.HeadDim = int(meta("attention.key_length"))
 	cfg.SlidingWin = int(meta("attention.sliding_window"))
 	cfg.RMSEps, _ = g.Float(arch + ".attention.layer_norm_rms_epsilon")
+	// K2-Horizon takes the RMS over groups of the row rather than the
+	// whole of it (layernorm_num_groups); absent, the row is one group.
+	cfg.NormGroups = int(meta("attention.group_norm_groups"))
 	cfg.RopeTheta, _ = g.Float(arch + ".rope.freq_base")
 	if cfg.RopeTheta == 0 {
 		cfg.RopeTheta = 10000

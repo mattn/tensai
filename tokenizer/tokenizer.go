@@ -69,12 +69,19 @@ type splitConfig struct {
 	// punctSlash admits '/' into the punctuation run's newline tail
 	// (o200k's "[\r\n/]*").
 	punctSlash bool
+	// letterMarks widens the letter run from \p{L}+ to
+	// (?:\p{L}|\p{M}|\u200C|\u200D)+ (K2-Horizon): combining marks and
+	// the zero-width joiners stay inside a word instead of ending it,
+	// which is what keeps Arabic, Devanagari and emoji sequences whole.
+	letterMarks bool
 }
 
 var (
 	gpt2Config   = splitConfig{}
 	cl100kConfig = splitConfig{ciContractions: true, letterPrefix: true, maxDigits: 3, newlineRuns: true}
 	o200kConfig  = splitConfig{ciContractions: true, letterPrefix: true, maxDigits: 3, newlineRuns: true, caseWords: true, punctSlash: true}
+	// K2-Horizon: cl100k's split with marks and joiners kept in the word.
+	k2Config = splitConfig{ciContractions: true, letterPrefix: true, maxDigits: 3, newlineRuns: true, letterMarks: true}
 )
 
 // jsonFile mirrors the subset of tokenizer.json this package understands.
@@ -245,6 +252,10 @@ func classifyRegex(re string) (splitConfig, error) {
 		} else {
 			cfg.maxDigits = 1
 		}
+		// K2-Horizon's word run admits marks and zero-width joiners.
+		if strings.Contains(re, `\p{M}|\u200C|\u200D`) {
+			cfg.letterMarks = true
+		}
 		return cfg, nil
 	}
 	return gpt2Config, fmt.Errorf("tokenizer: unsupported split pattern %q", re)
@@ -408,14 +419,18 @@ func (t *Tokenizer) split(s string) []string {
 		// Letters, with either " ?" (gpt2) or "[^\r\n\p{L}\p{N}]?"
 		// (cl100k) as the optional prefix.
 		pfx := j
+		word := unicode.IsLetter
+		if cfg.letterMarks {
+			word = isWordMark
+		}
 		if cfg.letterPrefix {
-			if !unicode.IsLetter(rs[j]) && !unicode.IsNumber(rs[j]) && rs[j] != '\r' && rs[j] != '\n' && j+1 < len(rs) && unicode.IsLetter(rs[j+1]) {
+			if !unicode.IsLetter(rs[j]) && !unicode.IsNumber(rs[j]) && rs[j] != '\r' && rs[j] != '\n' && j+1 < len(rs) && word(rs[j+1]) {
 				pfx = j + 1
 			}
-		} else if rs[j] == ' ' && j+1 < len(rs) && unicode.IsLetter(rs[j+1]) {
+		} else if rs[j] == ' ' && j+1 < len(rs) && word(rs[j+1]) {
 			pfx = j + 1
 		}
-		if pfx < len(rs) && unicode.IsLetter(rs[pfx]) {
+		if pfx < len(rs) && word(rs[pfx]) {
 			j = pfx
 			if cfg.caseWords {
 				// o200k: an uppercase-ish run (letters except ASCII a-z)
@@ -434,7 +449,7 @@ func (t *Tokenizer) split(s string) []string {
 					}
 				}
 			} else {
-				for j < len(rs) && unicode.IsLetter(rs[j]) {
+				for j < len(rs) && word(rs[j]) {
 					j++
 				}
 			}
@@ -556,6 +571,12 @@ func isUpperWord(r rune) bool {
 
 func isLowerWord(r rune) bool {
 	return unicode.Is(unicode.Ll, r) || isCaselessWord(r)
+}
+
+// isWordMark is the K2-Horizon word class: a letter, a combining mark,
+// or one of the two zero-width joiners.
+func isWordMark(r rune) bool {
+	return unicode.IsLetter(r) || unicode.Is(unicode.M, r) || r == 0x200C || r == 0x200D
 }
 
 func isCaselessWord(r rune) bool {

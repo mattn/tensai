@@ -36,6 +36,10 @@ type config struct {
 	Heads        int     `json:"num_attention_heads"`
 	KVHeads      int     `json:"num_key_value_heads"`
 	RMSEps       float64 `json:"rms_norm_eps"`
+	// NormGroups splits a hidden-state row into this many equal groups,
+	// each normalized by its own RMS (K2-Horizon); 0 or 1 is the usual
+	// single group. The weights stay one per element either way.
+	NormGroups   int     `json:"layernorm_num_groups"`
 	RopeTheta    float64 `json:"rope_theta"`
 	MaxPos       int     `json:"max_position_embeddings"`
 	Vocab        int     `json:"vocab_size"`
@@ -673,6 +677,21 @@ func catVec(vs ...[]float32) []float32 {
 	return out
 }
 
+// rmsnorm normalizes one hidden-state row with the model's norm shape.
+// K2-Horizon divides the row into NormGroups equal parts and takes each
+// part's own RMS, with the weight still one per element, so a grouped
+// norm is the plain one run once per part over the matching slices.
+func (m *qwen) rmsnorm(out, x, w []float32) {
+	if g := m.cfg.NormGroups; g > 1 && len(x)%g == 0 {
+		n := len(x) / g
+		for i := 0; i < g; i++ {
+			rmsnormInto(out[i*n:(i+1)*n], x[i*n:(i+1)*n], w[i*n:(i+1)*n], m.cfg.RMSEps)
+		}
+		return
+	}
+	rmsnormInto(out, x, w, m.cfg.RMSEps)
+}
+
 func rmsnormInto(out, x, w []float32, eps float64) {
 	var ss float64
 	for _, v := range x {
@@ -1195,7 +1214,7 @@ func (m *qwen) prefill(tokens []int, startPos int) []float32 {
 	hs := m.cfg.HiddenSize
 	last := x.Data[(len(tokens)-1)*hs : len(tokens)*hs]
 	a := make([]float32, hs)
-	rmsnormInto(a, last, m.normW, m.cfg.RMSEps)
+	m.rmsnorm(a, last, m.normW)
 	return m.capLogits(mv(a, m.lmT, m.qLmT, nil))
 }
 
@@ -1207,7 +1226,7 @@ func (m *qwen) prefillLogits(tokens []int, startPos int) *tensai.Matrix {
 	hs := m.cfg.HiddenSize
 	a := tensai.NewMatrix(x.Rows, hs)
 	for t := 0; t < x.Rows; t++ {
-		rmsnormInto(a.Data[t*hs:(t+1)*hs], x.Data[t*hs:(t+1)*hs], m.normW, m.cfg.RMSEps)
+		m.rmsnorm(a.Data[t*hs:(t+1)*hs], x.Data[t*hs:(t+1)*hs], m.normW)
 	}
 	logits := mmb(a, m.lmT, m.qLmT, nil)
 	m.capLogits(logits.Data)
@@ -1255,7 +1274,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 	a := tensai.NewMatrix(n, hs)
 	norm := func(w []float32) {
 		for t := 0; t < n; t++ {
-			rmsnormInto(a.Data[t*hs:(t+1)*hs], x.Data[t*hs:(t+1)*hs], w, cfg.RMSEps)
+			m.rmsnorm(a.Data[t*hs:(t+1)*hs], x.Data[t*hs:(t+1)*hs], w)
 		}
 	}
 	var qbuf, gbuf []float32
@@ -1569,7 +1588,7 @@ func (m *qwen) step(token, pos int) []float32 {
 		case b.vFromK:
 			qkvW = qProjW + kvDim
 		}
-		rmsnormInto(a, x, b.ln1, cfg.RMSEps)
+		m.rmsnorm(a, x, b.ln1)
 		if b.delta != nil {
 			if b.dstate == nil {
 				b.dstate = b.delta.newState()
@@ -1668,7 +1687,7 @@ func (m *qwen) step(token, pos int) []float32 {
 		}
 	}
 
-	rmsnormInto(a, x, m.normW, cfg.RMSEps)
+	m.rmsnorm(a, x, m.normW)
 	return m.capLogits(mv(a, m.lmT, m.qLmT, nil))
 }
 
@@ -1677,7 +1696,7 @@ func (m *qwen) step(token, pos int) []float32 {
 // kinds of first half — attention and the delta rule — end here.
 func (m *qwen) blockFFN(b *qblock, x, a, gu, downBuf []float32) {
 	cfg := m.cfg
-	rmsnormInto(a, x, b.ln2, cfg.RMSEps)
+	m.rmsnorm(a, x, b.ln2)
 	var down []float32
 	if len(b.experts) > 0 {
 		down = m.moeFFN(b, a)
