@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/internal/llm"
@@ -38,6 +39,7 @@ commands:
   run      generate a completion for a prompt
   chat     interactive multi-turn chat on stdin
   serve    OpenAI-compatible /v1/chat/completions server
+  ask      answer a question by scoring options, no generation
   bench    compare CPU and GPU prefill and decode speed
   models   list cached models; "models rm <name>" deletes one
   version  print the version
@@ -283,6 +285,46 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+	case "ask":
+		fs := flag.NewFlagSet("tensai ask", flag.ExitOnError)
+		o, finish := modelFlags(fs)
+		choice := fs.String("choice", "", "comma-separated answers to choose among")
+		yesno := fs.Bool("yesno", false, "score yes against no")
+		state := fs.String("state", "", "the situation the question is asked about, given ahead of it")
+		jsonOut := fs.Bool("json", false, "print the probabilities as one JSON object")
+		fs.Parse(args)
+		question := joinArgs(fs.Args())
+		var options []string
+		switch {
+		case *yesno && *choice != "":
+			fmt.Fprintln(os.Stderr, "give -yesno or -choice, not both")
+			os.Exit(2)
+		case *yesno:
+			options = []string{"yes", "no"}
+		case *choice != "":
+			for _, c := range strings.Split(*choice, ",") {
+				if c = strings.TrimSpace(c); c != "" {
+					options = append(options, c)
+				}
+			}
+		}
+		if question == "" || len(options) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: tensai ask [flags] (-choice a,b,c | -yesno) <question>")
+			os.Exit(2)
+		}
+		// The state is the context a decision is made in, and the model
+		// reads it as the first part of the user turn.
+		if *state != "" {
+			question = *state + "\n\n" + question
+		}
+		e := openEngine(o, finish)
+		defer e.Close()
+		probs, err := e.Score(question, options)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		askPrint(options, probs, *jsonOut)
 	case "bench":
 		fs := flag.NewFlagSet("tensai bench", flag.ExitOnError)
 		o, finish := modelFlags(fs)
@@ -309,6 +351,44 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "tensai: unknown command %q\n\n%s\n", cmd, usage)
 		os.Exit(2)
+	}
+}
+
+// askPrint lists the options by probability, the way a reader wants
+// them, or as one JSON object in the order given, the way a program
+// does: the text form is for the eye, the JSON for the caller that asked
+// a typed question and wants a typed answer back.
+func askPrint(options []string, probs []float64, asJSON bool) {
+	if asJSON {
+		m := make(map[string]float64, len(options))
+		for i, o := range options {
+			m[o] = probs[i]
+		}
+		best := 0
+		for i := range probs {
+			if probs[i] > probs[best] {
+				best = i
+			}
+		}
+		out, _ := json.Marshal(struct {
+			Answer        string             `json:"answer"`
+			Probabilities map[string]float64 `json:"probabilities"`
+		}{options[best], m})
+		fmt.Println(string(out))
+		return
+	}
+	idx := make([]int, len(options))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool { return probs[idx[a]] > probs[idx[b]] })
+	width := 0
+	for _, o := range options {
+		width = max(width, utf8.RuneCountInString(o))
+	}
+	for _, i := range idx {
+		pad := strings.Repeat(" ", width-utf8.RuneCountInString(options[i]))
+		fmt.Printf("%s%s  %5.1f%%\n", options[i], pad, 100*probs[i])
 	}
 }
 

@@ -142,6 +142,7 @@ tensai run -q8 -json "Explain RoPE briefly"      # one JSON object with usage co
 tensai chat -q8 -model ./model.gguf              # multi-turn; the KV cache carries the dialogue
 tensai models                                    # list the cache; "models rm <name>" deletes
 tensai bench -q8                                 # CPU vs GPU, prefill and decode
+tensai ask -q8 -yesno "Is Paris in France?"      # a probability, no generation
 ```
 
 ### Measuring CPU against GPU
@@ -178,6 +179,45 @@ discarded, so the samples describe steady state — a cold prefill on this path
 can read 30% low, which is what makes an unwarmed number unfair to compare
 against a tool that reports steady state. Prefill throughput still falls as
 the prompt grows, since attention is quadratic, so compare at one length.
+
+### Asking without generating
+
+`tensai ask` answers a question by measuring rather than generating. The
+question goes through the chat template like `run`'s would, and each option
+is scored as the log-likelihood the model assigns to writing it as the start
+of its answer; the softmax over those is the answer. No token is sampled, so
+the model cannot reply with anything outside the list, and what it does not
+know shows up as probability spread across the options rather than as a
+confident invention.
+
+```bash
+tensai ask -q8 -yesno "Is Paris the capital of France? Answer yes or no."
+tensai ask -q8 -choice "positive,negative,neutral" "Sentiment of: 'cold food, rude waiter'. One word."
+tensai ask -q8 -state "just finished work" -choice "coffee,beer,tea" "What to drink? One word."
+tensai ask -q8 -json -choice "spam,ham" "Classify: 'You have won a prize'. One word."
+```
+
+```
+yes   99.9%
+no     0.1%
+```
+
+`-state` is the situation the question is asked about, rendered ahead of it
+in the user turn; `-json` returns the chosen option and the probability of
+each, for a caller that asked a typed question and wants a typed answer.
+The cost is one prefill plus a decode step per option token, so a 0.5B
+answers in a few tens of milliseconds and the prompt's cache is rolled back
+between options rather than recomputed.
+
+Two things to know. Options are scored in the form given: `yes` and `Yes`
+are different tokens, and which one a model reaches for is a property of the
+model, so a question that ends in "Answer yes or no." is worth the words. And
+the numbers are the model's, calibration included: a 7B asked whether Paris
+is the capital of Germany can put twenty percent on yes, so read a spread
+between options as the signal and a single absolute value with the model's
+biases in mind. Asked about something it does not know, the same 7B that
+confidently invents a biography under `run` puts every candidate near fifty
+percent here, which is the honest answer it cannot give in prose.
 
 ### Serving an OpenAI-compatible API
 
