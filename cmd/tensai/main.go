@@ -66,6 +66,10 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 	fs.Float64Var(&o.Temp, "temp", 0, "sampling temperature; 0 = greedy")
 	fs.Float64Var(&o.TopP, "topp", 0.9, "nucleus sampling: keep the smallest set of tokens with this much probability mass (1 disables)")
 	fs.Int64Var(&o.Seed, "seed", 1, "sampling seed for -temp > 0")
+	fs.Float64Var(&o.Repeat, "repeat", 1, "repeat penalty over the recent context, llama.cpp style: 1 = off, 1.1 = mild")
+	fs.IntVar(&o.RepeatLastN, "repeat-last", 64, "how many recent tokens the repeat penalty looks back over")
+	fs.Float64Var(&o.Presence, "presence", 0, "presence penalty on tokens already generated (OpenAI style)")
+	fs.Float64Var(&o.Frequency, "frequency", 0, "frequency penalty per occurrence of a generated token (OpenAI style)")
 	// Bits and the model reference resolve only after Parse.
 	finish := func() {
 		if *q8 {
@@ -308,14 +312,18 @@ func main() {
 				}
 			}
 		}
-		if question == "" || len(options) < 2 {
-			fmt.Fprintln(os.Stderr, "usage: tensai ask [flags] (-choice a,b,c | -yesno) <question>")
-			os.Exit(2)
-		}
 		// The state is the context a decision is made in, and the model
-		// reads it as the first part of the user turn.
-		if *state != "" {
+		// reads it as the first part of the user turn. A state with no
+		// question after it is the question.
+		switch {
+		case *state != "" && question != "":
 			question = *state + "\n\n" + question
+		case *state != "":
+			question = *state
+		}
+		if question == "" || len(options) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: tensai ask [flags] (-choice a,b,c | -yesno) [-state <situation>] <question>")
+			os.Exit(2)
 		}
 		e := openEngine(o, finish)
 		defer e.Close()
@@ -743,9 +751,5 @@ func humanSize(n int64) string {
 }
 
 func joinArgs(a []string) string {
-	s := a[0]
-	for _, w := range a[1:] {
-		s += " " + w
-	}
-	return s
+	return strings.Join(a, " ")
 }
