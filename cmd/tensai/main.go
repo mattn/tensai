@@ -21,7 +21,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/internal/llm"
@@ -390,13 +389,11 @@ func askPrint(options []string, probs []float64, asJSON bool) {
 		idx[i] = i
 	}
 	sort.SliceStable(idx, func(a, b int) bool { return probs[idx[a]] > probs[idx[b]] })
-	width := 0
-	for _, o := range options {
-		width = max(width, utf8.RuneCountInString(o))
-	}
+	// The number leads: it has a fixed width, and the label after it
+	// needs none, which spares this code guessing at how wide a string
+	// is on a terminal.
 	for _, i := range idx {
-		pad := strings.Repeat(" ", width-utf8.RuneCountInString(options[i]))
-		fmt.Printf("%s%s  %5.1f%%\n", options[i], pad, 100*probs[i])
+		fmt.Printf("%5.1f%%  %s\n", 100*probs[i], options[i])
 	}
 }
 
