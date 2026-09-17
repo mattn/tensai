@@ -135,6 +135,7 @@ tensai run -q8 -json "Explain RoPE briefly"      # 補完と使用量を 1 つ�
 tensai chat -q8 -model ./model.gguf              # マルチターン。KV キャッシュが対話全体を運ぶ
 tensai models                                    # キャッシュ一覧。"models rm <name>" で削除
 tensai bench -q8                                 # CPU vs GPU のプレフィル/デコード比較
+tensai ask -q8 -yesno "Is Paris in France?"      # 生成せず確率で答える
 ```
 
 ### CPU と GPU の比較
@@ -169,6 +170,39 @@ gpu/cpu      5.20x                   0.75x
 低く出ることがあり、定常状態を報告するツールと比べるとそれが不公平になり
 ます。プレフィルの t/s は attention が二次なのでプロンプトが長いほど下がり
 ます。比較は同じ長さで行ってください。
+
+### 生成せずに答える
+
+`tensai ask` は生成ではなく計測で答えます。質問は `run` と同じチャットテンプレートを
+通り、各選択肢は「モデルがその選択肢を答えの書き出しとして書く対数尤度」として採点され、
+その softmax が答えです。トークンは一切サンプリングしないので、モデルは選択肢の外の
+ものを答えられず、知らないことは自信ありげな作り話ではなく選択肢間の確率の散らばりとして
+現れます。
+
+```bash
+tensai ask -q8 -yesno "Is Paris the capital of France? Answer yes or no."
+tensai ask -q8 -choice "positive,negative,neutral" "Sentiment of: 'cold food, rude waiter'. One word."
+tensai ask -q8 -state "仕事終わり" -choice "コーヒー,ビール,紅茶" "いま何を飲む？ 一語で答えて。"
+tensai ask -q8 -json -choice "spam,ham" "Classify: 'You have won a prize'. One word."
+```
+
+```
+yes   99.9%
+no     0.1%
+```
+
+`-state` は質問の前提となる状況で、ユーザーターンの先頭に置かれます。`-json` は選ばれた
+選択肢と各選択肢の確率を返すので、型付きの質問をして型付きの答えを受け取りたい呼び出し元
+向けです。コストはプレフィル 1 回と選択肢のトークン数ぶんの decode step で、0.5B なら
+数十ミリ秒。プロンプトのキャッシュは選択肢ごとに巻き戻して使い回します。
+
+注意が 2 つ。選択肢は与えた表記のまま採点されます。`yes` と `Yes` は別のトークンで、
+モデルがどちらを書きたがるかはモデルの性質なので、「Answer yes or no.」で終わる質問文には
+意味があります。もう 1 つ、数値はキャリブレーション込みでモデルのものです。7B に「パリは
+ドイツの首都か」と聞くと yes に 20% 置くことがあるので、選択肢間の差を信号として読み、
+絶対値はモデルの癖を踏まえて読んでください。知らないことを聞かれた同じ 7B は、`run` では
+経歴を自信ありげに捏造しますが、ここでは候補すべてを 50% 付近に置きます。それが散文では
+言えない正直な答えです。
 
 ### OpenAI 互換 API の提供
 

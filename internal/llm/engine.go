@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -92,23 +93,24 @@ type Options struct {
 // Engine is a loaded model ready to generate: the tokenizer, the chat
 // template, optionally a draft model and a GPU residency.
 type Engine struct {
-	opts    Options
-	model   *qwen
-	draft   *qwen
-	tok     *tokenizer.Tokenizer
-	tm      tmpl
-	system  string
-	imEnd   int
-	eot     int
-	nCtx    int
-	g       *gpu.Device
-	gq      *gpuQwen
-	vlog    io.Writer
-	tools   []toolDef
-	prefill func([]int, int) []float32
-	step    func(int, int) []float32
-	reset   func()
-	rng     *rand.Rand
+	opts     Options
+	model    *qwen
+	draft    *qwen
+	tok      *tokenizer.Tokenizer
+	tm       tmpl
+	system   string
+	imEnd    int
+	eot      int
+	nCtx     int
+	g        *gpu.Device
+	gq       *gpuQwen
+	vlog     io.Writer
+	tools    []toolDef
+	prefill  func([]int, int) []float32
+	step     func(int, int) []float32
+	reset    func()
+	truncate func(int)
+	rng      *rand.Rand
 
 	steps  int
 	logits []float32
@@ -330,6 +332,7 @@ func Open(o Options) (*Engine, error) {
 	}
 	e.prefill, e.step = model.prefill, model.step
 	e.reset = model.reset
+	e.truncate = model.truncate
 
 	if o.GPU {
 		if o.Bits == 0 {
@@ -380,6 +383,12 @@ func Open(o Options) (*Engine, error) {
 		e.reset = func() {
 			model.reset()
 			gq.gpuLen = 0
+		}
+		e.truncate = func(n int) {
+			model.truncate(n)
+			if gq.gpuLen > n {
+				gq.gpuLen = n
+			}
 		}
 	}
 	return e, nil
@@ -729,6 +738,100 @@ func (e *Engine) runTool(c toolCall) string {
 		return out
 	}
 	return "No tool by that name is available."
+}
+
+// Score answers a question by measuring rather than generating. The
+// question goes through the chat template exactly as Generate's would,
+// and each option is scored as the log-likelihood the model assigns to
+// writing it, token by token, as the opening of its answer; the result
+// is the softmax over those, one probability per option. No token is
+// sampled, so the model cannot answer anything outside the list, and
+// what it does not know shows up as probability spread across the
+// options rather than as a confident invention.
+//
+// The prompt's cache is computed once and rolled back between options,
+// so the cost is one prefill plus a step per option token. Options are
+// scored in the form given: "yes" and "Yes" are different tokens, and
+// which one a model reaches for is a property of the model.
+func (e *Engine) Score(question string, options []string) ([]float64, error) {
+	if len(options) == 0 {
+		return nil, errors.New("tensai: no options to score")
+	}
+	prompt := question
+	if e.tm.foldSystem && e.system != "" {
+		prompt = e.system + "\n\n" + prompt
+	}
+	text := e.tm.bos + e.systemTurn() + e.tm.userOpen + prompt + e.tm.userClose + e.tm.asstOpen + e.tm.asstPrefill
+	ids := e.tok.Encode(text)
+	fmt.Fprintf(e.vlog, "rendered prompt: %s\n", clip(text, 600))
+	e.Reset()
+	start := time.Now()
+	base := e.prefill(ids, 0)
+	e.steps = len(ids)
+	fmt.Fprintf(e.opts.Log, "prompt: %d tokens, prefill: %v\n", len(ids), time.Since(start).Round(time.Millisecond))
+	// The prefix logits and any recurrent state are what every option
+	// starts from; the KV cache rolls back by truncation.
+	first := append([]float32(nil), base...)
+	snap := snapshotDelta(e.model)
+	ll := make([]float64, len(options))
+	for i, opt := range options {
+		toks := e.tok.Encode(opt)
+		if len(toks) == 0 {
+			return nil, fmt.Errorf("tensai: option %q tokenizes to nothing", opt)
+		}
+		logits := first
+		for j, id := range toks {
+			ll[i] += logProb(logits, id)
+			if j+1 < len(toks) {
+				logits = e.step(id, e.steps)
+				e.steps++
+			}
+		}
+		fmt.Fprintf(e.vlog, "option %q: %d tokens, log-likelihood %.3f\n", opt, len(toks), ll[i])
+		e.truncate(len(ids))
+		e.steps = len(ids)
+		restoreDelta(e.model, snap)
+	}
+	e.logits = first
+	return softmax64(ll), nil
+}
+
+// logProb is log softmax of logits at id, in float64 for the sum.
+func logProb(logits []float32, id int) float64 {
+	if id < 0 || id >= len(logits) {
+		return math.Inf(-1)
+	}
+	m := float64(logits[0])
+	for _, v := range logits[1:] {
+		if float64(v) > m {
+			m = float64(v)
+		}
+	}
+	var sum float64
+	for _, v := range logits {
+		sum += math.Exp(float64(v) - m)
+	}
+	return float64(logits[id]) - m - math.Log(sum)
+}
+
+// softmax64 normalizes log-likelihoods into probabilities.
+func softmax64(ll []float64) []float64 {
+	m := math.Inf(-1)
+	for _, v := range ll {
+		if v > m {
+			m = v
+		}
+	}
+	out := make([]float64, len(ll))
+	var sum float64
+	for i, v := range ll {
+		out[i] = math.Exp(v - m)
+		sum += out[i]
+	}
+	for i := range out {
+		out[i] /= sum
+	}
+	return out
 }
 
 // Generate runs one completion: the prompt goes through the model's chat
