@@ -199,8 +199,8 @@ tensai ask -q8 -json -choice "spam,ham" "Classify: 'You have won a prize'. One w
 ```
 
 ```
-yes   99.9%
-no     0.1%
+ 99.9%  yes
+  0.1%  no
 ```
 
 `-state` is the situation the question is asked about, rendered ahead of it
