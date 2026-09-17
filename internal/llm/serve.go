@@ -74,7 +74,13 @@ type chatRequest struct {
 	TopP        *float64      `json:"top_p"`
 	MaxTokens   int           `json:"max_tokens"`
 	Seed        *int64        `json:"seed"`
-	Tools       []toolDef     `json:"tools,omitempty"`
+	// OpenAI's two penalties, and the repeat penalty under the name
+	// vLLM and llama.cpp's server accept it by. Absent, the server's own
+	// settings apply.
+	PresencePenalty   *float64  `json:"presence_penalty"`
+	FrequencyPenalty  *float64  `json:"frequency_penalty"`
+	RepetitionPenalty *float64  `json:"repetition_penalty"`
+	Tools             []toolDef `json:"tools,omitempty"`
 	// ToolChoice is "none", "auto", "required", or an object naming one
 	// function. Only "none" changes what the model sees here: without a
 	// constrained sampler nothing can force a call, so the rest read as
@@ -748,6 +754,7 @@ type server struct {
 	nCtx    int
 	temp    float64
 	topP    float64
+	penalty penalty
 	imEnd   int
 	eot     int
 	tm      tmpl
@@ -848,6 +855,16 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	topP := s.topP
 	if req.TopP != nil {
 		topP = *req.TopP
+	}
+	pen := s.penalty
+	if req.PresencePenalty != nil {
+		pen.Presence = *req.PresencePenalty
+	}
+	if req.FrequencyPenalty != nil {
+		pen.Frequency = *req.FrequencyPenalty
+	}
+	if req.RepetitionPenalty != nil {
+		pen.Repeat = *req.RepetitionPenalty
 	}
 	limit := req.MaxTokens
 	if limit <= 0 {
@@ -1151,6 +1168,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				return id == s.imEnd || id == s.eot
 			}, rng, emit)
 	} else {
+		ps := newPenaltyState(pen, ids)
 		for len(out) < limit && steps < s.nCtx-1 {
 			// A disconnected client stops the generation instead of holding
 			// the model for tokens nobody will read.
@@ -1161,12 +1179,14 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				continue
 			default:
 			}
+			ps.apply(logits)
 			next := sample(logits, temp, topP, rng)
 			if next == s.imEnd || next == s.eot {
 				finish = "stop"
 				break
 			}
 			out = append(out, next)
+			ps.push([]int{next}, true)
 			if flush != nil {
 				push(s.tok.Decode([]int{next}), false)
 			}

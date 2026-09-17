@@ -87,7 +87,16 @@ type Options struct {
 	Temp   float64
 	TopP   float64
 	Seed   int64
-	Log    io.Writer // load/timing chatter; nil silences it
+	// Repetition control, applied to the logits before sampling. Repeat
+	// is llama.cpp's repeat penalty over the last RepeatLastN tokens
+	// (1 or 0 is off; 64 positions when RepeatLastN is 0); Presence and
+	// Frequency are OpenAI's penalties over what this completion has
+	// generated. Ignored under speculative decoding.
+	Repeat      float64
+	RepeatLastN int
+	Presence    float64
+	Frequency   float64
+	Log         io.Writer // load/timing chatter; nil silences it
 }
 
 // Engine is a loaded model ready to generate: the tokenizer, the chat
@@ -110,6 +119,7 @@ type Engine struct {
 	step     func(int, int) []float32
 	reset    func()
 	truncate func(int)
+	context  []int // the tail of what was fed, for the repeat penalty
 	rng      *rand.Rand
 
 	steps  int
@@ -404,6 +414,7 @@ func (e *Engine) Reset() {
 	}
 	e.steps = 0
 	e.logits = nil
+	e.context = e.context[:0]
 }
 
 // GPUName reports the adapter the engine is running on, empty when
@@ -443,7 +454,18 @@ func (e *Engine) Close() {
 // feed pushes tokens through the model, extending the KV cache; generate
 // then samples until an end token, which is also fed so the cache stays
 // aligned with the template for the next turn.
+// penalty is the run's repetition control as the sampler wants it.
+func (e *Engine) penalty() penalty {
+	return penalty{Repeat: e.opts.Repeat, LastN: e.opts.RepeatLastN, Presence: e.opts.Presence, Frequency: e.opts.Frequency}
+}
+
 func (e *Engine) feed(ids []int) {
+	// The repeat penalty looks back over the prompt as well as the
+	// answer, so the engine keeps the tail of everything it fed.
+	e.context = append(e.context, ids...)
+	if n := len(e.context) - 4096; n > 0 {
+		e.context = e.context[n:]
+	}
 	if len(ids) > 1 {
 		if e.draft != nil {
 			e.draft.prefill(ids, e.steps)
@@ -508,7 +530,9 @@ func (e *Engine) sample(w io.Writer, limit int) (int, string) {
 		return gen, finish
 	}
 	finish := "length"
+	pen := newPenaltyState(e.penalty(), e.context)
 	for ; gen < limit && e.steps < e.nCtx-1; gen++ {
+		pen.apply(e.logits)
 		next := sample(e.logits, e.opts.Temp, e.opts.TopP, e.rng)
 		if next == e.imEnd || next == e.eot {
 			e.feed([]int{next})
@@ -517,6 +541,7 @@ func (e *Engine) sample(w io.Writer, limit int) (int, string) {
 		}
 		fmt.Fprint(w, e.tok.Decode([]int{next}))
 		e.feed([]int{next})
+		pen.push([]int{next}, true)
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintf(e.opts.Log, "(%d tokens, %.1f tok/s)\n",
@@ -903,7 +928,7 @@ func (e *Engine) Serve(addr, apiKey string) error {
 	s := &server{
 		apiKey: apiKey,
 		model:  e.model, tok: e.tok, system: e.system, nCtx: e.nCtx,
-		temp: e.opts.Temp, topP: e.opts.TopP, imEnd: e.imEnd, eot: e.eot,
+		temp: e.opts.Temp, topP: e.opts.TopP, penalty: e.penalty(), imEnd: e.imEnd, eot: e.eot,
 		tm: e.tm, prefill: e.prefill, step: e.step, reset: e.reset,
 		draft: e.draft, specK: e.opts.SpecK, vlog: e.vlog,
 	}
