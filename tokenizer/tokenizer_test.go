@@ -148,3 +148,21 @@ func TestAgainstHF(t *testing.T) {
 		}
 	}
 }
+
+// Qwen3.5's split keeps combining marks in the word and takes digits one
+// at a time, and its regex is recognized from tokenizer.json.
+func TestQwen35Split(t *testing.T) {
+	cfg, err := classifyRegex(`(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.markWords || cfg.letterMarks || cfg.maxDigits != 1 {
+		t.Fatalf("classified as %+v", cfg)
+	}
+	tok := &Tokenizer{cfg: cfg}
+	got := tok.split("नमस्ते 2026 abc")
+	want := []string{"नमस्ते", " ", "2", "0", "2", "6", " abc"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("split %q, want %q", got, want)
+	}
+}

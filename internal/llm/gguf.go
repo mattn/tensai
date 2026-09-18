@@ -14,8 +14,10 @@ package llm
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -55,6 +57,10 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 		preJSON = `{"type":"Sequence","pretokenizers":[{"type":"Digits","individual_digits":true},{"type":"ByteLevel","use_regex":true}]}`
 	case "qwen2", "llama-bpe", "llama3", "smaug-bpe", "deepseek-r1-qwen":
 		preJSON = `{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}}`
+	case "qwen35":
+		// Qwen2's split with the word run taking combining marks and
+		// numbers one digit at a time.
+		preJSON = `{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}}`
 	case "k2-horizon":
 		// Llama 3's split with the word run widened to take combining
 		// marks and the zero-width joiners along with the letters.
@@ -848,9 +854,9 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	}
 	arch, _ := g.String("general.architecture")
 	switch arch {
-	case "llama", "qwen2", "qwen3", "smollm3", "gemma3", "gemma4", "phi3", "qwen2moe", "qwen3moe", "gpt-oss", "k2-horizon":
+	case "llama", "qwen2", "qwen3", "qwen35", "smollm3", "gemma3", "gemma4", "phi3", "qwen2moe", "qwen3moe", "gpt-oss", "k2-horizon":
 	default:
-		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2(+moe), qwen3(+moe), llama, smollm3, gemma3, gemma4, phi3, gpt-oss, and k2-horizon)", arch)
+		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2(+moe), qwen3(+moe), qwen35, llama, smollm3, gemma3, gemma4, phi3, gpt-oss, and k2-horizon)", arch)
 	}
 	meta := func(key string) int64 {
 		n, _ := g.Int(arch + "." + key)
@@ -879,6 +885,11 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		// gemma4 states several of its dimensions per layer, kv head
 		// counts included, so it fills them in before the check below.
 		if err := gemma4Config(g, &cfg); err != nil {
+			return nil, nil, err
+		}
+	}
+	if arch == "qwen35" {
+		if err := qwen35Config(g, &cfg); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -932,9 +943,10 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		if cfg.HeadDim != 0 {
 			hs = cfg.HeadDim
 		}
-		if rd != hs {
+		if rd != hs && arch != "qwen35" {
 			return nil, nil, fmt.Errorf("partial rotary (%d of %d dims) is not supported", rd, hs)
 		}
+		cfg.PartialRotary = float64(rd) / float64(hs)
 	}
 
 	fmt.Fprintf(vlog, "%s: %d layers, hidden %d, %d heads over %d kv, head %d, ff %s, ctx %d, vocab %d\n",
@@ -1363,8 +1375,9 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		headSz = cfg.HeadDim
 	}
 	// A valid repack cache stands in for the whole tensor load: the
-	// weights map straight from the cache file as clean pages.
-	useCache := cache && bits != 0
+	// weights map straight from the cache file as clean pages. The cache
+	// does not carry a delta layer yet.
+	useCache := cache && bits != 0 && arch != "qwen35"
 	// Requantization's per-column scales decode materially faster than
 	// the direct Q8_0 group scales. Once a user has paid its one-time
 	// conversion cost, prefer that valid cache on ordinary -q8 runs too.
@@ -1482,12 +1495,31 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 				b.sinks = vecOpt(p + "attn_sinks.weight")
 				b.bo = vecOpt(p + "attn_output.bias")
 			} else {
-				b.ln2 = tensor(p + "ffn_norm.weight").Data
+				b.ln2 = vecOpt(p + "ffn_norm.weight")
 				b.postAttn = vecOpt(p + "post_attention_norm.weight")
 				b.postFFN = vecOpt(p + "post_ffw_norm.weight")
+				if b.ln2 == nil && arch != "qwen35" {
+					panic(fmt.Sprintf("%s: no ffn_norm.weight", p))
+				}
 			}
 			b.qNorm = vecOpt(p + "attn_q_norm.weight")
 			b.kNorm = vecOpt(p + "attn_k_norm.weight")
+			if arch == "qwen35" {
+				// The norm ahead of the feed-forward is named for what
+				// it follows; there is no sandwich norm.
+				b.ln2, b.postAttn = b.postAttn, nil
+				if cfg.linearLayer(i) {
+					b.delta = loadDeltaGGUF(cfg, p, tensor, trans, linAuto)
+					b.wGU, b.qGU = linAuto([]string{p + "ffn_gate.weight", p + "ffn_up.weight"}, []int{0, 0})
+					b.wDown, b.qDown = linAuto([]string{p + "ffn_down.weight"}, []int{0})
+					for _, name := range g.Names() {
+						if strings.HasPrefix(name, p) {
+							g.Release(name)
+						}
+					}
+					return
+				}
+			}
 			if _, _, ok := g.Info(p + "attn_qkv.weight"); ok {
 				// Phi-3 ships q/k/v pre-fused in that order — the layout
 				// the runtime wants, no permutation (NEOX rope).
@@ -1587,4 +1619,88 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		}
 	}
 	return m, tok, nil
+}
+
+// qwen35Config reads what a Qwen3.5 gguf says about its linear-attention
+// layers, in the ssm.* keys llama.cpp's converter borrowed from Mamba:
+// group_count is the key heads, time_step_rank the value heads,
+// state_size the key width, inner_size the value width times its heads.
+// Which layers are linear follows full_attention_interval, every
+// interval-th layer attending; the tensors say the same, and are
+// believed when they disagree.
+func qwen35Config(g *gguf.File, cfg *config) error {
+	meta := func(key string) int {
+		n, _ := g.Int("qwen35." + key)
+		return int(n)
+	}
+	cfg.ModelType = "qwen3_5"
+	cfg.LinearKeyHeads = meta("ssm.group_count")
+	cfg.LinearValueHeads = meta("ssm.time_step_rank")
+	cfg.LinearKeyDim = meta("ssm.state_size")
+	cfg.LinearConvK = meta("ssm.conv_kernel")
+	if cfg.LinearKeyHeads == 0 || cfg.LinearValueHeads == 0 || cfg.LinearKeyDim == 0 || cfg.LinearConvK == 0 {
+		return errors.New("gguf is missing qwen35.ssm.* dimensions")
+	}
+	cfg.LinearValueDim = meta("ssm.inner_size") / cfg.LinearValueHeads
+	interval := meta("full_attention_interval")
+	cfg.LayerTypes = make([]string, cfg.Layers)
+	for i := range cfg.LayerTypes {
+		linear := interval > 0 && (i+1)%interval != 0
+		if _, _, ok := g.Info(fmt.Sprintf("blk.%d.ssm_out.weight", i)); ok {
+			linear = true
+		} else if _, _, ok := g.Info(fmt.Sprintf("blk.%d.attn_q.weight", i)); ok {
+			linear = false
+		}
+		cfg.LayerTypes[i] = map[bool]string{true: "linear_attention", false: "full_attention"}[linear]
+	}
+	// The query projection carries the attention gate beside the queries
+	// when it is twice as wide as they are.
+	for i := range cfg.LayerTypes {
+		if cfg.LayerTypes[i] == "full_attention" {
+			if _, shape, ok := g.Info(fmt.Sprintf("blk.%d.attn_q.weight", i)); ok {
+				cfg.AttnOutputGate = shape[0] == 2*cfg.Heads*cfg.HeadDim
+			}
+			break
+		}
+	}
+	return nil
+}
+
+// loadDeltaGGUF reads a linear-attention layer from a gguf. The names are
+// llama.cpp's: attn_qkv fuses q, k and v, attn_gate is z, ssm_alpha and
+// ssm_beta the decay and write projections, and ssm_a holds -exp(A_log)
+// rather than A_log itself. A converter tiles the value heads whenever
+// there are more of them than key heads, and the layer reads them that
+// way rather than the weights being put back.
+func loadDeltaGGUF(cfg config, p string, tensor func(string) *tensai.Tensor,
+	trans func(string, int) *tensai.Matrix,
+	linAuto func([]string, []int) (*tensai.Matrix, *qmat)) *deltaWeights {
+	d := &deltaWeights{
+		heads:  cfg.LinearValueHeads,
+		kHeads: cfg.LinearKeyHeads,
+		tiled:  cfg.LinearKeyHeads != cfg.LinearValueHeads,
+		kDim:   cfg.LinearKeyDim,
+		vDim:   cfg.LinearValueDim,
+		convK:  cfg.LinearConvK,
+		dtBias: tensor(p + "ssm_dt.bias").Data,
+		norm:   tensor(p + "ssm_norm.weight").Data,
+		conv:   tensor(p + "ssm_conv1d.weight").Data,
+	}
+	d.convDim = cfg.LinearKeyHeads*cfg.LinearKeyDim*2 + cfg.LinearValueHeads*cfg.LinearValueDim
+	a := tensor(p + "ssm_a").Data
+	d.aLog = make([]float32, len(a))
+	for i, v := range a {
+		d.aLog[i] = float32(math.Log(float64(-v)))
+	}
+	d.wQKV, d.qQKV = linAuto([]string{p + "attn_qkv.weight"}, []int{0})
+	d.wZ, d.qZ = linAuto([]string{p + "attn_gate.weight"}, []int{0})
+	d.wOut, d.qOut = linAuto([]string{p + "ssm_out.weight"}, []int{0})
+	d.wA = trans(p+"ssm_alpha.weight", 0)
+	d.wB = trans(p+"ssm_beta.weight", 0)
+	d.wQZ, d.qQZ = linAuto([]string{p + "attn_qkv.weight", p + "attn_gate.weight"}, []int{0, 0})
+	d.wAB = hcat([]*tensai.Matrix{d.wA, d.wB})
+	if err := d.check(); err != nil {
+		panic(err)
+	}
+	return d
 }

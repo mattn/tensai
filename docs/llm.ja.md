@@ -24,7 +24,7 @@ greedy の続きは GPT-2 のよく知られたリファレンス出力とトー
 |---|---|---|
 | qwen2 | Qwen 1.5/2/2.5, Qwen2.5-Coder, R1-Distill-Qwen 系 | attention バイアス |
 | qwen3 | Qwen3 dense | ヘッドごとの QK-norm、明示的 head_dim、`-think` |
-| qwen3_5 | Qwen3.5 / 3.6 / 3.8 | 4 層に 3 層が gated delta rule、残り 1 層が通常の attention。正規化は 1 + w、RoPE はヘッドの 1/4 だけ回し、クエリが attention 出力のゲートを連れる。CPU のみ、`-draft` 不可 |
+| qwen3_5 | Qwen3.5 / 3.6 / 3.8 | 4 層に 3 層が gated delta rule、残り 1 層が通常の attention。正規化は 1 + w、RoPE はヘッドの 1/4 だけ回し、クエリが attention 出力のゲートを連れる。大きいものは 1 つの key head を複数の value head で共有する。CPU のみ、`-draft` 不可、GGUF (`qwen35`) はリパックするがキャッシュはまだ書かない |
 
 `qwen3_5` のプレフィルは、モデルの大きさから想像するより高くつきます。delta 層は
 状態をトークンごとに引き継ぐので、バッチが効くのは再帰の周りの射影だけで、長い
