@@ -501,7 +501,7 @@ func (gq *gpuQwen) prefillChunk(tokens []int, startPos int) []float32 {
 
 	flat := &tensai.Tensor{Shape: []int{n, hs}, Data: make([]float32, n*hs)}
 	for t, tk := range tokens {
-		copy(flat.Data[t*hs:], m.embed.Data[tk*hs:(tk+1)*hs])
+		m.embedRow(tk, flat.Data[t*hs:(t+1)*hs])
 	}
 	if s := m.embedScale(); s != 0 {
 		for i := range flat.Data {
@@ -630,14 +630,13 @@ func (gq *gpuQwen) step(token, pos int) []float32 {
 	m := gq.m
 	cfg := m.cfg
 	hs := cfg.HiddenSize
-	row := m.embed.Data[token*hs : (token+1)*hs]
+	row := make([]float32, hs)
+	m.embedRow(token, row)
 	var pe *gpu.Tensor
 	if s := m.embedScale(); s != 0 {
-		scaled := make([]float32, hs)
-		for i, v := range row {
-			scaled[i] = v * s
+		for i := range row {
+			row[i] *= s
 		}
-		row = scaled
 	}
 	if m.ple != nil {
 		pe = gq.pleRows([]int{token}, &tensai.Matrix{Rows: 1, Cols: hs, Data: row})

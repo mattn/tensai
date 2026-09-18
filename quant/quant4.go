@@ -285,7 +285,7 @@ func (q *Q4Matrix) MatMul(x, out *tensai.Matrix) error {
 	}
 	// Tile-aligned, so the row-tail matvec's vector span starts on a
 	// layout tile like the batch kernel's 8-column steps do.
-	parallelChunks(q.Cols, workers, q4Tile, func(lo, hi int) {
+	workpool.Run(q.Cols, q4Tile, func(lo, hi int) {
 		run(lo, hi)
 	})
 	return nil

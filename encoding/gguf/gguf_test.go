@@ -164,7 +164,7 @@ func TestReadSynthetic(t *testing.T) {
 		t.Fatalf("flag: %v %v", b, ok)
 	}
 	toks, _ := f.KV("tokenizer.ggml.tokens")
-	if arr, ok := toks.([]any); !ok || len(arr) != 3 || arr[0] != "<s>" || arr[2] != "b" {
+	if arr, ok := toks.([]string); !ok || len(arr) != 3 || arr[0] != "<s>" || arr[2] != "b" {
 		t.Fatalf("tokens: %v", toks)
 	}
 

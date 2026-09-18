@@ -24,6 +24,7 @@
 package gguf
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -152,7 +153,10 @@ func Open(path string) (*File, error) {
 
 // NewFile parses a GGUF checkpoint from a reader.
 func NewFile(r io.ReaderAt) (*File, error) {
-	d := &decoder{r: io.NewSectionReader(r, 0, 1<<62)}
+	// The header is read once, front to back, so a buffered reader
+	// over it turns a quarter million token strings into a few large
+	// reads instead of a small one apiece.
+	d := &decoder{r: bufio.NewReaderSize(io.NewSectionReader(r, 0, 1<<62), 1<<20)}
 	if magic := d.u32(); magic != 0x46554747 { // "GGUF"
 		return nil, fmt.Errorf("gguf: bad magic 0x%08x", magic)
 	}
@@ -260,7 +264,9 @@ func (f *File) Release(name string) {
 func (f *File) Names() []string { return append([]string(nil), f.names...) }
 
 // KV returns a metadata value: string, bool, float64, int64, uint64 (and
-// float32/uint32/... as stored) or []any for arrays.
+// float32/uint32/... as stored); an array of strings, float32, int32,
+// uint32 or bools as a slice of that type, and any other array as
+// []any. Strings, Floats, Ints and Bools read the arrays by kind.
 func (f *File) KV(key string) (any, bool) {
 	v, ok := f.kv[key]
 	return v, ok
@@ -489,37 +495,53 @@ func DecodePQ2_0(blk []byte, w *[128]int8) float32 {
 // stored its elements at, or nil when the key is absent or not an array
 // of integers. Gemma 4 states its per-layer feed-forward widths this way.
 func (f *File) Ints(key string) []int64 {
-	arr, ok := f.kv[key].([]any)
-	if !ok {
-		return nil
-	}
-	out := make([]int64, len(arr))
-	for i, v := range arr {
-		n, ok := toInt64(v)
-		if !ok {
-			return nil
+	switch arr := f.kv[key].(type) {
+	case []int32:
+		out := make([]int64, len(arr))
+		for i, v := range arr {
+			out[i] = int64(v)
 		}
-		out[i] = n
+		return out
+	case []uint32:
+		out := make([]int64, len(arr))
+		for i, v := range arr {
+			out[i] = int64(v)
+		}
+		return out
+	case []any:
+		out := make([]int64, len(arr))
+		for i, v := range arr {
+			n, ok := toInt64(v)
+			if !ok {
+				return nil
+			}
+			out[i] = n
+		}
+		return out
 	}
-	return out
+	return nil
 }
 
 // Bools returns a boolean array metadata value, or nil when the key is
 // absent or not an array of booleans -- Gemma 4's sliding-window pattern.
 func (f *File) Bools(key string) []bool {
-	arr, ok := f.kv[key].([]any)
-	if !ok {
-		return nil
-	}
-	out := make([]bool, len(arr))
-	for i, v := range arr {
-		b, ok := v.(bool)
-		if !ok {
-			return nil
-		}
-		out[i] = b
-	}
-	return out
+	arr, _ := f.kv[key].([]bool)
+	return arr
+}
+
+// Strings returns a string array metadata value, or nil when the key is
+// absent or not one: the vocabulary, the merges, the names a rotation
+// applies to.
+func (f *File) Strings(key string) []string {
+	arr, _ := f.kv[key].([]string)
+	return arr
+}
+
+// Floats returns a float32 array metadata value, or nil: a SentencePiece
+// vocabulary's scores.
+func (f *File) Floats(key string) []float32 {
+	arr, _ := f.kv[key].([]float32)
+	return arr
 }
 
 func toInt64(v any) (int64, bool) {
@@ -892,7 +914,7 @@ func f16to32(h uint16) float32 {
 // decoder reads the little-endian header sequentially, latching the first
 // error.
 type decoder struct {
-	r   *io.SectionReader
+	r   *bufio.Reader
 	off int64
 	err error
 }
@@ -901,7 +923,7 @@ func (d *decoder) read(b []byte) {
 	if d.err != nil {
 		return
 	}
-	if _, err := io.ReadFull(io.NewSectionReader(d.r, d.off, int64(len(b))), b); err != nil {
+	if _, err := io.ReadFull(d.r, b); err != nil {
 		d.err = err
 		return
 	}
@@ -974,6 +996,43 @@ func (d *decoder) value(typ uint32) any {
 		if n > 1<<24 {
 			d.err = fmt.Errorf("array of %d elements", n)
 			return nil
+		}
+		// An array of one scalar type comes back as a slice of it: a
+		// vocabulary is a quarter million strings, and boxing each one
+		// in an interface cost more than reading it.
+		switch elem {
+		case 8:
+			arr := make([]string, n)
+			for i := range arr {
+				arr[i] = d.str()
+			}
+			return arr
+		case 6:
+			arr := make([]float32, n)
+			for i := range arr {
+				arr[i] = math.Float32frombits(d.u32())
+			}
+			return arr
+		case 5:
+			arr := make([]int32, n)
+			for i := range arr {
+				arr[i] = int32(d.u32())
+			}
+			return arr
+		case 4:
+			arr := make([]uint32, n)
+			for i := range arr {
+				arr[i] = d.u32()
+			}
+			return arr
+		case 7:
+			arr := make([]bool, n)
+			for i := range arr {
+				var b [1]byte
+				d.read(b[:])
+				arr[i] = b[0] != 0
+			}
+			return arr
 		}
 		arr := make([]any, n)
 		for i := range arr {
