@@ -1,20 +1,24 @@
-// Flappy Bird without a screen, played three ways, to put a number on a
-// question: how far does a language model get at a reflex game when it
-// is only asked, each step, whether to flap? Nothing is trained. The
-// model reads the state as a sentence and answers yes or no through
-// Engine.Score, so the answer is a probability and the cost is one
-// prefill per decision; a random flapper and a one-line heuristic play
-// the same game as the floor and the ceiling.
+// Flappy Bird played by a language model, to put a number on a question:
+// what can a model decide at a reflex game when each step is one scored
+// question? Nothing is trained. The model reads the state as a sentence
+// and answers through Engine.Score, so the answer is a probability and
+// the cost is one prefill per decision; a random flapper and a one-line
+// heuristic play the same game as the floor and the ceiling. Asked yes
+// or no, no model plays; asked which of two numbers is larger, with the
+// numbers as the options, a 1B plays the heuristic's game.
 //
 //	go run ./_example/flappy                    # Qwen2.5-0.5B-Instruct from the cache
 //	go run ./_example/flappy -model ./x.gguf    # another model
+//	go run ./_example/flappy -larger -rows      # the comparison asked as a choice of numbers
 //	go run ./_example/flappy -episodes 5 -show  # print each decision
+//	go run ./_example/flappy -larger -nobase -screen   # watch it in the terminal
 package main
 
 import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -162,16 +166,36 @@ func (heuristic) flap(g *game) (bool, string) {
 	return g.y < p.gapLow+pipeGap/2-2, ""
 }
 
+// rowHeuristic is the heuristic on heights rounded to one digit, the
+// most the -rows variant could do if the model compared perfectly.
+type rowHeuristic struct{}
+
+func (rowHeuristic) name() string { return "heur/rows" }
+func (rowHeuristic) flap(g *game) (bool, string) {
+	p := g.next()
+	return math.Round(g.y/10) < math.Round((p.gapLow+pipeGap/2-2)/10), ""
+}
+
 // model asks the language model, every step, and flaps when yes wins.
 type model struct {
 	e         *llm.Engine
 	threshold float64
 	hint      bool
 	compare   bool
+	// larger asks the comparison with the two numbers as the options:
+	// "which is larger, 57 or 63?", scored over "57" and "63". The
+	// answer is then a number the model writes, not a yes it leans to.
+	larger bool
+	// rows quantizes heights to one digit each before asking.
+	rows bool
 }
 
 func (m model) name() string {
 	switch {
+	case m.larger && m.rows:
+		return "model+row"
+	case m.larger:
+		return "model+lgr"
 	case m.compare:
 		return "model+cmp"
 	case m.hint:
@@ -186,6 +210,9 @@ func (m model) name() string {
 // leaves the model only a numeric comparison to get right, which is the
 // least it could be asked.
 func (m model) flap(g *game) (bool, string) {
+	if m.larger {
+		return m.flapLarger(g)
+	}
 	q := g.state(m.hint) + " Should the bird flap right now? Answer yes or no."
 	if m.compare {
 		p := g.next()
@@ -199,7 +226,84 @@ func (m model) flap(g *game) (bool, string) {
 	return probs[0] > m.threshold, fmt.Sprintf("yes %.0f%%", 100*probs[0])
 }
 
-func play(p player, seed int64, limit int, show bool) (score, steps int) {
+// flapLarger asks which of two numbers is larger, the bird's height and
+// the middle of the opening, and flaps when the model says the middle.
+// The heuristic's own margin is kept: the target sits 2 under the middle.
+func (m model) flapLarger(g *game) (bool, string) {
+	p := g.next()
+	bird, mid := g.y, p.gapLow+pipeGap/2-2
+	if m.rows {
+		bird, mid = math.Round(bird/10), math.Round(mid/10)
+	}
+	a, b := fmt.Sprintf("%.0f", bird), fmt.Sprintf("%.0f", mid)
+	if a == b {
+		return false, "same"
+	}
+	// Asked both ways round, so the order the numbers come in, which a
+	// small model leans on when they are close, cancels out.
+	var pm float64
+	for _, pair := range [][2]string{{a, b}, {b, a}} {
+		q := fmt.Sprintf("Which number is larger, %s or %s? Answer with the number only.", pair[0], pair[1])
+		probs, err := m.e.Score(q, []string{a, b})
+		if err != nil {
+			return false, err.Error()
+		}
+		pm += probs[1] / 2
+	}
+	return pm > m.threshold, fmt.Sprintf("%s>%s %.0f%%", b, a, 100*pm)
+}
+
+// The screen: the world drawn in text, redrawn in place with escape
+// sequences, so a game can be watched. Each row is rows units of
+// height and each column cols units of distance; the bird sits at
+// column birdCol.
+const (
+	screenRows = 25
+	screenCols = 64
+	rowUnits   = height / screenRows
+	colUnits   = scroll
+	birdCol    = 6
+)
+
+// draw paints the current frame over the previous one. The first frame
+// clears the terminal and hides the cursor; the caller shows it again.
+func (g *game) draw(who string, flap bool, note string) {
+	var sb strings.Builder
+	sb.WriteString("\x1b[H")
+	sb.WriteString(fmt.Sprintf("\x1b[2K %-12s pipes %-4d step %-4d %s\n", who, g.score, g.steps, note))
+	birdRow := int((height - g.y) / rowUnits)
+	for r := 0; r < screenRows; r++ {
+		sb.WriteString("\x1b[2K")
+		lo, hi := height-float64(r+1)*rowUnits, height-float64(r)*rowUnits // heights this row spans
+		for c := 0; c < screenCols; c++ {
+			x := float64(c-birdCol) * colUnits
+			ch := ' '
+			for _, p := range g.pipes {
+				if x >= p.x-birdSize && x <= p.x+birdSize {
+					if hi <= p.gapLow || lo >= p.gapLow+pipeGap {
+						ch = '#'
+					}
+					break
+				}
+			}
+			if c == birdCol && r == birdRow {
+				ch = '@'
+				if flap {
+					ch = '^'
+				}
+				if g.dead {
+					ch = 'x'
+				}
+			}
+			sb.WriteRune(ch)
+		}
+		sb.WriteByte('\n')
+	}
+	sb.WriteString(strings.Repeat("=", screenCols) + "\n")
+	os.Stdout.WriteString(sb.String())
+}
+
+func play(p player, seed int64, limit int, show, screen bool) (score, steps int) {
 	g := newGame(seed)
 	for !g.dead && g.steps < limit {
 		flap, note := p.flap(g)
@@ -210,7 +314,17 @@ func play(p player, seed int64, limit int, show bool) (score, steps int) {
 			}
 			fmt.Printf("  %s y=%5.1f vy=%5.1f pipe=%4.0f gap=%3.0f-%3.0f %s\n", mark, g.y, g.vy, g.next().x, g.next().gapLow, g.next().gapLow+pipeGap, note)
 		}
+		if screen {
+			g.draw(p.name(), flap, note)
+			// A player that answers at once is slowed to a watchable
+			// pace; a model sets its own.
+			time.Sleep(40 * time.Millisecond)
+		}
 		g.step(flap)
+	}
+	if screen {
+		g.draw(p.name(), false, map[bool]string{true: "dead", false: "win"}[g.dead])
+		time.Sleep(1500 * time.Millisecond)
 	}
 	return g.score, g.steps
 }
@@ -222,12 +336,19 @@ func main() {
 	limit := flag.Int("limit", 400, "steps per game before it is called a win")
 	threshold := flag.Float64("threshold", 0.5, "flap when P(yes) exceeds this")
 	show := flag.Bool("show", false, "print every decision")
-	skipModel := flag.Bool("nomodel", false, "run the two baselines only")
+	screen := flag.Bool("screen", false, "draw the game in the terminal as it is played")
+	skipModel := flag.Bool("nomodel", false, "run the baselines only")
+	skipBase := flag.Bool("nobase", false, "skip the baselines and play the model only")
 	hint := flag.Bool("hint", false, "also play the model with the relative-position hint in its state")
 	compare := flag.Bool("compare", false, "also play the model asked only the heuristic's comparison")
+	larger := flag.Bool("larger", false, "also play the model asked which of two numbers is larger, the numbers being the options")
+	rows := flag.Bool("rows", false, "also play the -larger variant with heights rounded to one digit")
 	flag.Parse()
 
-	players := []player{randomPlayer{rng: rand.New(rand.NewSource(1))}, heuristic{}}
+	var players []player
+	if !*skipBase {
+		players = []player{randomPlayer{rng: rand.New(rand.NewSource(1))}, heuristic{}, rowHeuristic{}}
+	}
 	if !*skipModel {
 		opts := llm.Options{Bits: *bits, Log: io.Discard}
 		if strings.HasSuffix(*modelPath, ".gguf") {
@@ -248,9 +369,26 @@ func main() {
 		if *compare {
 			players = append(players, model{e: e, threshold: *threshold, compare: true})
 		}
+		if *larger {
+			players = append(players, model{e: e, threshold: *threshold, larger: true})
+		}
+		if *rows {
+			players = append(players, model{e: e, threshold: *threshold, larger: true, rows: true})
+		}
 	}
 
-	fmt.Printf("%-10s %8s %8s %10s\n", "player", "pipes", "steps", "per step")
+	// With the screen on, the table waits until the games are over and
+	// goes under the last frame; otherwise it grows a row per player.
+	table := fmt.Sprintf("%-10s %8s %8s %10s\n", "player", "pipes", "steps", "per step")
+	if *screen {
+		os.Stdout.WriteString("\x1b[2J\x1b[?25l")
+		defer func() {
+			fmt.Printf("\x1b[%d;1H\x1b[?25h%s", screenRows+3, table)
+		}()
+	} else {
+		os.Stdout.WriteString(table)
+		table = ""
+	}
 	for _, p := range players {
 		var pipes, steps int
 		start := time.Now()
@@ -258,7 +396,7 @@ func main() {
 			if *show {
 				fmt.Printf("%s, episode %d\n", p.name(), ep+1)
 			}
-			s, n := play(p, int64(100+ep), *limit, *show)
+			s, n := play(p, int64(100+ep), *limit, *show, *screen)
 			pipes += s
 			steps += n
 		}
@@ -266,6 +404,11 @@ func main() {
 		if steps > 0 {
 			per = time.Since(start) / time.Duration(steps)
 		}
-		fmt.Printf("%-10s %8.1f %8.1f %10v\n", p.name(), float64(pipes)/float64(*episodes), float64(steps)/float64(*episodes), per.Round(time.Millisecond))
+		row := fmt.Sprintf("%-10s %8.1f %8.1f %10v\n", p.name(), float64(pipes)/float64(*episodes), float64(steps)/float64(*episodes), per.Round(time.Millisecond))
+		if *screen {
+			table += row
+		} else {
+			os.Stdout.WriteString(row)
+		}
 	}
 }
