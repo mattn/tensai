@@ -47,6 +47,10 @@ func LoadI8x32(s []int8) archsimd.Int8x32 {
 	return archsimd.LoadInt8x32(s)
 }
 
+func LoadU8x32(s []uint8) archsimd.Uint8x32 {
+	return archsimd.LoadUint8x32(s)
+}
+
 func StoreF32x8Part(v archsimd.Float32x8, s []float32) {
 	v.StorePart(s)
 }

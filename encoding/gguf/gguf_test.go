@@ -336,3 +336,56 @@ func TestParallelDequantMatchesSerial(t *testing.T) {
 		}
 	}
 }
+
+// The ternary decoders against blocks packed the reference way: every
+// trit lands where the reference quantizer put it, and the scale reads.
+func TestDecodeTernary(t *testing.T) {
+	var w [128]int8
+	for i := range w {
+		w[i] = int8((i*7+3)%3) - 1
+	}
+	// PTQ1_0, packed as quantize_row_ptq1_0_ref does.
+	blk := make([]byte, 28)
+	x := w[:]
+	j := 0
+	for _, c := range []int{32, 16, 8} {
+		for ; j+c <= 24; j += c {
+			for m := 0; m < c; m++ {
+				q := 0
+				for n := 0; n < 5; n++ {
+					q = q*3 + int(x[m+n*c]) + 1
+				}
+				blk[j+m] = byte((q*256 + 242) / 243)
+			}
+			x = x[5*c:]
+		}
+	}
+	for h := 0; h < 2; h++ {
+		q := 0
+		for m := 0; m < 4; m++ {
+			q = q*3 + int(x[h+m*2]) + 1
+		}
+		q *= 3
+		blk[24+h] = byte((q*256 + 242) / 243)
+	}
+	binary.LittleEndian.PutUint16(blk[26:], 0x3C00) // 1.0
+	var got [128]int8
+	if s := DecodePTQ1_0(blk, &got); s != 1 {
+		t.Fatalf("PTQ1_0 scale %v", s)
+	}
+	if got != w {
+		t.Fatalf("PTQ1_0 decoded\n%v\nwant\n%v", got, w)
+	}
+	// PQ2_0.
+	blk = make([]byte, 34)
+	binary.LittleEndian.PutUint16(blk, 0x4000) // 2.0
+	for i, v := range w {
+		blk[2+i/4] |= byte(v+1) << (2 * uint(i%4))
+	}
+	if s := DecodePQ2_0(blk, &got); s != 2 {
+		t.Fatalf("PQ2_0 scale %v", s)
+	}
+	if got != w {
+		t.Fatalf("PQ2_0 decoded %v", got)
+	}
+}

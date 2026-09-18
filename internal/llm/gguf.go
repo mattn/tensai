@@ -716,6 +716,62 @@ func repackMXFP4(dst *quant.MXFP4Matrix, raw []byte, out, in, colOff int) {
 	}
 }
 
+// repackPTQ1_0 copies a PTQ1_0 or PQ2_0 tensor's blocks -- laid out
+// [out, in] with 128 trits under one f16 scale -- into columns [colOff,
+// colOff+out) of a transposed TernaryMatrix. colMap permutes output
+// rows on the way in.
+func repackTernary(dst *quant.TernaryMatrix, typ string, raw []byte, out, in, colOff int, colMap func(int) int) {
+	nb := in / 128
+	bytes, decode := 28, gguf.DecodePTQ1_0
+	if typ == "PQ2_0" {
+		bytes, decode = 34, gguf.DecodePQ2_0
+	}
+	var w [128]int8
+	for r := 0; r < out; r++ {
+		j := colOff + r
+		if colMap != nil {
+			j = colOff + colMap(r)
+		}
+		for b := 0; b < nb; b++ {
+			blk := raw[(r*nb+b)*bytes:]
+			dst.Scale[dst.TableIndex(b, j)] = decode(blk[:bytes], &w)
+			dst.SetGroup(b, j, &w)
+		}
+	}
+}
+
+// embedTable reads token embeddings from the file a row at a time,
+// for a table too large to expand into float32.
+type embedTable struct {
+	f       *gguf.File
+	name    string
+	inverse *hadamard
+}
+
+// newEmbedTable opens its own handle on the file, so the table outlives
+// the load's mapping.
+func newEmbedTable(path, name string) (*embedTable, error) {
+	g, err := gguf.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return &embedTable{f: g, name: name}, nil
+}
+
+// row writes one token's embedding into dst, rotated back to the
+// model's basis when the table stores rotated rows.
+func (e *embedTable) row(token int, dst []float32) error {
+	t, err := e.f.TensorRows(e.name, token, token+1)
+	if err != nil {
+		return err
+	}
+	copy(dst, t.Data)
+	if e.inverse != nil {
+		e.inverse.invert(dst)
+	}
+	return nil
+}
+
 // unpermuteMap returns the llama rope unpermutation as a row index map,
 // or nil when heads is zero.
 func unpermuteMap(rows, heads int) func(int) int {
@@ -1235,11 +1291,49 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		return qmatQ8G(dst)
 	}
 
+	// allTernary reports whether every named tensor is a ternary
+	// encoding, which always repacks directly: there is no width to
+	// quantize it to, and expanding a 27B of them is not an option.
+	allTernary := func(names ...string) bool {
+		for _, name := range names {
+			typ, shape, ok := g.Info(name)
+			if !ok || (typ != "PTQ1_0" && typ != "PQ2_0") || shape[1]%128 != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	linDirectT := func(names []string, perms []int) *qmat {
+		var outs []int
+		var in int
+		for _, name := range names {
+			_, shape, _ := g.Info(name)
+			outs = append(outs, shape[0])
+			in = shape[1]
+		}
+		total := 0
+		for _, o := range outs {
+			total += o
+		}
+		dst := quant.NewTernaryMatrix(in, total)
+		colOff := 0
+		for i, name := range names {
+			typ, raw, err := g.RawTensor(name)
+			if err != nil {
+				panic(err)
+			}
+			repackTernary(dst, typ, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
+			colOff += outs[i]
+		}
+		return qmatT(dst)
+	}
 	// linDirectAuto picks the direct repack a fused weight group
 	// qualifies for — stored blocks lining up with a runtime layout —
 	// or nil when it must take the float detour.
 	linDirectAuto := func(names []string, perms []int) *qmat {
 		switch {
+		case allTernary(names...):
+			return linDirectT(names, perms)
 		case allQ8(names...):
 			return linDirect(names, perms)
 		case allQ4(names...):
@@ -1253,9 +1347,49 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		}
 		return nil
 	}
+	// A file in a rotated basis names the weights whose input the
+	// transform applies to; each is wrapped as it is repacked, and
+	// every name is checked off so an unapplied one is caught at load
+	// rather than heard as noise.
+	hspec, err := readHadamardSpec(g)
+	if err != nil {
+		return nil, nil, err
+	}
+	var rotMu sync.Mutex
+	rotated := map[string]bool{}
+	rotate := func(q *qmat, names []string) {
+		if hspec == nil || !hspec.weights[names[0]] {
+			for _, n := range names {
+				if hspec != nil && hspec.weights[n] {
+					panic(fmt.Sprintf("prism.hadamard: %s is rotated but is fused with %s, which is not", n, names[0]))
+				}
+			}
+			return
+		}
+		h, err := hspec.forWidth(q.rows())
+		if err != nil {
+			panic(err)
+		}
+		if hspec.vGrouped && strings.HasSuffix(names[0], ".ssm_out.weight") && cfg.LinearKeyHeads != cfg.LinearValueHeads {
+			h.perm = tiledToGrouped(cfg.LinearValueDim, cfg.LinearKeyHeads, cfg.LinearValueHeads/cfg.LinearKeyHeads)
+		}
+		q.rotate(h)
+		rotMu.Lock()
+		for _, n := range names {
+			if !hspec.weights[n] {
+				panic(fmt.Sprintf("prism.hadamard: %s is fused with rotated %s but is not rotated", n, names[0]))
+			}
+			rotated[n] = true
+		}
+		rotMu.Unlock()
+	}
 	linAuto := func(names []string, perms []int) (*tensai.Matrix, *qmat) {
 		if q := linDirectAuto(names, perms); q != nil {
+			rotate(q, names)
 			return nil, q
+		}
+		if hspec != nil && hspec.weights[names[0]] {
+			panic(fmt.Sprintf("prism.hadamard: %s is rotated but not stored ternary", names[0]))
 		}
 		var parts []*tensai.Matrix
 		for i, name := range names {
@@ -1406,11 +1540,37 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	if direct {
 		how = "repacking the stored blocks"
 	}
-	fmt.Fprintf(vlog, "%s into int%d weights, %d layers over %d workers\n",
-		how, bits, cfg.Layers, min(runtime.NumCPU(), 8))
+	into := fmt.Sprintf("int%d", bits)
+	// A ternary file has no width to choose: its blocks repack as they
+	// are, whatever the flags asked for.
+	ternary := allTernary("output.weight") || allTernary("token_embd.weight")
+	if ternary {
+		how, into = "repacking the stored blocks", "ternary"
+	}
+	fmt.Fprintf(vlog, "%s into %s weights, %d layers over %d workers\n",
+		how, into, cfg.Layers, min(runtime.NumCPU(), 8))
 	repackStart := time.Now()
 	m := &qwen{cfg: cfg, headSz: headSz, layout: layoutName(bits, direct)}
-	m.embed = tensor("token_embd.weight")
+	if ternary {
+		m.layout = "ternary"
+	}
+	if allTernary("token_embd.weight") {
+		// The table stays in the file and is read a row at a time.
+		m.embedRows, err = newEmbedTable(path, "token_embd.weight")
+		if err != nil {
+			return nil, nil, err
+		}
+		if hspec != nil && hspec.inverses["token_embd.weight"] {
+			if m.embedRows.inverse, err = hspec.forWidth(cfg.HiddenSize); err != nil {
+				return nil, nil, err
+			}
+		}
+	} else {
+		if hspec != nil && hspec.inverses["token_embd.weight"] {
+			return nil, nil, errors.New("prism.hadamard: an expanded embedding table cannot be rotated back")
+		}
+		m.embed = tensor("token_embd.weight")
+	}
 	var ropeFF []float32
 	// Gemma scales embeddings by sqrt(hidden); embedScale does it per
 	// token, since scaling the table would scale the tied lm head with
@@ -1446,6 +1606,7 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		defer g.Release("output.weight")
 		if _, _, ok := g.Info("output.weight"); ok {
 			if q := linDirectAuto([]string{"output.weight"}, []int{0}); q != nil {
+				rotate(q, []string{"output.weight"})
 				m.qLmT = q
 				return
 			}
@@ -1459,6 +1620,9 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		if q := linDirectAuto([]string{"token_embd.weight"}, []int{0}); q != nil {
 			m.qLmT = q
 			return
+		}
+		if m.embed == nil {
+			panic("tensai: no output.weight and the embedding table is not expanded")
 		}
 		lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
 		got := loadGate.acquire(lmStage)
@@ -1604,6 +1768,14 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	}
 	wg.Wait()
 	fmt.Fprintf(vlog, "weights ready in %v\n", time.Since(repackStart).Round(time.Millisecond))
+	if hspec != nil {
+		for n := range hspec.weights {
+			if !rotated[n] {
+				return nil, nil, fmt.Errorf("prism.hadamard: %s was not transformed at load", n)
+			}
+		}
+		fmt.Fprintf(vlog, "hadamard: %d weights read through a %d-block rotation\n", len(rotated), hspec.block)
+	}
 	m.initRopeFreqs()
 	if useCache {
 		// Write the cache and serve this run from it too: the freshly

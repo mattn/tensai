@@ -6,7 +6,8 @@
 // Reading is lazy: Open parses only the header, and each Tensor call reads
 // just that tensor's bytes. F32 comes back as-is; F16 and BF16 convert to
 // float32; the block-quantized types Q8_0, Q4_0, Q4_1, Q5_0, Q5_1 and the
-// K-quants Q2_K through Q6_K plus IQ4_NL and MXFP4 dequantize to float32 on the way
+// K-quants Q2_K through Q6_K plus IQ4_NL, MXFP4 and PrismML's ternary
+// PTQ1_0 and PQ2_0 dequantize to float32 on the way
 // out, which covers the encodings llama.cpp's published checkpoints
 // usually ship (the Q2_K..Q5_K_M mixes, their Q6_K tensors, and the
 // IQ4_NL blocks imatrix mixes lean on). Dimensions arrive in tensai's row-major order (GGUF stores
@@ -55,6 +56,12 @@ const (
 	typeIQ4NL = 20
 	typeBF16  = 30
 	typeMXFP4 = 39
+	// PrismML's ternary encodings, private to its llama.cpp fork: a
+	// group of 128 weights in {-1, 0, +1} under one f16 scale, the
+	// trits packed five to a byte (PTQ1_0) or one to a two-bit slot
+	// (PQ2_0).
+	typePQ2_0  = 142
+	typePTQ1_0 = 143
 )
 
 var typeNames = map[uint32]string{
@@ -64,6 +71,7 @@ var typeNames = map[uint32]string{
 	typeQ5_0: "Q5_0", typeQ5_1: "Q5_1",
 	typeQ2_K: "Q2_K", typeQ3_K: "Q3_K", typeIQ4NL: "IQ4_NL",
 	typeMXFP4: "MXFP4",
+	typePQ2_0: "PQ2_0", typePTQ1_0: "PTQ1_0",
 }
 
 // blockSpec describes one quantization block: how many values it decodes
@@ -85,6 +93,11 @@ var blockSpec = map[uint32]struct{ values, bytes int64 }{
 	typeQ4_K: {256, 2 + 2 + 12 + 128},      // d, dmin, packed scales, nibbles
 	typeQ5_K: {256, 2 + 2 + 12 + 32 + 128}, // + high bits
 	typeQ6_K: {256, 128 + 64 + 16 + 2},     // ql, qh, int8 scales, d
+	// Ternary: PTQ1_0 packs 120 trits five to a byte and the last 8
+	// four to a byte, then the f16 scale; PQ2_0 keeps a trit per
+	// two-bit slot behind its scale.
+	typePTQ1_0: {128, 24 + 2 + 2},
+	typePQ2_0:  {128, 2 + 32},
 }
 
 type tensorInfo struct {
@@ -411,8 +424,65 @@ func dequantBlocks(typ uint32, name string, dst []float32, raw []byte, n int64) 
 		for b := int64(0); b < n/256; b++ {
 			dequantQ6K(raw[b*210:b*210+210], dst[b*256:b*256+256])
 		}
+	case typePTQ1_0:
+		var w [128]int8
+		for b := int64(0); b < n/128; b++ {
+			s := DecodePTQ1_0(raw[b*28:b*28+28], &w)
+			for i, v := range w {
+				dst[b*128+int64(i)] = s * float32(v)
+			}
+		}
+	case typePQ2_0:
+		var w [128]int8
+		for b := int64(0); b < n/128; b++ {
+			s := DecodePQ2_0(raw[b*34:b*34+34], &w)
+			for i, v := range w {
+				dst[b*128+int64(i)] = s * float32(v)
+			}
+		}
 	}
 	return nil
+}
+
+// DecodePTQ1_0 unpacks one 28-byte PTQ1_0 block into its 128 weights,
+// each -1, 0 or +1, and returns the block's scale. The packing is
+// TQ1_0's at group 128: the first 24 bytes carry five trits apiece as a
+// base-3 number scaled into a byte, laid out in stages of 32, 16 and 8
+// bytes so that trit n of byte m within a stage is weight n*stage+m; the
+// next 2 bytes carry four trits apiece the same way; the scale ends the
+// block.
+func DecodePTQ1_0(blk []byte, w *[128]int8) float32 {
+	pow3 := [5]uint16{1, 3, 9, 27, 81}
+	k := 0
+	j := 0
+	for _, c := range [3]int{32, 16, 8} {
+		for ; j+c <= 24; j += c {
+			for n := 0; n < 5; n++ {
+				for m := 0; m < c; m++ {
+					q := uint16(blk[j+m]) * pow3[n]
+					w[k] = int8((q&0xFF)*3>>8) - 1
+					k++
+				}
+			}
+		}
+	}
+	for n := 0; n < 4; n++ {
+		for h := 0; h < 2; h++ {
+			q := uint16(blk[24+h]) * pow3[n]
+			w[k] = int8((q&0xFF)*3>>8) - 1
+			k++
+		}
+	}
+	return f16to32(binary.LittleEndian.Uint16(blk[26:]))
+}
+
+// DecodePQ2_0 unpacks one 34-byte PQ2_0 block: the f16 scale, then 128
+// two-bit slots holding w+1 in order, four to a byte from the low bits.
+func DecodePQ2_0(blk []byte, w *[128]int8) float32 {
+	for i := 0; i < 128; i++ {
+		w[i] = int8((blk[2+i/4]>>(2*uint(i%4)))&3) - 1
+	}
+	return f16to32(binary.LittleEndian.Uint16(blk))
 }
 
 // Ints returns an integer array metadata value, whatever width the file

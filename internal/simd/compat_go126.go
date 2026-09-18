@@ -35,6 +35,10 @@ func LoadI8x32(s []int8) archsimd.Int8x32 {
 	return archsimd.LoadInt8x32Slice(s)
 }
 
+func LoadU8x32(s []uint8) archsimd.Uint8x32 {
+	return archsimd.LoadUint8x32Slice(s)
+}
+
 func LoadF32x8Part(s []float32) archsimd.Float32x8 {
 	return archsimd.LoadFloat32x8SlicePart(s)
 }
