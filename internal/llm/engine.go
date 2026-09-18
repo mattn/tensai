@@ -860,7 +860,7 @@ func (e *Engine) ScoreMany(state string, qs []Question, label bool) (ScoreResult
 			text += renderLabels(q.Options)
 			options = labels[:len(q.Options)]
 		}
-		text += e.tm.userClose + e.tm.asstOpen + e.tm.asstPrefill
+		text += e.tm.userClose + e.tm.asstOpen + scorePrefill(e.tm, e.opts.Think)
 		ids := e.tok.Encode(text)
 		if qi == 0 {
 			fmt.Fprintf(e.vlog, "rendered prompt: %s\n", clip(text, 600))
@@ -914,6 +914,23 @@ func (e *Engine) ScoreMany(state string, qs []Question, label bool) (ScoreResult
 		res.Probs[qi] = softmax64(ll)
 	}
 	return res, nil
+}
+
+// scorePrefill is what the assistant turn opens with when the next
+// token is to be read as the answer. A thinking model writes its block
+// first, empty when thinking is off: a gemma4 opens its channel and
+// closes it before every answer, so the logits after the turn marker
+// are for the channel opener and say nothing about the options. The
+// empty block goes into the prompt so the read lands on the answer.
+// A template whose prefill already holds the block is left alone, and
+// so is one asked to think, since there is no scoring what it would
+// have thought.
+func scorePrefill(tm tmpl, think bool) string {
+	pre := tm.asstPrefill
+	if tm.reasonOpen == "" || think || strings.Contains(pre, tm.reasonClose) {
+		return pre
+	}
+	return pre + tm.reasonOpen + tm.reasonClose
 }
 
 // labels are what the options are called when the model answers by

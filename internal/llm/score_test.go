@@ -102,6 +102,27 @@ func TestScoreAgainstModel(t *testing.T) {
 	}
 }
 
+func TestScorePrefill(t *testing.T) {
+	// No thinking block: the prefill as it is.
+	if got := scorePrefill(tmpl{asstPrefill: "x"}, false); got != "x" {
+		t.Fatalf("plain template: %q", got)
+	}
+	// A gemma4 opens and closes its channel before the answer.
+	g4 := tmpl{reasonOpen: "<|channel>thought\n", reasonClose: "<channel|>"}
+	if got := scorePrefill(g4, false); got != "<|channel>thought\n<channel|>" {
+		t.Fatalf("gemma4: %q", got)
+	}
+	// Asked to think, the block is the model's to fill.
+	if got := scorePrefill(g4, true); got != "" {
+		t.Fatalf("gemma4 thinking: %q", got)
+	}
+	// A template that already closes an empty block is left alone.
+	q3 := tmpl{reasonOpen: "<think>", reasonClose: "</think>", asstPrefill: "<think>\n\n</think>\n\n"}
+	if got := scorePrefill(q3, false); got != q3.asstPrefill {
+		t.Fatalf("qwen3: %q", got)
+	}
+}
+
 func TestRenderLabels(t *testing.T) {
 	got := renderLabels([]string{"blue", "green"})
 	want := "\nA. blue\nB. green\nAnswer with the letter only."
