@@ -16,7 +16,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"runtime"
 	"runtime/debug"
@@ -1400,10 +1399,14 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	m := &qwen{cfg: cfg, headSz: headSz, layout: layoutName(bits, direct)}
 	m.embed = tensor("token_embd.weight")
 	var ropeFF []float32
+	// Gemma scales embeddings by sqrt(hidden); embedScale does it per
+	// token, since scaling the table would scale the tied lm head with
+	// it. (gemma3 once scaled the table here: the direct repack read
+	// the head from the stored blocks and never noticed, the
+	// requantized path built it from the table and every logit came
+	// out sqrt(hidden) times too large — the argmax it generates by
+	// unchanged, the probabilities ask reads absurd.)
 	if arch == "gemma4" {
-		// Gemma scales embeddings by sqrt(hidden). Doing it per token
-		// rather than to the table leaves the tied lm head the values it
-		// was trained with.
 		ropeFF = tensor("rope_freqs.weight").Data
 		// Only the E-series carries per-layer embeddings; the dense
 		// models state a width of zero and ship none of the tensors.
@@ -1414,13 +1417,6 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 			if err != nil {
 				return nil, nil, err
 			}
-		}
-	}
-	if arch == "gemma3" {
-		// Gemma scales embeddings by sqrt(hidden) before the first block.
-		s := float32(math.Sqrt(float64(cfg.HiddenSize)))
-		for i := range m.embed.Data {
-			m.embed.Data[i] *= s
 		}
 	}
 	m.normW = tensor("output_norm.weight").Data

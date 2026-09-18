@@ -27,8 +27,9 @@ const cacheMagic = "TSAICCH\x00"
 
 // cacheFormat names the serialized layouts and the walk order; bump it
 // whenever either changes so stale caches rewrite instead of decoding
-// garbage.
-const cacheFormat = 2
+// garbage. 3: gemma3's embedding table is cached unscaled, the way
+// gemma4's always was, so a format-2 gemma3 cache would be scaled twice.
+const cacheFormat = 3
 
 // Record kinds, one per weight representation the model can hold.
 const (
