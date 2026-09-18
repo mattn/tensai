@@ -8,7 +8,6 @@
 package main
 
 import (
-	"bufio"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -296,61 +295,65 @@ func main() {
 		yesno := fs.Bool("yesno", false, "score yes against no")
 		state := fs.String("state", "", "the situation the question is asked about, given ahead of it")
 		label := fs.Bool("label", false, "list the options under the question lettered A, B, C and score the letter, one token each, instead of the option text")
-		batch := fs.Bool("batch", false, `read questions from stdin, one JSON object {"question": ..., "options": [...]} per line, all about the same -state`)
+		batch := fs.Bool("batch", false, `read a System One request from stdin: {"state": ..., "questions": {id: {"type": "noul"|"choice"|"score", "instructions": ..., "criteria": ...}}}`)
 		jsonOut := fs.Bool("json", false, "print the probabilities as one JSON object")
 		fs.Parse(args)
 		question := joinArgs(fs.Args())
-		var qs []llm.Question
+		if *batch {
+			if *yesno || *choice != "" || *label || question != "" {
+				fmt.Fprintln(os.Stderr, "-batch takes its questions from stdin, and -state only when the request has none")
+				os.Exit(2)
+			}
+			var req llm.SystemOneRequest
+			if err := json.NewDecoder(os.Stdin).Decode(&req); err != nil {
+				fmt.Fprintln(os.Stderr, "reading the request:", err)
+				os.Exit(2)
+			}
+			if len(req.State) == 0 && *state != "" {
+				req.State, _ = json.Marshal(*state)
+			}
+			e := openEngine(o, finish)
+			defer e.Close()
+			resp, err := e.SystemOne(req)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			answersPrint(resp, *jsonOut)
+			return
+		}
+		var options []string
 		switch {
 		case *yesno && *choice != "":
 			fmt.Fprintln(os.Stderr, "give -yesno or -choice, not both")
 			os.Exit(2)
-		case *batch && (*yesno || *choice != "" || question != ""):
-			fmt.Fprintln(os.Stderr, "-batch takes its questions and options from stdin")
-			os.Exit(2)
-		case *batch:
-			var err error
-			if qs, err = readQuestions(os.Stdin); err != nil {
-				fmt.Fprintln(os.Stderr, err)
-				os.Exit(2)
-			}
 		case *yesno:
-			qs = []llm.Question{{Text: question, Options: []string{"yes", "no"}}}
+			options = []string{"yes", "no"}
 		case *choice != "":
-			var options []string
 			for _, c := range strings.Split(*choice, ",") {
 				if c = strings.TrimSpace(c); c != "" {
 					options = append(options, c)
 				}
 			}
-			qs = []llm.Question{{Text: question, Options: options}}
 		}
 		// The state is the context a decision is made in, and the model
 		// reads it as the first part of the user turn. A state with no
 		// question after it is the question.
-		if !*batch && *state != "" && question == "" && len(qs) > 0 {
-			qs[0].Text, *state = *state, ""
+		if *state != "" && question == "" {
+			question, *state = *state, ""
 		}
-		if len(qs) == 0 || qs[0].Text == "" || len(qs[0].Options) < 2 {
+		if question == "" || len(options) < 2 {
 			fmt.Fprintln(os.Stderr, "usage: tensai ask [flags] (-choice a,b,c | -yesno | -batch) [-state <situation>] [<question>]")
 			os.Exit(2)
 		}
 		e := openEngine(o, finish)
 		defer e.Close()
-		probs, err := e.ScoreMany(*state, qs, *label)
+		res, err := e.ScoreMany(*state, []llm.Question{{Text: question, Options: options}}, *label)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		for i, q := range qs {
-			if *batch && !*jsonOut {
-				if i > 0 {
-					fmt.Println()
-				}
-				fmt.Println(q.Text)
-			}
-			askPrint(q.Options, probs[i], *jsonOut)
-		}
+		askPrint(options, res.Probs[0], *jsonOut)
 	case "bench":
 		fs := flag.NewFlagSet("tensai bench", flag.ExitOnError)
 		o, finish := modelFlags(fs)
@@ -380,30 +383,51 @@ func main() {
 	}
 }
 
-// readQuestions reads one question per line of JSON from r, skipping
-// blank lines, the way a program batching its questions writes them.
-func readQuestions(r io.Reader) ([]llm.Question, error) {
-	var qs []llm.Question
-	sc := bufio.NewScanner(r)
-	sc.Buffer(nil, 1<<20)
-	for n := 1; sc.Scan(); n++ {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
+// answersPrint shows a System One response: as the JSON a program
+// reads, or one block per question for the eye, in id order.
+func answersPrint(resp *llm.SystemOneResponse, asJSON bool) {
+	if asJSON {
+		out, _ := json.Marshal(resp)
+		fmt.Println(string(out))
+		return
+	}
+	ids := make([]string, 0, len(resp.Answers))
+	for id := range resp.Answers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for i, id := range ids {
+		if i > 0 {
+			fmt.Println()
+		}
+		a := resp.Answers[id]
+		switch a.Type {
+		case "noul":
+			fmt.Printf("%s: %5.1f%%  yes\n", id, 100**a.Noul)
 			continue
+		case "choice":
+			fmt.Printf("%s: %s  (confidence %.2f)\n", id, a.Choice, *a.Confidence)
+		case "score":
+			fmt.Printf("%s: %.2f  (confidence %.2f)\n", id, *a.Score, *a.Confidence)
 		}
-		var q llm.Question
-		if err := json.Unmarshal([]byte(line), &q); err != nil {
-			return nil, fmt.Errorf("line %d: %v", n, err)
+		names := make([]string, 0, len(a.Probabilities))
+		for n := range a.Probabilities {
+			names = append(names, n)
 		}
-		if q.Text == "" || len(q.Options) < 2 {
-			return nil, fmt.Errorf("line %d: a question needs text and at least two options", n)
+		sort.SliceStable(names, func(x, y int) bool {
+			if a.Type == "score" {
+				return names[x] < names[y]
+			}
+			return a.Probabilities[names[x]] > a.Probabilities[names[y]]
+		})
+		for _, n := range names {
+			line := n
+			if a.Legend != nil {
+				line += "  " + a.Legend[n]
+			}
+			fmt.Printf("%5.1f%%  %s\n", 100*a.Probabilities[n], line)
 		}
-		qs = append(qs, q)
 	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	return qs, nil
 }
 
 // askPrint lists the options by probability, the way a reader wants

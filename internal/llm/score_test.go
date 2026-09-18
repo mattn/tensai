@@ -134,10 +134,11 @@ func TestScoreManyAgainstModel(t *testing.T) {
 		{Text: "Is it raining? Answer yes or no.", Options: []string{"yes", "no"}},
 	}
 	log.Reset()
-	many, err := e.ScoreMany(state, qs, false)
+	res, err := e.ScoreMany(state, qs, false)
 	if err != nil {
 		t.Fatal(err)
 	}
+	many := res.Probs
 	// The second question reused the state: fewer tokens prefilled
 	// than it has.
 	var total, done int
@@ -164,12 +165,20 @@ func TestScoreManyAgainstModel(t *testing.T) {
 	// Labeled, the letter of the right color wins. (The yes/no question
 	// is left out: a 0.5B leans on A whatever the question, which is
 	// the model's habit and not the mechanism's.)
-	labeled, err := e.ScoreMany(state, qs, true)
+	lres, err := e.ScoreMany(state, qs, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if labeled[0][0] < 0.5 {
+	if labeled := lres.Probs; labeled[0][0] < 0.5 {
 		t.Fatalf("unexpected labeled answer %v", labeled[0])
+	}
+	// Five labels were scored, one token each, and the prompt tokens
+	// are what the log said was prefilled.
+	if lres.OptionTokens != 5 {
+		t.Fatalf("labeled run scored %d option tokens, want 5", lres.OptionTokens)
+	}
+	if lres.PromptTokens <= total {
+		t.Fatalf("prompt tokens %d, but question 2 alone is %d", lres.PromptTokens, total)
 	}
 }
 

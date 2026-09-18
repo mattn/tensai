@@ -205,27 +205,53 @@ tensai ask -q8 -json -choice "spam,ham" "Classify: 'You have won a prize'. One w
 経歴を自信ありげに捏造しますが、ここでは候補すべてを 50% 付近に置きます。それが散文では
 言えない正直な答えです。
 
-#### 1 つの状況にいくつも聞く
+#### 1 つの状況に型つきの質問をする
 
-分類器は同じ状況についていくつも聞きます。メッセージの感情、何を求めているか、人が対応
-すべきか。`-batch` はその質問群を標準入力から 1 行 1 JSON で読み、すべて同じ `-state` に
-ついて順に答えます:
+分類器は同じ状況についていくつも聞きます。メッセージは急ぎか、どのチームの担当か、
+書き手はどれくらい怒っているか。`-batch` はそれらを TypeSafe の Jev API と同じ形の
+1 つのリクエストとして標準入力から受け取り、同じ形で答えます:
 
 ```bash
-tensai ask -q8 -batch -label -json -state "Customer message: 'Third time my package arrived broken. Refund me now.'" <<'EOF'
-{"question": "What is the customer's mood?", "options": ["angry", "happy", "neutral"]}
-{"question": "What is the customer asking for?", "options": ["a refund", "a replacement", "information"]}
-{"question": "Should this be escalated to a human?", "options": ["yes", "no"]}
+tensai ask -q8 -batch -json <<'EOF'
+{
+  "state": "Help! My payouts have been failing for 3 days.",
+  "questions": {
+    "is_urgent":   {"type": "noul",   "instructions": "Does this convey urgency?",
+                    "criteria": {"true": "Explicitly time-sensitive", "false": "No urgency expressed"}},
+    "department":  {"type": "choice", "instructions": "Which team should handle this?",
+                    "criteria": {"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations", "sales": "Pricing, upgrades, new accounts"}},
+    "frustration": {"type": "score",  "instructions": "How frustrated is the customer?",
+                    "criteria": ["Calm", "Frustrated", "Very angry"]}
+  }
+}
 EOF
 ```
 
+```json
+{"model":"tensai","answers":{
+  "is_urgent":   {"type":"noul","noul":0.93},
+  "department":  {"type":"choice","choice":"technical","probabilities":{"billing":0.22,"sales":0.12,"technical":0.66},"confidence":0.21},
+  "frustration": {"type":"score","score":0.93,"legend":{"0":"Calm","1":"Frustrated","2":"Very angry"},"probabilities":{"0":0.07,"1":0.93,"2":0.00},"confidence":0.76}},
+ "usage":{"input_tokens":174,"output_tokens":8}}
+```
+
+質問は 3 種類です。`noul` は yes/no で、yes の確率を返します。`criteria` で yes と no
+の意味を補足できます。`choice` は `criteria` に選択肢の名前と説明を並べ、選ばれた名前と
+選択肢ごとの確率、confidence を返します。`score` は `criteria` に順序つきのレベルを低い方
+から最大 10 個並べ、期待値としてのレベル (2 つのレベルの間の小数になりえます) と凡例、
+分布を返します。`confidence` は分布のエントロピーを最大値で割って 1 から引いたもので、
+Jev が公開している数値を再現します。`state`、`instructions`、各 criteria は文字列でも
+任意の JSON でもよく、文字列でないものは JSON のままモデルに見せます。
+
+内部ではどの質問も A, B, C と文字を振った多肢選択に描画して文字を採点するので、説明が
+どれだけ長くても選択肢 1 つは 1 トークンで、答えは質問直後の logits を 1 回読むだけです。
 状況は 1 回だけプレフィルされ、各質問はそのキャッシュを延長するので、N 問のコストは
-状況 1 回と各質問 1 回ぶんのプレフィルで、状況を N 回読み直しません。`-label` は選択肢を
-質問の下に A, B, C と並べ、選択肢の本文ではなく文字を採点します。本文がどれだけ長くても
-選択肢 1 つは 1 トークンで、答えは質問直後の logits を 1 回読むだけです。分類器向けの形は
-こちらで、一語で答えさせてその語を見たい質問にはラベルなしの形が向きます。小さいモデルは
-質問によらず A に寄るので、0.5B では 1 つの値を鵜呑みにせず文字同士を比べるか、本文の
-形を使ってください。
+状況 1 回と各質問 1 回ぶんで、状況を N 回読み直しません。同じ描画は 1 問の `ask` でも
+`-label` で使えます (なければ選択肢の本文をトークンごとに採点します)。小さいモデルは
+質問によらず A に寄るので、0.5B では 1 つの値を鵜呑みにせず選択肢同士を比べてください。
+
+`serve` は同じものを `POST /v1/systemone` として出すので、Jev 向けに書かれた
+クライアントを手元のモデルに向けられます。
 
 ### OpenAI 互換 API の提供
 
@@ -260,7 +286,7 @@ qwen2.5-0.5b-instruct-q8_0.gguf             531MB  gguf     tools       2026-08-
 チェックポイントも、実際に扱われるとおりに並びます。読み取りコストは `.gguf`
 1 つあたり約 80ms のメタデータ解析で、ディレクトリはタダです。
 
-`serve` は `/v1/chat/completions` (messages 配列、SSE ストリーミング、使用量カウント) を公開するので、OpenAI クライアントを向ければ何でも純 Go のモデルとチャットできます。組み込みのチャットデモページが `GET /` で提供されます。
+`serve` は `/v1/chat/completions` (messages 配列、SSE ストリーミング、使用量カウント) を公開するので、OpenAI クライアントを向ければ何でも純 Go のモデルとチャットできます。`ask -batch` の型つき質問を HTTP で受ける `/v1/systemone` もあります。組み込みのチャットデモページが `GET /` で提供されます。
 
 ### 思考の分離
 

@@ -786,11 +786,21 @@ type Question struct {
 // scored in the form given: "yes" and "Yes" are different tokens, and
 // which one a model reaches for is a property of the model.
 func (e *Engine) Score(question string, options []string) ([]float64, error) {
-	probs, err := e.ScoreMany("", []Question{{Text: question, Options: options}}, false)
+	res, err := e.ScoreMany("", []Question{{Text: question, Options: options}}, false)
 	if err != nil {
 		return nil, err
 	}
-	return probs[0], nil
+	return res.Probs[0], nil
+}
+
+// ScoreResult is what ScoreMany measured: one probability per option of
+// each question, and what it cost in tokens.
+type ScoreResult struct {
+	Probs [][]float64
+	// PromptTokens is what was prefilled: the state once, then each
+	// question. OptionTokens is what was scored: one per label, or the
+	// length of each option's text.
+	PromptTokens, OptionTokens int
 }
 
 // ScoreMany answers several questions about one state. The state opens
@@ -806,16 +816,17 @@ func (e *Engine) Score(question string, options []string) ([]float64, error) {
 // classifier wants; the unlabeled form scores the option text itself,
 // which is what a question that asks for a word in a particular form
 // wants.
-func (e *Engine) ScoreMany(state string, qs []Question, label bool) ([][]float64, error) {
+func (e *Engine) ScoreMany(state string, qs []Question, label bool) (ScoreResult, error) {
+	var res ScoreResult
 	if len(qs) == 0 {
-		return nil, errors.New("tensai: no questions to score")
+		return res, errors.New("tensai: no questions to score")
 	}
 	for _, q := range qs {
 		if len(q.Options) == 0 {
-			return nil, errors.New("tensai: no options to score")
+			return res, errors.New("tensai: no options to score")
 		}
 		if label && len(q.Options) > len(labels) {
-			return nil, fmt.Errorf("tensai: %d options, and only %d labels", len(q.Options), len(labels))
+			return res, fmt.Errorf("tensai: %d options, and only %d labels", len(q.Options), len(labels))
 		}
 	}
 	if e.tm.foldSystem && e.system != "" {
@@ -838,9 +849,10 @@ func (e *Engine) ScoreMany(state string, qs []Question, label bool) ([][]float64
 		live = pids
 	}
 	e.steps = len(pids)
+	res.PromptTokens = len(pids)
 	snap := snapshotDelta(e.model)
 	fmt.Fprintf(e.opts.Log, "state: %d tokens, prefill: %v\n", len(pids), time.Since(start).Round(time.Millisecond))
-	out := make([][]float64, len(qs))
+	res.Probs = make([][]float64, len(qs))
 	for qi, q := range qs {
 		text := prefix + q.Text
 		options := q.Options
@@ -871,6 +883,7 @@ func (e *Engine) ScoreMany(state string, qs []Question, label bool) ([][]float64
 		base := e.prefill(ids[n:], n)
 		e.steps = len(ids)
 		live = ids
+		res.PromptTokens += len(ids) - n
 		fmt.Fprintf(e.opts.Log, "question %d: %d tokens, %d prefilled in %v\n",
 			qi+1, len(ids), len(ids)-n, time.Since(start).Round(time.Millisecond))
 		// The question's logits and any recurrent state are what every
@@ -881,8 +894,9 @@ func (e *Engine) ScoreMany(state string, qs []Question, label bool) ([][]float64
 		for i, opt := range options {
 			toks := e.tok.Encode(opt)
 			if len(toks) == 0 {
-				return nil, fmt.Errorf("tensai: option %q tokenizes to nothing", opt)
+				return res, fmt.Errorf("tensai: option %q tokenizes to nothing", opt)
 			}
+			res.OptionTokens += len(toks)
 			logits := first
 			for j, id := range toks {
 				ll[i] += logProb(logits, id)
@@ -897,9 +911,9 @@ func (e *Engine) ScoreMany(state string, qs []Question, label bool) ([][]float64
 			restoreDelta(e.model, qsnap)
 		}
 		e.logits = first
-		out[qi] = softmax64(ll)
+		res.Probs[qi] = softmax64(ll)
 	}
-	return out, nil
+	return res, nil
 }
 
 // labels are what the options are called when the model answers by
@@ -1027,8 +1041,8 @@ func (e *Engine) Chat(in io.Reader, w io.Writer, n int) {
 // behind an Authorization: Bearer header.
 func (e *Engine) Serve(addr, apiKey string) error {
 	s := &server{
-		apiKey: apiKey,
-		model:  e.model, tok: e.tok, system: e.system, nCtx: e.nCtx,
+		apiKey: apiKey, engine: e,
+		model: e.model, tok: e.tok, system: e.system, nCtx: e.nCtx,
 		temp: e.opts.Temp, topP: e.opts.TopP, penalty: e.penalty(), imEnd: e.imEnd, eot: e.eot,
 		tm: e.tm, prefill: e.prefill, step: e.step, reset: e.reset,
 		draft: e.draft, specK: e.opts.SpecK, vlog: e.vlog,

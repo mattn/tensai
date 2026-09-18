@@ -746,6 +746,7 @@ func paramTypes(tools []toolDef, name string) map[string]string {
 type server struct {
 	mu      sync.Mutex // one request drives the model at a time
 	apiKey  string     // "" leaves /v1 open
+	engine  *Engine    // for the endpoints that score rather than generate
 	model   *qwen
 	draft   *qwen
 	specK   int
@@ -800,6 +801,7 @@ var webUI []byte
 func (s *server) listen(addr string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", s.auth(s.chatCompletions))
+	mux.HandleFunc("/v1/systemone", s.auth(s.systemOne))
 	mux.HandleFunc("/v1/models", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{
 			"object": "list",
@@ -816,7 +818,7 @@ func (s *server) listen(addr string) error {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write(webUI)
 	})
-	fmt.Printf("listening on %s (POST /v1/chat/completions)\n", addr)
+	fmt.Printf("listening on %s (POST /v1/chat/completions, /v1/systemone)\n", addr)
 	return http.ListenAndServe(addr, mux)
 }
 
@@ -831,6 +833,36 @@ func httpError(w http.ResponseWriter, code int, msg string) {
 	json.NewEncoder(w).Encode(map[string]any{
 		"error": map[string]any{"message": msg, "type": "invalid_request_error"},
 	})
+}
+
+// systemOne answers typed questions about a state, in the shape of
+// TypeSafe's Jev API, by scoring rather than generating. It takes the
+// model over and leaves it holding the last question, so the prompt
+// cache the chat endpoint keeps is emptied.
+func (s *server) systemOne(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		httpError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	began := time.Now()
+	var req SystemOneRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cache.live, s.cache.ckpt = nil, nil
+	resp, err := s.engine.SystemOne(req)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if s.vlog != nil {
+		fmt.Fprintf(s.vlog, "systemone: %d questions, %d tokens in, %d read, %v\n",
+			len(req.Questions), resp.Usage.InputTokens, resp.Usage.OutputTokens, time.Since(began).Round(time.Millisecond))
+	}
+	writeJSON(w, resp)
 }
 
 func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
