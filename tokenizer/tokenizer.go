@@ -27,7 +27,7 @@ type special struct {
 // Tokenizer encodes text to token ids and back.
 type Tokenizer struct {
 	vocab       map[string]int
-	inverse     map[int]string
+	inverse     []string  // piece by id; "" where no id
 	specials    []special // sorted longest-first
 	byID        map[int]string
 	ranks       map[[2]string]int
@@ -121,6 +121,30 @@ func Load(path string) (*Tokenizer, error) {
 	return Parse(raw)
 }
 
+// AddedToken is a token matched verbatim in the input, the way a chat
+// template's turn markers are.
+type AddedToken struct {
+	ID      int
+	Content string
+}
+
+// NewBPE builds a byte-level BPE tokenizer from its parts, the way a
+// gguf carries them: the vocabulary, the merges as "a b" lines in rank
+// order, the added tokens, and the pre_tokenizer JSON that names the
+// split. Parse reaches the same constructor through tokenizer.json;
+// this one skips serializing a quarter million entries to get there.
+func NewBPE(vocab map[string]int, merges []string, added []AddedToken, preTokenizer json.RawMessage) (*Tokenizer, error) {
+	t, err := newBPE(vocab, preTokenizer)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.setMerges(merges); err != nil {
+		return nil, err
+	}
+	t.finishBPE(added)
+	return t, nil
+}
+
 // Parse builds a Tokenizer from tokenizer.json bytes.
 func Parse(raw []byte) (*Tokenizer, error) {
 	var f jsonFile
@@ -141,33 +165,55 @@ func Parse(raw []byte) (*Tokenizer, error) {
 	if f.Model.Type != "" && f.Model.Type != "BPE" {
 		return nil, fmt.Errorf("tokenizer: unsupported model type %q", f.Model.Type)
 	}
-	if len(f.Model.Vocab) == 0 {
+	t, err := newBPE(f.Model.Vocab, f.PreTokenizer)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.parseMerges(f.Model.Merges); err != nil {
+		return nil, err
+	}
+	added := make([]AddedToken, len(f.AddedTokens))
+	for i, at := range f.AddedTokens {
+		added[i] = AddedToken{ID: at.ID, Content: at.Content}
+	}
+	t.finishBPE(added)
+	return t, nil
+}
+
+// newBPE is the vocabulary and the split; merges and added tokens
+// follow.
+func newBPE(vocab map[string]int, preTokenizer json.RawMessage) (*Tokenizer, error) {
+	if len(vocab) == 0 {
 		return nil, fmt.Errorf("tokenizer: empty vocab")
 	}
-
 	t := &Tokenizer{
-		vocab:   f.Model.Vocab,
-		inverse: make(map[int]string, len(f.Model.Vocab)),
+		vocab:   vocab,
 		byID:    map[int]string{},
 		ranks:   map[[2]string]int{},
 		byteDec: map[rune]byte{},
 		cache:   map[string][]int{},
 	}
-	for s, id := range t.vocab {
-		t.inverse[id] = s
+	maxID := -1
+	for _, id := range t.vocab {
+		maxID = max(maxID, id)
 	}
-
-	cfg, err := detectSplit(f.PreTokenizer)
+	t.inverse = make([]string, maxID+1)
+	for s, id := range t.vocab {
+		if id >= 0 {
+			t.inverse[id] = s
+		}
+	}
+	cfg, err := detectSplit(preTokenizer)
 	if err != nil {
 		return nil, err
 	}
 	t.cfg = cfg
+	return t, nil
+}
 
-	if err := t.parseMerges(f.Model.Merges); err != nil {
-		return nil, err
-	}
-
-	for _, at := range f.AddedTokens {
+// finishBPE registers the added tokens and the byte-level alphabet.
+func (t *Tokenizer) finishBPE(added []AddedToken) {
+	for _, at := range added {
 		t.specials = append(t.specials, special{content: at.Content, id: at.ID})
 		t.byID[at.ID] = at.Content
 	}
@@ -185,7 +231,6 @@ func Parse(raw []byte) (*Tokenizer, error) {
 		}
 		t.byteDec[t.byteEnc[b]] = byte(b)
 	}
-	return t, nil
 }
 
 // detectSplit maps the pre_tokenizer JSON onto one of the two known
@@ -271,14 +316,7 @@ func (t *Tokenizer) parseMerges(raw json.RawMessage) error {
 	// merges are serialized either as ["a b", ...] or [["a","b"], ...].
 	var asStrings []string
 	if err := json.Unmarshal(raw, &asStrings); err == nil {
-		for rank, line := range asStrings {
-			parts := strings.SplitN(line, " ", 2)
-			if len(parts) != 2 {
-				return fmt.Errorf("tokenizer: bad merge %q", line)
-			}
-			t.ranks[[2]string{parts[0], parts[1]}] = rank
-		}
-		return nil
+		return t.setMerges(asStrings)
 	}
 	var asPairs [][2]string
 	if err := json.Unmarshal(raw, &asPairs); err != nil {
@@ -286,6 +324,21 @@ func (t *Tokenizer) parseMerges(raw json.RawMessage) error {
 	}
 	for rank, p := range asPairs {
 		t.ranks[p] = rank
+	}
+	return nil
+}
+
+// setMerges ranks the merges given as "a b" lines.
+func (t *Tokenizer) setMerges(lines []string) error {
+	if t.ranks == nil {
+		t.ranks = make(map[[2]string]int, len(lines))
+	}
+	for rank, line := range lines {
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("tokenizer: bad merge %q", line)
+		}
+		t.ranks[[2]string{parts[0], parts[1]}] = rank
 	}
 	return nil
 }
@@ -357,7 +410,7 @@ func (t *Tokenizer) Decode(ids []int) string {
 			bs = append(bs, sp...)
 			continue
 		}
-		for _, r := range t.inverse[id] {
+		for _, r := range t.piece(id) {
 			bs = append(bs, t.byteDec[r])
 		}
 	}
@@ -609,4 +662,12 @@ func sortSpecials(t *Tokenizer) {
 	sort.Slice(t.specials, func(i, j int) bool {
 		return len(t.specials[i].content) > len(t.specials[j].content)
 	})
+}
+
+// piece is the vocabulary entry for id, or "" for an id outside it.
+func (t *Tokenizer) piece(id int) string {
+	if id < 0 || id >= len(t.inverse) {
+		return ""
+	}
+	return t.inverse[id]
 }

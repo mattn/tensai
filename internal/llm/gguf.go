@@ -43,12 +43,12 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 	default:
 		return nil, fmt.Errorf("unsupported tokenizer model %q", model)
 	}
-	toksAny, ok := g.KV("tokenizer.ggml.tokens")
-	if !ok {
+	tokens := g.Strings("tokenizer.ggml.tokens")
+	if tokens == nil {
 		return nil, fmt.Errorf("gguf has no embedded tokenizer")
 	}
-	mergesAny, _ := g.KV("tokenizer.ggml.merges")
-	typesAny, _ := g.KV("tokenizer.ggml.token_type")
+	merges := g.Strings("tokenizer.ggml.merges")
+	types := g.Ints("tokenizer.ggml.token_type")
 
 	pre, _ := g.String("tokenizer.ggml.pre")
 	var preJSON string
@@ -73,51 +73,19 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 		return nil, fmt.Errorf("unsupported pre-tokenizer tag %q", pre)
 	}
 
-	tokens := toksAny.([]any)
 	vocab := make(map[string]int, len(tokens))
 	for id, t := range tokens {
-		s, ok := t.(string)
-		if !ok {
-			return nil, fmt.Errorf("token %d is not a string", id)
-		}
-		vocab[s] = id
+		vocab[t] = id
 	}
-	var merges []string
-	if arr, ok := mergesAny.([]any); ok {
-		merges = make([]string, len(arr))
-		for i, m := range arr {
-			merges[i], _ = m.(string)
+	var specials []tokenizer.AddedToken
+	for id, n := range types {
+		// Type 3 marks control tokens (<|im_start|> and friends), type
+		// 4 user-defined added tokens (Qwen3's <think> tags).
+		if (n == 3 || n == 4) && id < len(tokens) {
+			specials = append(specials, tokenizer.AddedToken{ID: id, Content: tokens[id]})
 		}
 	}
-	type added struct {
-		ID      int    `json:"id"`
-		Content string `json:"content"`
-	}
-	var specials []added
-	if arr, ok := typesAny.([]any); ok {
-		for id, tp := range arr {
-			// Type 3 marks control tokens (<|im_start|> and friends), type
-			// 4 user-defined added tokens (Qwen3's <think> tags).
-			if n, ok := tp.(int32); ok && (n == 3 || n == 4) && id < len(tokens) {
-				specials = append(specials, added{ID: id, Content: tokens[id].(string)})
-			}
-		}
-	}
-
-	spec := map[string]any{
-		"pre_tokenizer": json.RawMessage(preJSON),
-		"added_tokens":  specials,
-		"model": map[string]any{
-			"type":   "BPE",
-			"vocab":  vocab,
-			"merges": merges,
-		},
-	}
-	raw, err := json.Marshal(spec)
-	if err != nil {
-		return nil, err
-	}
-	return tokenizer.Parse(raw)
+	return tokenizer.NewBPE(vocab, merges, specials, json.RawMessage(preJSON))
 }
 
 // ggufSPMBPETokenizer builds Gemma 4's tokenizer: SentencePiece
@@ -126,33 +94,24 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 // merged, which matters here beyond the turn markers: the vocabulary
 // spells ordinary tokens like <div> and <=> the same way.
 func ggufSPMBPETokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
-	toksAny, ok := g.KV("tokenizer.ggml.tokens")
-	if !ok {
+	tokens := g.Strings("tokenizer.ggml.tokens")
+	if tokens == nil {
 		return nil, fmt.Errorf("gguf has no embedded tokenizer")
 	}
-	mergesAny, ok := g.KV("tokenizer.ggml.merges")
-	if !ok {
+	merges := g.Strings("tokenizer.ggml.merges")
+	if merges == nil {
 		return nil, fmt.Errorf("gguf spm-bpe tokenizer has no merges")
 	}
-	typesAny, ok := g.KV("tokenizer.ggml.token_type")
-	if !ok {
+	types64 := g.Ints("tokenizer.ggml.token_type")
+	if types64 == nil {
 		return nil, fmt.Errorf("gguf spm-bpe tokenizer has no token types")
 	}
-	ta, _ := toksAny.([]any)
-	ya, _ := typesAny.([]any)
-	ma, _ := mergesAny.([]any)
-	if len(ta) != len(ya) {
-		return nil, fmt.Errorf("gguf has %d tokens but %d token types", len(ta), len(ya))
+	if len(tokens) != len(types64) {
+		return nil, fmt.Errorf("gguf has %d tokens but %d token types", len(tokens), len(types64))
 	}
-	tokens := make([]string, len(ta))
-	types := make([]int32, len(ta))
-	for i := range ta {
-		tokens[i], _ = ta[i].(string)
-		types[i], _ = ya[i].(int32)
-	}
-	merges := make([]string, len(ma))
-	for i := range ma {
-		merges[i], _ = ma[i].(string)
+	types := make([]int32, len(types64))
+	for i, v := range types64 {
+		types[i] = int32(v)
 	}
 	// llama.cpp defaults SentencePiece space-prefixing on when the key is
 	// absent; Gemma 4 writes an explicit false.
@@ -313,25 +272,18 @@ func repackQ504(dst *quant.Q4Matrix, raw []byte, out, in, colOff int, colMap fun
 // ggufSPMTokenizer builds a SentencePiece tokenizer from the embedded
 // vocabulary, scores, and token types.
 func ggufSPMTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
-	toksAny, ok := g.KV("tokenizer.ggml.tokens")
-	if !ok {
+	tokens := g.Strings("tokenizer.ggml.tokens")
+	if tokens == nil {
 		return nil, fmt.Errorf("gguf has no embedded tokenizer")
 	}
-	scoresAny, ok := g.KV("tokenizer.ggml.scores")
-	if !ok {
+	scores := g.Floats("tokenizer.ggml.scores")
+	if scores == nil {
 		return nil, fmt.Errorf("gguf spm tokenizer has no scores")
 	}
-	typesAny, _ := g.KV("tokenizer.ggml.token_type")
-	ta := toksAny.([]any)
-	sa := scoresAny.([]any)
-	ya := typesAny.([]any)
-	tokens := make([]string, len(ta))
-	scores := make([]float32, len(ta))
-	types := make([]int32, len(ta))
-	for i := range ta {
-		tokens[i], _ = ta[i].(string)
-		scores[i], _ = sa[i].(float32)
-		types[i], _ = ya[i].(int32)
+	types64 := g.Ints("tokenizer.ggml.token_type")
+	types := make([]int32, len(types64))
+	for i, v := range types64 {
+		types[i] = int32(v)
 	}
 	// llama.cpp defaults SentencePiece space-prefixing on when the key is
 	// absent (Phi-3, the Llama-2 family); Gemma writes an explicit false.

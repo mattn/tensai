@@ -456,6 +456,10 @@ func loadWeightCache(cpath, src string, bits int, direct bool, cfg config, headS
 		f.Close()
 		return nil, err
 	}
+	// The first token sweeps every weight, so the pages are wanted now,
+	// and mapped in bulk they arrive several times faster than faulted
+	// in one by one under the kernels.
+	mmapfile.Populate(data)
 	bad := func(err error) (*qwen, error) {
 		closer()
 		f.Close()

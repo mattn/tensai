@@ -344,7 +344,7 @@ func (q *QMatrix) MatMul(x, out *tensai.Matrix) error {
 		run(0, q.Cols)
 		return nil
 	}
-	parallelChunks(q.Cols, workers, q4Tile, func(lo, hi int) {
+	workpool.Run(q.Cols, q4Tile, func(lo, hi int) {
 		run(lo, hi)
 	})
 	return nil

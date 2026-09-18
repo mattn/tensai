@@ -187,7 +187,7 @@ func (q *TernaryMatrix) MatMul(x, out *tensai.Matrix) error {
 		run(0, q.Cols)
 		return nil
 	}
-	parallelChunks(q.Cols, workers, tTile, func(lo, hi int) {
+	workpool.Run(q.Cols, tTile, func(lo, hi int) {
 		run(lo, hi)
 	})
 	return nil

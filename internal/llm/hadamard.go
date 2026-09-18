@@ -98,22 +98,10 @@ func readHadamardSpec(g *gguf.File) (*hadamardSpec, error) {
 	if off != len(values) {
 		return nil, errors.New("prism.hadamard.sign_values has values no width claims")
 	}
-	names := func(key string) []string {
-		arr, _ := g.KV("prism.hadamard." + key)
-		var out []string
-		if a, ok := arr.([]any); ok {
-			for _, v := range a {
-				if s, ok := v.(string); ok {
-					out = append(out, s)
-				}
-			}
-		}
-		return out
-	}
-	for _, n := range names("weight_names") {
+	for _, n := range g.Strings("prism.hadamard.weight_names") {
 		spec.weights[n] = true
 	}
-	for _, n := range names("inverse_weight_names") {
+	for _, n := range g.Strings("prism.hadamard.inverse_weight_names") {
 		spec.inverses[n] = true
 	}
 	if len(spec.weights) == 0 {
