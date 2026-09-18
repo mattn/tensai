@@ -1,0 +1,1396 @@
+
+<!doctype html>
+<html lang="ja" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A tiny machine-learning framework in pure Go">
+      
+      
+      
+        <link rel="canonical" href="https://mattn.github.io/tensai/ja/guide/autograd/">
+      
+      
+        <link rel="prev" href="../training/">
+      
+      
+        <link rel="next" href="../quantization/">
+      
+      
+        
+          <link rel="alternate" href="../../../guide/autograd/" hreflang="en">
+        
+          <link rel="alternate" href="./" hreflang="ja">
+        
+      
+      
+      <link rel="icon" href="../../../assets/logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>自動微分 - tensai</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#_1" class="md-skip">
+          コンテンツにスキップ
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="ヘッダー">
+    <a href="../../" title="tensai" class="md-header__button md-logo" aria-label="tensai" data-md-component="logo">
+      
+  <img src="../../../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            tensai
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              自動微分
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+      <div class="md-header__option">
+  <div class="md-select">
+    
+    <button class="md-header__button md-icon" aria-label="言語切り替え">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m12.87 15.07-2.54-2.51.03-.03A17.5 17.5 0 0 0 14.07 6H17V4h-7V2H8v2H1v2h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2zm-2.62 7 1.62-4.33L19.12 17z"/></svg>
+    </button>
+    <div class="md-select__inner">
+      <ul class="md-select__list">
+        
+          <li class="md-select__item">
+            <a href="../../../guide/autograd/" hreflang="en" class="md-select__link">
+              English
+            </a>
+          </li>
+        
+          <li class="md-select__item">
+            <a href="./" hreflang="ja" class="md-select__link">
+              日本語
+            </a>
+          </li>
+        
+      </ul>
+    </div>
+  </div>
+</div>
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="検索" placeholder="検索" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="検索">
+        
+        <button type="reset" class="md-search__icon md-icon" title="クリア" aria-label="クリア" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            検索を初期化
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/mattn/tensai" title="リポジトリへ" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    mattn/tensai
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="ナビゲーション" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../../" title="tensai" class="md-nav__button md-logo" aria-label="tensai" data-md-component="logo">
+      
+  <img src="../../../assets/logo.svg" alt="logo">
+
+    </a>
+    tensai
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/mattn/tensai" title="リポジトリへ" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    mattn/tensai
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    ホーム
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    はじめに
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    ガイド
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    ガイド
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../tensors/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    テンソルと行列
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../layers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    レイヤー・損失・最適化
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../training/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    モデルの学習
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    自動微分
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    自動微分
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="目次">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      目次
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#paraminputtrainer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Param、Input、Trainer
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        演算
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        畳み込み
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_4" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ブロードキャスト
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#attention" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Attention の組み立て
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tape" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tape によるバッファ再利用
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#gpu" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        グラフを GPU で走らせる
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_5" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        グラフの可視化
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_6" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        リカレントネットワーク
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_7" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        パラメータの保存
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../quantization/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    量子化
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../simd/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SIMD アクセラレーション
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../gpu/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    GPU (WebGPU)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    対応プラットフォーム
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../formats/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    モデルフォーマット
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tokenizers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    トークナイザ
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../llm/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LLM 推論
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    サンプル
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="目次">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      目次
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#paraminputtrainer" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Param、Input、Trainer
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        演算
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        畳み込み
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_4" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ブロードキャスト
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#attention" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Attention の組み立て
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tape" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tape によるバッファ再利用
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#gpu" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        グラフを GPU で走らせる
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_5" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        グラフの可視化
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_6" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        リカレントネットワーク
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_7" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        パラメータの保存
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="_1">自動微分<a class="headerlink" href="#_1" title="Permanent link">&para;</a></h1>
+<p>モデルが Sequential の型にはまらないとき (重み共有、カスタム損失、変わったアーキテクチャ) は、計算を直接組み立ててリバースモード自動微分に勾配を導出させます。エンジンは micrograd スタイル: <code>Node</code> の動的グラフで、define-by-run、使い捨てです。</p>
+<p><code>Node</code> が持つ値は n 次元の <code>Tensor</code> です。つまり <code>(rows, cols)</code> の行列に効く演算がそのまま <code>(batch, sequence, model)</code> の活性にも効きます。要素ごとの演算は NumPy 流にブロードキャストし、<code>MatMul</code> は行列のスタックをまとめて掛けます。リーフを作るところでは <code>Matrix</code> をゼロコピーの 2 次元ビューとして受け取るので、2 次元のコードは今までどおりに読めます。</p>
+<h2 id="paraminputtrainer">Param、Input、Trainer<a class="headerlink" href="#paraminputtrainer" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="nx">w1</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Param</span><span class="p">(</span><span class="nx">tensai</span><span class="p">.</span><span class="nx">RandomMatrix</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="nx">rng</span><span class="p">))</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nx">b1</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Param</span><span class="p">(</span><span class="nx">tensai</span><span class="p">.</span><span class="nx">NewMatrix</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">8</span><span class="p">))</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="nx">w2</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Param</span><span class="p">(</span><span class="nx">tensai</span><span class="p">.</span><span class="nx">RandomMatrix</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nx">rng</span><span class="p">))</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="nx">trainer</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">NewTrainer</span><span class="p">(</span><span class="nx">optim</span><span class="p">.</span><span class="nx">NewAdam</span><span class="p">(</span><span class="mf">0.05</span><span class="p">),</span><span class="w"> </span><span class="nx">w1</span><span class="p">,</span><span class="w"> </span><span class="nx">b1</span><span class="p">,</span><span class="w"> </span><span class="nx">w2</span><span class="p">)</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>
+<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="k">for</span><span class="w"> </span><span class="nx">step</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="nx">step</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="mi">2000</span><span class="p">;</span><span class="w"> </span><span class="nx">step</span><span class="o">++</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="w">    </span><span class="nx">loss</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Input</span><span class="p">(</span><span class="nx">x</span><span class="p">).</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">w1</span><span class="p">).</span><span class="nx">AddRow</span><span class="p">(</span><span class="nx">b1</span><span class="p">).</span><span class="nx">Tanh</span><span class="p">().</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">w2</span><span class="p">).</span><span class="nx">Sigmoid</span><span class="p">().</span><span class="nx">MSELoss</span><span class="p">(</span><span class="nx">y</span><span class="p">.</span><span class="nx">Tensor</span><span class="p">())</span>
+<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="w">    </span><span class="nx">trainer</span><span class="p">.</span><span class="nx">Step</span><span class="p">(</span><span class="nx">loss</span><span class="p">)</span><span class="w"> </span><span class="c1">// 逆伝播 + 更新 + 勾配クリア、損失値を返す</span>
+<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a><span class="p">}</span>
+</code></pre></div>
+<p><code>Param</code> は勾配を追跡して更新する値、<code>Input</code> はデータを包みます。どちらも <code>*tensai.Matrix</code> と <code>*tensai.Tensor</code> の両方を受け取ります。行列は同じ配列を共有する 2 次元テンソルビューになるので、行列から作ったパラメータはその行列を更新し続けます。</p>
+<p>手動で回したいときの部品も公開されています: <code>loss.Backward()</code>、<code>p.Grad()</code>、<code>autograd.ZeroGrads(params...)</code>。<code>Backward</code> は要素が 1 つのノードから始まり、勾配に<strong>加算</strong>します。学習ステップの最後に勾配をクリアするのはそのためです (<code>Trainer.Step</code> がやってくれます)。</p>
+<p>ノードの <code>Value()</code> と <code>Grad()</code> は <code>*tensai.Tensor</code> を返します。フィールドではなくメソッドなのは、値がホストメモリにあるとは限らないからです — デバイス常駐のグラフでは、ここが値の戻ってくる場所になります。<code>Shape()</code> は何も取り寄せずに形状を返し、<code>Matrix()</code> は 2 次元ノードの行列ビュー、<code>Scalar()</code> は 1 要素ノードの値、<code>Named("w1")</code> は <code>ToDot</code> 用のラベルです。</p>
+<h2 id="_2">演算<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>演算</th>
+<th>形状</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>MatMul(o)</code></td>
+<td><code>(…, m, k) * (…, k, n)</code> → <code>(…, m, n)</code>。先頭の軸はブロードキャストするので、2 次元の重み 1 枚がバッチ全体に効きます</td>
+</tr>
+<tr>
+<td><code>Add</code>, <code>Sub</code>, <code>Mul</code> (<code>MulElem</code>), <code>Div</code></td>
+<td>要素ごと、NumPy 流のブロードキャスト</td>
+</tr>
+<tr>
+<td><code>Scale(s)</code>, <code>Neg()</code></td>
+<td>スカラー倍</td>
+</tr>
+<tr>
+<td><code>AddRow(row)</code></td>
+<td><code>(m, n) + (1, n)</code>。<code>Add</code> が元々ブロードキャストするので、意図を明示するだけの形です</td>
+</tr>
+<tr>
+<td><code>T()</code>, <code>Transpose(perm...)</code></td>
+<td>最後の 2 軸を入れ替え / 全軸を並べ替え</td>
+</tr>
+<tr>
+<td><code>Reshape(shape...)</code></td>
+<td>1 つだけ <code>-1</code> を書けます。バッファは共有します</td>
+</tr>
+<tr>
+<td><code>Softmax()</code></td>
+<td>最終軸に対して</td>
+</tr>
+<tr>
+<td><code>LayerNorm(gain, bias, eps)</code></td>
+<td>最終軸に対して。<code>gain</code> と <code>bias</code> は特徴量ごとに 1 要素で、<code>nil</code> でも学習対象でも構いません</td>
+</tr>
+<tr>
+<td><code>Embed(ids, shape...)</code></td>
+<td><code>(vocab, d)</code> のテーブルと <code>len(ids)</code> 個の添字 → <code>shape…, d</code>。同じ id が複数あれば逆伝播で加算されます</td>
+</tr>
+<tr>
+<td><code>Conv2D(w, bias, cfg)</code></td>
+<td><code>(batch, channels, h, w)</code> を <code>(channels*k*k, outChannels)</code> の重みで畳み込み → <code>(batch, outChannels, outH, outW)</code></td>
+</tr>
+<tr>
+<td><code>Im2Col(cfg)</code></td>
+<td>畳み込みが掛けるパッチ展開そのもの</td>
+</tr>
+<tr>
+<td><code>MaxPool2D(size)</code>, <code>AvgPool2D(size)</code></td>
+<td>最後の 2 軸を正方窓で。ストライドは窓と同じ</td>
+</tr>
+<tr>
+<td><code>Sum()</code>, <code>Mean()</code></td>
+<td>全体を 1 要素に集約</td>
+</tr>
+<tr>
+<td><code>SumAxis(axis, keepDims)</code>, <code>MeanAxis(axis, keepDims)</code></td>
+<td>1 軸を集約。負の軸は末尾から数えます</td>
+</tr>
+<tr>
+<td><code>ReLU()</code>, <code>LeakyReLU(a)</code>, <code>Sigmoid()</code>, <code>Tanh()</code>, <code>GELU()</code>, <code>Exp()</code>, <code>Log()</code>, <code>Sqrt()</code></td>
+<td>要素ごと</td>
+</tr>
+<tr>
+<td><code>Dropout(rate, rng)</code></td>
+<td>要素を落として生き残りをスケール。マスクは 1 度引かれ、逆伝播も同じものを使います</td>
+</tr>
+<tr>
+<td><code>MSELoss(target)</code>, <code>SoftmaxCELoss(target)</code>, <code>CrossEntropy(labels []int)</code></td>
+<td>スカラー損失。交差エントロピーは最終軸をクラスとして読みます</td>
+</tr>
+</tbody>
+</table>
+<p>グラフはステップごとに動的に組み立てる使い捨てです。形状の不一致はエラーではなく構築時の panic になります。エラーを返すとチェーンが書けなくなりますし、形状違いはプログラミングのミスだからです。すべての演算の勾配は、テストで数値微分と突き合わせて検証しています。</p>
+<h2 id="_3">畳み込み<a class="headerlink" href="#_3" title="Permanent link">&para;</a></h2>
+<p>畳み込みは <code>Im2Col</code> と積です。展開が各出力ピクセルを「それを作ったパッチの 1 行」に変え、重みは出力チャネルごとに 1 列です。</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1">// x は (batch, channels, height, width)、w は (channels*k*k, outChannels)。</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="nx">h</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">x</span><span class="p">.</span><span class="nx">Conv2D</span><span class="p">(</span><span class="nx">w</span><span class="p">,</span><span class="w"> </span><span class="nx">bias</span><span class="p">,</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Conv</span><span class="p">{</span><span class="nx">Kernel</span><span class="p">:</span><span class="w"> </span><span class="mi">3</span><span class="p">,</span><span class="w"> </span><span class="nx">Pad</span><span class="p">:</span><span class="w"> </span><span class="mi">1</span><span class="p">})</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="nx">h</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">h</span><span class="p">.</span><span class="nx">ReLU</span><span class="p">().</span><span class="nx">MaxPool2D</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span>
+</code></pre></div>
+<p><code>Conv2D</code> は部品を組み合わせているだけ (<code>x.Im2Col(cfg).MatMul(w).Transpose(0, 2, 1).Reshape(...)</code> にバイアス) なので、時間を使う積は GPU が速くするのと同じ積です。組み合わせで足りないときのために <code>Im2Col</code> は単体でも公開しています。<code>MaxPool2D</code> は勝った位置に、<code>AvgPool2D</code> は窓全体に勾配を配ります。順伝播は Sequential が使う <code>layer.Conv2D</code> と一致します。</p>
+<h2 id="_4">ブロードキャスト<a class="headerlink" href="#_4" title="Permanent link">&para;</a></h2>
+<p>要素ごとの演算は末尾の軸を揃え、長さ 1 の軸を引き伸ばします。<code>(1, 1, d)</code> のバイアスが <code>(batch, seq, d)</code> の活性に足せるのはこのためです。勾配は逆向きに同じ規則に従い、<strong>引き伸ばした軸ぶんだけ合計されて戻ります</strong>。バイアスも、特徴量ごとの <code>LayerNorm</code> の gain も、バッチで共有した重みも、それを使った全位置の寄与を特別扱いなしに集められるのはこの一点のおかげです。</p>
+<h2 id="attention">Attention の組み立て<a class="headerlink" href="#attention" title="Permanent link">&para;</a></h2>
+<p>マルチヘッド attention は reshape と transpose とバッチ積 2 回です:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1">// x は (batch, seq, model)、wq, wk, wv, wo は (model, model)。</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="nx">heads</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="kd">func</span><span class="p">(</span><span class="nx">t</span><span class="w"> </span><span class="o">*</span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Node</span><span class="p">)</span><span class="w"> </span><span class="o">*</span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Node</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">    </span><span class="c1">// (batch, seq, model) -&gt; (batch, head, seq, headDim)</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">    </span><span class="k">return</span><span class="w"> </span><span class="nx">t</span><span class="p">.</span><span class="nx">Reshape</span><span class="p">(</span><span class="nx">batch</span><span class="p">,</span><span class="w"> </span><span class="nx">seq</span><span class="p">,</span><span class="w"> </span><span class="nx">nHeads</span><span class="p">,</span><span class="w"> </span><span class="nx">headDim</span><span class="p">).</span><span class="nx">Transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">)</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="p">}</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="nx">q</span><span class="p">,</span><span class="w"> </span><span class="nx">k</span><span class="p">,</span><span class="w"> </span><span class="nx">v</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">heads</span><span class="p">(</span><span class="nx">x</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">wq</span><span class="p">)),</span><span class="w"> </span><span class="nx">heads</span><span class="p">(</span><span class="nx">x</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">wk</span><span class="p">)),</span><span class="w"> </span><span class="nx">heads</span><span class="p">(</span><span class="nx">x</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">wv</span><span class="p">))</span>
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="c1">// 全シーケンス・全ヘッドのスコア (batch, head, seq, seq) を一度に。</span>
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="nx">att</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">q</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">k</span><span class="p">.</span><span class="nx">T</span><span class="p">()).</span><span class="nx">Scale</span><span class="p">(</span><span class="mi">1</span><span class="w"> </span><span class="o">/</span><span class="w"> </span><span class="kt">float32</span><span class="p">(</span><span class="nx">math</span><span class="p">.</span><span class="nx">Sqrt</span><span class="p">(</span><span class="nx">headDim</span><span class="p">))).</span><span class="nx">Add</span><span class="p">(</span><span class="nx">mask</span><span class="p">).</span><span class="nx">Softmax</span><span class="p">()</span>
+<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>
+<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="nx">y</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">att</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">v</span><span class="p">).</span><span class="nx">Transpose</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span><span class="w"> </span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">3</span><span class="p">).</span><span class="nx">Reshape</span><span class="p">(</span><span class="nx">batch</span><span class="p">,</span><span class="w"> </span><span class="nx">seq</span><span class="p">,</span><span class="w"> </span><span class="nx">model</span><span class="p">).</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">wo</span><span class="p">)</span>
+</code></pre></div>
+<p><code>mask</code> は <code>(1, 1, seq, seq)</code> の定数 <code>Input</code> で、対角と下側が <code>0</code>、上側が <code>math.Inf(-1)</code> です。バッチとヘッドにブロードキャストされ、softmax が未来の位置に重みを与えなくなります。<code>_example/tinygpt</code> はこれをそのまま使った文字単位の transformer (pre-norm ブロック、GELU の feed-forward、次文字の交差エントロピー) で、1 分ほどで 1 ページ分のテキストを覚えます。</p>
+<h2 id="tape">Tape によるバッファ再利用<a class="headerlink" href="#tape" title="Permanent link">&para;</a></h2>
+<p>グラフはステップごとに組み立てて捨てるので、既定では中間値と勾配のすべてを毎ステップ確保し直します。<code>Tape</code> はそれを再利用します。パラメータを一度 Bind して、ステップの最後に Reset するだけです:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nx">tape</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">NewTape</span><span class="p">()</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="nx">tape</span><span class="p">.</span><span class="nx">Bind</span><span class="p">(</span><span class="nx">w1</span><span class="p">,</span><span class="w"> </span><span class="nx">b1</span><span class="p">,</span><span class="w"> </span><span class="nx">w2</span><span class="p">,</span><span class="w"> </span><span class="nx">b2</span><span class="p">)</span><span class="w"> </span><span class="c1">// op は親から tape を引き継ぐ</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="k">for</span><span class="w"> </span><span class="nx">step</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="nx">step</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="nx">steps</span><span class="p">;</span><span class="w"> </span><span class="nx">step</span><span class="o">++</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">    </span><span class="nx">trainer</span><span class="p">.</span><span class="nx">Step</span><span class="p">(</span><span class="nx">forward</span><span class="p">(</span><span class="nx">x</span><span class="p">).</span><span class="nx">MSELoss</span><span class="p">(</span><span class="nx">y</span><span class="p">))</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">    </span><span class="nx">tape</span><span class="p">.</span><span class="nx">Reset</span><span class="p">()</span><span class="w"> </span><span class="c1">// このステップのバッファをプールに返す</span>
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="p">}</span>
+</code></pre></div>
+<p>規則は学習ループが元々守っているもの 1 つだけです: <strong><code>Reset</code> の後、終わったステップの値を読んではいけません</strong> — <code>Value</code> も <code>Grad</code> もです。パラメータの値は再利用されない (tape が持つのは op が作ったものだけ) ので、学習した重みはいつでも保持して安全です。それ以外を残したいときは <code>Clone</code> でコピーしてから Reset してください。<code>Tape</code> は並行利用できないので、学習ゴルーチンごとに 1 つ持たせます。</p>
+<p>32 ステップを展開する <code>_example/charrnn</code> では、1 学習ステップの確保量が 22MB から 0.75MB に減り、実時間も約 1/4 短くなります。</p>
+<p>同じ再利用は 1 段下でも使えます。<code>MatMulInto</code>, <code>MatMulTNInto</code>, <code>MatMulNTInto</code>, <code>AddInto</code>, <code>SubInto</code>, <code>MulInto</code>, <code>DivInto</code> は、行列に対する <code>DotInto</code> と同じように、呼び出し側が持つテンソルに書き込みます。</p>
+<h2 id="gpu">グラフを GPU で走らせる<a class="headerlink" href="#gpu" title="Permanent link">&para;</a></h2>
+<p>tape はグラフ全体をデバイスに置けます。値も勾配も Adam の更新もデバイスに留まり、毎ステップ帰ってくるのは損失だけです:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nx">dev</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">gpu</span><span class="p">.</span><span class="nx">Open</span><span class="p">(</span><span class="nx">gpu</span><span class="p">.</span><span class="nx">HighPerformance</span><span class="p">)</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">    </span><span class="k">defer</span><span class="w"> </span><span class="nx">dev</span><span class="p">.</span><span class="nx">Close</span><span class="p">()</span>
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">    </span><span class="nx">tape</span><span class="p">.</span><span class="nx">UseDevice</span><span class="p">(</span><span class="nx">dev</span><span class="p">)</span>
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="p">}</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="nx">tape</span><span class="p">.</span><span class="nx">Bind</span><span class="p">(</span><span class="nx">params</span><span class="p">...)</span><span class="w"> </span><span class="c1">// パラメータは一度アップロードされて常駐する</span>
+</code></pre></div>
+<p><code>Value()</code> と <code>Grad()</code> は必要になった時点でダウンロードするので、ノードを読むコードはそのまま動きます — これがフィールドではなくメソッドである理由です。<code>Resident()</code> は値が今どちらにあるかを返します。</p>
+<p>デバイスにカーネルがある演算はデバイスで走り、それ以外は CPU にフォールバックして、その演算に必要なぶんだけ持ち帰ります。対象は 3 つの積、繰り返しオペランドを許す要素ごとの演算、<code>Scale</code>、ReLU/tanh/sigmoid/GELU とその勾配、<code>LayerNorm</code>、<code>Softmax</code>、<code>Transpose</code>、<code>Reshape</code>、<code>Embed</code> (scatter-add 込み)、ブロードキャストの集約、そして Adam の更新 — つまり transformer ブロックはまるごと常駐し、バスを渡るのは損失だけです。</p>
+<p><code>-tags wgpu24</code> 経由の AMD 780M で、<code>x @ w1 -&gt; GELU -&gt; @ w2 -&gt; MSE</code> の 1 ステップ:</p>
+<table>
+<thead>
+<tr>
+<th>モデル幅</th>
+<th>CPU (AVX2)</th>
+<th>アクセラレータフック</th>
+<th>常駐グラフ</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>512</td>
+<td>31.1ms</td>
+<td>30.8ms</td>
+<td><strong>13.1ms</strong></td>
+</tr>
+<tr>
+<td>1024</td>
+<td>172.8ms</td>
+<td>93.2ms</td>
+<td><strong>33.3ms</strong></td>
+</tr>
+<tr>
+<td>2048</td>
+<td>1382ms</td>
+<td>442ms</td>
+<td><strong>193ms</strong></td>
+</tr>
+</tbody>
+</table>
+<p>transformer ブロック (因果マスク付き pre-norm attention + GELU の feed-forward、batch 8・系列長 128・語彙 512) の学習は:</p>
+<table>
+<thead>
+<tr>
+<th>モデル幅</th>
+<th>CPU (AVX2)</th>
+<th>常駐グラフ</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>256</td>
+<td>83.5ms</td>
+<td><strong>47.0ms</strong></td>
+</tr>
+<tr>
+<td>512</td>
+<td>209.3ms</td>
+<td><strong>54.3ms</strong></td>
+</tr>
+</tbody>
+</table>
+<p>フック (<code>tensai.UseAccelerator</code>) は積を 1 つずつデバイスに送るので積ごとに往復しますが、常駐ではバッチのアップロード 1 回と損失のダウンロード 1 回で済みます。どちらもオプトインで、併用も可能です (tape にデバイスがあるときフックは参照されません)。</p>
+<h2 id="_5">グラフの可視化<a class="headerlink" href="#_5" title="Permanent link">&para;</a></h2>
+<p><code>loss.ToDot()</code> は Graphviz の DOT を返します (リーフには <code>.Named("w1")</code> でラベルを付けます):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>go<span class="w"> </span>run<span class="w"> </span>./_example/dot<span class="w"> </span><span class="p">|</span><span class="w"> </span>dot<span class="w"> </span>-Tsvg<span class="w"> </span>&gt;<span class="w"> </span>graph.svg
+</code></pre></div>
+<h2 id="_6">リカレントネットワーク<a class="headerlink" href="#_6" title="Permanent link">&para;</a></h2>
+<p><code>rnn.Cell</code> と <code>rnn.LSTMCell</code> は自動微分エンジンの上に乗っているので、系列の展開はただの Go のループで、BPTT は自動で付いてきます:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nx">cell</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">rnn</span><span class="p">.</span><span class="nx">NewLSTMCell</span><span class="p">(</span><span class="nx">inSize</span><span class="p">,</span><span class="w"> </span><span class="nx">hidden</span><span class="p">,</span><span class="w"> </span><span class="nx">rng</span><span class="p">)</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="nx">wOut</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Param</span><span class="p">(</span><span class="nx">tensai</span><span class="p">.</span><span class="nx">RandomMatrix</span><span class="p">(</span><span class="nx">hidden</span><span class="p">,</span><span class="w"> </span><span class="nx">numClasses</span><span class="p">,</span><span class="w"> </span><span class="nx">rng</span><span class="p">))</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="nx">bOut</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Param</span><span class="p">(</span><span class="nx">tensai</span><span class="p">.</span><span class="nx">NewMatrix</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="nx">numClasses</span><span class="p">))</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="nx">trainer</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">autograd</span><span class="p">.</span><span class="nx">NewTrainer</span><span class="p">(</span><span class="nx">optim</span><span class="p">.</span><span class="nx">NewAdam</span><span class="p">(</span><span class="mf">0.01</span><span class="p">),</span><span class="w"> </span><span class="nb">append</span><span class="p">(</span><span class="nx">cell</span><span class="p">.</span><span class="nx">Params</span><span class="p">(),</span><span class="w"> </span><span class="nx">wOut</span><span class="p">,</span><span class="w"> </span><span class="nx">bOut</span><span class="p">)...)</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="k">for</span><span class="w"> </span><span class="nx">step</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="mi">0</span><span class="p">;</span><span class="w"> </span><span class="nx">step</span><span class="w"> </span><span class="o">&lt;</span><span class="w"> </span><span class="nx">epochs</span><span class="p">;</span><span class="w"> </span><span class="nx">step</span><span class="o">++</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a><span class="w">    </span><span class="nx">h</span><span class="p">,</span><span class="w"> </span><span class="nx">c</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">cell</span><span class="p">.</span><span class="nx">InitState</span><span class="p">(</span><span class="nx">batch</span><span class="p">)</span>
+<a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a><span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="nx">_</span><span class="p">,</span><span class="w"> </span><span class="nx">x</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="k">range</span><span class="w"> </span><span class="nx">steps</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="c1">// 1 時刻あたり (batch x inSize) の行列 1 枚</span>
+<a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a><span class="w">        </span><span class="nx">h</span><span class="p">,</span><span class="w"> </span><span class="nx">c</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">cell</span><span class="p">.</span><span class="nx">Step</span><span class="p">(</span><span class="nx">autograd</span><span class="p">.</span><span class="nx">Input</span><span class="p">(</span><span class="nx">x</span><span class="p">),</span><span class="w"> </span><span class="nx">h</span><span class="p">,</span><span class="w"> </span><span class="nx">c</span><span class="p">)</span>
+<a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a><span class="w">    </span><span class="p">}</span>
+<a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a><span class="w">    </span><span class="nx">logits</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">h</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">wOut</span><span class="p">).</span><span class="nx">AddRow</span><span class="p">(</span><span class="nx">bOut</span><span class="p">)</span>
+<a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a><span class="w">    </span><span class="nx">trainer</span><span class="p">.</span><span class="nx">Step</span><span class="p">(</span><span class="nx">logits</span><span class="p">.</span><span class="nx">CrossEntropy</span><span class="p">(</span><span class="nx">labels</span><span class="p">))</span><span class="w"> </span><span class="c1">// labels はクラス番号の []int</span>
+<a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a><span class="p">}</span>
+</code></pre></div>
+<p><code>_example/charrnn</code> は埋め込んだパブリックドメインのテキストで文字単位の LSTM を学習し、読み直したパラメータから文章を生成します。</p>
+<p><code>rnn.SelfAttention</code> はシングルヘッド・1 系列版です。<code>attn.Forward(x)</code> が <code>(seqLen, inSize)</code> のノードに対して学習済み射影付きの <code>softmax(Q*K^T/sqrt(d))*V</code> を計算し、素の <code>rnn.Attention(q, k, v)</code> も公開されています。バッチとヘッドが要るときは上のブロックを書いてください。</p>
+<h2 id="_7">パラメータの保存<a class="headerlink" href="#_7" title="Permanent link">&para;</a></h2>
+<p>自動微分のパラメータは順番で保存・復元します:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="nx">autograd</span><span class="p">.</span><span class="nx">SaveParamsFile</span><span class="p">(</span><span class="s">"cell.json"</span><span class="p">,</span><span class="w"> </span><span class="nx">cell</span><span class="p">.</span><span class="nx">Params</span><span class="p">()...)</span>
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="c1">// 同じセルを組み立ててから</span>
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a><span class="nx">autograd</span><span class="p">.</span><span class="nx">LoadParamsFile</span><span class="p">(</span><span class="s">"cell.json"</span><span class="p">,</span><span class="w"> </span><span class="nx">cell</span><span class="p">.</span><span class="nx">Params</span><span class="p">()...)</span>
+</code></pre></div>
+<p>任意のランクのパラメータが往復します。2 次元のものは以前のチェックポイントと同じエンコーディングを保つので、エンジンが n 次元になる前に書いたファイルもそのまま読めます。</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  ページトップへ戻る
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="フッター" >
+        
+          
+          <a href="../training/" class="md-footer__link md-footer__link--prev" aria-label="前: モデルの学習">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                前
+              </span>
+              <div class="md-ellipsis">
+                モデルの学習
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../quantization/" class="md-footer__link md-footer__link--next" aria-label="次: 量子化">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                次
+              </span>
+              <div class="md-ellipsis">
+                量子化
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      MIT License &mdash; Yasuhiro Matsumoto (a.k.a. mattn)
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/mattn" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "\u30b3\u30d4\u30fc\u3057\u307e\u3057\u305f", "clipboard.copy": "\u30af\u30ea\u30c3\u30d7\u30dc\u30fc\u30c9\u3078\u30b3\u30d4\u30fc", "search.result.more.one": "\u3053\u306e\u30da\u30fc\u30b8\u5185\u306b\u3082\u30461\u4ef6\u898b\u3064\u304b\u308a\u307e\u3057\u305f", "search.result.more.other": "\u3053\u306e\u30da\u30fc\u30b8\u5185\u306b\u3042\u3068#\u4ef6\u898b\u3064\u304b\u308a\u307e\u3057\u305f", "search.result.none": "\u4f55\u3082\u898b\u3064\u304b\u308a\u307e\u305b\u3093\u3067\u3057\u305f", "search.result.one": "1\u4ef6\u898b\u3064\u304b\u308a\u307e\u3057\u305f", "search.result.other": "#\u4ef6\u898b\u3064\u304b\u308a\u307e\u3057\u305f", "search.result.placeholder": "\u691c\u7d22\u30ad\u30fc\u30ef\u30fc\u30c9\u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044", "search.result.term.missing": "\u691c\u7d22\u306b\u542b\u307e\u308c\u306a\u3044", "select.version": "\u30d0\u30fc\u30b8\u30e7\u30f3\u5207\u308a\u66ff\u3048"}, "version": null}</script>
+    
+    
+      <script src="../../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

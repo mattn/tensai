@@ -1,0 +1,1276 @@
+
+<!doctype html>
+<html lang="ja" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="A tiny machine-learning framework in pure Go">
+      
+      
+      
+        <link rel="canonical" href="https://mattn.github.io/tensai/ja/guide/gpu/">
+      
+      
+        <link rel="prev" href="../simd/">
+      
+      
+        <link rel="next" href="../platforms/">
+      
+      
+        
+          <link rel="alternate" href="../../../guide/gpu/" hreflang="en">
+        
+          <link rel="alternate" href="./" hreflang="ja">
+        
+      
+      
+      <link rel="icon" href="../../../assets/logo.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>GPU (WebGPU) - tensai</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#gpu-webgpu" class="md-skip">
+          コンテンツにスキップ
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="ヘッダー">
+    <a href="../../" title="tensai" class="md-header__button md-logo" aria-label="tensai" data-md-component="logo">
+      
+  <img src="../../../assets/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            tensai
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              GPU (WebGPU)
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+      <div class="md-header__option">
+  <div class="md-select">
+    
+    <button class="md-header__button md-icon" aria-label="言語切り替え">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m12.87 15.07-2.54-2.51.03-.03A17.5 17.5 0 0 0 14.07 6H17V4h-7V2H8v2H1v2h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2zm-2.62 7 1.62-4.33L19.12 17z"/></svg>
+    </button>
+    <div class="md-select__inner">
+      <ul class="md-select__list">
+        
+          <li class="md-select__item">
+            <a href="../../../guide/gpu/" hreflang="en" class="md-select__link">
+              English
+            </a>
+          </li>
+        
+          <li class="md-select__item">
+            <a href="./" hreflang="ja" class="md-select__link">
+              日本語
+            </a>
+          </li>
+        
+      </ul>
+    </div>
+  </div>
+</div>
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="検索" placeholder="検索" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="検索">
+        
+        <button type="reset" class="md-search__icon md-icon" title="クリア" aria-label="クリア" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            検索を初期化
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/mattn/tensai" title="リポジトリへ" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    mattn/tensai
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="ナビゲーション" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../../" title="tensai" class="md-nav__button md-logo" aria-label="tensai" data-md-component="logo">
+      
+  <img src="../../../assets/logo.svg" alt="logo">
+
+    </a>
+    tensai
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/mattn/tensai" title="リポジトリへ" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+  </div>
+  <div class="md-source__repository">
+    mattn/tensai
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    ホーム
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    はじめに
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    ガイド
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    ガイド
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../tensors/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    テンソルと行列
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../layers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    レイヤー・損失・最適化
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../training/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    モデルの学習
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../autograd/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    自動微分
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../quantization/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    量子化
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../simd/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SIMD アクセラレーション
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    GPU (WebGPU)
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    GPU (WebGPU)
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="目次">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      目次
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        セットアップ
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        基本的な使い方
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        常駐バッファ
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#attention" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        デバイス上の attention
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_4" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        デバイス上の量子化重み
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_5" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        学習: アクセラレータフック
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_6" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        クロスオーバーの測定
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-tags-wgpu24-wgpu-native-api-wsl2-gpu" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -tags wgpu24: 新しい wgpu-native API と、WSL2 の中の本物の GPU
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../platforms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    対応プラットフォーム
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../formats/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    モデルフォーマット
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../tokenizers/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    トークナイザ
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../llm/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    LLM 推論
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../examples/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    サンプル
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="目次">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      目次
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#_1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        セットアップ
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        基本的な使い方
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        常駐バッファ
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#attention" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        デバイス上の attention
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_4" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        デバイス上の量子化重み
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_5" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        学習: アクセラレータフック
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#_6" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        クロスオーバーの測定
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#-tags-wgpu24-wgpu-native-api-wsl2-gpu" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        -tags wgpu24: 新しい wgpu-native API と、WSL2 の中の本物の GPU
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="gpu-webgpu">GPU (WebGPU)<a class="headerlink" href="#gpu-webgpu" title="Permanent link">&para;</a></h1>
+<p><code>-tags wgpu</code> (linux, macOS, Windows) でビルドすると、CPU 版 <code>MatMul</code> と同じ形状・ブロードキャスト意味論の実験的 GPU バックエンドが有効になります。cgo は使いません: バインディングは <a href="https://github.com/gfx-rs/wgpu-native">wgpu-native</a> 共有ライブラリを <code>ebitengine/purego</code> 経由で実行時にロードします (linux/macOS は <code>dlopen</code>、Windows は <code>LoadLibrary</code>)。wgpu-native は Linux で Vulkan、Windows で Vulkan か D3D12、macOS で Metal を選ぶので、AMD、Intel、Apple、NVIDIA の GPU がすべて動きます — lavapipe のような CPU Vulkan 実装も動き、GPU のないマシンでのテストはそれで回っています。</p>
+<h2 id="_1">セットアップ<a class="headerlink" href="#_1" title="Permanent link">&para;</a></h2>
+<p><strong>v22.1.0.5</strong> のリリースバイナリ (このバインディングが対象とする C API) をダウンロードし、ローダーが見つかる場所に置くか <code>TENSAI_WGPU_LIB</code> で指定します:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>curl<span class="w"> </span>-sLO<span class="w"> </span>https://github.com/gfx-rs/wgpu-native/releases/download/v22.1.0.5/wgpu-linux-x86_64-release.zip
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>unzip<span class="w"> </span>wgpu-linux-x86_64-release.zip<span class="w"> </span>-d<span class="w"> </span>wgpu
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="nv">TENSAI_WGPU_LIB</span><span class="o">=</span><span class="nv">$PWD</span>/wgpu/lib/libwgpu_native.so<span class="w"> </span>go<span class="w"> </span><span class="nb">test</span><span class="w"> </span>-tags<span class="w"> </span>wgpu<span class="w"> </span>./...
+</code></pre></div>
+<p>Windows では同じリリースの <code>wgpu-windows-x86_64-msvc-release.zip</code> を取り、中の <code>wgpu_native.dll</code> を変数で指定します (<code>PATH</code> 上か実行ファイルの隣にある <code>wgpu_native.dll</code> は変数なしで見つかります):</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="nv">$env:TENSAI_WGPU_LIB</span><span class="p">=</span><span class="s2">"$PWD\wgpu\lib\wgpu_native.dll"</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="n">go</span> <span class="n">run</span> <span class="n">-tags</span> <span class="n">wgpu</span> <span class="p">./</span><span class="n">_example</span><span class="p">/</span><span class="n">wgpu</span>
+</code></pre></div>
+<p>ビルドタグなしでは <code>gpu.Open</code> がエラーを返すだけで、他には何も変わりません。</p>
+<h2 id="_2">基本的な使い方<a class="headerlink" href="#_2" title="Permanent link">&para;</a></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nx">dev</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">gpu</span><span class="p">.</span><span class="nx">Open</span><span class="p">()</span><span class="w"> </span><span class="c1">// GPU やライブラリがなければきれいに失敗する</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">!=</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="cm">/* tensai.MatMul にフォールバック */</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="k">defer</span><span class="w"> </span><span class="nx">dev</span><span class="p">.</span><span class="nx">Close</span><span class="p">()</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="nx">fmt</span><span class="p">.</span><span class="nx">Println</span><span class="p">(</span><span class="nx">dev</span><span class="p">.</span><span class="nx">Name</span><span class="p">())</span><span class="w"> </span><span class="c1">// 例: "AMD Radeon 780M (integrated)"</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="nx">out</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">dev</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">a</span><span class="p">,</span><span class="w"> </span><span class="nx">b</span><span class="p">)</span>
+</code></pre></div>
+<p>iGPU と dGPU の両方があるマシンでは希望を渡せます: <code>gpu.Open(gpu.LowPower)</code> は iGPU へ、<code>gpu.HighPerformance</code> は dGPU へ寄せます (ヒントです — アダプタが 1 つならそれが返ります)。</p>
+<h2 id="_3">常駐バッファ<a class="headerlink" href="#_3" title="Permanent link">&para;</a></h2>
+<p><code>dev.MatMul(a, b)</code> は Upload → MatMul → Download → Free の省略形です。バッファを GPU に常駐させれば、重みはバスを 1 回しか渡らず、中間結果はデバイスを離れません:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nx">gw</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">dev</span><span class="p">.</span><span class="nx">Upload</span><span class="p">(</span><span class="nx">w</span><span class="p">)</span><span class="w">              </span><span class="c1">// 重みは 1 回だけアップロード</span>
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="k">defer</span><span class="w"> </span><span class="nx">gw</span><span class="p">.</span><span class="nx">Free</span><span class="p">()</span><span class="w">                     </span><span class="c1">// GPU メモリは GC されない</span>
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="nx">gx</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">dev</span><span class="p">.</span><span class="nx">Upload</span><span class="p">(</span><span class="nx">x</span><span class="p">)</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="nx">h</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">gx</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">gw</span><span class="p">)</span><span class="w">               </span><span class="c1">// 自由にチェーン。ホストには触れない</span>
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="nx">out</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">h</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">gw2</span><span class="p">)</span>
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="nx">result</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">out</span><span class="p">.</span><span class="nx">Download</span><span class="p">()</span><span class="w">         </span><span class="c1">// 最後に 1 回だけ読み戻す</span>
+</code></pre></div>
+<p>常駐が最も効くのは転送のたびに PCIe を渡るディスクリート GPU です。共有メモリの iGPU では効果は小さく、主に中間結果の読み戻しを省ける分になります。</p>
+<h2 id="attention">デバイス上の attention<a class="headerlink" href="#attention" title="Permanent link">&para;</a></h2>
+<p>MatMul の他に、常駐テンソルは <code>MatMulT</code>、インプレースの <code>Scale</code>、最終軸の行並列 <code>Softmax</code> をサポートします — シングルヘッド attention を GPU 上で完結させるのに十分です:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nx">out</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">gq</span><span class="p">.</span><span class="nx">Attention</span><span class="p">(</span><span class="nx">gk</span><span class="p">,</span><span class="w"> </span><span class="nx">gv</span><span class="p">)</span><span class="w">                 </span><span class="c1">// softmax(q@k^T/sqrt(d))@v、ホスト往復なし</span>
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="nx">out</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="nx">gq</span><span class="p">.</span><span class="nx">MultiHeadAttention</span><span class="p">(</span><span class="nx">gk</span><span class="p">,</span><span class="w"> </span><span class="nx">gv</span><span class="p">,</span><span class="w"> </span><span class="nx">heads</span><span class="p">)</span><span class="w">  </span><span class="c1">// パックされた (batch, seq, heads*dh) レイアウト</span>
+</code></pre></div>
+<p>マルチヘッド attention はストライド付きカーネルでパックレイアウトから各ヘッドを切り出すので、permute は一切実体化されません。causal 版 (<code>CausalAttention</code>, <code>CausalMultiHeadAttention</code>) はカーネル内で未来位置をマスクし、k と v は q より多くの位置を持てます — 自己回帰モデルのプロンプトプレフィルとチャンクデコードのパターンです — のでマスクテンソルも作られません。<code>CausalMultiHeadAttention</code> は 1 回の融合 flash-attention 風ディスパッチ (kv タイル上のオンライン softmax、ヘッド次元 128 まで) で走ります: スコア行列は存在しないので、メモリはシーケンス長によらず q+k+v+出力 のままです。</p>
+<h2 id="_4">デバイス上の量子化重み<a class="headerlink" href="#_4" title="Permanent link">&para;</a></h2>
+<p><code>UploadQ8</code> は <code>QMatrix</code> を u32 あたり int8 重み 4 つでパックし、<code>gpu.QMatrix.MatMul</code> がレジスタ内で逆量子化するので、デコード matvec の転送は f32 の 1/4 バイトになります。<code>UploadQ4</code> は int4 の双子に同じことをするので、<code>-q4 -gpu</code> は int8 では収まらないモデルを動かせます。</p>
+<p>トランスフォーマーのデコード 1 ステップの残りも揃っています — <code>RMSNorm</code>、インプレース <code>RoPE</code>、<code>Add</code>、<code>SiluMul</code>、<code>GroupedCausalAttention</code> (クエリよりヘッド数の少ない KV キャッシュ)、常駐キャッシュに新しい k/v 行を追記する <code>CopyRowsInto</code> — なので <code>tensai run -q8 -gpu</code> は全ブロックをデバイス上で実行し、トークンごとに戻ってくるのは隠れ状態だけです。<code>BeginBatch</code>/<code>Flush</code> は 1 トークン分のディスパッチを 1 回のサブミッションに記録し、解放された中間バッファはバッファプールで再利用されます。</p>
+<h2 id="_5">学習: アクセラレータフック<a class="headerlink" href="#_5" title="Permanent link">&para;</a></h2>
+<p>ここまでの積はすべて推論の形です。学習では 1 つの matmul につきさらに 2 つ増えます — 入力側の勾配 <code>grad * w^T</code> と重みの勾配 <code>x^T * grad</code> で、常駐テンソルではそれぞれ <code>MatMulT</code> と <code>MatMulTN</code> です。</p>
+<p><code>Device</code> は <code>tensai.Accelerator</code> を満たすので、1 行で、どのパッケージのものであれ CPU が回すはずだった積を GPU に回せます:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nx">dev</span><span class="p">,</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">gpu</span><span class="p">.</span><span class="nx">Open</span><span class="p">(</span><span class="nx">gpu</span><span class="p">.</span><span class="nx">HighPerformance</span><span class="p">)</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="k">if</span><span class="w"> </span><span class="nx">err</span><span class="w"> </span><span class="o">==</span><span class="w"> </span><span class="kc">nil</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">    </span><span class="k">defer</span><span class="w"> </span><span class="nx">dev</span><span class="p">.</span><span class="nx">Close</span><span class="p">()</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="w">    </span><span class="nx">tensai</span><span class="p">.</span><span class="nx">UseAccelerator</span><span class="p">(</span><span class="nx">dev</span><span class="p">)</span><span class="w"> </span><span class="c1">// 止めるときは tensai.UseAccelerator(nil)</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a><span class="p">}</span>
+</code></pre></div>
+<p>デバイスに送られるのは <code>tensai.DefaultAcceleratorThreshold</code> (4e8 積和) 以上の積だけです。それより小さいものは AVX2 カーネルの方が速く、往復のぶんだけ損をします。境界を変えるには <code>tensai.UseAcceleratorThreshold</code> を使います。バックエンドがエラーを返した積は CPU で実行されるので、アクセラレーションが答えを変えることはありません — 変わるのは所要時間だけです。</p>
+<p>学習ステップの他の部分は動きません。活性も勾配も optimizer もホスト側に残るので、高速化された積はそのつどオペランドをアップロードし結果をダウンロードします。これが上限を決めていて、しきい値がこの値である理由でもあります。<code>-tags wgpu24</code> 経由の AMD 780M で、射影 2 つのブロック (<code>x @ w1 -&gt; GELU -&gt; @ w2 -&gt; MSE</code>、積は 6 つ) の autograd 1 ステップを測ると:</p>
+<table>
+<thead>
+<tr>
+<th>モデル幅</th>
+<th>CPU (AVX2)</th>
+<th>デバイス使用</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>512</td>
+<td>31.3ms</td>
+<td>32.4ms</td>
+<td>しきい値未満なので変化なし</td>
+</tr>
+<tr>
+<td>1024</td>
+<td>176ms</td>
+<td>145ms</td>
+<td>1.22x</td>
+</tr>
+<tr>
+<td>2048</td>
+<td>1367ms</td>
+<td>955ms</td>
+<td>1.43x</td>
+</tr>
+</tbody>
+</table>
+<p>グラフ全体を常駐させれば転送そのものが無くなります。同じステップが幅 2048 で 193ms、CPU の 7 倍です。やり方は<a href="../autograd/">自動微分</a>の tape の節を参照してください。</p>
+<p>ここまでが積です。逆伝播の残りも、推論では単独では要らなかった常駐カーネルとして揃っています:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="nx">h</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">gx</span><span class="p">.</span><span class="nx">MatMul</span><span class="p">(</span><span class="nx">gw</span><span class="p">)</span><span class="w">               </span><span class="c1">// 順伝播</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="nx">a</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">h</span><span class="p">.</span><span class="nx">Activate</span><span class="p">(</span><span class="nx">gpu</span><span class="p">.</span><span class="nx">ActGELU</span><span class="p">)</span><span class="w">     </span><span class="c1">// 戻りは h.ActivateGrad(gpu.ActGELU, grad)</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="nx">s</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">a</span><span class="p">.</span><span class="nx">Binary</span><span class="p">(</span><span class="nx">gpu</span><span class="p">.</span><span class="nx">OpMul</span><span class="p">,</span><span class="w"> </span><span class="nx">gscale</span><span class="p">)</span><span class="w"> </span><span class="c1">// add, sub, mul, div。短いオペランドは繰り返す</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="nx">db</span><span class="p">,</span><span class="w"> </span><span class="nx">_</span><span class="w"> </span><span class="o">:=</span><span class="w"> </span><span class="nx">gdelta</span><span class="p">.</span><span class="nx">SumCols</span><span class="p">()</span><span class="w">           </span><span class="c1">// バッチにブロードキャストした行の勾配</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a><span class="nx">gw</span><span class="p">.</span><span class="nx">AdamStep</span><span class="p">(</span><span class="nx">ggrad</span><span class="p">,</span><span class="w"> </span><span class="nx">gm</span><span class="p">,</span><span class="w"> </span><span class="nx">gv</span><span class="p">,</span><span class="w"> </span><span class="nx">lr</span><span class="p">,</span><span class="w"> </span><span class="nx">b1</span><span class="p">,</span><span class="w"> </span><span class="nx">b2</span><span class="p">,</span><span class="w"> </span><span class="nx">rc1</span><span class="p">,</span><span class="w"> </span><span class="nx">rc2</span><span class="p">,</span><span class="w"> </span><span class="nx">eps</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">)</span>
+</code></pre></div>
+<p><code>LayerNorm</code>・<code>LayerNormGrad</code>・<code>LayerNormXhat</code> は最終軸の正規化とその分解、<code>SoftmaxGrad</code> は softmax のヤコビアンを 1 パスで適用し、<code>Permute</code> は 4 軸までの並べ替え (attention がヘッドを分ける reshape + transpose) を行います。<code>Embed</code> は <code>UploadIndices</code> で上げた添字列でテーブル行を集め、<code>EmbedGrad</code> が勾配を書き戻します。WGSL に f32 のアトミック加算が無いのでビットパターンへの compare-and-swap で実装しており、バッチ内で同じトークンが複数回出ても正しく加算されます。<code>Activate</code> と <code>ActivateGrad</code> は ReLU・tanh・sigmoid・GELU に対応し、CPU カーネルと同じ式です — ここの GELU は誤差関数版で、推論経路が FFN に融合している tanh 近似ではありません — なので学習の途中でデバイスとホストを行き来できます。<code>AdamStep</code> も <code>optim</code> のカーネルと一致し、モーメントも含めて同じです。</p>
+<h2 id="_6">クロスオーバーの測定<a class="headerlink" href="#_6" title="Permanent link">&para;</a></h2>
+<p><code>_example/wgpu -sweep</code> はサイズの階段を上りながら、GPU が CPU カーネルを追い越す地点に印を付けます。CPU 側はパッケージの他の部分と同じ <code>dotRows</code> カーネルなので、サンプルを 2 回ビルドすればポータブル Go、AVX2、GPU の 2 つの使用パターンを比較できます:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="nv">GOEXPERIMENT</span><span class="o">=</span>nosimd<span class="w"> </span>go<span class="w"> </span>build<span class="w"> </span>-tags<span class="w"> </span>wgpu<span class="w"> </span>-o<span class="w"> </span>wgpu-nosimd<span class="w"> </span>./_example/wgpu
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a><span class="nv">GOEXPERIMENT</span><span class="o">=</span>simd<span class="w">   </span>go<span class="w"> </span>build<span class="w"> </span>-tags<span class="w"> </span>wgpu<span class="w"> </span>-o<span class="w"> </span>wgpu-simd<span class="w">   </span>./_example/wgpu
+<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>./wgpu-nosimd<span class="w"> </span>-sweep<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>./wgpu-simd<span class="w"> </span>-sweep
+</code></pre></div>
+<p>Ryzen の iGPU (AMD Radeon 780M、ネイティブ Windows、AVX2 CPU カーネル) では、レジスタタイリングカーネルが階段の全段を GPU 側に載せます:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>             shape                   MFLOP   gpu+xfer   resident        cpu   res/cpu
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>mnist dense  1x100x784@784x128        20.1     1.51ms      597µs      652µs     1.09x
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>mnist conv2  1x19600x72@72x16         45.2    1.388ms      763µs    2.354ms     3.09x
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>tiny         1x128x128@128x128         4.2      432µs      302µs      410µs     1.36x
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>small        1x512x512@512x512       268.4    1.331ms    1.216ms    6.865ms     5.65x
+<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>medium       8x512x512@512x512      2147.5    8.053ms    6.297ms    71.56ms    11.36x
+<a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a>large        32x512x512@512x512     8589.9    86.71ms   28.856ms  266.277ms     9.23x
+<a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a>huge         64x512x512@512x512    17179.9  116.374ms   62.128ms  566.726ms     9.12x
+</code></pre></div>
+<p>クロスオーバーは CPU カーネル、GPU ドライバ、転送パターンで動きます — WSL2 内の dozen のような変換レイヤー越しでは比率はほぼ同等〜3 倍に縮み、CPU Vulkan 実装では GPU パスが素直に負けます。出荷するドライバの上で測ってください。</p>
+<h2 id="-tags-wgpu24-wgpu-native-api-wsl2-gpu"><code>-tags wgpu24</code>: 新しい wgpu-native API と、WSL2 の中の本物の GPU<a class="headerlink" href="#-tags-wgpu24-wgpu-native-api-wsl2-gpu" title="Permanent link">&para;</a></h2>
+<p><code>-tags wgpu24</code> は同じ <code>gpu.Open</code> API を刷新された wgpu-native C API に対してビルドします — <strong>v29 系</strong>のリリースバイナリと組み合わせてください。新 API の収穫は <code>WGPUInstanceFlag_AllowUnderlyingNoncompliantAdapter</code> で、非準拠の Vulkan ドライバを見えるようにします。具体的には: Mesa の dozen (Vulkan-on-D3D12) は WSL2 内で本物のホスト GPU を公開しますが、v22 API はそれを非準拠として隠して lavapipe にフォールバックします。wgpu24 ビルドなら届きます:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="nv">VK_DRIVER_FILES</span><span class="o">=</span>/path/to/dzn_icd.json<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a><span class="nv">TENSAI_WGPU_LIB</span><span class="o">=</span><span class="nv">$PWD</span>/wgpu29/lib/libwgpu_native.so<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a><span class="w">    </span>go<span class="w"> </span>run<span class="w"> </span>-tags<span class="w"> </span>wgpu24<span class="w"> </span>./_example/wgpu<span class="w">   </span><span class="c1"># adapter: Microsoft Direct3D12 (AMD Radeon(TM) Graphics)</span>
+</code></pre></div>
+<p>両方のタグを付けると <code>wgpu24</code> が勝ちます。そしてこのような環境では、その選択がすべてを決めます — どのアダプタに届くかが決まるからです。WSL2 内の dozen 越しに Radeon 780M で測ると、v22 ビルドは llvmpipe に落ちます:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><code>-tags wgpu</code> (v22)</th>
+<th><code>-tags wgpu24</code> (v29)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>到達したアダプタ</td>
+<td>llvmpipe (ソフトウェア)</td>
+<td>Microsoft Direct3D12 (Radeon 780M)</td>
+</tr>
+<tr>
+<td>f32 <code>32x512x512@512x512</code>、入力常駐</td>
+<td>461.7ms</td>
+<td>69.5ms</td>
+</tr>
+<tr>
+<td>int8 プレフィル / デコード</td>
+<td>27.0 / 6.0 t/s</td>
+<td>1801 / 27.1 t/s</td>
+</tr>
+</tbody>
+</table>
+<p><code>Makefile</code> が <code>wgpu24</code> でビルドするのはこのためです。この差はどちらのビルドがどのハードウェアに届くかであって、同じアダプタ上で 2 つのライブラリを比較した結果ではありません — 準拠ドライバが両方から見える環境なら、どちらでも構いません。</p>
+<p>どちらの束縛でビルドするかは変数なので、片方と相性の悪いドライバに当たっても
+ファイルを編集せずに切り替えられます:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>make<span class="w"> </span>build<span class="w">              </span><span class="c1"># 既定の wgpu24</span>
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>make<span class="w"> </span>build<span class="w"> </span><span class="nv">WGPU</span><span class="o">=</span>wgpu<span class="w">    </span><span class="c1"># v22 の束縛</span>
+</code></pre></div>
+<p><code>install</code> と <code>cross</code> も同じ変数を見ます。バイナリとライブラリは対にしてください —
+<code>wgpu24</code> ビルドには v29 系の <code>libwgpu_native</code>、<code>wgpu</code> ビルドには v22 が要ります。
+バイナリの隣にあるもの以外を読ませたいときは <code>TENSAI_WGPU_LIB</code> で指定します。
+リリースは両方を配っているので、片方と相性の悪いドライバに当たっても Go を
+入れ直す必要はありません — <code>tensai_*</code> が <code>wgpu24</code> ビルド、<code>tensai-wgpu22_*</code> が
+もう一方で、中のバイナリ名はどちらも <code>tensai</code> です。</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  ページトップへ戻る
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+    
+      
+      <nav class="md-footer__inner md-grid" aria-label="フッター" >
+        
+          
+          <a href="../simd/" class="md-footer__link md-footer__link--prev" aria-label="前: SIMD アクセラレーション">
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+            </div>
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                前
+              </span>
+              <div class="md-ellipsis">
+                SIMD アクセラレーション
+              </div>
+            </div>
+          </a>
+        
+        
+          
+          <a href="../platforms/" class="md-footer__link md-footer__link--next" aria-label="次: 対応プラットフォーム">
+            <div class="md-footer__title">
+              <span class="md-footer__direction">
+                次
+              </span>
+              <div class="md-ellipsis">
+                対応プラットフォーム
+              </div>
+            </div>
+            <div class="md-footer__button md-icon">
+              
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M4 11v2h12l-5.5 5.5 1.42 1.42L19.84 12l-7.92-7.92L10.5 5.5 16 11z"/></svg>
+            </div>
+          </a>
+        
+      </nav>
+    
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+    <div class="md-copyright__highlight">
+      MIT License &mdash; Yasuhiro Matsumoto (a.k.a. mattn)
+    </div>
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/mattn" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M173.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6m-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3m44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9M252.8 8C114.1 8 8 113.3 8 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C436.2 457.8 504 362.9 504 252 504 113.3 391.5 8 252.8 8M105.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1m-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7m32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1m-11.4-14.7c-1.6 1-1.6 3.6 0 5.9s4.3 3.3 5.6 2.3c1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../../..", "features": ["navigation.sections", "navigation.top", "navigation.footer", "content.code.copy", "search.suggest", "search.highlight"], "search": "../../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "\u30b3\u30d4\u30fc\u3057\u307e\u3057\u305f", "clipboard.copy": "\u30af\u30ea\u30c3\u30d7\u30dc\u30fc\u30c9\u3078\u30b3\u30d4\u30fc", "search.result.more.one": "\u3053\u306e\u30da\u30fc\u30b8\u5185\u306b\u3082\u30461\u4ef6\u898b\u3064\u304b\u308a\u307e\u3057\u305f", "search.result.more.other": "\u3053\u306e\u30da\u30fc\u30b8\u5185\u306b\u3042\u3068#\u4ef6\u898b\u3064\u304b\u308a\u307e\u3057\u305f", "search.result.none": "\u4f55\u3082\u898b\u3064\u304b\u308a\u307e\u305b\u3093\u3067\u3057\u305f", "search.result.one": "1\u4ef6\u898b\u3064\u304b\u308a\u307e\u3057\u305f", "search.result.other": "#\u4ef6\u898b\u3064\u304b\u308a\u307e\u3057\u305f", "search.result.placeholder": "\u691c\u7d22\u30ad\u30fc\u30ef\u30fc\u30c9\u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044", "search.result.term.missing": "\u691c\u7d22\u306b\u542b\u307e\u308c\u306a\u3044", "select.version": "\u30d0\u30fc\u30b8\u30e7\u30f3\u5207\u308a\u66ff\u3048"}, "version": null}</script>
+    
+    
+      <script src="../../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
