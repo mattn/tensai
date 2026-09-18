@@ -269,6 +269,9 @@ type qwen struct {
 	// file a row at a time rather than expanded: a ternary table of a
 	// quarter million rows would be gigabytes in float32.
 	embedRows *embedTable
+	// bits is the width the weights were loaded at, which the loader
+	// chose itself when asked to.
+	bits int
 }
 
 // embedRow copies token's embedding into dst.

@@ -874,6 +874,11 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		n, _ := g.Int(arch + "." + key)
 		return n
 	}
+	if bits == BitsAuto {
+		var why string
+		bits, why = ggufBits(g)
+		fmt.Fprintf(vlog, "width: int%d, %s\n", bits, why)
+	}
 	var cfg config
 	cfg.ModelType = arch
 	cfg.HiddenSize = int(meta("embedding_length"))
@@ -1484,6 +1489,7 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		fastPath := cachePath(path, bits, false)
 		if m, err := loadWeightCache(fastPath, path, g, bits, false, cfg, headSz, hspec); err == nil {
 			keep = true
+			m.bits = bits
 			fmt.Fprintf(os.Stderr, "using faster requantized cache: %s\n", fastPath)
 			m.layout = layoutName(bits, false)
 			return m, tok, nil
@@ -1493,6 +1499,7 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	if useCache {
 		if m, err := loadWeightCache(cpath, path, g, bits, direct, cfg, headSz, hspec); err == nil {
 			keep = true
+			m.bits = bits
 			fmt.Fprintln(vlog, "weights mapped from the repack cache")
 			m.layout = layoutName(bits, direct)
 			if ternary {
@@ -1516,7 +1523,7 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	fmt.Fprintf(vlog, "%s into %s weights, %d layers over %d workers\n",
 		how, into, cfg.Layers, min(runtime.NumCPU(), 8))
 	repackStart := time.Now()
-	m := &qwen{cfg: cfg, headSz: headSz, layout: layoutName(bits, direct)}
+	m := &qwen{cfg: cfg, headSz: headSz, layout: layoutName(bits, direct), bits: bits}
 	if ternary {
 		m.layout = "ternary"
 	}
@@ -1744,7 +1751,7 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 			fmt.Fprintf(os.Stderr, "repack cache not written: %v\n", err)
 		} else if m2, err := loadWeightCache(cpath, path, g, bits, direct, cfg, headSz, hspec); err == nil {
 			fmt.Fprintf(os.Stderr, "repack cache written: %s\n", cpath)
-			m2.layout = m.layout
+			m2.layout, m2.bits = m.layout, m.bits
 			m = m2
 			debug.FreeOSMemory()
 		}

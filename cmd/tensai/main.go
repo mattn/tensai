@@ -52,7 +52,8 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 	model := fs.String("model", "", `which model to run: a name from "tensai models", a path to a directory or .gguf, a Hugging Face repo to download, or org/repo/file.gguf for one of its gguf files`)
 	q8 := fs.Bool("q8", false, "decode against int8-quantized weights")
 	q4 := fs.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
-	fs.BoolVar(&o.GPU, "gpu", false, "decode on the GPU (requires -q8 or -q4 and a wgpu build tag)")
+	f32 := fs.Bool("f32", false, "decode against float32 weights")
+	fs.BoolVar(&o.GPU, "gpu", false, "decode on the GPU (quantized weights and a wgpu build tag)")
 	fs.BoolVar(&o.Verbose, "v", false, "narrate what the model is doing: what the file says it is, how it is read, the prompt it was handed, and where a request's time went")
 	fs.BoolVar(&o.Verbose, "verbose", false, "same as -v")
 	fs.BoolVar(&o.Requant, "requant", false, "requantize gguf weights through float32 instead of repacking their stored blocks")
@@ -71,11 +72,16 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 	fs.Float64Var(&o.Frequency, "frequency", 0, "frequency penalty per occurrence of a generated token (OpenAI style)")
 	// Bits and the model reference resolve only after Parse.
 	finish := func() {
-		if *q8 {
+		// Without a width the loader picks one: what the file stores,
+		// narrowed to int4 when int8 would not fit the machine.
+		o.Bits = llm.BitsAuto
+		switch {
+		case *q8:
 			o.Bits = 8
-		}
-		if *q4 {
+		case *q4:
 			o.Bits = 4
+		case *f32:
+			o.Bits = 0
 		}
 		if err := resolveModel(o, *model); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -362,7 +368,7 @@ func main() {
 		reps := fs.Int("r", 5, "timed repetitions per side, after one warm-up")
 		fs.Parse(args)
 		finish()
-		if o.Bits == 0 {
+		if o.Bits <= 0 {
 			// The GPU path needs quantized weights; bench both sides
 			// the same way.
 			o.Bits = 8
