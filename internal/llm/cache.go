@@ -19,6 +19,7 @@ import (
 	"unsafe"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/encoding/gguf"
 	"github.com/mattn/tensai/internal/mmapfile"
 	"github.com/mattn/tensai/quant"
 )
@@ -31,7 +32,9 @@ const cacheMagic = "TSAICCH\x00"
 // gemma4's always was, so a format-2 gemma3 cache would be scaled twice.
 // 4: a delta layer's weights follow its block's, a ternary matrix is a
 // record, and a quantized weight records the rotation its input takes.
-const cacheFormat = 4
+// 5: the embedding table is left in the gguf and read a row at a time,
+// so it is no longer in the cache.
+const cacheFormat = 5
 
 // Record kinds, one per weight representation the model can hold.
 const (
@@ -442,7 +445,7 @@ var cacheFiles []*os.File
 // Any error means the caller should do the normal load (and rewrite
 // the cache); a stale or corrupt file is reported, a missing one is
 // just os.IsNotExist.
-func loadWeightCache(cpath, src string, bits int, direct bool, cfg config, headSz int, hspec *hadamardSpec) (*qwen, error) {
+func loadWeightCache(cpath, src string, g *gguf.File, bits int, direct bool, cfg config, headSz int, hspec *hadamardSpec) (*qwen, error) {
 	st, err := os.Stat(src)
 	if err != nil {
 		return nil, err
@@ -509,12 +512,11 @@ func loadWeightCache(cpath, src string, bits int, direct bool, cfg config, headS
 			}
 		}
 	}
-	// An embedding table the loader never expanded is read from the
-	// source a row at a time, as before.
-	if m.embed == nil && cfg.PLEDim == 0 {
-		if m.embedRows, err = newEmbedTable(src, "token_embd.weight"); err != nil {
-			return bad(err)
-		}
+	// The embedding table is never in the cache: it is read from the
+	// source a row at a time. (A cache from before that holds one, and
+	// it is simply not used.)
+	if m.embed == nil {
+		m.embedRows = newEmbedTable(g, "token_embd.weight")
 		if hspec != nil && hspec.inverses["token_embd.weight"] {
 			if m.embedRows.inverse, err = hspec.forWidth(cfg.HiddenSize); err != nil {
 				return bad(err)

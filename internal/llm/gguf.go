@@ -700,14 +700,11 @@ type embedTable struct {
 	inverse *hadamard
 }
 
-// newEmbedTable opens its own handle on the file, so the table outlives
-// the load's mapping.
-func newEmbedTable(path, name string) (*embedTable, error) {
-	g, err := gguf.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	return &embedTable{f: g, name: name}, nil
+// newEmbedTable reads rows from an open file, which stays open for the
+// model's life: the load's own handle is handed over rather than the
+// header being parsed a second time.
+func newEmbedTable(g *gguf.File, name string) *embedTable {
+	return &embedTable{f: g, name: name}
 }
 
 // row writes one token's embedding into dst, rotated back to the
@@ -855,7 +852,14 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	if err != nil {
 		return nil, nil, err
 	}
-	defer g.Close()
+	// The handle outlives the load when the embedding table reads
+	// through it; the layers' pages are released as they repack.
+	keep := false
+	defer func() {
+		if !keep {
+			g.Close()
+		}
+	}()
 
 	if st, err := os.Stat(path); err == nil {
 		fmt.Fprintf(vlog, "reading %s (%.1f GiB)\n", path, float64(st.Size())/(1<<30))
@@ -1478,7 +1482,8 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	fmt.Fprintf(vlog, "repack cache: %s\n", map[bool]string{true: cachePath(path, bits, direct), false: "off"}[useCache])
 	if useCache && direct && bits == 8 {
 		fastPath := cachePath(path, bits, false)
-		if m, err := loadWeightCache(fastPath, path, bits, false, cfg, headSz, hspec); err == nil {
+		if m, err := loadWeightCache(fastPath, path, g, bits, false, cfg, headSz, hspec); err == nil {
+			keep = true
 			fmt.Fprintf(os.Stderr, "using faster requantized cache: %s\n", fastPath)
 			m.layout = layoutName(bits, false)
 			return m, tok, nil
@@ -1486,7 +1491,8 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	}
 	cpath := cachePath(path, bits, direct)
 	if useCache {
-		if m, err := loadWeightCache(cpath, path, bits, direct, cfg, headSz, hspec); err == nil {
+		if m, err := loadWeightCache(cpath, path, g, bits, direct, cfg, headSz, hspec); err == nil {
+			keep = true
 			fmt.Fprintln(vlog, "weights mapped from the repack cache")
 			m.layout = layoutName(bits, direct)
 			if ternary {
@@ -1514,22 +1520,15 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	if ternary {
 		m.layout = "ternary"
 	}
-	if allTernary("token_embd.weight") {
-		// The table stays in the file and is read a row at a time.
-		m.embedRows, err = newEmbedTable(path, "token_embd.weight")
-		if err != nil {
+	// The embedding table stays in the file and is read a row at a
+	// time: a step needs one row, and a 262144-row table expanded to
+	// float32 is a gigabyte in the cache and in memory for nothing.
+	m.embedRows = newEmbedTable(g, "token_embd.weight")
+	keep = true
+	if hspec != nil && hspec.inverses["token_embd.weight"] {
+		if m.embedRows.inverse, err = hspec.forWidth(cfg.HiddenSize); err != nil {
 			return nil, nil, err
 		}
-		if hspec != nil && hspec.inverses["token_embd.weight"] {
-			if m.embedRows.inverse, err = hspec.forWidth(cfg.HiddenSize); err != nil {
-				return nil, nil, err
-			}
-		}
-	} else {
-		if hspec != nil && hspec.inverses["token_embd.weight"] {
-			return nil, nil, errors.New("prism.hadamard: an expanded embedding table cannot be rotated back")
-		}
-		m.embed = tensor("token_embd.weight")
 	}
 	var ropeFF []float32
 	// Gemma scales embeddings by sqrt(hidden); embedScale does it per
@@ -1581,13 +1580,12 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 			m.qLmT = q
 			return
 		}
-		if m.embed == nil {
-			panic("tensai: no output.weight and the embedding table is not expanded")
-		}
+		// A tied table stored in a form with no direct repack goes
+		// through float32 for the head alone.
 		lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
 		got := loadGate.acquire(lmStage)
 		defer loadGate.release(got)
-		em, err := m.embed.Matrix()
+		em, err := tensor("token_embd.weight").Matrix()
 		if err != nil {
 			panic(err)
 		}
@@ -1744,7 +1742,7 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		// clean, droppable pages.
 		if err := writeWeightCache(cpath, path, bits, direct, m); err != nil {
 			fmt.Fprintf(os.Stderr, "repack cache not written: %v\n", err)
-		} else if m2, err := loadWeightCache(cpath, path, bits, direct, cfg, headSz, hspec); err == nil {
+		} else if m2, err := loadWeightCache(cpath, path, g, bits, direct, cfg, headSz, hspec); err == nil {
 			fmt.Fprintf(os.Stderr, "repack cache written: %s\n", cpath)
 			m2.layout = m.layout
 			m = m2

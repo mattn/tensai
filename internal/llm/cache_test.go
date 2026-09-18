@@ -63,7 +63,7 @@ func TestWeightCacheRoundTrip(t *testing.T) {
 	// The reader reopens the per-layer embedding table from the source
 	// file, which this fake has none of, so read it back without one.
 	cfg.PLEDim = 0
-	got, err := loadWeightCache(cpath, gguf, 4, true, cfg, cfg.HeadDim, nil)
+	got, err := loadWeightCache(cpath, gguf, nil, 4, true, cfg, cfg.HeadDim, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestWeightCacheDeltaTernary(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Without the source's declaration a rotated cache is refused.
-	if _, err := loadWeightCache(cpath, gguf, 0, true, cfg, cfg.HeadDim, nil); err == nil {
+	if _, err := loadWeightCache(cpath, gguf, nil, 0, true, cfg, cfg.HeadDim, nil); err == nil {
 		t.Fatal("a rotated cache loaded without a rotation to rebuild")
 	}
 	// The embedding table is reopened from the source, which this fake
@@ -169,7 +169,7 @@ func TestWeightCacheDeltaTernary(t *testing.T) {
 	if err := writeWeightCache(cpath, gguf, 0, true, src); err != nil {
 		t.Fatal(err)
 	}
-	got, err := loadWeightCache(cpath, gguf, 0, true, cfg, cfg.HeadDim, hspec)
+	got, err := loadWeightCache(cpath, gguf, nil, 0, true, cfg, cfg.HeadDim, hspec)
 	if err != nil {
 		t.Fatal(err)
 	}
