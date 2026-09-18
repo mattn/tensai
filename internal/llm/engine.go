@@ -27,6 +27,7 @@ import (
 
 	"github.com/mattn/tensai/encoding/gguf"
 	"github.com/mattn/tensai/gpu"
+	"github.com/mattn/tensai/internal/sysmem"
 	"github.com/mattn/tensai/tokenizer"
 )
 
@@ -69,7 +70,7 @@ type Options struct {
 	Data string // directory for downloaded model files
 	Repo string // Hugging Face repo for missing files; DefaultRepo if empty
 	GGUF string // load model and tokenizer from a single .gguf instead
-	Bits int    // decode weights: 0 float32, 8 int8, 4 int4
+	Bits int    // decode weights: 0 float32, 8 int8, 4 int4, BitsAuto to choose
 	GPU  bool   // decode on the GPU (needs Bits and a wgpu build tag)
 	// Verbose narrates what the model is doing to Log: what the file
 	// says it is, how it is being read, what prompt it was handed, and
@@ -215,10 +216,17 @@ func Open(o Options) (*Engine, error) {
 		if err != nil {
 			return nil, err
 		}
+		o.Bits = model.bits
 	} else {
 		weights, err := fetchWeights(base, o.Data)
 		if err != nil {
 			return nil, err
+		}
+		if o.Bits == BitsAuto {
+			// A float checkpoint's weight count is its bytes over two.
+			var why string
+			o.Bits, why = pickBits("", weightBytes(weights)/2, sysmem.Available())
+			fmt.Fprintf(vlog, "width: int%d, %s\n", o.Bits, why)
 		}
 		var paths [2]string
 		for i, name := range []string{"tokenizer.json", "config.json"} {
@@ -1319,6 +1327,40 @@ func (p *progressReader) Read(b []byte) (int, error) {
 
 // fetchWeights returns the checkpoint path: a plain model.safetensors, or
 // for sharded models the index file after downloading every shard.
+// weightBytes is the size of a checkpoint's weight files: the one file,
+// or every shard an index names.
+func weightBytes(weights string) int64 {
+	if !strings.HasSuffix(weights, ".index.json") {
+		st, err := os.Stat(weights)
+		if err != nil {
+			return 0
+		}
+		return st.Size()
+	}
+	raw, err := os.ReadFile(weights)
+	if err != nil {
+		return 0
+	}
+	var parsed struct {
+		WeightMap map[string]string `json:"weight_map"`
+	}
+	if json.Unmarshal(raw, &parsed) != nil {
+		return 0
+	}
+	seen := map[string]bool{}
+	var total int64
+	for _, shard := range parsed.WeightMap {
+		if seen[shard] {
+			continue
+		}
+		seen[shard] = true
+		if st, err := os.Stat(filepath.Join(filepath.Dir(weights), shard)); err == nil {
+			total += st.Size()
+		}
+	}
+	return total
+}
+
 func fetchWeights(base, dir string) (string, error) {
 	if p := filepath.Join(dir, "model.safetensors"); exists(p) {
 		return p, nil

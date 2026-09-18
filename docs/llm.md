@@ -67,7 +67,7 @@ The capital of France is Paris.
 
 ## Quantized loading
 
-With `-q8`/`-q4` each weight quantizes as it loads and its float32 copy dies immediately, so the full-precision model never has to fit in memory. Quantized GGUF checkpoints skip the float32 detour entirely: Q8_0, Q4_0, Q5_0, the Q4_K/Q5_K/Q6_K K-quant family, MXFP4, and PrismML's ternary PTQ1_0/PQ2_0 repack straight from the memory-mapped file, keeping llama.cpp's own quantization intact. A 1.5B Q4_K_M loads in about 3 seconds instead of 8; a 3B Q8_0 opens in 5 seconds instead of 32 (`-requant` restores the float detour, trading a much slower load for about 10% more decode speed).
+Without `-q8` or `-q4` the loader chooses the width itself: what the file stores sets the ceiling (int4 blocks such as Q4_K repack into int4 exactly and gain nothing from int8; Q8_0, Q5_K, Q6_K and float checkpoints keep their precision only at int8), and when int8 would not fit the memory the machine has available (the weights plus a quarter for the tables, and half a gigabyte over) the model narrows to int4 rather than swap. `-v` says which was picked and why; `-f32` asks for float32 weights outright. With `-q8`/`-q4` each weight quantizes as it loads and its float32 copy dies immediately, so the full-precision model never has to fit in memory. Quantized GGUF checkpoints skip the float32 detour entirely: Q8_0, Q4_0, Q5_0, the Q4_K/Q5_K/Q6_K K-quant family, MXFP4, and PrismML's ternary PTQ1_0/PQ2_0 repack straight from the memory-mapped file, keeping llama.cpp's own quantization intact. A 1.5B Q4_K_M loads in about 3 seconds instead of 8; a 3B Q8_0 opens in 5 seconds instead of 32 (`-requant` restores the float detour, trading a much slower load for about 10% more decode speed).
 
 The first `.gguf` load also writes the repacked weights to a cache file next to the model (`-nocache` opts out), and every later load just memory-maps it: the 1.5B Q4_K_M reopens in ~0.3 seconds, a Mistral 7B in well under a second, and gpt-oss-20b in under two. Mapped weights are clean file-backed pages the kernel can drop and re-read at will — on a machine where the model barely fits, that replaces swap thrashing with ordinary page cache behavior.
 
@@ -134,7 +134,7 @@ commands:
   version  print the version
 ```
 
-All model commands share the same flags: `-model` (which model to run), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-tool`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
+All model commands share the same flags: `-model` (which model to run), `-q8`/`-q4`/`-f32` (the weight width, chosen from the file and the memory when none is given), `-gpu`, `-draft`, `-think`, `-tool`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
 
 `-v` narrates what is otherwise a silent wait. It says what the file claims to be (architecture, layer and head counts, context, vocabulary), how the weights are being read (repacked or mapped from the cache, and how long each took), which template family and system prompt were chosen, and — the one thing a caller cannot otherwise see — the prompt as rendered, markers and all. Under `serve` each request announces itself on arrival with its message and tool counts, then reports how many tokens it prefilled and how fast. It adds lines and changes nothing else.
 
