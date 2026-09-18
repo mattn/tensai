@@ -294,9 +294,34 @@ func main() {
 		choice := fs.String("choice", "", "comma-separated answers to choose among")
 		yesno := fs.Bool("yesno", false, "score yes against no")
 		state := fs.String("state", "", "the situation the question is asked about, given ahead of it")
+		label := fs.Bool("label", false, "list the options under the question lettered A, B, C and score the letter, one token each, instead of the option text")
+		batch := fs.Bool("batch", false, `read a System One request from stdin: {"state": ..., "questions": {id: {"type": "noul"|"choice"|"score", "instructions": ..., "criteria": ...}}}`)
 		jsonOut := fs.Bool("json", false, "print the probabilities as one JSON object")
 		fs.Parse(args)
 		question := joinArgs(fs.Args())
+		if *batch {
+			if *yesno || *choice != "" || *label || question != "" {
+				fmt.Fprintln(os.Stderr, "-batch takes its questions from stdin, and -state only when the request has none")
+				os.Exit(2)
+			}
+			var req llm.SystemOneRequest
+			if err := json.NewDecoder(os.Stdin).Decode(&req); err != nil {
+				fmt.Fprintln(os.Stderr, "reading the request:", err)
+				os.Exit(2)
+			}
+			if len(req.State) == 0 && *state != "" {
+				req.State, _ = json.Marshal(*state)
+			}
+			e := openEngine(o, finish)
+			defer e.Close()
+			resp, err := e.SystemOne(req)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			answersPrint(resp, *jsonOut)
+			return
+		}
 		var options []string
 		switch {
 		case *yesno && *choice != "":
@@ -314,24 +339,21 @@ func main() {
 		// The state is the context a decision is made in, and the model
 		// reads it as the first part of the user turn. A state with no
 		// question after it is the question.
-		switch {
-		case *state != "" && question != "":
-			question = *state + "\n\n" + question
-		case *state != "":
-			question = *state
+		if *state != "" && question == "" {
+			question, *state = *state, ""
 		}
 		if question == "" || len(options) < 2 {
-			fmt.Fprintln(os.Stderr, "usage: tensai ask [flags] (-choice a,b,c | -yesno) [-state <situation>] <question>")
+			fmt.Fprintln(os.Stderr, "usage: tensai ask [flags] (-choice a,b,c | -yesno | -batch) [-state <situation>] [<question>]")
 			os.Exit(2)
 		}
 		e := openEngine(o, finish)
 		defer e.Close()
-		probs, err := e.Score(question, options)
+		res, err := e.ScoreMany(*state, []llm.Question{{Text: question, Options: options}}, *label)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		askPrint(options, probs, *jsonOut)
+		askPrint(options, res.Probs[0], *jsonOut)
 	case "bench":
 		fs := flag.NewFlagSet("tensai bench", flag.ExitOnError)
 		o, finish := modelFlags(fs)
@@ -358,6 +380,53 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "tensai: unknown command %q\n\n%s\n", cmd, usage)
 		os.Exit(2)
+	}
+}
+
+// answersPrint shows a System One response: as the JSON a program
+// reads, or one block per question for the eye, in id order.
+func answersPrint(resp *llm.SystemOneResponse, asJSON bool) {
+	if asJSON {
+		out, _ := json.Marshal(resp)
+		fmt.Println(string(out))
+		return
+	}
+	ids := make([]string, 0, len(resp.Answers))
+	for id := range resp.Answers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for i, id := range ids {
+		if i > 0 {
+			fmt.Println()
+		}
+		a := resp.Answers[id]
+		switch a.Type {
+		case "noul":
+			fmt.Printf("%s: %5.1f%%  yes\n", id, 100**a.Noul)
+			continue
+		case "choice":
+			fmt.Printf("%s: %s  (confidence %.2f)\n", id, a.Choice, *a.Confidence)
+		case "score":
+			fmt.Printf("%s: %.2f  (confidence %.2f)\n", id, *a.Score, *a.Confidence)
+		}
+		names := make([]string, 0, len(a.Probabilities))
+		for n := range a.Probabilities {
+			names = append(names, n)
+		}
+		sort.SliceStable(names, func(x, y int) bool {
+			if a.Type == "score" {
+				return names[x] < names[y]
+			}
+			return a.Probabilities[names[x]] > a.Probabilities[names[y]]
+		})
+		for _, n := range names {
+			line := n
+			if a.Legend != nil {
+				line += "  " + a.Legend[n]
+			}
+			fmt.Printf("%5.1f%%  %s\n", 100*a.Probabilities[n], line)
+		}
 	}
 }
 
