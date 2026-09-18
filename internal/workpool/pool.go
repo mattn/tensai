@@ -136,7 +136,7 @@ func Run(n, align int, body func(lo, hi int)) {
 		body(0, n)
 		return
 	}
-	chunk := ((n+workers-1)/workers + align - 1) &^ (align - 1)
+	chunk := ((n+4*workers-1)/(4*workers) + align - 1) &^ (align - 1)
 	if chunk <= 0 {
 		chunk = align
 	}

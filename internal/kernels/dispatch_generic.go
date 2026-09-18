@@ -57,3 +57,14 @@ func AxpyRows(out, ws []float32, rows [][]float32, off int) {
 		axpyGeneric(w, rows[i][off:off+len(out)], out)
 	}
 }
+
+// Hadamard is the Walsh-Hadamard transform of v in place, times scale.
+func Hadamard(v []float32, scale float32) { hadamardGeneric(v, scale) }
+
+// DecayRead scales row by decay and adds k times it into mem.
+func DecayRead(row []float32, decay, k float32, mem []float32) { decayReadGeneric(row, decay, k, mem) }
+
+// WriteRead adds k times delta into row and q times the result into out.
+func WriteRead(row, delta []float32, k, q float32, out []float32) {
+	writeReadGeneric(row, delta, k, q, out)
+}

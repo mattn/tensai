@@ -253,6 +253,9 @@ func Open(o Options) (*Engine, error) {
 	if o.Bits != 0 {
 		how = fmt.Sprintf("int%d", o.Bits)
 	}
+	if model.layout == "ternary" {
+		how = "ternary"
+	}
 	fmt.Fprintf(o.Log, "loaded %s (%d layers, hidden %d) as %s in %v\n",
 		model.cfg.ModelType, model.cfg.Layers, model.cfg.HiddenSize, how, time.Since(start).Round(time.Millisecond))
 

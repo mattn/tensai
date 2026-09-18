@@ -70,6 +70,7 @@ func TestDeltaSnapshotRoundTrip(t *testing.T) {
 	d.wA, d.wB = r.mat(hidden, heads), r.mat(hidden, heads)
 	d.wOut = r.mat(vd*heads, hidden)
 	d.conv, d.aLog, d.dtBias, d.norm = r.vec(d.convDim*convK), r.vec(heads), r.vec(heads), r.vec(vd)
+	d.fuse()
 
 	m := &qwen{blocks: []qblock{{delta: d, dstate: d.newState()}}}
 	scratch := newDeltaScratch(d, hidden)

@@ -24,7 +24,7 @@ The `tensai` command runs modern instruction-tuned models: RMSNorm, rotary posit
 |---|---|---|
 | qwen2 | Qwen 1.5/2/2.5, Qwen2.5-Coder, the R1-Distill-Qwen line | attention biases |
 | qwen3 | Qwen3 dense | per-head QK-norm, explicit head_dim, `-think` |
-| qwen3_5 | Qwen3.5, Qwen3.6, Qwen3.8 | a gated delta rule on three layers in four, ordinary attention on the fourth; norms scale by 1 + w, RoPE turns a quarter of each head, and the queries carry a gate for the attention output. The larger ones share each key head among several value heads. CPU only, no `-draft`, and a GGUF (`qwen35`) repacks but does not cache yet |
+| qwen3_5 | Qwen3.5, Qwen3.6, Qwen3.8 | a gated delta rule on three layers in four, ordinary attention on the fourth; norms scale by 1 + w, RoPE turns a quarter of each head, and the queries carry a gate for the attention output. The larger ones share each key head among several value heads. CPU only, no `-draft` |
 
 A `qwen3_5` prompt costs more to prefill than its size suggests: the delta
 layers carry state token by token, so only the projections around the
@@ -67,11 +67,47 @@ The capital of France is Paris.
 
 ## Quantized loading
 
-With `-q8`/`-q4` each weight quantizes as it loads and its float32 copy dies immediately, so the full-precision model never has to fit in memory. Quantized GGUF checkpoints skip the float32 detour entirely: Q8_0, Q4_0, Q5_0, the Q4_K/Q5_K/Q6_K K-quant family, and MXFP4 repack straight from the memory-mapped file, keeping llama.cpp's own quantization intact. A 1.5B Q4_K_M loads in about 3 seconds instead of 8; a 3B Q8_0 opens in 5 seconds instead of 32 (`-requant` restores the float detour, trading a much slower load for about 10% more decode speed).
+With `-q8`/`-q4` each weight quantizes as it loads and its float32 copy dies immediately, so the full-precision model never has to fit in memory. Quantized GGUF checkpoints skip the float32 detour entirely: Q8_0, Q4_0, Q5_0, the Q4_K/Q5_K/Q6_K K-quant family, MXFP4, and PrismML's ternary PTQ1_0/PQ2_0 repack straight from the memory-mapped file, keeping llama.cpp's own quantization intact. A 1.5B Q4_K_M loads in about 3 seconds instead of 8; a 3B Q8_0 opens in 5 seconds instead of 32 (`-requant` restores the float detour, trading a much slower load for about 10% more decode speed).
 
 The first `.gguf` load also writes the repacked weights to a cache file next to the model (`-nocache` opts out), and every later load just memory-maps it: the 1.5B Q4_K_M reopens in ~0.3 seconds, a Mistral 7B in well under a second, and gpt-oss-20b in under two. Mapped weights are clean file-backed pages the kernel can drop and re-read at will — on a machine where the model barely fits, that replaces swap thrashing with ordinary page cache behavior.
 
 On a 15GB machine the ladder looks like: a 0.5B at ~40 tok/s with `-q8`, a 1.5B Q4_K_M at ~25 tok/s with `-q4` (tiled integer kernels, native Windows), and Qwen2.5-**7B**-Instruct — 15GB of BF16 shards, int4-quantized on the fly during a two-minute load into ~6GB resident — answering correctly at 3.5 tok/s.
+
+### Ternary weights
+
+PrismML's Bonsai checkpoints (`Ternary-Bonsai-2-27B`, a Qwen3.8-27B) keep
+every weight at -1, 0 or +1 with one f16 scale per 128, in two encodings of
+their own that stock llama.cpp does not read: `PTQ1_0` packs the trits five
+to a byte (5.95 GB for the 27B), `PQ2_0` one to a two-bit slot (7.21 GB).
+Both repack into a ternary layout of two bits a weight, so a 27B decodes in
+under 8 GB, with no width to choose: `-q8` and `-q4` are accepted and
+ignored, since there is nothing to quantize.
+
+```bash
+tensai run -model prism-ml/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf "What is the capital of France?"
+```
+
+The weights sit in a rotated basis: each matrix was multiplied along its
+input by a blockwise Walsh-Hadamard transform with fixed sign flips before
+the rounding, which spreads an activation's energy evenly across a block
+and is what makes three levels enough. The file declares it under
+`prism.hadamard.*`, and the loader applies the matching transform to every
+activation those matrices read, and the inverse to each embedding row it
+looks up; a file that declares a transform the loader does not know is
+refused rather than run into noise. The embedding table stays in the file
+and is read a row at a time, since a quarter million rotated rows would be
+gigabytes expanded.
+
+The ternary kernel reads the codes as the unsigned operand of the
+multiply-add and the activations as the signed one, so the correction it
+needs is the sum of a group's activations, shared by every column, and no
+per-column table streams beside the weights. On a Ryzen 7735HS the 27B
+prefills at about 6 tokens/s and decodes at 3.4, which is the memory
+bandwidth (about 28 GB/s of weights a token); its answers match the
+PrismML llama.cpp build token for token on the prompts tried. The first
+load repacks 27 billion weights, about a minute, and writes the repack
+cache (8.5 GB beside the model); later loads map it in under a second.
+The model runs on the CPU, as every qwen3_5 does.
 
 ## Prefill, speculative decoding, sampling
 

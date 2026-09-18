@@ -60,6 +60,7 @@ func TestDeltaAgainstReference(t *testing.T) {
 	d.aLog = r.vec(heads)
 	d.dtBias = r.vec(heads)
 	d.norm = r.vec(vd)
+	d.fuse()
 	if err := d.check(); err != nil {
 		t.Fatal(err)
 	}
@@ -91,6 +92,7 @@ func TestDeltaCarriesState(t *testing.T) {
 	d.wA, d.wB = r.mat(hidden, heads), r.mat(hidden, heads)
 	d.wOut = r.mat(vd*heads, hidden)
 	d.conv, d.aLog, d.dtBias, d.norm = r.vec(d.convDim*convK), r.vec(heads), r.vec(heads), r.vec(vd)
+	d.fuse()
 
 	x := r.vec(hidden)
 	st, scratch := d.newState(), newDeltaScratch(d, hidden)
@@ -157,6 +159,7 @@ func TestDeltaKeyHeadGrouping(t *testing.T) {
 	g.wA, g.wB = r.mat(hidden, heads), r.mat(hidden, heads)
 	g.wOut = r.mat(vd*heads, hidden)
 	g.conv, g.aLog, g.dtBias, g.norm = r.vec(g.convDim*convK), r.vec(heads), r.vec(heads), r.vec(vd)
+	g.fuse()
 	if err := g.check(); err != nil {
 		t.Fatal(err)
 	}
@@ -177,6 +180,7 @@ func TestDeltaKeyHeadGrouping(t *testing.T) {
 	tl.wOut = permRows(g.wOut, vd, perm)
 	tl.conv = append(append([]float32(nil), g.conv[:2*keyDim*convK]...), permVec(g.conv[2*keyDim*convK:], vd*convK, perm)...)
 	tl.aLog, tl.dtBias, tl.norm = permVec(g.aLog, 1, perm), permVec(g.dtBias, 1, perm), g.norm
+	tl.fuse()
 
 	gs, gsc := g.newState(), newDeltaScratch(g, hidden)
 	ts, tsc := tl.newState(), newDeltaScratch(tl, hidden)

@@ -377,3 +377,49 @@ func TestGeluMulMatchesTanhForm(t *testing.T) {
 		}
 	}
 }
+
+func TestHadamardAgreesWithGeneric(t *testing.T) {
+	for _, n := range []int{8, 16, 32, 64, 128, 256, 512, 1024, 2048} {
+		a := make([]float32, n)
+		for i := range a {
+			a[i] = float32(i%7) - 3 + float32(i)/float32(n)
+		}
+		b := append([]float32(nil), a...)
+		Hadamard(a, 0.25)
+		hadamardGeneric(b, 0.25)
+		for i := range a {
+			if a[i] != b[i] {
+				t.Fatalf("n=%d: [%d] = %v, generic %v", n, i, a[i], b[i])
+			}
+		}
+	}
+}
+
+func BenchmarkHadamard1024(b *testing.B) {
+	v := make([]float32, 1024)
+	for i := range v {
+		v[i] = float32(i)
+	}
+	for i := 0; i < b.N; i++ {
+		Hadamard(v, 0.03125)
+	}
+}
+
+func TestDecayReadWriteRead(t *testing.T) {
+	const n = 37
+	row, mem, delta, out := make([]float32, n), make([]float32, n), make([]float32, n), make([]float32, n)
+	row2, mem2, out2 := make([]float32, n), make([]float32, n), make([]float32, n)
+	for i := 0; i < n; i++ {
+		row[i], mem[i], delta[i], out[i] = float32(i)-7, float32(i%5), float32(i%3)-1, float32(i%4)
+		row2[i], mem2[i], out2[i] = row[i], mem[i], out[i]
+	}
+	DecayRead(row, 0.75, 1.5, mem)
+	decayReadGeneric(row2, 0.75, 1.5, mem2)
+	WriteRead(row, delta, -0.5, 2, out)
+	writeReadGeneric(row2, delta, -0.5, 2, out2)
+	for i := 0; i < n; i++ {
+		if row[i] != row2[i] || mem[i] != mem2[i] || out[i] != out2[i] {
+			t.Fatalf("[%d]: row %v/%v mem %v/%v out %v/%v", i, row[i], row2[i], mem[i], mem2[i], out[i], out2[i])
+		}
+	}
+}

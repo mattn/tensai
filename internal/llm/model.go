@@ -116,10 +116,12 @@ type qmat struct {
 	cols int
 	f    func(x, out []float32) error
 	mm   func(x, out *tensai.Matrix) error
-	q8   *quant.QMatrix     // retained for GPU upload
-	q4   *quant.Q4Matrix    // likewise, for the int4 twin
-	q8g  *quant.Q8GMatrix   // retained for the repack cache
-	mx   *quant.MXFP4Matrix // likewise
+	rot  int                  // the rotation wrapped around f and mm, for the cache
+	q8   *quant.QMatrix       // retained for GPU upload
+	q4   *quant.Q4Matrix      // likewise, for the int4 twin
+	q8g  *quant.Q8GMatrix     // retained for the repack cache
+	mx   *quant.MXFP4Matrix   // likewise
+	t    *quant.TernaryMatrix // likewise
 }
 
 func qmatQ8(q *quant.QMatrix) *qmat {
@@ -136,6 +138,27 @@ func qmatQ8G(q *quant.Q8GMatrix) *qmat {
 
 func qmatMX(q *quant.MXFP4Matrix) *qmat {
 	return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, mx: q}
+}
+
+func qmatT(q *quant.TernaryMatrix) *qmat {
+	return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, t: q}
+}
+
+// rows is the input width of the weight.
+func (q *qmat) rows() int {
+	switch {
+	case q.q8 != nil:
+		return q.q8.Rows
+	case q.q4 != nil:
+		return q.q4.Rows
+	case q.q8g != nil:
+		return q.q8g.Rows
+	case q.mx != nil:
+		return q.mx.Rows
+	case q.t != nil:
+		return q.t.Rows
+	}
+	return 0
 }
 
 func quantizeMat(m *tensai.Matrix, bits int) *qmat {
@@ -242,6 +265,22 @@ type qwen struct {
 	// dscratch is one token's working set for the delta layers, which all
 	// share the same shapes; nil until a delta layer runs.
 	dscratch *deltaScratch
+	// embedRows stands in for embed when the table is read from the
+	// file a row at a time rather than expanded: a ternary table of a
+	// quarter million rows would be gigabytes in float32.
+	embedRows *embedTable
+}
+
+// embedRow copies token's embedding into dst.
+func (m *qwen) embedRow(token int, dst []float32) {
+	if m.embedRows != nil {
+		if err := m.embedRows.row(token, dst); err != nil {
+			panic(err)
+		}
+		return
+	}
+	hs := m.cfg.HiddenSize
+	copy(dst, m.embed.Data[token*hs:(token+1)*hs])
 }
 
 func loadConfig(path string) (config, error) {
@@ -1255,7 +1294,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 
 	x := tensai.NewMatrix(n, hs)
 	for t, tk := range tokens {
-		copy(x.Data[t*hs:(t+1)*hs], m.embed.Data[tk*hs:(tk+1)*hs])
+		m.embedRow(tk, x.Data[t*hs:(t+1)*hs])
 	}
 	if s := m.embedScale(); s != 0 {
 		for i := range x.Data {
@@ -1524,7 +1563,7 @@ func (m *qwen) step(token, pos int) []float32 {
 	hs := cfg.HiddenSize
 
 	x := make([]float32, hs)
-	copy(x, m.embed.Data[token*hs:(token+1)*hs])
+	m.embedRow(token, x)
 	if s := m.embedScale(); s != 0 {
 		for i := range x {
 			x[i] *= s
