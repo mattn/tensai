@@ -49,7 +49,7 @@ var wantDeltaStep = []float32{
 func TestDeltaAgainstReference(t *testing.T) {
 	const hidden, heads, kd, vd, convK = 8, 2, 4, 4, 4
 	r := &lcg{x: 12345}
-	d := &deltaWeights{heads: heads, kDim: kd, vDim: vd, convK: convK}
+	d := &deltaWeights{heads: heads, kHeads: heads, kDim: kd, vDim: vd, convK: convK}
 	d.convDim = kd*heads*2 + vd*heads
 	d.wQKV = r.mat(hidden, d.convDim)
 	d.wZ = r.mat(hidden, vd*heads)
@@ -85,7 +85,7 @@ func TestDeltaAgainstReference(t *testing.T) {
 func TestDeltaCarriesState(t *testing.T) {
 	const hidden, heads, kd, vd, convK = 8, 2, 4, 4, 4
 	r := &lcg{x: 999}
-	d := &deltaWeights{heads: heads, kDim: kd, vDim: vd, convK: convK}
+	d := &deltaWeights{heads: heads, kHeads: heads, kDim: kd, vDim: vd, convK: convK}
 	d.convDim = kd*heads*2 + vd*heads
 	d.wQKV, d.wZ = r.mat(hidden, d.convDim), r.mat(hidden, vd*heads)
 	d.wA, d.wB = r.mat(hidden, heads), r.mat(hidden, heads)
@@ -111,5 +111,103 @@ func TestDeltaCarriesState(t *testing.T) {
 		if again[i] != first[i] {
 			t.Fatalf("a fresh state gave %v, want %v", again[i], first[i])
 		}
+	}
+}
+
+// permCols reorders blocks of width w in a matrix's columns: output
+// block i is input block perm[i].
+func permCols(m *tensai.Matrix, w int, perm []int) *tensai.Matrix {
+	out := tensai.NewMatrix(m.Rows, m.Cols)
+	for r := 0; r < m.Rows; r++ {
+		for i, p := range perm {
+			copy(out.Data[r*m.Cols+i*w:r*m.Cols+(i+1)*w], m.Data[r*m.Cols+p*w:r*m.Cols+(p+1)*w])
+		}
+	}
+	return out
+}
+
+// permRows does the same to blocks of rows.
+func permRows(m *tensai.Matrix, w int, perm []int) *tensai.Matrix {
+	out := tensai.NewMatrix(m.Rows, m.Cols)
+	for i, p := range perm {
+		copy(out.Data[i*w*m.Cols:(i+1)*w*m.Cols], m.Data[p*w*m.Cols:(p+1)*w*m.Cols])
+	}
+	return out
+}
+
+// permVec reorders blocks of a vector.
+func permVec(v []float32, w int, perm []int) []float32 {
+	out := make([]float32, len(v))
+	for i, p := range perm {
+		copy(out[i*w:(i+1)*w], v[p*w:(p+1)*w])
+	}
+	return out
+}
+
+// Fewer key heads than value heads: value heads share a key head, and
+// the layer must read the same key whichever order the value heads come
+// in. A layer in HF's grouped order and the same layer with its value
+// heads tiled the way a gguf converter leaves them give the same answer.
+func TestDeltaKeyHeadGrouping(t *testing.T) {
+	const hidden, kHeads, heads, kd, vd, convK = 8, 2, 4, 4, 4, 4
+	r := &lcg{x: 4242}
+	g := &deltaWeights{heads: heads, kHeads: kHeads, kDim: kd, vDim: vd, convK: convK}
+	g.convDim = kd*kHeads*2 + vd*heads
+	g.wQKV, g.wZ = r.mat(hidden, g.convDim), r.mat(hidden, vd*heads)
+	g.wA, g.wB = r.mat(hidden, heads), r.mat(hidden, heads)
+	g.wOut = r.mat(vd*heads, hidden)
+	g.conv, g.aLog, g.dtBias, g.norm = r.vec(g.convDim*convK), r.vec(heads), r.vec(heads), r.vec(vd)
+	if err := g.check(); err != nil {
+		t.Fatal(err)
+	}
+	// Tiled order lists value head (key head k, replica j) at j*kHeads+k:
+	// with two key heads and two replicas, grouped heads 0,2,1,3.
+	perm := []int{0, 2, 1, 3}
+	tl := &deltaWeights{heads: heads, kHeads: kHeads, tiled: true, kDim: kd, vDim: vd, convK: convK, convDim: g.convDim}
+	keyDim := kd * kHeads
+	tl.wQKV = tensai.NewMatrix(hidden, g.convDim)
+	for row := 0; row < hidden; row++ {
+		src := g.wQKV.Data[row*g.convDim : (row+1)*g.convDim]
+		dst := tl.wQKV.Data[row*g.convDim : (row+1)*g.convDim]
+		copy(dst, src[:2*keyDim])
+		copy(dst[2*keyDim:], permVec(src[2*keyDim:], vd, perm))
+	}
+	tl.wZ = permCols(g.wZ, vd, perm)
+	tl.wA, tl.wB = permCols(g.wA, 1, perm), permCols(g.wB, 1, perm)
+	tl.wOut = permRows(g.wOut, vd, perm)
+	tl.conv = append(append([]float32(nil), g.conv[:2*keyDim*convK]...), permVec(g.conv[2*keyDim*convK:], vd*convK, perm)...)
+	tl.aLog, tl.dtBias, tl.norm = permVec(g.aLog, 1, perm), permVec(g.dtBias, 1, perm), g.norm
+
+	gs, gsc := g.newState(), newDeltaScratch(g, hidden)
+	ts, tsc := tl.newState(), newDeltaScratch(tl, hidden)
+	for i := 0; i < 3; i++ {
+		x := r.vec(hidden)
+		want := append([]float32(nil), g.step(gs, x, gsc)...)
+		got := tl.step(ts, x, tsc)
+		for j := range want {
+			if diff := got[j] - want[j]; diff > 1e-5 || diff < -1e-5 {
+				t.Fatalf("step %d out[%d] = %.7f tiled, %.7f grouped", i, j, got[j], want[j])
+			}
+		}
+	}
+	// And the grouped layer is not secretly reading one key head for
+	// every value head: a key head lookup that ignored the value head
+	// would give a different answer.
+	wrong := *g
+	wrong.kHeads = 1
+	wrong.heads = 4
+	ws, wsc := wrong.newState(), newDeltaScratch(&wrong, hidden)
+	gs, gsc = g.newState(), newDeltaScratch(g, hidden)
+	x := r.vec(hidden)
+	want := append([]float32(nil), g.step(gs, x, gsc)...)
+	got := wrong.step(ws, x, wsc)
+	same := true
+	for j := range want {
+		if got[j] != want[j] {
+			same = false
+		}
+	}
+	if same {
+		t.Fatal("key head grouping made no difference")
 	}
 }

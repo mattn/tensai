@@ -74,6 +74,9 @@ type splitConfig struct {
 	// the zero-width joiners stay inside a word instead of ending it,
 	// which is what keeps Arabic, Devanagari and emoji sequences whole.
 	letterMarks bool
+	// markWords widens the letter run to [\p{L}\p{M}]+ (Qwen3.5): the
+	// combining marks stay in the word, the joiners do not.
+	markWords bool
 }
 
 var (
@@ -252,9 +255,12 @@ func classifyRegex(re string) (splitConfig, error) {
 		} else {
 			cfg.maxDigits = 1
 		}
-		// K2-Horizon's word run admits marks and zero-width joiners.
+		// K2-Horizon's word run admits marks and zero-width joiners;
+		// Qwen3.5's the marks alone.
 		if strings.Contains(re, `\p{M}|\u200C|\u200D`) {
 			cfg.letterMarks = true
+		} else if strings.Contains(re, `[\p{L}\p{M}]+`) {
+			cfg.markWords = true
 		}
 		return cfg, nil
 	}
@@ -422,6 +428,8 @@ func (t *Tokenizer) split(s string) []string {
 		word := unicode.IsLetter
 		if cfg.letterMarks {
 			word = isWordMark
+		} else if cfg.markWords {
+			word = isLetterOrMark
 		}
 		if cfg.letterPrefix {
 			if !unicode.IsLetter(rs[j]) && !unicode.IsNumber(rs[j]) && rs[j] != '\r' && rs[j] != '\n' && j+1 < len(rs) && word(rs[j+1]) {
@@ -577,6 +585,11 @@ func isLowerWord(r rune) bool {
 // or one of the two zero-width joiners.
 func isWordMark(r rune) bool {
 	return unicode.IsLetter(r) || unicode.Is(unicode.M, r) || r == 0x200C || r == 0x200D
+}
+
+// isLetterOrMark is the Qwen3.5 word class: a letter or a combining mark.
+func isLetterOrMark(r rune) bool {
+	return unicode.IsLetter(r) || unicode.Is(unicode.M, r)
 }
 
 func isCaselessWord(r rune) bool {

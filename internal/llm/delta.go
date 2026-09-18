@@ -20,7 +20,14 @@ import (
 
 // deltaWeights is one linear-attention layer.
 type deltaWeights struct {
-	heads    int // value heads; key heads are the same count here
+	heads  int // value heads
+	kHeads int // key (and query) heads; each serves heads/kHeads value heads
+	// tiled says the value heads are in llama.cpp's order rather than
+	// HF's. HF groups them by key head: value heads 0..r-1 share key
+	// head 0. A gguf converter tiles them instead, value head h taking
+	// key head h % kHeads, so a broadcast over the key heads is a plain
+	// repeat. The weights come as they are; only the lookup differs.
+	tiled    bool
 	kDim     int // per-head key/query width
 	vDim     int // per-head value width
 	convK    int
@@ -82,6 +89,7 @@ func loadDelta(cfg config, p string, vec func(string) []float32,
 	linqF32Fused func(...string) *tensai.Matrix) *deltaWeights {
 	d := &deltaWeights{
 		heads:  cfg.LinearValueHeads,
+		kHeads: cfg.LinearKeyHeads,
 		kDim:   cfg.LinearKeyDim,
 		vDim:   cfg.LinearValueDim,
 		convK:  cfg.LinearConvK,
@@ -112,6 +120,9 @@ func (d *deltaWeights) check() error {
 	if got := len(d.conv); got != d.convDim*d.convK {
 		return fmt.Errorf("delta conv1d has %d weights, want %d", got, d.convDim*d.convK)
 	}
+	if d.kHeads == 0 || d.heads%d.kHeads != 0 {
+		return fmt.Errorf("delta has %d value heads over %d key heads", d.heads, d.kHeads)
+	}
 	for _, x := range []struct {
 		name string
 		got  int
@@ -126,6 +137,14 @@ func (d *deltaWeights) check() error {
 		}
 	}
 	return nil
+}
+
+// keyHead is the key (and query) head value head hi reads.
+func (d *deltaWeights) keyHead(hi int) int {
+	if d.tiled {
+		return hi % d.kHeads
+	}
+	return hi / (d.heads / d.kHeads)
 }
 
 // l2norm scales v to unit length, matching the reference's epsilon inside
@@ -190,7 +209,7 @@ func (d *deltaWeights) mix(st *deltaState, qkv, z, a, b []float32, scratch *delt
 	copy(prev[(kw-2)*d.convDim:], qkv)
 
 	kd, vd, h := d.kDim, d.vDim, d.heads
-	keyDim := kd * h
+	keyDim := kd * d.kHeads
 	res := scratch.out
 	qScale := float32(1 / math.Sqrt(float64(kd)))
 	// Heads share nothing: each owns its slice of the state and of every
@@ -223,8 +242,13 @@ func (d *deltaWeights) head(st *deltaState, scratch *deltaScratch, res, out, z, 
 	hi, kd, vd, keyDim int, qScale float32) {
 	qs, ks, vs := out[:keyDim], out[keyDim:2*keyDim], out[2*keyDim:]
 	{
-		q := qs[hi*kd : (hi+1)*kd]
-		k := ks[hi*kd : (hi+1)*kd]
+		// The query and key are shared by every value head on this key
+		// head, and normalized here, so each head works on its own copy.
+		kh := d.keyHead(hi)
+		q := scratch.q[hi*kd : (hi+1)*kd]
+		k := scratch.k[hi*kd : (hi+1)*kd]
+		copy(q, qs[kh*kd:(kh+1)*kd])
+		copy(k, ks[kh*kd:(kh+1)*kd])
 		v := vs[hi*vd : (hi+1)*vd]
 		l2norm(q)
 		l2norm(k)
@@ -285,6 +309,7 @@ func (d *deltaWeights) head(st *deltaState, scratch *deltaScratch, res, out, z, 
 // and each wants its own mem and delta; decode reuses the first.
 type deltaScratch struct {
 	qkv, conv, z, a, b, mem, delta, out, proj []float32
+	q, k                                      []float32 // per value head, normalized
 	perHead                                   []*deltaScratch
 	batch                                     []float32
 }
@@ -321,6 +346,8 @@ func newDeltaScratchOne(d *deltaWeights, hidden int) *deltaScratch {
 		delta: make([]float32, d.vDim*d.heads),
 		out:   make([]float32, d.vDim*d.heads),
 		proj:  make([]float32, hidden),
+		q:     make([]float32, d.kDim*d.heads),
+		k:     make([]float32, d.kDim*d.heads),
 	}
 }
 
@@ -345,7 +372,7 @@ func (d *deltaWeights) mixBatch(st *deltaState, qz *tensai.Matrix, ab *tensai.Ma
 	mixed *tensai.Matrix, scratch *deltaScratch) {
 	n := mixed.Rows
 	kd, vd, h := d.kDim, d.vDim, d.heads
-	keyDim := kd * h
+	keyDim := kd * d.kHeads
 	kw := d.convK
 	// The convolution first, for every token: each channel mixes with its
 	// three predecessors, which for the first tokens are the window the
