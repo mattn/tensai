@@ -5,6 +5,8 @@ import (
 	"math/bits"
 	"math/rand"
 	"testing"
+
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 // fwht is the Sylvester matrix: entry (r, c) is (-1)^popcount(r&c)
@@ -117,4 +119,49 @@ func TestRotatedWeightReadsRotatedInput(t *testing.T) {
 			t.Fatalf("output %d: plain %v, rotated %v", o, plain, rot)
 		}
 	}
+}
+
+func BenchmarkHadamardApply(b *testing.B) {
+	const width = 17408
+	h := &hadamard{block: 1024, signs: make([]float32, width)}
+	for i := range h.signs {
+		h.signs[i] = float32(1 - 2*(i%3&1))
+	}
+	x := make([]float32, width)
+	for i := range x {
+		x[i] = float32(i%13) - 6
+	}
+	b.SetBytes(width * 4)
+	for i := 0; i < b.N; i++ {
+		h.release(h.apply(x))
+	}
+}
+
+func BenchmarkHadamardParts(b *testing.B) {
+	const width = 17408
+	h := &hadamard{block: 1024, signs: make([]float32, width)}
+	x := make([]float32, width)
+	y := make([]float32, width)
+	b.Run("mulsigns", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			kernels.MulSlices(y, x, h.signs)
+		}
+	})
+	b.Run("blocks", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			for off := 0; off+1024 <= width; off += 1024 {
+				kernels.Hadamard(y[off:off+1024], 0.03125)
+			}
+		}
+	})
+	b.Run("scale", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			kernels.ScaleSlice(y, 0.5)
+		}
+	})
+	b.Run("alloc", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			y = make([]float32, width)
+		}
+	})
 }

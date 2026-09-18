@@ -138,7 +138,7 @@ func TestTernaryGenericAgrees(t *testing.T) {
 	}
 	xs, sx, gsum := signedActs(x, rows)
 	a, b := make([]tensai.Float, cols), make([]tensai.Float, cols)
-	ternaryMatvecCols(a, xs, sx, gsum, q.Q, q.Scale, rows, cols, 0, cols)
+	ternaryMatvecCols(a, xs, xsQuads(xs), sx, gsum, q.Q, q.Scale, rows, cols, 0, cols)
 	ternaryMatvecColsGeneric(b, xs, sx, gsum, q.Q, q.Scale, rows, cols, 0, cols)
 	for j := range a {
 		if a[j] != b[j] {
@@ -185,10 +185,11 @@ func BenchmarkTernaryMatVecSmall(b *testing.B) {
 	}
 	out := make([]tensai.Float, cols)
 	xs, sx, gsum := signedActs(x, rows)
+	xq := xsQuads(xs)
 	b.SetBytes(int64(rows * cols / 4))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		ternaryMatvecCols(out, xs, sx, gsum, q.Q, q.Scale, rows, cols, 0, cols)
+		ternaryMatvecCols(out, xs, xq, sx, gsum, q.Q, q.Scale, rows, cols, 0, cols)
 	}
 }
 

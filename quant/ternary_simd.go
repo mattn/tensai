@@ -17,7 +17,7 @@ import (
 // chain sums is the dot product plus the group's activation sum, taken
 // off once per group, the same for every column.
 
-func ternaryMatvecCols(out []tensai.Float, xs []int8, sx tensai.Float, gsum []int32, qw []uint8, scale []tensai.Float, rows, cols, lo, hi int) {
+func ternaryMatvecCols(out []tensai.Float, xs []int8, xq []uint32, sx tensai.Float, gsum []int32, qw []uint8, scale []tensai.Float, rows, cols, lo, hi int) {
 	if !simd.HasAVX2 {
 		ternaryMatvecColsGeneric(out, xs, sx, gsum, qw, scale, rows, cols, lo, hi)
 		return
@@ -29,7 +29,6 @@ func ternaryMatvecCols(out []tensai.Float, xs []int8, sx tensai.Float, gsum []in
 		m3 := archsimd.BroadcastUint8x32(3)
 		ones := archsimd.BroadcastInt16x16(1)
 		clear(out[lo:vecEnd])
-		xq := xsQuads(xs)
 		for jt := lo; jt < vecEnd; jt += 32 {
 			tile := qw[(jt/tTile)*blocks*tBlock:]
 			stab := scale[(jt/tTile)*groups*tTile:]
@@ -40,7 +39,9 @@ func ternaryMatvecCols(out []tensai.Float, xs []int8, sx tensai.Float, gsum []in
 			for g := 0; g < groups; g++ {
 				bb := g * (tGroup / 16)
 				be := min(bb+tGroup/16, blocks)
-				var a0, a1, a2, a3 archsimd.Int32x8
+				// Pair sums stay int16 across the group (32 quads of at
+				// most 252) and widen once at its end.
+				var a0, a1, a2, a3 archsimd.Int16x16
 				for b := bb; b < be; b++ {
 					blk := tile[b*tBlock:]
 					x0 := archsimd.BroadcastUint32x8(xq[4*b]).AsInt8x32()
@@ -48,32 +49,32 @@ func ternaryMatvecCols(out []tensai.Float, xs []int8, sx tensai.Float, gsum []in
 					x2 := archsimd.BroadcastUint32x8(xq[4*b+2]).AsInt8x32()
 					x3 := archsimd.BroadcastUint32x8(xq[4*b+3]).AsInt8x32()
 					v := simd.LoadU8x32(blk)
-					a0 = a0.Add(v.And(m3).DotProductPairsSaturated(x0).DotProductPairs(ones))
-					a0 = a0.Add(v.AsUint16x16().ShiftAllRight(2).AsUint8x32().And(m3).DotProductPairsSaturated(x1).DotProductPairs(ones))
-					a0 = a0.Add(v.AsUint16x16().ShiftAllRight(4).AsUint8x32().And(m3).DotProductPairsSaturated(x2).DotProductPairs(ones))
-					a0 = a0.Add(v.AsUint16x16().ShiftAllRight(6).AsUint8x32().And(m3).DotProductPairsSaturated(x3).DotProductPairs(ones))
+					a0 = a0.Add(v.And(m3).DotProductPairsSaturated(x0))
+					a0 = a0.Add(v.AsUint16x16().ShiftAllRight(2).AsUint8x32().And(m3).DotProductPairsSaturated(x1))
+					a0 = a0.Add(v.AsUint16x16().ShiftAllRight(4).AsUint8x32().And(m3).DotProductPairsSaturated(x2))
+					a0 = a0.Add(v.AsUint16x16().ShiftAllRight(6).AsUint8x32().And(m3).DotProductPairsSaturated(x3))
 					v = simd.LoadU8x32(blk[32:])
-					a1 = a1.Add(v.And(m3).DotProductPairsSaturated(x0).DotProductPairs(ones))
-					a1 = a1.Add(v.AsUint16x16().ShiftAllRight(2).AsUint8x32().And(m3).DotProductPairsSaturated(x1).DotProductPairs(ones))
-					a1 = a1.Add(v.AsUint16x16().ShiftAllRight(4).AsUint8x32().And(m3).DotProductPairsSaturated(x2).DotProductPairs(ones))
-					a1 = a1.Add(v.AsUint16x16().ShiftAllRight(6).AsUint8x32().And(m3).DotProductPairsSaturated(x3).DotProductPairs(ones))
+					a1 = a1.Add(v.And(m3).DotProductPairsSaturated(x0))
+					a1 = a1.Add(v.AsUint16x16().ShiftAllRight(2).AsUint8x32().And(m3).DotProductPairsSaturated(x1))
+					a1 = a1.Add(v.AsUint16x16().ShiftAllRight(4).AsUint8x32().And(m3).DotProductPairsSaturated(x2))
+					a1 = a1.Add(v.AsUint16x16().ShiftAllRight(6).AsUint8x32().And(m3).DotProductPairsSaturated(x3))
 					v = simd.LoadU8x32(blk[64:])
-					a2 = a2.Add(v.And(m3).DotProductPairsSaturated(x0).DotProductPairs(ones))
-					a2 = a2.Add(v.AsUint16x16().ShiftAllRight(2).AsUint8x32().And(m3).DotProductPairsSaturated(x1).DotProductPairs(ones))
-					a2 = a2.Add(v.AsUint16x16().ShiftAllRight(4).AsUint8x32().And(m3).DotProductPairsSaturated(x2).DotProductPairs(ones))
-					a2 = a2.Add(v.AsUint16x16().ShiftAllRight(6).AsUint8x32().And(m3).DotProductPairsSaturated(x3).DotProductPairs(ones))
+					a2 = a2.Add(v.And(m3).DotProductPairsSaturated(x0))
+					a2 = a2.Add(v.AsUint16x16().ShiftAllRight(2).AsUint8x32().And(m3).DotProductPairsSaturated(x1))
+					a2 = a2.Add(v.AsUint16x16().ShiftAllRight(4).AsUint8x32().And(m3).DotProductPairsSaturated(x2))
+					a2 = a2.Add(v.AsUint16x16().ShiftAllRight(6).AsUint8x32().And(m3).DotProductPairsSaturated(x3))
 					v = simd.LoadU8x32(blk[96:])
-					a3 = a3.Add(v.And(m3).DotProductPairsSaturated(x0).DotProductPairs(ones))
-					a3 = a3.Add(v.AsUint16x16().ShiftAllRight(2).AsUint8x32().And(m3).DotProductPairsSaturated(x1).DotProductPairs(ones))
-					a3 = a3.Add(v.AsUint16x16().ShiftAllRight(4).AsUint8x32().And(m3).DotProductPairsSaturated(x2).DotProductPairs(ones))
-					a3 = a3.Add(v.AsUint16x16().ShiftAllRight(6).AsUint8x32().And(m3).DotProductPairsSaturated(x3).DotProductPairs(ones))
+					a3 = a3.Add(v.And(m3).DotProductPairsSaturated(x0))
+					a3 = a3.Add(v.AsUint16x16().ShiftAllRight(2).AsUint8x32().And(m3).DotProductPairsSaturated(x1))
+					a3 = a3.Add(v.AsUint16x16().ShiftAllRight(4).AsUint8x32().And(m3).DotProductPairsSaturated(x2))
+					a3 = a3.Add(v.AsUint16x16().ShiftAllRight(6).AsUint8x32().And(m3).DotProductPairsSaturated(x3))
 				}
 				gs := archsimd.BroadcastInt32x8(gsum[g])
 				tg := stab[g*tTile:]
-				simd.StoreF32x8(simd.LoadF32x8(d0).Add(a0.Sub(gs).ConvertToFloat32().Mul(simd.LoadF32x8(tg))), d0)
-				simd.StoreF32x8(simd.LoadF32x8(d1).Add(a1.Sub(gs).ConvertToFloat32().Mul(simd.LoadF32x8(tg[8:]))), d1)
-				simd.StoreF32x8(simd.LoadF32x8(d2).Add(a2.Sub(gs).ConvertToFloat32().Mul(simd.LoadF32x8(tg[16:]))), d2)
-				simd.StoreF32x8(simd.LoadF32x8(d3).Add(a3.Sub(gs).ConvertToFloat32().Mul(simd.LoadF32x8(tg[24:]))), d3)
+				simd.StoreF32x8(simd.LoadF32x8(d0).Add(a0.DotProductPairs(ones).Sub(gs).ConvertToFloat32().Mul(simd.LoadF32x8(tg))), d0)
+				simd.StoreF32x8(simd.LoadF32x8(d1).Add(a1.DotProductPairs(ones).Sub(gs).ConvertToFloat32().Mul(simd.LoadF32x8(tg[8:]))), d1)
+				simd.StoreF32x8(simd.LoadF32x8(d2).Add(a2.DotProductPairs(ones).Sub(gs).ConvertToFloat32().Mul(simd.LoadF32x8(tg[16:]))), d2)
+				simd.StoreF32x8(simd.LoadF32x8(d3).Add(a3.DotProductPairs(ones).Sub(gs).ConvertToFloat32().Mul(simd.LoadF32x8(tg[24:]))), d3)
 			}
 		}
 		sxv := archsimd.BroadcastFloat32x8(sx)
@@ -85,16 +86,6 @@ func ternaryMatvecCols(out []tensai.Float, xs []int8, sx tensai.Float, gsum []in
 	if vecEnd < hi {
 		ternaryMatvecColsGeneric(out, xs, sx, gsum, qw, scale, rows, cols, vecEnd, hi)
 	}
-}
-
-// xsQuads packs a signed activation row four bytes to a word, one word
-// per row-quad, for the broadcasts.
-func xsQuads(xs []int8) []uint32 {
-	xq := make([]uint32, len(xs)/4)
-	for i := range xq {
-		xq[i] = uint32(uint8(xs[4*i])) | uint32(uint8(xs[4*i+1]))<<8 | uint32(uint8(xs[4*i+2]))<<16 | uint32(uint8(xs[4*i+3]))<<24
-	}
-	return xq
 }
 
 // ternaryMatmulRows8 is the eight-row batched form: two passes of four
@@ -138,36 +129,39 @@ func ternaryMatmulRows4(out *tensai.Matrix, xss [][]int8, sxs []tensai.Float, gs
 			for g := 0; g < groups; g++ {
 				bb := g * (tGroup / 16)
 				be := min(bb+tGroup/16, blocks)
-				var a0, a1, a2, a3 archsimd.Int32x8
+				// A group's pair sums fit int16 (32 quads of at most
+				// 252), so the accumulators stay 16-bit until the group
+				// ends and widen once.
+				var a0, a1, a2, a3 archsimd.Int16x16
 				for b := bb; b < be; b++ {
 					v := simd.LoadU8x32(tile[b*tBlock:])
 					q := 4 * b
 					w := v.And(m3)
-					a0 = a0.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq0[q]).AsInt8x32()).DotProductPairs(ones))
-					a1 = a1.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq1[q]).AsInt8x32()).DotProductPairs(ones))
-					a2 = a2.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq2[q]).AsInt8x32()).DotProductPairs(ones))
-					a3 = a3.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq3[q]).AsInt8x32()).DotProductPairs(ones))
+					a0 = a0.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq0[q]).AsInt8x32()))
+					a1 = a1.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq1[q]).AsInt8x32()))
+					a2 = a2.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq2[q]).AsInt8x32()))
+					a3 = a3.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq3[q]).AsInt8x32()))
 					w = v.AsUint16x16().ShiftAllRight(2).AsUint8x32().And(m3)
-					a0 = a0.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq0[q+1]).AsInt8x32()).DotProductPairs(ones))
-					a1 = a1.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq1[q+1]).AsInt8x32()).DotProductPairs(ones))
-					a2 = a2.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq2[q+1]).AsInt8x32()).DotProductPairs(ones))
-					a3 = a3.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq3[q+1]).AsInt8x32()).DotProductPairs(ones))
+					a0 = a0.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq0[q+1]).AsInt8x32()))
+					a1 = a1.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq1[q+1]).AsInt8x32()))
+					a2 = a2.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq2[q+1]).AsInt8x32()))
+					a3 = a3.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq3[q+1]).AsInt8x32()))
 					w = v.AsUint16x16().ShiftAllRight(4).AsUint8x32().And(m3)
-					a0 = a0.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq0[q+2]).AsInt8x32()).DotProductPairs(ones))
-					a1 = a1.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq1[q+2]).AsInt8x32()).DotProductPairs(ones))
-					a2 = a2.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq2[q+2]).AsInt8x32()).DotProductPairs(ones))
-					a3 = a3.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq3[q+2]).AsInt8x32()).DotProductPairs(ones))
+					a0 = a0.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq0[q+2]).AsInt8x32()))
+					a1 = a1.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq1[q+2]).AsInt8x32()))
+					a2 = a2.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq2[q+2]).AsInt8x32()))
+					a3 = a3.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq3[q+2]).AsInt8x32()))
 					w = v.AsUint16x16().ShiftAllRight(6).AsUint8x32().And(m3)
-					a0 = a0.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq0[q+3]).AsInt8x32()).DotProductPairs(ones))
-					a1 = a1.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq1[q+3]).AsInt8x32()).DotProductPairs(ones))
-					a2 = a2.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq2[q+3]).AsInt8x32()).DotProductPairs(ones))
-					a3 = a3.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq3[q+3]).AsInt8x32()).DotProductPairs(ones))
+					a0 = a0.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq0[q+3]).AsInt8x32()))
+					a1 = a1.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq1[q+3]).AsInt8x32()))
+					a2 = a2.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq2[q+3]).AsInt8x32()))
+					a3 = a3.Add(w.DotProductPairsSaturated(archsimd.BroadcastUint32x8(xq3[q+3]).AsInt8x32()))
 				}
 				sc := simd.LoadF32x8(stab[g*tTile:])
-				simd.StoreF32x8(simd.LoadF32x8(d0).Add(a0.Sub(archsimd.BroadcastInt32x8(gs0[g])).ConvertToFloat32().Mul(sc)), d0)
-				simd.StoreF32x8(simd.LoadF32x8(d1).Add(a1.Sub(archsimd.BroadcastInt32x8(gs1[g])).ConvertToFloat32().Mul(sc)), d1)
-				simd.StoreF32x8(simd.LoadF32x8(d2).Add(a2.Sub(archsimd.BroadcastInt32x8(gs2[g])).ConvertToFloat32().Mul(sc)), d2)
-				simd.StoreF32x8(simd.LoadF32x8(d3).Add(a3.Sub(archsimd.BroadcastInt32x8(gs3[g])).ConvertToFloat32().Mul(sc)), d3)
+				simd.StoreF32x8(simd.LoadF32x8(d0).Add(a0.DotProductPairs(ones).Sub(archsimd.BroadcastInt32x8(gs0[g])).ConvertToFloat32().Mul(sc)), d0)
+				simd.StoreF32x8(simd.LoadF32x8(d1).Add(a1.DotProductPairs(ones).Sub(archsimd.BroadcastInt32x8(gs1[g])).ConvertToFloat32().Mul(sc)), d1)
+				simd.StoreF32x8(simd.LoadF32x8(d2).Add(a2.DotProductPairs(ones).Sub(archsimd.BroadcastInt32x8(gs2[g])).ConvertToFloat32().Mul(sc)), d2)
+				simd.StoreF32x8(simd.LoadF32x8(d3).Add(a3.DotProductPairs(ones).Sub(archsimd.BroadcastInt32x8(gs3[g])).ConvertToFloat32().Mul(sc)), d3)
 			}
 		}
 		for r := 0; r < 4; r++ {

@@ -126,12 +126,13 @@ func (q *TernaryMatrix) MatVec(x, out []tensai.Float) error {
 			len(x), len(out), q.Rows, q.Cols)
 	}
 	xs, sx, gsum := signedActs(x, q.Rows)
+	xq := xsQuads(xs)
 	if matvecWorkerCount(q.Cols, q.Rows) == 1 {
-		ternaryMatvecCols(out, xs, sx, gsum, q.Q, q.Scale, q.Rows, q.Cols, 0, q.Cols)
+		ternaryMatvecCols(out, xs, xq, sx, gsum, q.Q, q.Scale, q.Rows, q.Cols, 0, q.Cols)
 		return nil
 	}
 	workpool.Run(q.Cols, tTile, func(lo, hi int) {
-		ternaryMatvecCols(out, xs, sx, gsum, q.Q, q.Scale, q.Rows, q.Cols, lo, hi)
+		ternaryMatvecCols(out, xs, xq, sx, gsum, q.Q, q.Scale, q.Rows, q.Cols, lo, hi)
 	})
 	return nil
 }
@@ -225,4 +226,14 @@ func ternaryMatmulRows8Generic(out *tensai.Matrix, xss [][]int8, sxs []tensai.Fl
 		o := out.Data[(r0+r)*cols : (r0+r+1)*cols]
 		ternaryMatvecColsGeneric(o, xss[r], sxs[r], gsums[r], qw, scale, rows, cols, lo, hi)
 	}
+}
+
+// xsQuads packs a signed activation row four bytes to a word, one word
+// per row-quad, for the kernels' broadcasts.
+func xsQuads(xs []int8) []uint32 {
+	xq := make([]uint32, len(xs)/4)
+	for i := range xq {
+		xq[i] = uint32(uint8(xs[4*i])) | uint32(uint8(xs[4*i+1]))<<8 | uint32(uint8(xs[4*i+2]))<<16 | uint32(uint8(xs[4*i+3]))<<24
+	}
+	return xq
 }

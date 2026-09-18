@@ -114,6 +114,13 @@ func loadDelta(cfg config, p string, vec func(string) []float32,
 	return d
 }
 
+// fuse builds the fused projections from the separate float32 ones,
+// for a layer assembled by hand rather than loaded.
+func (d *deltaWeights) fuse() {
+	d.wQZ = hcat([]*tensai.Matrix{d.wQKV, d.wZ})
+	d.wAB = hcat([]*tensai.Matrix{d.wA, d.wB})
+}
+
 // check reports a shape the forward pass could not survive, which is
 // cheaper to say at load than to debug as garbage tokens.
 func (d *deltaWeights) check() error {
@@ -175,11 +182,13 @@ func silu(x float32) float32 {
 // step advances one token through the layer, in place on x. conv holds the
 // previous convK-1 rows; the state absorbs the token and answers the query.
 func (d *deltaWeights) step(st *deltaState, x []float32, scratch *deltaScratch) []float32 {
-	mvInto(scratch.qkv, x, d.wQKV, d.qQKV, nil)
-	mvInto(scratch.z, x, d.wZ, d.qZ, nil)
-	mvInto(scratch.a, x, d.wA, nil, nil)
-	mvInto(scratch.b, x, d.wB, nil, nil)
-	res := d.mix(st, scratch.qkv, scratch.z, scratch.a, scratch.b, scratch)
+	// The fused projections read x once: qkv and z in one pass over
+	// their weights, a and b in another.
+	mvInto(scratch.qz, x, d.wQZ, d.qQZ, nil)
+	mvInto(scratch.ab, x, d.wAB, nil, nil)
+	qkv, z := scratch.qz[:d.convDim], scratch.qz[d.convDim:]
+	a, b := scratch.ab[:d.heads], scratch.ab[d.heads:]
+	res := d.mix(st, qkv, z, a, b, scratch)
 	y := scratch.proj
 	mvInto(y, res, d.wOut, d.qOut, nil)
 	return y
@@ -263,12 +272,14 @@ func (d *deltaWeights) head(st *deltaState, scratch *deltaScratch, res, out, z, 
 		for j := range mem {
 			mem[j] = 0
 		}
-		// Decay the state and read what it already holds for this key.
+		// Decay the state and read what it already holds for this key,
+		// in one pass over each row.
 		for i := 0; i < kd; i++ {
 			row := s[i*vd : (i+1)*vd]
-			kernels.ScaleSlice(row, decay)
 			if k[i] != 0 {
-				tensai.Axpy(k[i], row, mem)
+				kernels.DecayRead(row, decay, k[i], mem)
+			} else {
+				kernels.ScaleSlice(row, decay)
 			}
 		}
 		// The correction the key writes is the same vector for every row
@@ -284,10 +295,12 @@ func (d *deltaWeights) head(st *deltaState, scratch *deltaScratch, res, out, z, 
 		}
 		for i := 0; i < kd; i++ {
 			row := s[i*vd : (i+1)*vd]
-			if k[i] != 0 {
+			switch {
+			case k[i] != 0 && q[i] != 0:
+				kernels.WriteRead(row, delta, k[i], q[i], o)
+			case k[i] != 0:
 				tensai.Axpy(k[i], delta, row)
-			}
-			if q[i] != 0 {
+			case q[i] != 0:
 				tensai.Axpy(q[i], row, o)
 			}
 		}
@@ -309,6 +322,7 @@ func (d *deltaWeights) head(st *deltaState, scratch *deltaScratch, res, out, z, 
 // and each wants its own mem and delta; decode reuses the first.
 type deltaScratch struct {
 	qkv, conv, z, a, b, mem, delta, out, proj []float32
+	qz, ab                                    []float32 // the fused projections' outputs
 	q, k                                      []float32 // per value head, normalized
 	perHead                                   []*deltaScratch
 	batch                                     []float32
@@ -348,6 +362,8 @@ func newDeltaScratchOne(d *deltaWeights, hidden int) *deltaScratch {
 		proj:  make([]float32, hidden),
 		q:     make([]float32, d.kDim*d.heads),
 		k:     make([]float32, d.kDim*d.heads),
+		qz:    make([]float32, d.convDim+d.vDim*d.heads),
+		ab:    make([]float32, 2*d.heads),
 	}
 }
 

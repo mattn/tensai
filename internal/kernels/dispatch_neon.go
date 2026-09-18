@@ -258,3 +258,15 @@ func LnFwdRow(out, xhat, src, gamma, beta []float32, eps float32) float32 {
 func LnBwdRow(out, g, xhat, gamma, gradGamma, gradBeta []float32, invStd float32) {
 	lnBwdRowGeneric(out, g, xhat, gamma, gradGamma, gradBeta, invStd)
 }
+
+// Hadamard is the Walsh-Hadamard transform of v in place, times scale;
+// no NEON form yet.
+func Hadamard(v []float32, scale float32) { hadamardGeneric(v, scale) }
+
+// DecayRead scales row by decay and adds k times it into mem.
+func DecayRead(row []float32, decay, k float32, mem []float32) { decayReadGeneric(row, decay, k, mem) }
+
+// WriteRead adds k times delta into row and q times the result into out.
+func WriteRead(row, delta []float32, k, q float32, out []float32) {
+	writeReadGeneric(row, delta, k, q, out)
+}

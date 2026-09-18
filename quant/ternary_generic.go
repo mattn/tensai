@@ -7,7 +7,7 @@ import "github.com/mattn/tensai"
 // Portable dispatchers for the ternary kernels; build with
 // GOEXPERIMENT=simd on amd64 for the AVX2 versions in ternary_simd.go.
 
-func ternaryMatvecCols(out []tensai.Float, xs []int8, sx tensai.Float, gsum []int32, qw []uint8, scale []tensai.Float, rows, cols, lo, hi int) {
+func ternaryMatvecCols(out []tensai.Float, xs []int8, _ []uint32, sx tensai.Float, gsum []int32, qw []uint8, scale []tensai.Float, rows, cols, lo, hi int) {
 	ternaryMatvecColsGeneric(out, xs, sx, gsum, qw, scale, rows, cols, lo, hi)
 }
 

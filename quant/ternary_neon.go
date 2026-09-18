@@ -7,7 +7,7 @@ import "github.com/mattn/tensai"
 // The ternary kernels have no NEON form yet; arm64 takes the portable
 // one.
 
-func ternaryMatvecCols(out []tensai.Float, xs []int8, sx tensai.Float, gsum []int32, qw []uint8, scale []tensai.Float, rows, cols, lo, hi int) {
+func ternaryMatvecCols(out []tensai.Float, xs []int8, _ []uint32, sx tensai.Float, gsum []int32, qw []uint8, scale []tensai.Float, rows, cols, lo, hi int) {
 	ternaryMatvecColsGeneric(out, xs, sx, gsum, qw, scale, rows, cols, lo, hi)
 }
 

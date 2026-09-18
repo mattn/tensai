@@ -116,6 +116,7 @@ type qmat struct {
 	cols int
 	f    func(x, out []float32) error
 	mm   func(x, out *tensai.Matrix) error
+	rot  int                  // the rotation wrapped around f and mm, for the cache
 	q8   *quant.QMatrix       // retained for GPU upload
 	q4   *quant.Q4Matrix      // likewise, for the int4 twin
 	q8g  *quant.Q8GMatrix     // retained for the repack cache

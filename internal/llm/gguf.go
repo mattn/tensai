@@ -1370,10 +1370,12 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		if err != nil {
 			panic(err)
 		}
+		rot := rotPlain
 		if hspec.vGrouped && strings.HasSuffix(names[0], ".ssm_out.weight") && cfg.LinearKeyHeads != cfg.LinearValueHeads {
 			h.perm = tiledToGrouped(cfg.LinearValueDim, cfg.LinearKeyHeads, cfg.LinearValueHeads/cfg.LinearKeyHeads)
+			rot = rotGrouped
 		}
-		q.rotate(h)
+		q.rotate(h, rot)
 		rotMu.Lock()
 		for _, n := range names {
 			if !hspec.weights[n] {
@@ -1509,9 +1511,13 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		headSz = cfg.HeadDim
 	}
 	// A valid repack cache stands in for the whole tensor load: the
-	// weights map straight from the cache file as clean pages. The cache
-	// does not carry a delta layer yet.
-	useCache := cache && bits != 0 && arch != "qwen35"
+	// weights map straight from the cache file as clean pages. A
+	// ternary file caches under its own name whatever width was asked.
+	ternary := allTernary("output.weight") || allTernary("token_embd.weight")
+	if ternary {
+		bits, direct = 0, true
+	}
+	useCache := cache && (bits != 0 || ternary)
 	// Requantization's per-column scales decode materially faster than
 	// the direct Q8_0 group scales. Once a user has paid its one-time
 	// conversion cost, prefer that valid cache on ordinary -q8 runs too.
@@ -1520,7 +1526,7 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	fmt.Fprintf(vlog, "repack cache: %s\n", map[bool]string{true: cachePath(path, bits, direct), false: "off"}[useCache])
 	if useCache && direct && bits == 8 {
 		fastPath := cachePath(path, bits, false)
-		if m, err := loadWeightCache(fastPath, path, bits, false, cfg, headSz); err == nil {
+		if m, err := loadWeightCache(fastPath, path, bits, false, cfg, headSz, hspec); err == nil {
 			fmt.Fprintf(os.Stderr, "using faster requantized cache: %s\n", fastPath)
 			m.layout = layoutName(bits, false)
 			return m, tok, nil
@@ -1528,9 +1534,12 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	}
 	cpath := cachePath(path, bits, direct)
 	if useCache {
-		if m, err := loadWeightCache(cpath, path, bits, direct, cfg, headSz); err == nil {
+		if m, err := loadWeightCache(cpath, path, bits, direct, cfg, headSz, hspec); err == nil {
 			fmt.Fprintln(vlog, "weights mapped from the repack cache")
 			m.layout = layoutName(bits, direct)
+			if ternary {
+				m.layout = "ternary"
+			}
 			return m, tok, nil
 		} else if !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "repack cache unusable (%v); repacking\n", err)
@@ -1543,7 +1552,6 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	into := fmt.Sprintf("int%d", bits)
 	// A ternary file has no width to choose: its blocks repack as they
 	// are, whatever the flags asked for.
-	ternary := allTernary("output.weight") || allTernary("token_embd.weight")
 	if ternary {
 		how, into = "repacking the stored blocks", "ternary"
 	}
@@ -1784,8 +1792,9 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		// clean, droppable pages.
 		if err := writeWeightCache(cpath, path, bits, direct, m); err != nil {
 			fmt.Fprintf(os.Stderr, "repack cache not written: %v\n", err)
-		} else if m2, err := loadWeightCache(cpath, path, bits, direct, cfg, headSz); err == nil {
+		} else if m2, err := loadWeightCache(cpath, path, bits, direct, cfg, headSz, hspec); err == nil {
 			fmt.Fprintf(os.Stderr, "repack cache written: %s\n", cpath)
+			m2.layout = m.layout
 			m = m2
 			debug.FreeOSMemory()
 		}
@@ -1838,6 +1847,21 @@ func qwen35Config(g *gguf.File, cfg *config) error {
 	return nil
 }
 
+// newDeltaHeader is a gguf delta layer's geometry, before its weights:
+// what the config says, with the value heads in the tiled order a
+// converter leaves them in whenever they outnumber the key heads.
+func newDeltaHeader(cfg config) *deltaWeights {
+	return &deltaWeights{
+		heads:   cfg.LinearValueHeads,
+		kHeads:  cfg.LinearKeyHeads,
+		tiled:   cfg.LinearKeyHeads != cfg.LinearValueHeads,
+		kDim:    cfg.LinearKeyDim,
+		vDim:    cfg.LinearValueDim,
+		convK:   cfg.LinearConvK,
+		convDim: cfg.LinearKeyHeads*cfg.LinearKeyDim*2 + cfg.LinearValueHeads*cfg.LinearValueDim,
+	}
+}
+
 // loadDeltaGGUF reads a linear-attention layer from a gguf. The names are
 // llama.cpp's: attn_qkv fuses q, k and v, attn_gate is z, ssm_alpha and
 // ssm_beta the decay and write projections, and ssm_a holds -exp(A_log)
@@ -1847,18 +1871,10 @@ func qwen35Config(g *gguf.File, cfg *config) error {
 func loadDeltaGGUF(cfg config, p string, tensor func(string) *tensai.Tensor,
 	trans func(string, int) *tensai.Matrix,
 	linAuto func([]string, []int) (*tensai.Matrix, *qmat)) *deltaWeights {
-	d := &deltaWeights{
-		heads:  cfg.LinearValueHeads,
-		kHeads: cfg.LinearKeyHeads,
-		tiled:  cfg.LinearKeyHeads != cfg.LinearValueHeads,
-		kDim:   cfg.LinearKeyDim,
-		vDim:   cfg.LinearValueDim,
-		convK:  cfg.LinearConvK,
-		dtBias: tensor(p + "ssm_dt.bias").Data,
-		norm:   tensor(p + "ssm_norm.weight").Data,
-		conv:   tensor(p + "ssm_conv1d.weight").Data,
-	}
-	d.convDim = cfg.LinearKeyHeads*cfg.LinearKeyDim*2 + cfg.LinearValueHeads*cfg.LinearValueDim
+	d := newDeltaHeader(cfg)
+	d.dtBias = tensor(p + "ssm_dt.bias").Data
+	d.norm = tensor(p + "ssm_norm.weight").Data
+	d.conv = tensor(p + "ssm_conv1d.weight").Data
 	a := tensor(p + "ssm_a").Data
 	d.aLog = make([]float32, len(a))
 	for i, v := range a {

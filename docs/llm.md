@@ -24,7 +24,7 @@ The `tensai` command runs modern instruction-tuned models: RMSNorm, rotary posit
 |---|---|---|
 | qwen2 | Qwen 1.5/2/2.5, Qwen2.5-Coder, the R1-Distill-Qwen line | attention biases |
 | qwen3 | Qwen3 dense | per-head QK-norm, explicit head_dim, `-think` |
-| qwen3_5 | Qwen3.5, Qwen3.6, Qwen3.8 | a gated delta rule on three layers in four, ordinary attention on the fourth; norms scale by 1 + w, RoPE turns a quarter of each head, and the queries carry a gate for the attention output. The larger ones share each key head among several value heads. CPU only, no `-draft`, and a GGUF (`qwen35`) repacks but does not cache yet |
+| qwen3_5 | Qwen3.5, Qwen3.6, Qwen3.8 | a gated delta rule on three layers in four, ordinary attention on the fourth; norms scale by 1 + w, RoPE turns a quarter of each head, and the queries carry a gate for the attention output. The larger ones share each key head among several value heads. CPU only, no `-draft` |
 
 A `qwen3_5` prompt costs more to prefill than its size suggests: the delta
 layers carry state token by token, so only the projections around the
@@ -102,11 +102,12 @@ The ternary kernel reads the codes as the unsigned operand of the
 multiply-add and the activations as the signed one, so the correction it
 needs is the sum of a group's activations, shared by every column, and no
 per-column table streams beside the weights. On a Ryzen 7735HS the 27B
-prefills at about 6 tokens/s and decodes at 3; its answers match the PrismML
-llama.cpp build token for token on the prompts tried. The repack of 27
-billion weights takes about a minute on every load, since the cache does
-not carry a ternary layout or a delta layer yet, and the model runs on the
-CPU, as every qwen3_5 does.
+prefills at about 6 tokens/s and decodes at 3.4, which is the memory
+bandwidth (about 28 GB/s of weights a token); its answers match the
+PrismML llama.cpp build token for token on the prompts tried. The first
+load repacks 27 billion weights, about a minute, and writes the repack
+cache (8.5 GB beside the model); later loads map it in under a second.
+The model runs on the CPU, as every qwen3_5 does.
 
 ## Prefill, speculative decoding, sampling
 

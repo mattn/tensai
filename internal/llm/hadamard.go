@@ -15,9 +15,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/gguf"
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 // hadamard is the transform one weight's input goes through: an optional
@@ -27,6 +29,7 @@ type hadamard struct {
 	block int
 	signs []float32 // one per input channel, +1 or -1
 	perm  []int     // dst[i] = src[perm[i]] before the signs; nil for none
+	pool  sync.Pool // transformed rows, reused across calls
 }
 
 // hadamardSpec is what the metadata declares for the whole file.
@@ -150,27 +153,37 @@ func tiledToGrouped(hd, nk, rep int) []int {
 	return perm
 }
 
-// apply returns the transformed copy of x.
+// apply returns the transformed copy of x, in a buffer from the pool;
+// the caller hands it back with release once the weight has read it.
 func (h *hadamard) apply(x []float32) []float32 {
-	y := make([]float32, len(x))
+	var y []float32
+	if p, ok := h.pool.Get().(*[]float32); ok && len(*p) == len(x) {
+		y = *p
+	} else {
+		y = make([]float32, len(x))
+	}
 	h.applyInto(y, x)
 	return y
 }
 
+func (h *hadamard) release(y []float32) {
+	h.pool.Put(&y)
+}
+
 // applyInto writes the transform of x into y, which must not alias it.
+// The normalization of every block is one scale at the end.
 func (h *hadamard) applyInto(y, x []float32) {
 	if h.perm != nil {
 		for i, p := range h.perm {
 			y[i] = x[p]
 		}
+		kernels.MulSlices(y, y, h.signs)
 	} else {
-		copy(y, x)
+		kernels.MulSlices(y, x, h.signs)
 	}
-	for i, s := range h.signs {
-		y[i] *= s
-	}
+	scale := float32(1 / math.Sqrt(float64(h.block)))
 	for off := 0; off+h.block <= len(y); off += h.block {
-		fwht(y[off : off+h.block])
+		kernels.Hadamard(y[off:off+h.block], scale)
 	}
 }
 
@@ -187,37 +200,37 @@ func (h *hadamard) applyRows(x *tensai.Matrix) *tensai.Matrix {
 // transform is orthogonal and symmetric, so its inverse is itself, and
 // the signs undo themselves.
 func (h *hadamard) invert(x []float32) {
+	scale := float32(1 / math.Sqrt(float64(h.block)))
 	for off := 0; off+h.block <= len(x); off += h.block {
-		fwht(x[off : off+h.block])
+		kernels.Hadamard(x[off:off+h.block], scale)
 	}
-	for i, s := range h.signs {
-		x[i] *= s
-	}
+	kernels.MulSlices(x, x, h.signs)
 }
 
 // fwht is the normalized Walsh-Hadamard transform of v in place, in the
 // Sylvester order the butterfly produces: entry (r, c) of the matrix is
 // (-1)^popcount(r&c) / sqrt(n). len(v) must be a power of two.
 func fwht(v []float32) {
-	n := len(v)
-	for h := 1; h < n; h *= 2 {
-		for i := 0; i < n; i += 2 * h {
-			for j := i; j < i+h; j++ {
-				a, b := v[j], v[j+h]
-				v[j], v[j+h] = a+b, a-b
-			}
-		}
-	}
-	s := float32(1 / math.Sqrt(float64(n)))
-	for i := range v {
-		v[i] *= s
-	}
+	kernels.Hadamard(v, float32(1/math.Sqrt(float64(len(v)))))
 }
+
+// The rotation kinds a weight records for the cache.
+const (
+	rotNone    = iota
+	rotPlain   // signs and blocks
+	rotGrouped // value heads put in grouped order first (ssm_out)
+)
 
 // rotate wraps a quantized weight so that what it reads is transformed
 // first.
-func (q *qmat) rotate(h *hadamard) {
+func (q *qmat) rotate(h *hadamard, rot int) {
+	q.rot = rot
 	f, mm := q.f, q.mm
-	q.f = func(x, out []float32) error { return f(h.apply(x), out) }
+	q.f = func(x, out []float32) error {
+		y := h.apply(x)
+		err := f(y, out)
+		h.release(y)
+		return err
+	}
 	q.mm = func(x, out *tensai.Matrix) error { return mm(h.applyRows(x), out) }
 }
