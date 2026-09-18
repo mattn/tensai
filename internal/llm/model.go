@@ -1061,10 +1061,11 @@ func (m *qwen) qkScale(b *qblock, d int) float64 {
 // was trained with. Derived rather than stored, because a model reaches
 // the decoder through three loaders and two of them once forgot.
 func (m *qwen) embedScale() float32 {
-	if m.cfg.ModelType != "gemma4" {
-		return 0
+	switch m.cfg.ModelType {
+	case "gemma3", "gemma4":
+		return float32(math.Sqrt(float64(m.cfg.HiddenSize)))
 	}
-	return float32(math.Sqrt(float64(m.cfg.HiddenSize)))
+	return 0
 }
 
 // kvHeadCount is the layer's kv head count. gemma4's larger models
