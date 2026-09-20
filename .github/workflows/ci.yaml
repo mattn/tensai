@@ -14,13 +14,21 @@ jobs:
         go: ["1.26.x", "1.27.x"]
         goexperiment: ["", "simd"]
         # macos-latest is Apple Silicon: the one runner that executes the
-        # NEON kernels natively rather than under emulation.
+        # NEON kernels natively rather than under emulation. Windows runs
+        # the OS-specific files (mmap, memory queries, the cache root) that
+        # a cross-compile only type-checks.
         include:
           - os: macos-latest
             go: "1.27.x"
             goexperiment: "simd"
+          - os: windows-latest
+            go: "1.27.x"
+            goexperiment: "simd"
     env:
       GOEXPERIMENT: ${{ matrix.goexperiment }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
