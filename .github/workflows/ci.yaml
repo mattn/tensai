@@ -7,11 +7,18 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os: [ubuntu-latest]
         go: ["1.26.x", "1.27.x"]
         goexperiment: ["", "simd"]
+        # macos-latest is Apple Silicon: the one runner that executes the
+        # NEON kernels natively rather than under emulation.
+        include:
+          - os: macos-latest
+            go: "1.27.x"
+            goexperiment: "simd"
     env:
       GOEXPERIMENT: ${{ matrix.goexperiment }}
     steps:
