@@ -14,9 +14,19 @@ func LoadF32x8(s []float32) archsimd.Float32x8 {
 	return archsimd.LoadFloat32x8(s)
 }
 
+// LoadF32x8Part loads up to eight floats, zero-filling the rest. It does
+// not call archsimd's part load: through Go 1.27.1 that is a full 32-byte
+// load masked afterwards, which reads past the slice and faults when the
+// slice ends at a page boundary (Windows heaps expose this on every run,
+// Linux ones rarely). Copying the tail through an array keeps the read
+// inside the slice.
 func LoadF32x8Part(s []float32) archsimd.Float32x8 {
-	v, _ := archsimd.LoadFloat32x8Part(s)
-	return v
+	if len(s) >= 8 {
+		return archsimd.LoadFloat32x8(s)
+	}
+	var buf [8]float32
+	copy(buf[:], s)
+	return archsimd.LoadFloat32x8(buf[:])
 }
 
 func StoreF32x8(v archsimd.Float32x8, s []float32) {
