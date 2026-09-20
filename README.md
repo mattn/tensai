@@ -507,9 +507,9 @@ and falls back on a CPU without it; NEON is mandatory on AArch64, so there is
 nothing to check. The GPU comes from a build tag and a wgpu-native shared
 library loaded at runtime.
 
-The arm64 kernels are newer and narrower than the amd64 ones: they vectorize
-the decode path, not yet the 4-bit and grouped-int8 matvecs, the batched
-prefill, or the dense float matmul.
+The arm64 kernels cover the same ground as the amd64 ones at half the
+lane width: every quantized matvec and prefill fold, the attention and
+element-wise rows, the dense float matmul and the training kernels.
 
 ## SIMD Coverage
 
