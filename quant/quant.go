@@ -224,7 +224,9 @@ func quantizeActsScalar(x []tensai.Float, xu []uint8) tensai.Float {
 	}
 	inv := 1 / sx
 	for i, v := range x {
-		f := v * inv
+		// The conversion keeps the product and the nudge as two roundings,
+		// which the vector bodies also do; arm64 would otherwise fuse them.
+		f := tensai.Float(v * inv)
 		if f >= 0 {
 			f += 0.5
 		} else {

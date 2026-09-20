@@ -42,7 +42,12 @@ func qxSigned8(xu []uint8, i4 int) archsimd.Int16x8 {
 // quadCols folds one 16-byte group (four columns, four rows) against the
 // broadcast activations into four int32 column sums.
 func quadCols(row []int8, xv archsimd.Int16x8) archsimd.Int32x4 {
-	wv := simd.LoadI8x16(row)
+	return quadColsV(simd.LoadI8x16(row), xv)
+}
+
+// quadColsV is quadCols over a weight vector already in registers, for
+// layouts that unpack their bytes before the multiply.
+func quadColsV(wv archsimd.Int8x16, xv archsimd.Int16x8) archsimd.Int32x4 {
 	w0 := wv.ExtendLo8ToInt16()                // columns 0 and 1
 	w1 := wv.HiToLo().ExtendLo8ToInt16()       // columns 2 and 3
 	p := w0.Mul(xv).ConcatAddPairs(w1.Mul(xv)) // two halves per column
