@@ -496,7 +496,7 @@ has the full breakdown; the short version:
 | linux/amd64 | AVX2 | Vulkan | yes, this is where the kernels are developed and benchmarked |
 | linux/arm64 | NEON | Vulkan | tests and a generation run, under emulation |
 | darwin/amd64 | AVX2 | Metal | — |
-| darwin/arm64 | NEON | Metal | not yet on the hardware |
+| darwin/arm64 | NEON | Metal | tests, on Apple Silicon in CI |
 | windows/amd64 | AVX2 | D3D12, Vulkan | yes |
 | windows/arm64 | NEON | D3D12, Vulkan | not yet |
 | others | portable | none | — |

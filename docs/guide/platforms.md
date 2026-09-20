@@ -47,15 +47,16 @@ build system selects, and worth keeping separate:
 |---|---|---|
 | linux/amd64 | AVX2 | Yes, this is where the kernels are developed and benchmarked |
 | linux/arm64 | NEON | Yes, tests and a generation run under emulation |
-| darwin/arm64 | NEON | Not yet: no measurement on the hardware |
+| darwin/arm64 | NEON | Tests pass on Apple Silicon in CI; no measurement yet |
 | windows/amd64 | AVX2 | Yes |
 | windows/arm64 | NEON | Not yet |
 
-The emulated run is the reason to trust the arm64 arithmetic and not its
-speed: every package's tests pass, a quantized matvec checksums identically
-against both the portable bodies and AVX2, and a 0.5B produces the same text
-as it does on amd64. None of that says how fast the kernels are on real
-silicon, which only a run on the hardware can answer.
+The emulated run and the CI job on Apple Silicon are the reason to trust
+the arm64 arithmetic and not its speed: every package's tests pass, a
+quantized matvec checksums identically against both the portable bodies and
+AVX2, and a 0.5B produces the same text as it does on amd64. None of that
+says how fast the kernels are on real silicon, which only a benchmark on the
+hardware can answer.
 
 What the NEON build vectorizes today is narrower than the AVX2 one:
 
