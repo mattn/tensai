@@ -28,7 +28,11 @@ func Map(f *os.File) ([]byte, func() error, error) {
 		syscall.CloseHandle(h)
 		return nil, nil, err
 	}
-	data := unsafe.Slice((*byte)(unsafe.Pointer(addr)), size)
+	// The view is not Go memory, so the address never moves; reading the
+	// uintptr's storage as a pointer says so in a form vet accepts, where
+	// a direct unsafe.Pointer(addr) is flagged as a possible misuse.
+	base := *(*unsafe.Pointer)(unsafe.Pointer(&addr))
+	data := unsafe.Slice((*byte)(base), size)
 	closeFn := func() error {
 		err := syscall.UnmapViewOfFile(addr)
 		if cerr := syscall.CloseHandle(h); err == nil {

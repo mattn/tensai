@@ -436,10 +436,29 @@ func (r *cacheReader) qmat(p **qmat) {
 	}
 }
 
-// cacheFiles pins the mmap'd cache files' descriptors for the life of
-// the process, so the finalizer on os.File never closes one under a
-// live mapping.
-var cacheFiles []*os.File
+// cacheFiles pins the mmap'd cache files for the life of the process,
+// so the finalizer on os.File never closes one under a live mapping.
+// Each entry keeps the unmap alongside the descriptor for
+// releaseWeightCaches, which a test calls once its model is gone:
+// Windows will not delete a file that is still mapped.
+var cacheFiles []cacheFile
+
+type cacheFile struct {
+	f     *os.File
+	unmap func() error
+}
+
+// releaseWeightCaches unmaps and closes every cache file loaded so far.
+// The models built from them must be dead by then; only tests, which
+// build a model in a temporary directory and then remove it, have a
+// moment where that is known.
+func releaseWeightCaches() {
+	for _, c := range cacheFiles {
+		c.unmap()
+		c.f.Close()
+	}
+	cacheFiles = nil
+}
 
 // loadWeightCache maps cpath and rebuilds the model's weights from it.
 // Any error means the caller should do the normal load (and rewrite
@@ -532,7 +551,7 @@ func loadWeightCache(cpath, src string, g *gguf.File, bits int, direct bool, cfg
 		}
 	}
 	m.initRopeFreqs()
-	cacheFiles = append(cacheFiles, f)
+	cacheFiles = append(cacheFiles, cacheFile{f, closer})
 	return m, nil
 }
 

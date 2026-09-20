@@ -39,8 +39,15 @@ func LoadU8x32(s []uint8) archsimd.Uint8x32 {
 	return archsimd.LoadUint8x32Slice(s)
 }
 
+// LoadF32x8Part loads up to eight floats, zero-filling the rest, through
+// an array rather than archsimd's part load; see compat_go127.go for why.
 func LoadF32x8Part(s []float32) archsimd.Float32x8 {
-	return archsimd.LoadFloat32x8SlicePart(s)
+	if len(s) >= 8 {
+		return archsimd.LoadFloat32x8Slice(s)
+	}
+	var buf [8]float32
+	copy(buf[:], s)
+	return archsimd.LoadFloat32x8(&buf)
 }
 
 func StoreF32x8(v archsimd.Float32x8, s []float32) {

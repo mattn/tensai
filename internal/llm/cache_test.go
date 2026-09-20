@@ -52,6 +52,7 @@ func TestWeightCacheRoundTrip(t *testing.T) {
 	}
 
 	dir := t.TempDir()
+	t.Cleanup(releaseWeightCaches)
 	gguf := filepath.Join(dir, "model.gguf")
 	if err := os.WriteFile(gguf, []byte("not really a gguf"), 0o600); err != nil {
 		t.Fatal(err)
@@ -151,6 +152,7 @@ func TestWeightCacheDeltaTernary(t *testing.T) {
 	src.blocks[1].qQKV = tern(8, 16, 4)
 
 	dir := t.TempDir()
+	t.Cleanup(releaseWeightCaches)
 	gguf := filepath.Join(dir, "model.gguf")
 	if err := os.WriteFile(gguf, []byte("not really a gguf"), 0o600); err != nil {
 		t.Fatal(err)
