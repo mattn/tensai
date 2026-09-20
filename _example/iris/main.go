@@ -4,7 +4,7 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/dataset/iris"
@@ -27,7 +27,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(uint64(seed), 0))
 	train, test, err := ds.SplitStratified(testFraction, rng)
 	if err != nil {
 		panic(err)
@@ -44,7 +44,7 @@ func main() {
 		panic(err)
 	}
 
-	batchRng := rand.New(rand.NewSource(seed + 1))
+	batchRng := rand.New(rand.NewPCG(uint64(seed+1), 0))
 	for epoch := 1; epoch <= epochs; epoch++ {
 		var lossSum float32
 		var steps int

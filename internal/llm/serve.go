@@ -17,7 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"strconv"
@@ -906,7 +906,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if req.Seed != nil {
 		seed = *req.Seed
 	}
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(uint64(seed), 0))
 
 	tools := req.Tools
 	// "none" is the one choice that changes the prompt: with no

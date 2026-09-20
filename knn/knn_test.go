@@ -1,14 +1,14 @@
 package knn
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
 )
 
 func TestKNNTwoClusters(t *testing.T) {
-	rng := rand.New(rand.NewSource(73))
+	rng := rand.New(rand.NewPCG(73, 0))
 	const perClass = 50
 	train := tensai.NewMatrix(2*perClass, 2)
 	targets := tensai.NewMatrix(2*perClass, 1)
@@ -47,7 +47,7 @@ func TestKNNTwoClusters(t *testing.T) {
 }
 
 func TestKNNOneNeighborMemorizes(t *testing.T) {
-	rng := rand.New(rand.NewSource(79))
+	rng := rand.New(rand.NewPCG(79, 0))
 	train := tensai.RandomMatrix(30, 4, rng)
 	targets := tensai.NewMatrix(30, 1)
 	for i := range targets.Data {

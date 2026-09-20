@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,7 +14,7 @@ import (
 )
 
 func TestRoundTrip(t *testing.T) {
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	tensors := map[string]*tensai.Tensor{}
 	for _, c := range []struct {
 		name  string
@@ -141,7 +141,7 @@ func TestDtypeConversions(t *testing.T) {
 }
 
 func TestSharded(t *testing.T) {
-	rng := rand.New(rand.NewSource(2))
+	rng := rand.New(rand.NewPCG(2, 0))
 	dir := t.TempDir()
 	mk := func(shape ...int) *tensai.Tensor {
 		x := tensai.NewTensor(shape...)

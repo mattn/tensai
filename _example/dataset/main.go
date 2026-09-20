@@ -6,7 +6,7 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/dataset"
@@ -66,7 +66,7 @@ func accuracy(model *model.Sequential, ds *dataset.Dataset) float64 {
 }
 
 func main() {
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(uint64(seed), 0))
 	ds := synthesize(rng)
 
 	// The synthetic data alternates classes, so shuffle before splitting.

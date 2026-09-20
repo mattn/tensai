@@ -1,7 +1,7 @@
 package llm
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	tensai "github.com/mattn/tensai"
@@ -16,7 +16,7 @@ import (
 func TestZeroValueBlockKeepsItsOwnCache(t *testing.T) {
 	const layers, hidden, heads, kvHeads, ff = 2, 8, 2, 1, 16
 	head := hidden / heads
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	mat := func(r, c int) *tensai.Matrix {
 		m := tensai.NewMatrix(r, c)
 		for i := range m.Data {

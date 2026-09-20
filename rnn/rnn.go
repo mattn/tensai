@@ -1,7 +1,7 @@
 package rnn
 
 import (
-	"math/rand"
+	"math/rand/v2"
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/autograd"

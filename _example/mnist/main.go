@@ -6,7 +6,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 
@@ -137,7 +137,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(uint64(seed), 0))
 	for epoch := 1; epoch <= epochs; epoch++ {
 		var lossSum float32
 		var steps int

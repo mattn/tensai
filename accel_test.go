@@ -2,7 +2,7 @@ package tensai
 
 import (
 	"errors"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -81,7 +81,7 @@ func closeEnough(t *testing.T, got, want *Tensor) {
 }
 
 func TestAcceleratorRouting(t *testing.T) {
-	rng := rand.New(rand.NewSource(3))
+	rng := rand.New(rand.NewPCG(3, 0))
 	a := randTestTensor(rng, 8, 6)
 	b := randTestTensor(rng, 8, 5)
 
@@ -99,7 +99,7 @@ func TestAcceleratorRouting(t *testing.T) {
 }
 
 func TestAcceleratorThreshold(t *testing.T) {
-	rng := rand.New(rand.NewSource(5))
+	rng := rand.New(rand.NewPCG(5, 0))
 	small, w := randTestTensor(rng, 4, 4), randTestTensor(rng, 4, 4)
 	f := &fakeAccel{}
 	// 4*4*4 = 64 MACs, well under the threshold.
@@ -127,7 +127,7 @@ func TestAcceleratorThreshold(t *testing.T) {
 // TestAcceleratorFallback checks that a failing backend costs correctness
 // nothing: the product simply runs on the CPU.
 func TestAcceleratorFallback(t *testing.T) {
-	rng := rand.New(rand.NewSource(7))
+	rng := rand.New(rand.NewPCG(7, 0))
 	a, b := randTestTensor(rng, 6, 4), randTestTensor(rng, 4, 5)
 	want := refProduct(a, b, gemmNN)
 
@@ -148,7 +148,7 @@ func TestAcceleratorFallback(t *testing.T) {
 // TestAcceleratorInto checks the Into forms route as well, since those are
 // what the autograd engine calls.
 func TestAcceleratorInto(t *testing.T) {
-	rng := rand.New(rand.NewSource(11))
+	rng := rand.New(rand.NewPCG(11, 0))
 	a, b := randTestTensor(rng, 8, 6), randTestTensor(rng, 8, 5)
 	f := &fakeAccel{}
 	out := NewTensor(6, 5)

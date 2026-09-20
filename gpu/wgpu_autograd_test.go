@@ -4,7 +4,7 @@ package gpu_test
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -26,7 +26,7 @@ func TestGPUAcceleratesAutograd(t *testing.T) {
 	defer g.Close()
 
 	grads := func(seed int64) []*tensai.Tensor {
-		rng := rand.New(rand.NewSource(seed))
+		rng := rand.New(rand.NewPCG(uint64(seed), 0))
 		x := randTensor(rng, 32, 48)
 		y := randTensor(rng, 32, 16)
 		w1 := autograd.Param(randTensor(rng, 48, 64))
@@ -61,7 +61,7 @@ func TestGPUAcceleratedTrainingConverges(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
 
-	rng := rand.New(rand.NewSource(23))
+	rng := rand.New(rand.NewPCG(23, 0))
 	x := randTensor(rng, 64, 32)
 	target := randTensor(rng, 64, 8)
 	w1 := autograd.Param(randTensor(rng, 32, 64))
@@ -97,7 +97,7 @@ func TestGPUResidentTraining(t *testing.T) {
 	defer g.Close()
 
 	build := func() (x, y *tensai.Tensor, params []*autograd.Node) {
-		rng := rand.New(rand.NewSource(101))
+		rng := rand.New(rand.NewPCG(101, 0))
 		x = randTensor(rng, 32, 24)
 		y = randTensor(rng, 32, 8)
 		w1 := autograd.Param(randTensor(rng, 24, 32))
@@ -154,7 +154,7 @@ func TestGPUResidentStaysOnDevice(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
 
-	rng := rand.New(rand.NewSource(103))
+	rng := rand.New(rand.NewPCG(103, 0))
 	x := randTensor(rng, 16, 16)
 	w := autograd.Param(randTensor(rng, 16, 16))
 	tape := autograd.NewTape()
@@ -202,12 +202,12 @@ func TestGPUResidentTransformer(t *testing.T) {
 		headDim                         = model / heads
 	)
 	build := func() (tokens, labels []int, mask *tensai.Tensor, params []*autograd.Node) {
-		rng := rand.New(rand.NewSource(211))
+		rng := rand.New(rand.NewPCG(211, 0))
 		tokens = make([]int, batch*seq)
 		labels = make([]int, batch*seq)
 		for i := range tokens {
-			tokens[i] = rng.Intn(vocab)
-			labels[i] = rng.Intn(vocab)
+			tokens[i] = rng.IntN(vocab)
+			labels[i] = rng.IntN(vocab)
 		}
 		mask = tensai.NewTensor(1, 1, seq, seq)
 		for i := 0; i < seq; i++ {
@@ -291,7 +291,7 @@ func TestGPUResidentShapes(t *testing.T) {
 	defer g.Close()
 
 	const batch, seq, dim, vocab = 2, 4, 8, 5
-	rng := rand.New(rand.NewSource(311))
+	rng := rand.New(rand.NewPCG(311, 0))
 	table := autograd.Param(randTensor(rng, vocab, dim))
 	pos := autograd.Param(randTensor(rng, 1, seq, dim))
 	w := autograd.Param(randTensor(rng, dim, dim))
@@ -302,7 +302,7 @@ func TestGPUResidentShapes(t *testing.T) {
 
 	tokens := make([]int, batch*seq)
 	for i := range tokens {
-		tokens[i] = rng.Intn(vocab)
+		tokens[i] = rng.IntN(vocab)
 	}
 	steps := []struct {
 		name string
@@ -362,7 +362,7 @@ func TestGPUSequentialGraph(t *testing.T) {
 	defer g.Close()
 
 	build := func() (*model.Sequential, *tensai.Matrix, *tensai.Matrix) {
-		rng := rand.New(rand.NewSource(313))
+		rng := rand.New(rand.NewPCG(313, 0))
 		x := randTensor(rng, 16, 24)
 		y := randTensor(rng, 16, 4)
 		xm, err := x.Matrix()

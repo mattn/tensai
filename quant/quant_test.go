@@ -2,14 +2,14 @@ package quant
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
 )
 
 func TestQuantizeMatVec(t *testing.T) {
-	rng := rand.New(rand.NewSource(31))
+	rng := rand.New(rand.NewPCG(31, 0))
 	for _, c := range []struct{ rows, cols int }{
 		{768, 2304}, // big enough for the parallel path
 		{16, 16},
@@ -77,7 +77,7 @@ func TestQuantizeMatVec(t *testing.T) {
 // lives in: there the f32 matvec is memory-bandwidth bound and the int8
 // weights pull four times less.
 func BenchmarkMatVecF32Big(b *testing.B) {
-	rng := rand.New(rand.NewSource(33))
+	rng := rand.New(rand.NewPCG(33, 0))
 	w := tensai.RandomMatrix(4096, 16384, rng)
 	x := tensai.NewMatrix(1, 4096)
 	for i := range x.Data {
@@ -94,7 +94,7 @@ func BenchmarkMatVecF32Big(b *testing.B) {
 }
 
 func BenchmarkMatVecQ8Big(b *testing.B) {
-	rng := rand.New(rand.NewSource(33))
+	rng := rand.New(rand.NewPCG(33, 0))
 	q := Quantize(tensai.RandomMatrix(4096, 16384, rng))
 	x := make([]tensai.Float, 4096)
 	for i := range x {
@@ -111,7 +111,7 @@ func BenchmarkMatVecQ8Big(b *testing.B) {
 }
 
 func BenchmarkMatVecF32(b *testing.B) {
-	rng := rand.New(rand.NewSource(32))
+	rng := rand.New(rand.NewPCG(32, 0))
 	w := tensai.RandomMatrix(768, 2304, rng)
 	x := tensai.NewMatrix(1, 768)
 	for i := range x.Data {
@@ -128,7 +128,7 @@ func BenchmarkMatVecF32(b *testing.B) {
 }
 
 func BenchmarkMatVecQ8(b *testing.B) {
-	rng := rand.New(rand.NewSource(32))
+	rng := rand.New(rand.NewPCG(32, 0))
 	q := Quantize(tensai.RandomMatrix(768, 2304, rng))
 	x := make([]tensai.Float, 768)
 	for i := range x {
@@ -145,7 +145,7 @@ func BenchmarkMatVecQ8(b *testing.B) {
 }
 
 func TestQMatMulBatch(t *testing.T) {
-	rng := rand.New(rand.NewSource(51))
+	rng := rand.New(rand.NewPCG(51, 0))
 	for _, c := range []struct{ batch, rows, cols int }{
 		{11, 768, 2304}, // 8-row blocks plus a remainder
 		{8, 64, 33},     // scalar column tails
@@ -211,7 +211,7 @@ func TestQMatMulBatch(t *testing.T) {
 // BenchmarkQ8Prefill measures the batched matmul against running the same
 // rows one matvec at a time — the prompt-prefill comparison.
 func BenchmarkQ8PrefillBatched(b *testing.B) {
-	rng := rand.New(rand.NewSource(52))
+	rng := rand.New(rand.NewPCG(52, 0))
 	q := Quantize(tensai.RandomMatrix(1536, 8960, rng))
 	x := tensai.RandomMatrix(64, 1536, rng)
 	out := tensai.NewMatrix(64, 8960)
@@ -225,7 +225,7 @@ func BenchmarkQ8PrefillBatched(b *testing.B) {
 }
 
 func BenchmarkQ4PrefillBatched(b *testing.B) {
-	rng := rand.New(rand.NewSource(52))
+	rng := rand.New(rand.NewPCG(52, 0))
 	q, err := Quantize4(tensai.RandomMatrix(1536, 8960, rng))
 	if err != nil {
 		b.Fatal(err)
@@ -242,7 +242,7 @@ func BenchmarkQ4PrefillBatched(b *testing.B) {
 }
 
 func BenchmarkQ4PrefillRowwise(b *testing.B) {
-	rng := rand.New(rand.NewSource(52))
+	rng := rand.New(rand.NewPCG(52, 0))
 	q, err := Quantize4(tensai.RandomMatrix(1536, 8960, rng))
 	if err != nil {
 		b.Fatal(err)
@@ -261,7 +261,7 @@ func BenchmarkQ4PrefillRowwise(b *testing.B) {
 }
 
 func BenchmarkQ8PrefillRowwise(b *testing.B) {
-	rng := rand.New(rand.NewSource(52))
+	rng := rand.New(rand.NewPCG(52, 0))
 	q := Quantize(tensai.RandomMatrix(1536, 8960, rng))
 	x := tensai.RandomMatrix(64, 1536, rng)
 	out := tensai.NewMatrix(64, 8960)
@@ -277,7 +277,7 @@ func BenchmarkQ8PrefillRowwise(b *testing.B) {
 }
 
 func TestQuantizeActsAgree(t *testing.T) {
-	rng := rand.New(rand.NewSource(77))
+	rng := rand.New(rand.NewPCG(77, 0))
 	for _, n := range []int{5, 16, 31, 1536, 4099} {
 		x := make([]tensai.Float, n)
 		for i := range x {
@@ -310,10 +310,10 @@ func TestQuantizeActsAgree(t *testing.T) {
 // Group-32 form GGUF's Q4_K repacks into — the shape a Q4_K_M prefill
 // actually runs.
 func BenchmarkQ4PrefillMinForm(b *testing.B) {
-	rng := rand.New(rand.NewSource(52))
+	rng := rand.New(rand.NewPCG(52, 0))
 	q := NewQ4Matrix(1536, 8960, 32, true)
 	for i := range q.Q {
-		q.Q[i] = uint8(rng.Intn(256))
+		q.Q[i] = uint8(rng.IntN(256))
 	}
 	for i := range q.ScaleMin {
 		q.ScaleMin[i] = PackScaleMin(0.01, 0.2)

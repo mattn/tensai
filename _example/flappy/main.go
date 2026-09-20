@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -59,7 +59,7 @@ type game struct {
 }
 
 func newGame(seed int64) *game {
-	g := &game{y: 50, rng: rand.New(rand.NewSource(seed)), nextX: 40}
+	g := &game{y: 50, rng: rand.New(rand.NewPCG(uint64(seed), 0)), nextX: 40}
 	for i := 0; i < 3; i++ {
 		g.spawn()
 	}
@@ -347,7 +347,7 @@ func main() {
 
 	var players []player
 	if !*skipBase {
-		players = []player{randomPlayer{rng: rand.New(rand.NewSource(1))}, heuristic{}, rowHeuristic{}}
+		players = []player{randomPlayer{rng: rand.New(rand.NewPCG(1, 0))}, heuristic{}, rowHeuristic{}}
 	}
 	if !*skipModel {
 		opts := llm.Options{Bits: *bits, Log: io.Discard}

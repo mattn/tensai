@@ -2,14 +2,14 @@ package quant
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
 )
 
 func TestQuantize4MatVec(t *testing.T) {
-	rng := rand.New(rand.NewSource(41))
+	rng := rand.New(rand.NewPCG(41, 0))
 	for _, c := range []struct{ rows, cols int }{
 		{768, 2304}, // parallel path
 		{64, 32},
@@ -86,7 +86,7 @@ func TestQuantize4MatVec(t *testing.T) {
 }
 
 func TestQuantize4Group32(t *testing.T) {
-	rng := rand.New(rand.NewSource(43))
+	rng := rand.New(rand.NewPCG(43, 0))
 	for _, c := range []struct{ rows, cols int }{
 		{256, 96}, // several 32-row groups
 		{100, 33}, // partial final group
@@ -188,7 +188,7 @@ func TestQuantize4Group32(t *testing.T) {
 }
 
 func TestQuantize4MinForm(t *testing.T) {
-	rng := rand.New(rand.NewSource(44))
+	rng := rand.New(rand.NewPCG(44, 0))
 	for _, c := range []struct{ rows, cols int }{
 		{256, 96},
 		{100, 33}, // partial final group
@@ -292,7 +292,7 @@ func TestQuantize4MinForm(t *testing.T) {
 }
 
 func BenchmarkMatVecQ4Big(b *testing.B) {
-	rng := rand.New(rand.NewSource(33))
+	rng := rand.New(rand.NewPCG(33, 0))
 	q, err := Quantize4(tensai.RandomMatrix(4096, 16384, rng))
 	if err != nil {
 		b.Fatal(err)

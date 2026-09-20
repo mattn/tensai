@@ -2,7 +2,7 @@ package loss
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -59,12 +59,12 @@ func TestSoftmaxCEGradient(t *testing.T) {
 }
 
 func TestBinaryCrossEntropyGradient(t *testing.T) {
-	rng := rand.New(rand.NewSource(13))
+	rng := rand.New(rand.NewPCG(13, 0))
 	pred := tensai.NewMatrix(4, 3)
 	target := tensai.NewMatrix(4, 3)
 	for i := range pred.Data {
 		pred.Data[i] = tensai.Float(0.1 + 0.8*rng.Float64())
-		target.Data[i] = tensai.Float(rng.Intn(2))
+		target.Data[i] = tensai.Float(rng.IntN(2))
 	}
 	loss := BinaryCrossEntropy{}
 	_, grad, err := loss.Loss(pred, target)

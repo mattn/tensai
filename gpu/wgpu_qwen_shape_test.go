@@ -4,7 +4,7 @@ package gpu
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -15,7 +15,7 @@ import (
 func TestGPUGroupedCausalAttentionQwenShape(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(7))
+	rng := rand.New(rand.NewPCG(7, 0))
 
 	const heads, kvHeads, dh = 14, 2, 64
 	const d, kvDim = heads * dh, kvHeads * dh
@@ -92,7 +92,7 @@ func TestGPUGroupedCausalAttentionF16(t *testing.T) {
 	if !g.HasF16() {
 		t.Skip("device has no shader-f16")
 	}
-	rng := rand.New(rand.NewSource(16))
+	rng := rand.New(rand.NewPCG(16, 0))
 
 	const heads, kvHeads, dh = 14, 2, 64
 	const d, kvDim = heads * dh, kvHeads * dh
@@ -225,7 +225,7 @@ func BenchmarkGPUGroupedAttnPrefill(b *testing.B) {
 		b.Skipf("wgpu unavailable: %v", err)
 	}
 	defer g.Close()
-	rng := rand.New(rand.NewSource(9))
+	rng := rand.New(rand.NewPCG(9, 0))
 	const heads, kvHeads, dh = 14, 2, 64
 	const d, kvDim = heads * dh, kvHeads * dh
 	const seqQ, seqKV = 512, 625
@@ -279,7 +279,7 @@ func TestGPUGroupedCausalAttentionF16Split(t *testing.T) {
 	if !g.HasF16() {
 		t.Skip("device has no shader-f16")
 	}
-	rng := rand.New(rand.NewSource(17))
+	rng := rand.New(rand.NewPCG(17, 0))
 
 	const heads, kvHeads, dh = 14, 2, 64
 	const d, kvDim = heads * dh, kvHeads * dh
@@ -367,7 +367,7 @@ func TestGPUGroupedCausalAttentionF16Split(t *testing.T) {
 func TestGPUCausalAttentionWideHead(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(11))
+	rng := rand.New(rand.NewPCG(11, 0))
 
 	const heads, kvHeads, dh = 8, 1, 512
 	const d, kvDim = heads * dh, kvHeads * dh

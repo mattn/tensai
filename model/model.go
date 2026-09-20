@@ -2,7 +2,7 @@ package model
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/layer"
@@ -33,7 +33,7 @@ type lossInto interface {
 // NewSequential returns an empty Sequential model. optimizer and loss are
 // configured via Compile.
 func NewSequential() *Sequential {
-	return &Sequential{rng: rand.New(rand.NewSource(0))}
+	return &Sequential{rng: rand.New(rand.NewPCG(0, 0))}
 }
 
 // Add appends a layer to the network. Layers are added in forward order.

@@ -2,7 +2,7 @@ package quant
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -58,7 +58,7 @@ func TestTernaryIndex(t *testing.T) {
 }
 
 func TestTernaryMatVecAndMatMul(t *testing.T) {
-	rng := rand.New(rand.NewSource(3))
+	rng := rand.New(rand.NewPCG(3, 0))
 	for _, c := range []struct{ rows, cols int }{
 		{1024, 2304}, // parallel path, many groups
 		{300, 33},    // partial final group and tile, scalar tails
@@ -70,7 +70,7 @@ func TestTernaryMatVecAndMatMul(t *testing.T) {
 				q.Scale[q.TableIndex(g, j)] = tensai.Float(0.01 + rng.Float64())
 			}
 			for i := 0; i < c.rows; i++ {
-				q.Set(i, j, int8(rng.Intn(3))-1)
+				q.Set(i, j, int8(rng.IntN(3))-1)
 			}
 		}
 		x := make([]tensai.Float, c.rows)
@@ -121,7 +121,7 @@ func TestTernaryMatVecAndMatMul(t *testing.T) {
 // The vector kernel and the portable one agree exactly, which the
 // dispatch test above only checks on whichever build it runs.
 func TestTernaryGenericAgrees(t *testing.T) {
-	rng := rand.New(rand.NewSource(9))
+	rng := rand.New(rand.NewPCG(9, 0))
 	const rows, cols = 512, 96
 	q := NewTernaryMatrix(rows, cols)
 	for j := 0; j < cols; j++ {
@@ -129,7 +129,7 @@ func TestTernaryGenericAgrees(t *testing.T) {
 			q.Scale[q.TableIndex(g, j)] = tensai.Float(rng.Float64())
 		}
 		for i := 0; i < rows; i++ {
-			q.Set(i, j, int8(rng.Intn(3))-1)
+			q.Set(i, j, int8(rng.IntN(3))-1)
 		}
 	}
 	x := make([]tensai.Float, rows)
@@ -150,9 +150,9 @@ func TestTernaryGenericAgrees(t *testing.T) {
 func BenchmarkTernaryMatVec(b *testing.B) {
 	const rows, cols = 5120, 34816
 	q := NewTernaryMatrix(rows, cols)
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	for i := range q.Q {
-		q.Q[i] = uint8(rng.Intn(256)) & 0xAA // codes 0 or 2 mostly
+		q.Q[i] = uint8(rng.IntN(256)) & 0xAA // codes 0 or 2 mostly
 	}
 	for i := range q.Scale {
 		q.Scale[i] = 0.01
@@ -172,9 +172,9 @@ func BenchmarkTernaryMatVec(b *testing.B) {
 func BenchmarkTernaryMatVecSmall(b *testing.B) {
 	const rows, cols = 1024, 2048
 	q := NewTernaryMatrix(rows, cols)
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	for i := range q.Q {
-		q.Q[i] = uint8(rng.Intn(256)) & 0xAA
+		q.Q[i] = uint8(rng.IntN(256)) & 0xAA
 	}
 	for i := range q.Scale {
 		q.Scale[i] = 0.01
@@ -196,9 +196,9 @@ func BenchmarkTernaryMatVecSmall(b *testing.B) {
 func BenchmarkTernaryMatMul32(b *testing.B) {
 	const rows, cols, batch = 1536, 8960, 64
 	q := NewTernaryMatrix(rows, cols)
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	for i := range q.Q {
-		q.Q[i] = uint8(rng.Intn(256)) & 0xAA
+		q.Q[i] = uint8(rng.IntN(256)) & 0xAA
 	}
 	for i := range q.Scale {
 		q.Scale[i] = 0.01

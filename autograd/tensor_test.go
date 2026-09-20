@@ -3,7 +3,7 @@ package autograd
 import (
 	"bytes"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"strings"
 	"testing"
 
@@ -37,7 +37,9 @@ func posTensor(rng *rand.Rand, shape ...int) *tensai.Tensor {
 // the graph to a scalar; a plain Sum would be blind to any op whose row
 // gradient is constant, so the reductions are weighted where that matters.
 func TestTensorOpGradients(t *testing.T) {
-	rng := rand.New(rand.NewSource(2026))
+	// The seed keeps every LeakyReLU pre-activation clear of the kink, where
+	// a finite difference straddles two slopes.
+	rng := rand.New(rand.NewPCG(2027, 0))
 	x := randTensor(rng, 2, 3, 4)       // (batch, seq, model)
 	w := randTensor(rng, 4, 5)          // a shared projection
 	weights := randTensor(rng, 2, 3, 5) // weighting for the final reduction
@@ -162,7 +164,7 @@ func TestTensorOpGradients(t *testing.T) {
 // TestTensorCrossEntropy checks the loss over a (batch, seq, vocab) logit
 // stack, which is the shape a language model produces.
 func TestTensorCrossEntropy(t *testing.T) {
-	rng := rand.New(rand.NewSource(11))
+	rng := rand.New(rand.NewPCG(11, 0))
 	x := randTensor(rng, 2, 3, 4)
 	w := randTensor(rng, 4, 5)
 	labels := []int{0, 4, 2, 1, 3, 3}
@@ -203,7 +205,7 @@ func TestEmbedAccumulatesRepeats(t *testing.T) {
 // TestLayerNormMatchesDefinition checks the forward pass against the plain
 // definition of the statistics it normalizes by.
 func TestLayerNormMatchesDefinition(t *testing.T) {
-	rng := rand.New(rand.NewSource(13))
+	rng := rand.New(rand.NewPCG(13, 0))
 	x := randTensor(rng, 2, 3, 4)
 	out := Input(x).LayerNorm(nil, nil, 1e-5)
 	for r := 0; r < 6; r++ {
@@ -227,7 +229,7 @@ func TestLayerNormMatchesDefinition(t *testing.T) {
 
 // TestTensorParamsRoundTrip saves and reloads parameters of mixed rank.
 func TestTensorParamsRoundTrip(t *testing.T) {
-	rng := rand.New(rand.NewSource(17))
+	rng := rand.New(rand.NewPCG(17, 0))
 	params := []*Node{
 		Param(randTensor(rng, 2, 3, 4)),
 		Param(randTensor(rng, 5)),
@@ -289,7 +291,7 @@ func TestLegacyParamsLoad(t *testing.T) {
 // the token at the first position. Getting there requires the gradient to
 // flow through the attention weights, not just the projections.
 func TestAttentionTrainsBatched(t *testing.T) {
-	rng := rand.New(rand.NewSource(23))
+	rng := rand.New(rand.NewPCG(23, 0))
 	const (
 		batch, seq, model, vocab = 4, 4, 16, 5
 	)
@@ -297,7 +299,7 @@ func TestAttentionTrainsBatched(t *testing.T) {
 	labels := make([]int, batch*seq)
 	for b := 0; b < batch; b++ {
 		for s := 0; s < seq; s++ {
-			tokens[b*seq+s] = rng.Intn(vocab)
+			tokens[b*seq+s] = rng.IntN(vocab)
 		}
 		for s := 0; s < seq; s++ {
 			labels[b*seq+s] = tokens[b*seq] // always the first token
@@ -354,7 +356,7 @@ func TestAttentionTrainsBatched(t *testing.T) {
 // finite differences, including the padded and strided cases where a pixel
 // lands in several windows or in none.
 func TestConvGradients(t *testing.T) {
-	rng := rand.New(rand.NewSource(4242))
+	rng := rand.New(rand.NewPCG(4242, 0))
 	x := randTensor(rng, 2, 3, 6, 6) // (batch, channels, height, width)
 	w := randTensor(rng, 3*3*3, 4)   // (channels*k*k, outChannels)
 	bias := randTensor(rng, 4)       // one per output channel
@@ -413,7 +415,7 @@ func TestConvGradients(t *testing.T) {
 // convolution in the layer package, which is the reference implementation
 // the Sequential models use.
 func TestConvMatchesLayer(t *testing.T) {
-	rng := rand.New(rand.NewSource(4243))
+	rng := rand.New(rand.NewPCG(4243, 0))
 	const batch, inC, h, w, outC, k = 2, 3, 7, 7, 5, 3
 	conv := layer.NewConv2D(outC, k, 1, 1)
 	if _, err := conv.InitImage(layer.Image{H: h, W: w, C: inC}, rng); err != nil {
@@ -491,14 +493,14 @@ func mustTensor(t *testing.T, data []tensai.Float, shape ...int) *tensai.Tensor 
 // forward pass drew: a dropped element gets nothing, a kept one gets the
 // upstream gradient scaled the way its value was.
 func TestDropoutMask(t *testing.T) {
-	rng := rand.New(rand.NewSource(97))
+	rng := rand.New(rand.NewPCG(97, 0))
 	x := randTensor(rng, 4, 16)
 	for i := range x.Data {
 		x.Data[i] += 2 // keep every value clear of zero
 	}
 	p := Param(x)
 	const rate = 0.5
-	out := p.Dropout(rate, rand.New(rand.NewSource(5)))
+	out := p.Dropout(rate, rand.New(rand.NewPCG(5, 0)))
 	upstream := randTensor(rng, 4, 16)
 	out.Mul(Input(upstream)).Sum().Backward()
 
