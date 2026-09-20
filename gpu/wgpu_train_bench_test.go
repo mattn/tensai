@@ -5,7 +5,7 @@ package gpu_test
 import (
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -26,7 +26,7 @@ func BenchmarkGemmTrain(b *testing.B) {
 		b.Skipf("wgpu unavailable: %v", err)
 	}
 	defer g.Close()
-	rng := rand.New(rand.NewSource(11))
+	rng := rand.New(rand.NewPCG(11, 0))
 
 	modes := []struct {
 		name string
@@ -84,7 +84,7 @@ func BenchmarkGemmRoundTrip(b *testing.B) {
 		b.Skipf("wgpu unavailable: %v", err)
 	}
 	defer g.Close()
-	rng := rand.New(rand.NewSource(13))
+	rng := rand.New(rand.NewPCG(13, 0))
 	for _, size := range []int{512, 1024, 2048} {
 		x, w := randTensor(rng, size, size), randTensor(rng, size, size)
 		b.Run(fmt.Sprintf("gpu/%d", size), func(b *testing.B) {
@@ -118,7 +118,7 @@ func BenchmarkTrainStepAccel(b *testing.B) {
 
 	run := func(rows, model int) func(*testing.B) {
 		return func(b *testing.B) {
-			rng := rand.New(rand.NewSource(3))
+			rng := rand.New(rand.NewPCG(3, 0))
 			x := randTensor(rng, rows, model)
 			y := randTensor(rng, rows, model)
 			w1 := autograd.Param(randTensor(rng, model, model))
@@ -148,7 +148,7 @@ func BenchmarkTrainStepAccel(b *testing.B) {
 // tape holds the buffers, so only the loss crosses the bus each step.
 func runResident(g *gpu.Device, rows, model int) func(*testing.B) {
 	return func(b *testing.B) {
-		rng := rand.New(rand.NewSource(3))
+		rng := rand.New(rand.NewPCG(3, 0))
 		x := randTensor(rng, rows, model)
 		y := randTensor(rng, rows, model)
 		w1 := autograd.Param(randTensor(rng, model, model))
@@ -177,7 +177,7 @@ func BenchmarkElementwise(b *testing.B) {
 		b.Skipf("wgpu unavailable: %v", err)
 	}
 	defer g.Close()
-	rng := rand.New(rand.NewSource(17))
+	rng := rand.New(rand.NewPCG(17, 0))
 	for _, n := range []int{1 << 20, 1 << 22} {
 		x := randTensor(rng, n)
 		gx, err := g.Upload(x)
@@ -224,12 +224,12 @@ func BenchmarkTransformerStep(b *testing.B) {
 	step := func(model int, resident bool) func(*testing.B) {
 		return func(b *testing.B) {
 			headDim := model / heads
-			rng := rand.New(rand.NewSource(7))
+			rng := rand.New(rand.NewPCG(7, 0))
 			tokens := make([]int, batch*seq)
 			labels := make([]int, batch*seq)
 			for i := range tokens {
-				tokens[i] = rng.Intn(vocab)
-				labels[i] = rng.Intn(vocab)
+				tokens[i] = rng.IntN(vocab)
+				labels[i] = rng.IntN(vocab)
 			}
 			mask := tensai.NewTensor(1, 1, seq, seq)
 			for i := 0; i < seq; i++ {

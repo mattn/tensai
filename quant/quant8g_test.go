@@ -2,7 +2,7 @@ package quant
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -54,7 +54,7 @@ func buildQ8G(m *tensai.Matrix, group int) *Q8GMatrix {
 }
 
 func TestQ8GMatVecAndMatMul(t *testing.T) {
-	rng := rand.New(rand.NewSource(91))
+	rng := rand.New(rand.NewPCG(91, 0))
 	for _, c := range []struct{ rows, cols, group int }{
 		{768, 2304, 0}, // parallel path, many groups
 		{100, 33, 0},   // partial final group, scalar tails

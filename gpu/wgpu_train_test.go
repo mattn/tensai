@@ -4,7 +4,7 @@ package gpu
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -29,7 +29,7 @@ func checkClose(t *testing.T, name string, got *tensai.Tensor, want []tensai.Flo
 func TestGPUBinaryOps(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(31))
+	rng := rand.New(rand.NewPCG(31, 0))
 
 	x := randTensor(rng, 6, 8)
 	y := randTensor(rng, 6, 8)
@@ -91,7 +91,7 @@ func TestGPUBinaryOps(t *testing.T) {
 func TestGPUActivations(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(37))
+	rng := rand.New(rand.NewPCG(37, 0))
 
 	x := randTensor(rng, 4, 16)
 	grad := randTensor(rng, 4, 16)
@@ -165,7 +165,7 @@ func TestGPUActivations(t *testing.T) {
 func TestGPUSumCols(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(41))
+	rng := rand.New(rand.NewPCG(41, 0))
 
 	x := randTensor(rng, 33, 12) // rows not a multiple of the workgroup
 	gx, err := g.Upload(x)
@@ -199,7 +199,7 @@ func TestGPUSumCols(t *testing.T) {
 func TestGPUAdamStep(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(43))
+	rng := rand.New(rand.NewPCG(43, 0))
 
 	const n = 40
 	w := randTensor(rng, n)
@@ -273,7 +273,7 @@ func upload3(t *testing.T, g *Device, a, b, c *tensai.Tensor) (*Tensor, *Tensor,
 func TestGPULayerNorm(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(53))
+	rng := rand.New(rand.NewPCG(53, 0))
 
 	const rows, cols = 5, 40
 	x := randTensor(rng, rows, cols)
@@ -344,7 +344,7 @@ func TestGPULayerNorm(t *testing.T) {
 func TestGPUSoftmaxGrad(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(59))
+	rng := rand.New(rand.NewPCG(59, 0))
 
 	const b, h, seq = 2, 3, 12
 	scores := randTensor(rng, b, h, seq, seq)
@@ -392,7 +392,7 @@ func TestGPUSoftmaxGrad(t *testing.T) {
 func TestGPUPermute(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(61))
+	rng := rand.New(rand.NewPCG(61, 0))
 
 	cases := []struct {
 		shape []int
@@ -447,7 +447,7 @@ func TestGPUPermute(t *testing.T) {
 func TestGPUEmbed(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(67))
+	rng := rand.New(rand.NewPCG(67, 0))
 
 	const vocab, dim = 7, 12
 	table := randTensor(rng, vocab, dim)

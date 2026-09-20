@@ -3,7 +3,7 @@ package llm
 import (
 	"math"
 	"math/bits"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai/internal/kernels"
@@ -32,11 +32,11 @@ func TestFWHTIsSylvester(t *testing.T) {
 // Applying the transform and then its inverse is the identity, blocks,
 // signs and permutation included, and the transform preserves length.
 func TestHadamardRoundTrip(t *testing.T) {
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	const block, width = 8, 48
 	h := &hadamard{block: block, signs: make([]float32, width)}
 	for i := range h.signs {
-		h.signs[i] = float32(1 - 2*rng.Intn(2))
+		h.signs[i] = float32(1 - 2*rng.IntN(2))
 	}
 	x := make([]float32, width)
 	for i := range x {
@@ -88,7 +88,7 @@ func TestHadamardRoundTrip(t *testing.T) {
 // applied to the rotated activation; the loader folds the rotation on
 // one side and the runtime supplies the other.
 func TestRotatedWeightReadsRotatedInput(t *testing.T) {
-	rng := rand.New(rand.NewSource(2))
+	rng := rand.New(rand.NewPCG(2, 0))
 	const block, in, out = 4, 8, 3
 	h := &hadamard{block: block, signs: []float32{1, -1, 1, 1, -1, -1, 1, -1}}
 	w := make([][]float32, out) // [out][in], the HF orientation

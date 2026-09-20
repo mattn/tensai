@@ -1,12 +1,12 @@
 package tensai
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 )
 
 func benchmarkDot(b *testing.B, size int) {
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	x := RandomMatrix(size, size, rng)
 	y := RandomMatrix(size, size, rng)
 	b.SetBytes(int64(size * size * 4))

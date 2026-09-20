@@ -3,7 +3,7 @@ package tensai
 import (
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 
 	"github.com/mattn/tensai/internal/kernels"

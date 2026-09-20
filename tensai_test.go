@@ -2,7 +2,7 @@ package tensai
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -38,7 +38,7 @@ func TestDotShape(t *testing.T) {
 }
 
 func TestDotTAInto(t *testing.T) {
-	rng := rand.New(rand.NewSource(89))
+	rng := rand.New(rand.NewPCG(89, 0))
 	// The last three are tall and narrow, which is the shape a
 	// convolution's weight gradient has and the register-accumulating
 	// kernel takes: a k that is not a multiple of four, a b that is not a
@@ -75,7 +75,7 @@ func TestDotTAInto(t *testing.T) {
 }
 
 func TestDotVecAxpy(t *testing.T) {
-	rng := rand.New(rand.NewSource(81))
+	rng := rand.New(rand.NewPCG(81, 0))
 	for _, n := range []int{0, 1, 7, 8, 15, 16, 64, 127, 1000} {
 		a := make([]Float, n)
 		b := make([]Float, n)

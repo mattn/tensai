@@ -2,7 +2,7 @@ package model
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -18,7 +18,7 @@ import (
 // graph's generality costs on a CPU.
 func BenchmarkStep(b *testing.B) {
 	build := func(width int) (*Sequential, *tensai.Matrix, *tensai.Matrix) {
-		rng := rand.New(rand.NewSource(3))
+		rng := rand.New(rand.NewPCG(3, 0))
 		x := randMatrix(rng, 64, width)
 		y := randMatrix(rng, 64, 16)
 		net := NewSequential()

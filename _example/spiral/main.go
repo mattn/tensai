@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/dataset"
@@ -28,7 +28,7 @@ const (
 )
 
 func makeSpiral() *dataset.Dataset {
-	rng := rand.New(rand.NewSource(trainingSeed))
+	rng := rand.New(rand.NewPCG(uint64(trainingSeed), 0))
 	inputs := tensai.NewMatrix(numClasses*pointsPerClass, featuresPerRow)
 	targets := tensai.NewMatrix(numClasses*pointsPerClass, 1)
 	for cls := 0; cls < numClasses; cls++ {
@@ -49,7 +49,7 @@ func makeSpiral() *dataset.Dataset {
 }
 
 func main() {
-	splitRng := rand.New(rand.NewSource(trainingSeed + 2))
+	splitRng := rand.New(rand.NewPCG(uint64(trainingSeed+2), 0))
 	train, test, err := makeSpiral().SplitStratified(testFraction, splitRng)
 	if err != nil {
 		panic(err)
@@ -65,7 +65,7 @@ func main() {
 		panic(err)
 	}
 
-	rng := rand.New(rand.NewSource(trainingSeed + 1))
+	rng := rand.New(rand.NewPCG(uint64(trainingSeed+1), 0))
 	for epoch := 1; epoch <= epochs; epoch++ {
 		var lossSum float32
 		var steps int

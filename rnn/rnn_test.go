@@ -3,7 +3,7 @@ package rnn
 import (
 	"bytes"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -47,7 +47,7 @@ func checkParamGrad(t *testing.T, param *tensai.Tensor, build func() (*autograd.
 }
 
 func TestRNNCellGradientThroughTime(t *testing.T) {
-	rng := rand.New(rand.NewSource(43))
+	rng := rand.New(rand.NewPCG(43, 0))
 	cell := NewCell(2, 3, rng)
 	steps := []*tensai.Matrix{
 		tensai.RandomMatrix(4, 2, rng),
@@ -73,7 +73,7 @@ func TestRNNCellGradientThroughTime(t *testing.T) {
 }
 
 func TestLSTMCellGradient(t *testing.T) {
-	rng := rand.New(rand.NewSource(47))
+	rng := rand.New(rand.NewPCG(47, 0))
 	cell := NewLSTMCell(2, 3, rng)
 	steps := []*tensai.Matrix{
 		tensai.RandomMatrix(4, 2, rng),
@@ -98,7 +98,7 @@ func TestLSTMCellGradient(t *testing.T) {
 }
 
 func TestSelfAttentionGradient(t *testing.T) {
-	rng := rand.New(rand.NewSource(53))
+	rng := rand.New(rand.NewPCG(53, 0))
 	attn := NewSelfAttention(4, 3, rng)
 	seq := tensai.RandomMatrix(5, 4, rng) // seqLen=5, inSize=4
 	weights := tensai.RandomMatrix(5, 3, rng)
@@ -138,7 +138,7 @@ func TestRNNLearnsParity(t *testing.T) {
 		targets.Data[s] = tensai.Float(parity)
 	}
 
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	cell := NewCell(1, 8, rng)
 	wOut := autograd.Param(tensai.RandomMatrix(8, 2, rng))
 	bOut := autograd.Param(tensai.NewMatrix(1, 2))
@@ -172,7 +172,7 @@ func TestRNNLearnsParity(t *testing.T) {
 }
 
 func TestSaveLoadParams(t *testing.T) {
-	rng := rand.New(rand.NewSource(59))
+	rng := rand.New(rand.NewPCG(59, 0))
 	cell := NewLSTMCell(3, 5, rng)
 	x := tensai.RandomMatrix(4, 3, rng)
 
@@ -190,7 +190,7 @@ func TestSaveLoadParams(t *testing.T) {
 
 	// A differently initialized cell must reproduce the original's output
 	// after loading.
-	cell2 := NewLSTMCell(3, 5, rand.New(rand.NewSource(61)))
+	cell2 := NewLSTMCell(3, 5, rand.New(rand.NewPCG(61, 0)))
 	if err := autograd.LoadParams(&buf, cell2.Params()...); err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestSaveLoadParams(t *testing.T) {
 	if err := autograd.SaveParams(&buf, cell.Params()...); err != nil {
 		t.Fatal(err)
 	}
-	other := NewLSTMCell(3, 6, rand.New(rand.NewSource(67)))
+	other := NewLSTMCell(3, 6, rand.New(rand.NewPCG(67, 0)))
 	if err := autograd.LoadParams(&buf, other.Params()...); err == nil {
 		t.Error("loading into a different architecture should fail")
 	}

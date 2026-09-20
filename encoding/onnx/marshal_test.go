@@ -2,7 +2,7 @@ package onnx
 
 import (
 	"bytes"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	tensai "github.com/mattn/tensai"
@@ -22,7 +22,7 @@ func trainStep(t *testing.T, m *model.Sequential, in, out int, classes bool, rng
 	if classes {
 		y = tensai.NewMatrix(8, 1)
 		for i := range y.Data {
-			y.Data[i] = float32(rng.Intn(out))
+			y.Data[i] = float32(rng.IntN(out))
 		}
 	} else {
 		y = tensai.NewMatrix(8, out)
@@ -36,7 +36,7 @@ func trainStep(t *testing.T, m *model.Sequential, in, out int, classes bool, rng
 }
 
 func TestMarshalMLP(t *testing.T) {
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	m := model.NewSequential()
 	m.Add(layer.NewDense(16))
 	m.Add(&layer.Tanh{})
@@ -74,7 +74,7 @@ func TestMarshalMLP(t *testing.T) {
 }
 
 func TestMarshalCNN(t *testing.T) {
-	rng := rand.New(rand.NewSource(2))
+	rng := rand.New(rand.NewPCG(2, 0))
 	m := model.NewSequential()
 	m.Add(layer.NewConv2D(6, 3, 1, 1))
 	m.Add(&layer.ReLU{})
@@ -112,7 +112,7 @@ func TestMarshalErrors(t *testing.T) {
 		t.Fatal("expected error for activation-first model")
 	}
 
-	rng := rand.New(rand.NewSource(3))
+	rng := rand.New(rand.NewPCG(3, 0))
 	sm := model.NewSequential()
 	sm.Add(layer.NewConv2D(2, 3, 1, 1))
 	sm.Add(&layer.Softmax{})

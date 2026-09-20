@@ -3,7 +3,7 @@
 package gpu
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -15,7 +15,7 @@ import (
 func TestGPUMatMulRMSNorm(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(65))
+	rng := rand.New(rand.NewPCG(65, 0))
 	const rows, cols = 896, 300
 	q, err := g.UploadQ8(quant.Quantize(tensai.RandomMatrix(rows, cols, rng)))
 	if err != nil {
@@ -78,7 +78,7 @@ func TestGPUMatMulAttnCombine(t *testing.T) {
 	if !g.HasF16() {
 		t.Skip("device has no shader-f16")
 	}
-	rng := rand.New(rand.NewSource(67))
+	rng := rand.New(rand.NewPCG(67, 0))
 	const heads, kvHeads, dh, seqKV = 14, 2, 64, 400
 	const d, kvDim = heads * dh, kvHeads * dh
 	upload16 := func(src *tensai.Tensor) *Tensor {
@@ -162,7 +162,7 @@ func benchChainSplit(b *testing.B, links, inter int) {
 		b.Skipf("wgpu unavailable: %v", err)
 	}
 	defer g.Close()
-	rng := rand.New(rand.NewSource(64))
+	rng := rand.New(rand.NewPCG(64, 0))
 	up, err := g.UploadQ8(quant.Quantize(tensai.RandomMatrix(896, inter, rng)))
 	if err != nil {
 		b.Fatal(err)
@@ -236,7 +236,7 @@ func benchChain(b *testing.B, links, inter int) {
 		b.Skipf("wgpu unavailable: %v", err)
 	}
 	defer g.Close()
-	rng := rand.New(rand.NewSource(64))
+	rng := rand.New(rand.NewPCG(64, 0))
 	up, err := g.UploadQ8(quant.Quantize(tensai.RandomMatrix(896, inter, rng)))
 	if err != nil {
 		b.Fatal(err)
@@ -312,7 +312,7 @@ func BenchmarkGPUDecodeAttn(b *testing.B) {
 		b.Skipf("wgpu unavailable: %v", err)
 	}
 	defer g.Close()
-	rng := rand.New(rand.NewSource(66))
+	rng := rand.New(rand.NewPCG(66, 0))
 	const heads, kvHeads, headSz, steps = 14, 2, 64, 400
 	kc, err := g.Upload(randTensor(rng, 512, kvHeads*headSz))
 	if err != nil {

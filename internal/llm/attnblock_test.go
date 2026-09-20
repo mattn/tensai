@@ -2,7 +2,7 @@ package llm
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -16,7 +16,7 @@ import (
 func TestAttendGroupBlockMatchesRows(t *testing.T) {
 	const heads, kvHeads, steps0, qb = 8, 1, 11, 8
 	group := heads / kvHeads
-	rng := rand.New(rand.NewSource(3))
+	rng := rand.New(rand.NewPCG(3, 0))
 	for _, tt := range []struct {
 		name   string
 		head   int

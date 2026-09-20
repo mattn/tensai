@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"os/user"
@@ -334,7 +334,7 @@ func Open(o Options) (*Engine, error) {
 	e := &Engine{
 		opts: o, model: model, draft: draftM, tok: tok, tm: tm,
 		system: system, imEnd: stopID(0), eot: stopID(1),
-		rng:  rand.New(rand.NewSource(o.Seed)),
+		rng:  rand.New(rand.NewPCG(uint64(o.Seed), 0)),
 		vlog: vlog,
 	}
 	if e.tools, err = resolveTools(o.Tools); err != nil {

@@ -2,7 +2,7 @@ package layer
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 
 	"github.com/mattn/tensai"
 )

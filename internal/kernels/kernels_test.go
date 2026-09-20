@@ -2,7 +2,7 @@ package kernels
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -108,7 +108,7 @@ func TestGELUKernelAccuracy(t *testing.T) {
 // TestLayerNormKernelMatchesGeneric compares the dispatched LayerNorm row
 // kernels against the scalar reference, including non-multiple-of-8 tails.
 func TestLayerNormKernelMatchesGeneric(t *testing.T) {
-	rng := rand.New(rand.NewSource(83))
+	rng := rand.New(rand.NewPCG(83, 0))
 	for _, cols := range []int{3, 8, 13, 64, 100} {
 		src := make([]float32, cols)
 		g := make([]float32, cols)
@@ -159,7 +159,7 @@ func TestLayerNormKernelMatchesGeneric(t *testing.T) {
 }
 
 func TestSiluMul(t *testing.T) {
-	rng := rand.New(rand.NewSource(21))
+	rng := rand.New(rand.NewPCG(21, 0))
 	for _, n := range []int{1, 7, 8, 33, 1000} {
 		gate := make([]float32, n)
 		up := make([]float32, n)
@@ -183,7 +183,7 @@ func TestSiluMul(t *testing.T) {
 // twins bit for bit, across group widths, head sizes, and both the
 // vector and sub-16 generic paths.
 func TestDotVecsAxpys(t *testing.T) {
-	rng := rand.New(rand.NewSource(63))
+	rng := rand.New(rand.NewPCG(63, 0))
 	for _, d := range []int{8, 16, 64, 128, 130} {
 		for nq := 1; nq <= 8; nq++ {
 			qs := make([]float32, nq*d)
@@ -226,7 +226,7 @@ func TestDotVecsAxpys(t *testing.T) {
 }
 
 func TestSoftmaxBwdAdd(t *testing.T) {
-	rng := rand.New(rand.NewSource(81))
+	rng := rand.New(rand.NewPCG(81, 0))
 	for _, n := range []int{1, 7, 8, 15, 16, 127, 128, 130, 4096} {
 		dst := make([]float32, n)
 		grad := make([]float32, n)
@@ -253,7 +253,7 @@ func TestSoftmaxBwdAdd(t *testing.T) {
 }
 
 func TestSGDStepKernelMatchesGeneric(t *testing.T) {
-	rng := rand.New(rand.NewSource(29))
+	rng := rand.New(rand.NewPCG(29, 0))
 	for _, n := range []int{1, 3, 7, 8, 9, 31, 64} {
 		w := make([]float32, n)
 		vel := make([]float32, n)

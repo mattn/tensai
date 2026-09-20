@@ -2,7 +2,7 @@ package autograd
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"runtime"
 	"testing"
 
@@ -14,7 +14,7 @@ import (
 // parameters, so the same model can run with and without a tape.
 func buildXOR(t *testing.T, seed int64) (params []*Node, step func() tensai.Float) {
 	t.Helper()
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(uint64(seed), 0))
 	inputs, err := tensai.NewMatrixFromSlice(4, 2, []tensai.Float{0, 0, 0, 1, 1, 0, 1, 1})
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +69,7 @@ func TestTapeMatchesUntaped(t *testing.T) {
 // its bookkeeping, which is where a tape pays.
 func buildWide(t *testing.T, seed int64) (params []*Node, step func() tensai.Float) {
 	t.Helper()
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(uint64(seed), 0))
 	x := tensai.RandomMatrix(32, 64, rng)
 	y := tensai.RandomMatrix(32, 16, rng).Tensor()
 	w1 := Param(tensai.RandomMatrix(64, 128, rng))
@@ -110,10 +110,10 @@ func TestTapeReusesBuffers(t *testing.T) {
 
 	// The buffers themselves must come back, not just their sizes: the
 	// value of the same node in two successive steps shares one array.
-	w := Param(tensai.RandomMatrix(3, 4, rand.New(rand.NewSource(3))))
+	w := Param(tensai.RandomMatrix(3, 4, rand.New(rand.NewPCG(3, 0))))
 	tape2 := NewTape()
 	tape2.Bind(w)
-	x := tensai.RandomMatrix(2, 3, rand.New(rand.NewSource(4)))
+	x := tensai.RandomMatrix(2, 3, rand.New(rand.NewPCG(4, 0)))
 	first := Input(x).MatMul(w)
 	tape2.Reset()
 	second := Input(x).MatMul(w)
@@ -149,7 +149,7 @@ func TestTapeLeavesParamsAlone(t *testing.T) {
 // TestTapeGradientsStayCorrect runs the numeric-gradient check on a taped
 // graph, so a recycled buffer that still held stale numbers would show up.
 func TestTapeGradientsStayCorrect(t *testing.T) {
-	rng := rand.New(rand.NewSource(29))
+	rng := rand.New(rand.NewPCG(29, 0))
 	x := randTensor(rng, 2, 3, 4)
 	w := randTensor(rng, 4, 5)
 	weights := randTensor(rng, 2, 3, 5)
