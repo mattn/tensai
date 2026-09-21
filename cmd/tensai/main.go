@@ -887,6 +887,7 @@ func generateImage(model, prompt, out string, size, steps int, seed int64, bits 
 	if err != nil {
 		return err
 	}
+	defer m.Close()
 	say("transformer: loaded in %v", time.Since(start).Round(time.Second))
 
 	latents := qwenimage.Noise(rand.New(rand.NewPCG(uint64(seed), 0)), side, side)

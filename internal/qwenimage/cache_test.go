@@ -28,9 +28,11 @@ func TestCacheRoundTrip(t *testing.T) {
 	}
 
 	got := &Transformer{blocks: []*Block{{}}}
-	if err := readCache(tmp, 8, got.walk); err != nil {
+	release, err := readCache(tmp, 8, got.walk)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer release()
 	same := func(name string, a, b *linear) {
 		t.Helper()
 		if (a.q == nil) != (b.q == nil) {
@@ -70,7 +72,7 @@ func TestCacheRoundTrip(t *testing.T) {
 
 	// A checkpoint that has moved on must not be read from an old cache.
 	touch(t, tmp)
-	if err := readCache(tmp, 8, (&Transformer{blocks: []*Block{{}}}).walk); err == nil {
+	if _, err := readCache(tmp, 8, (&Transformer{blocks: []*Block{{}}}).walk); err == nil {
 		t.Error("a cache older than its checkpoint was accepted")
 	}
 }

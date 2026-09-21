@@ -58,6 +58,9 @@ type teLayer struct {
 type TextEncoder struct {
 	w      *safetensors.Shards
 	layers []*teLayer
+	// release unmaps the cache the layers point into, when they came
+	// from one.
+	release func() error
 }
 
 // LoadTextEncoder reads the encoder, quantizing its weights when bits is
@@ -83,7 +86,8 @@ func loadTextEncoder(dir string, bits, layers int) (*TextEncoder, error) {
 	// cache only stands in for the layers.
 	full := bits != 0 && layers == teLayers
 	if full {
-		if err := readCache(dir, bits, t.walk); err == nil {
+		if release, err := readCache(dir, bits, t.walk); err == nil {
+			t.release = release
 			return t, nil
 		}
 	}
@@ -130,8 +134,18 @@ func loadTextEncoder(dir string, bits, layers int) (*TextEncoder, error) {
 	return t, nil
 }
 
-// Close releases the checkpoint.
-func (t *TextEncoder) Close() error { return t.w.Close() }
+// Close releases the checkpoint and, if the layers came from a cache,
+// the mapping they point into. Nothing may use the encoder afterwards.
+func (t *TextEncoder) Close() error {
+	err := t.w.Close()
+	if t.release != nil {
+		if rerr := t.release(); err == nil {
+			err = rerr
+		}
+		t.release = nil
+	}
+	return err
+}
 
 // embed reads one row per token out of the embedding table, which is far
 // too large to hold for the handful of rows a prompt needs.

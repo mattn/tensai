@@ -259,30 +259,34 @@ func writeCache(dir string, bits int, walk func(codec)) error {
 	return os.Rename(tmp.Name(), path)
 }
 
-// cacheFiles pins the mapped caches for the life of the process, so the
-// finalizer on os.File never closes one under a live mapping.
-var cacheFiles []*os.File
-
-// readCache fills a model's weight slots from a mapped cache. A missing,
-// stale or corrupt file is reported so the caller can quantize instead.
-func readCache(dir string, bits int, walk func(codec)) error {
+// readCache fills a model's weight slots from a mapped cache and returns
+// what releases the mapping. The weights point into it, so a model holds
+// that until it is done; a missing, stale or corrupt file is reported so
+// the caller can quantize instead.
+func readCache(dir string, bits int, walk func(codec)) (func() error, error) {
 	src, err := stamp(dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	f, err := os.Open(cachePath(dir, bits))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	data, unmap, err := mmapfile.Map(f)
 	if err != nil {
 		f.Close()
+		return nil, err
+	}
+	release := func() error {
+		err := unmap()
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
 		return err
 	}
-	bad := func(err error) error {
-		unmap()
-		f.Close()
-		return err
+	bad := func(err error) (func() error, error) {
+		release()
+		return nil, err
 	}
 	c := &cacheReader{b: data}
 	if string(c.blob()) != cacheMagic || c.num() != cacheVersion || c.num() != bits {
@@ -295,6 +299,5 @@ func readCache(dir string, bits int, walk func(codec)) error {
 	if c.err != nil {
 		return bad(c.err)
 	}
-	cacheFiles = append(cacheFiles, f)
-	return nil
+	return release, nil
 }

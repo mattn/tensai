@@ -36,6 +36,20 @@ type Transformer struct {
 	normOut        *linear
 	projOut        *linear
 	blocks         []*Block
+	// release unmaps the cache the weights point into, when they came
+	// from one.
+	release func() error
+}
+
+// Close releases the mapped cache a model was read from. The weights
+// point into it, so nothing may use the model afterwards.
+func (m *Transformer) Close() error {
+	if m.release == nil {
+		return nil
+	}
+	err := m.release()
+	m.release = nil
+	return err
 }
 
 // ditLayers is how many blocks the checkpoint has.
@@ -62,7 +76,8 @@ func loadTransformer(dir string, bits, layers int) (*Transformer, error) {
 	// model is worth caching: a partial one would poison the file.
 	full := bits != 0 && layers == ditLayers
 	if full {
-		if err := readCache(dir, bits, m.walk); err == nil {
+		if release, err := readCache(dir, bits, m.walk); err == nil {
+			m.release = release
 			return m, nil
 		}
 	}
