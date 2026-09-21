@@ -68,7 +68,7 @@ func TestBlockMatchesReference(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	b, err := LoadBlock(w, 0)
+	b, err := LoadBlock(w, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,4 +90,62 @@ func TestBlockMatchesReference(t *testing.T) {
 	if worst > 1e-3 {
 		t.Errorf("element %d is %g, reference %g", at, x.Data[at], want[at])
 	}
+}
+
+// TestBlockInt8Error measures what quantizing a block's weights costs,
+// on the same inputs the float test uses. The model does not fit in
+// memory as floats, so this number decides whether it can run at all;
+// it is reported rather than bounded tightly, since what matters is the
+// picture at the end of 32 blocks and a denoising loop.
+func TestBlockInt8Error(t *testing.T) {
+	dir := transformerDir(t)
+	const seq = 48
+	read := func(name string, n int) []tensai.Float {
+		return readF32(t, filepath.Join("testdata", name), n)
+	}
+	x := &tensai.Matrix{Rows: seq, Cols: ditDim, Data: read("block_x_48.f32", seq*ditDim)}
+	modRows := read("block_mod_48.f32", 2*4*ditDim)
+	want := read("block_y_48.f32", seq*ditDim)
+	rope := &Rope{
+		Cos: &tensai.Matrix{Rows: seq, Cols: ropePairs, Data: read("block_cos_48.f32", seq*ropePairs)},
+		Sin: &tensai.Matrix{Rows: seq, Cols: ropePairs, Data: read("block_sin_48.f32", seq*ropePairs)},
+	}
+	part := func(row, i int) []tensai.Float {
+		return modRows[row*4*ditDim+i*ditDim:][:ditDim]
+	}
+	m := &Modulation{}
+	for row := 0; row < 2; row++ {
+		m.Scale1 = append(m.Scale1, part(row, 0))
+		m.Gate1 = append(m.Gate1, part(row, 1))
+		m.Scale2 = append(m.Scale2, part(row, 2))
+		m.Gate2 = append(m.Gate2, part(row, 3))
+	}
+	l := &Layout{KeyLimit: make([]int, seq), Row: make([]int, seq)}
+	for i := range l.Row {
+		l.KeyLimit[i] = seq
+		if i < seq/2 {
+			l.Row[i] = 1
+		}
+	}
+
+	w, err := OpenTransformer(filepath.Join(dir, "diffusion_pytorch_model.safetensors.index.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	b, err := LoadBlock(w, 0, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Forward(x, m, l, rope, NewScratch(seq)); err != nil {
+		t.Fatal(err)
+	}
+	var sq, ref float64
+	for i, v := range want {
+		d := float64(x.Data[i] - v)
+		sq += d * d
+		ref += float64(v) * float64(v)
+	}
+	t.Logf("int8 relative error %.4f%% (rms %.4g against the block's %.4g)",
+		100*math.Sqrt(sq/ref), math.Sqrt(sq/float64(len(want))), math.Sqrt(ref/float64(len(want))))
 }
