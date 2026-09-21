@@ -75,10 +75,21 @@ func loadTextEncoder(dir string, bits, layers int) (*TextEncoder, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &TextEncoder{w: w}
+	t := &TextEncoder{w: w, layers: make([]*teLayer, layers)}
+	for i := range t.layers {
+		t.layers[i] = &teLayer{}
+	}
+	// The embedding table is read from the checkpoint either way, so the
+	// cache only stands in for the layers.
+	full := bits != 0 && layers == teLayers
+	if full {
+		if err := readCache(dir, bits, t.walk); err == nil {
+			return t, nil
+		}
+	}
 	for i := 0; i < layers; i++ {
 		p := fmt.Sprintf("model.language_model.layers.%d.", i)
-		l := &teLayer{}
+		l := t.layers[i]
 		for _, f := range []struct {
 			dst        **linear
 			name       string
@@ -112,7 +123,9 @@ func loadTextEncoder(dir string, bits, layers int) (*TextEncoder, error) {
 				return nil, err
 			}
 		}
-		t.layers = append(t.layers, l)
+	}
+	if full {
+		_ = writeCache(dir, bits, t.walk)
 	}
 	return t, nil
 }

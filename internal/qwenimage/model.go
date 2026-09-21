@@ -53,13 +53,26 @@ func LoadTransformer(dir string, bits int) (*Transformer, error) {
 // around them is the same, which is what lets the wiring be checked
 // against a reference on a machine that cannot hold all 32.
 func loadTransformer(dir string, bits, layers int) (*Transformer, error) {
+	m := &Transformer{blocks: make([]*Block, layers)}
+	for i := range m.blocks {
+		m.blocks[i] = &Block{}
+	}
+	// A quantized checkpoint is the same every time and takes minutes to
+	// build, so a cache beside the weights stands in for it. Only a whole
+	// model is worth caching: a partial one would poison the file.
+	full := bits != 0 && layers == ditLayers
+	if full {
+		if err := readCache(dir, bits, m.walk); err == nil {
+			return m, nil
+		}
+	}
+
 	w, err := safetensors.OpenSharded(filepath.Join(dir, "diffusion_pytorch_model.safetensors.index.json"))
 	if err != nil {
 		return nil, err
 	}
 	defer w.Close()
 
-	m := &Transformer{}
 	for _, f := range []struct {
 		dst        **linear
 		name       string
@@ -89,7 +102,13 @@ func loadTransformer(dir string, bits, layers int) (*Transformer, error) {
 		if err != nil {
 			return nil, err
 		}
-		m.blocks = append(m.blocks, b)
+		m.blocks[i] = b
+	}
+	if full {
+		// A cache that cannot be written costs the next run the same
+		// work and nothing else, so a failure here is not the caller's
+		// problem; the temporary file is cleaned up either way.
+		_ = writeCache(dir, bits, m.walk)
 	}
 	return m, nil
 }
