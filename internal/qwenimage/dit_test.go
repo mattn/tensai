@@ -45,7 +45,7 @@ func TestBlockMatchesReference(t *testing.T) {
 	part := func(row, i int) []tensai.Float {
 		return modRows[row*4*ditDim+i*ditDim:][:ditDim]
 	}
-	m := &Modulation{Row: make([]int, seq)}
+	m := &Modulation{}
 	for row := 0; row < 2; row++ {
 		m.Scale1 = append(m.Scale1, part(row, 0))
 		m.Gate1 = append(m.Gate1, part(row, 1))
@@ -53,10 +53,13 @@ func TestBlockMatchesReference(t *testing.T) {
 		m.Gate2 = append(m.Gate2, part(row, 3))
 	}
 	// block.py marks the second half as target tokens, which read the
-	// sampled timestep's row; the rest read the t=0 row.
-	for i := range m.Row {
+	// sampled timestep's row, and passes no attention mask, so every
+	// query reads every key.
+	l := &Layout{KeyLimit: make([]int, seq), Row: make([]int, seq)}
+	for i := range l.Row {
+		l.KeyLimit[i] = seq
 		if i < seq/2 {
-			m.Row[i] = 1
+			l.Row[i] = 1
 		}
 	}
 
@@ -69,7 +72,7 @@ func TestBlockMatchesReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Forward(x, m, rope, NewScratch(seq)); err != nil {
+	if err := b.Forward(x, m, l, rope, NewScratch(seq)); err != nil {
 		t.Fatal(err)
 	}
 

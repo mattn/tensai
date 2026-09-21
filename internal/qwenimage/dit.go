@@ -30,13 +30,12 @@ const (
 	ropePairs  = ditHeadDim / 2 // 64 complex pairs per head
 )
 
-// Modulation is the per-token scale and gate for one block half. Rows
-// holds one entry per distinct timestep the sequence modulates from, and
-// Row says which of them each token reads.
+// Modulation is the scale and gate each block half applies, one entry
+// per distinct timestep the sequence modulates from. Which of them a
+// token reads is the layout's business.
 type Modulation struct {
 	Scale1, Gate1 [][]tensai.Float // per row, ditDim wide
 	Scale2, Gate2 [][]tensai.Float
-	Row           []int // per token
 }
 
 // Rope carries the rotation each token's head dimensions take, already
@@ -182,18 +181,20 @@ func applyRope(x *tensai.Matrix, rope *Rope) {
 	}
 }
 
-// attention runs every head over the whole sequence and writes the
-// concatenated heads into out.
-func attention(out, q, k, v *tensai.Matrix) {
+// attention runs every head over the sequence and writes the
+// concatenated heads into out. A query reads the keys its limit allows,
+// which is what makes the prompt causal and the image bidirectional.
+func attention(out, q, k, v *tensai.Matrix, keyLimit []int) {
 	n := q.Rows
 	scale := tensai.Float(1 / math.Sqrt(ditHeadDim))
 	scores := make([]tensai.Float, n)
 	for h := 0; h < ditHeads; h++ {
 		off := h * ditHeadDim
 		for i := 0; i < n; i++ {
+			lim := keyLimit[i]
 			qi := q.Data[i*q.Cols+off:][:ditHeadDim]
 			maxs := tensai.Float(math.Inf(-1))
-			for j := 0; j < n; j++ {
+			for j := 0; j < lim; j++ {
 				s := tensai.DotVec(qi, k.Data[j*k.Cols+off:][:ditHeadDim]) * scale
 				scores[j] = s
 				if s > maxs {
@@ -201,14 +202,14 @@ func attention(out, q, k, v *tensai.Matrix) {
 				}
 			}
 			var sum tensai.Float
-			for j, s := range scores {
+			for j, s := range scores[:lim] {
 				e := tensai.Float(math.Exp(float64(s - maxs)))
 				scores[j] = e
 				sum += e
 			}
 			dst := out.Data[i*out.Cols+off:][:ditHeadDim]
 			clear(dst)
-			for j, e := range scores {
+			for j, e := range scores[:lim] {
 				kernels.Axpy(e/sum, v.Data[j*v.Cols+off:][:ditHeadDim], dst)
 			}
 		}
@@ -216,14 +217,14 @@ func attention(out, q, k, v *tensai.Matrix) {
 }
 
 // Forward runs one block over the joint sequence, in place.
-func (b *Block) Forward(x *tensai.Matrix, m *Modulation, rope *Rope, s *Scratch) error {
+func (b *Block) Forward(x *tensai.Matrix, m *Modulation, l *Layout, rope *Rope, s *Scratch) error {
 	if x.Cols != ditDim {
 		return fmt.Errorf("qwenimage: block wants %d columns, got %d", ditDim, x.Cols)
 	}
 	s.reset(x.Rows)
 
 	layerNorm(s.norm, x)
-	modulate(s.norm, m.Scale1, m.Row)
+	modulate(s.norm, m.Scale1, l.Row)
 	for _, p := range []struct {
 		dst *tensai.Matrix
 		w   *tensai.Matrix
@@ -238,14 +239,14 @@ func (b *Block) Forward(x *tensai.Matrix, m *Modulation, rope *Rope, s *Scratch)
 		applyRope(s.q, rope)
 		applyRope(s.k, rope)
 	}
-	attention(s.attn, s.q, s.k, s.v)
+	attention(s.attn, s.q, s.k, s.v, l.KeyLimit)
 	if err := tensai.DotTBInto(s.norm, s.attn, b.toOut); err != nil {
 		return err
 	}
-	addGated(x, s.norm, m.Gate1, m.Row)
+	addGated(x, s.norm, m.Gate1, l.Row)
 
 	layerNorm(s.norm, x)
-	modulate(s.norm, m.Scale2, m.Row)
+	modulate(s.norm, m.Scale2, l.Row)
 	if err := tensai.DotTBInto(s.gate, s.norm, b.mlpGate); err != nil {
 		return err
 	}
@@ -256,7 +257,7 @@ func (b *Block) Forward(x *tensai.Matrix, m *Modulation, rope *Rope, s *Scratch)
 	if err := tensai.DotTBInto(s.norm, s.gate, b.mlpOut); err != nil {
 		return err
 	}
-	addGated(x, s.norm, m.Gate2, m.Row)
+	addGated(x, s.norm, m.Gate2, l.Row)
 	return nil
 }
 
