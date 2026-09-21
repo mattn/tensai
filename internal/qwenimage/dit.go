@@ -7,6 +7,7 @@ import (
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
 	"github.com/mattn/tensai/internal/kernels"
+	"github.com/mattn/tensai/quant"
 )
 
 // The denoising transformer is single-stream: text and image tokens run
@@ -44,12 +45,27 @@ type Rope struct {
 	Cos, Sin *tensai.Matrix // (tokens, ropePairs)
 }
 
+// linear is one of a block's weight matrices. The checkpoint is 14GB in
+// the form it ships, so a machine that cannot hold that keeps the
+// weights quantized instead and the float form stays nil.
+type linear struct {
+	f *tensai.Matrix // (out, in), as the checkpoint stores it
+	q *quant.QMatrix // (in, out), the layout the int8 kernels want
+}
+
+func (l *linear) apply(out, x *tensai.Matrix) error {
+	if l.q != nil {
+		return l.q.MatMul(x, out)
+	}
+	return tensai.DotTBInto(out, x, l.f)
+}
+
 // Block is one of the transformer's 32 layers.
 type Block struct {
-	toQ, toK, toV, toOut *tensai.Matrix
+	toQ, toK, toV, toOut *linear
 	normQ, normK         []tensai.Float
-	mlpProj, mlpGate     *tensai.Matrix
-	mlpOut               *tensai.Matrix
+	mlpProj, mlpGate     *linear
+	mlpOut               *linear
 }
 
 // weights is what a Block loads from: either a single file or the
@@ -69,13 +85,15 @@ func matrix(w weights, name string, rows, cols int) (*tensai.Matrix, error) {
 	return &tensai.Matrix{Rows: rows, Cols: cols, Data: t.Data}, nil
 }
 
-// LoadBlock reads one transformer block out of a checkpoint.
-func LoadBlock(w weights, i int) (*Block, error) {
+// LoadBlock reads one transformer block out of a checkpoint. With bits
+// set to 8 every weight is quantized as it arrives, which is what makes
+// the model fit where its float form would not; 0 keeps the floats.
+func LoadBlock(w weights, i, bits int) (*Block, error) {
 	p := fmt.Sprintf("transformer_blocks.%d.", i)
 	b := &Block{}
 	var err error
 	for _, f := range []struct {
-		dst        **tensai.Matrix
+		dst        **linear
 		name       string
 		rows, cols int
 	}{
@@ -87,7 +105,7 @@ func LoadBlock(w weights, i int) (*Block, error) {
 		{&b.mlpGate, p + "img_mlp.gate_layer.weight", ditMLP, ditDim},
 		{&b.mlpOut, p + "img_mlp.out.weight", ditDim, ditMLP},
 	} {
-		if *f.dst, err = matrix(w, f.name, f.rows, f.cols); err != nil {
+		if *f.dst, err = loadLinear(w, f.name, f.rows, f.cols, bits); err != nil {
 			return nil, err
 		}
 	}
@@ -98,6 +116,30 @@ func LoadBlock(w weights, i int) (*Block, error) {
 		return nil, err
 	}
 	return b, nil
+}
+
+// loadLinear reads one weight matrix, quantizing it on the way in when
+// asked. The float form is dropped as soon as the quantized one exists,
+// so loading a 7B model never needs its float32 size.
+func loadLinear(w weights, name string, rows, cols, bits int) (*linear, error) {
+	m, err := matrix(w, name, rows, cols)
+	if err != nil {
+		return nil, err
+	}
+	if bits != 8 {
+		return &linear{f: m}, nil
+	}
+	// The kernels contract over the stored matrix's rows, so the
+	// checkpoint's (out, in) has to change hands before it quantizes;
+	// the scale then lands per output feature, which is the axis whose
+	// weights share a range.
+	t := tensai.NewMatrix(cols, rows)
+	for o := 0; o < rows; o++ {
+		for i := 0; i < cols; i++ {
+			t.Data[i*rows+o] = m.Data[o*cols+i]
+		}
+	}
+	return &linear{q: quant.Quantize(t)}, nil
 }
 
 func vector(w weights, name string, n int) ([]tensai.Float, error) {
@@ -227,9 +269,9 @@ func (b *Block) Forward(x *tensai.Matrix, m *Modulation, l *Layout, rope *Rope, 
 	modulate(s.norm, m.Scale1, l.Row)
 	for _, p := range []struct {
 		dst *tensai.Matrix
-		w   *tensai.Matrix
+		w   *linear
 	}{{s.q, b.toQ}, {s.k, b.toK}, {s.v, b.toV}} {
-		if err := tensai.DotTBInto(p.dst, s.norm, p.w); err != nil {
+		if err := p.w.apply(p.dst, s.norm); err != nil {
 			return err
 		}
 	}
@@ -240,21 +282,21 @@ func (b *Block) Forward(x *tensai.Matrix, m *Modulation, l *Layout, rope *Rope, 
 		applyRope(s.k, rope)
 	}
 	attention(s.attn, s.q, s.k, s.v, l.KeyLimit)
-	if err := tensai.DotTBInto(s.norm, s.attn, b.toOut); err != nil {
+	if err := b.toOut.apply(s.norm, s.attn); err != nil {
 		return err
 	}
 	addGated(x, s.norm, m.Gate1, l.Row)
 
 	layerNorm(s.norm, x)
 	modulate(s.norm, m.Scale2, l.Row)
-	if err := tensai.DotTBInto(s.gate, s.norm, b.mlpGate); err != nil {
+	if err := b.mlpGate.apply(s.gate, s.norm); err != nil {
 		return err
 	}
-	if err := tensai.DotTBInto(s.up, s.norm, b.mlpProj); err != nil {
+	if err := b.mlpProj.apply(s.up, s.norm); err != nil {
 		return err
 	}
 	kernels.SiluMul(s.gate.Data, s.up.Data)
-	if err := tensai.DotTBInto(s.norm, s.gate, b.mlpOut); err != nil {
+	if err := b.mlpOut.apply(s.norm, s.gate); err != nil {
 		return err
 	}
 	addGated(x, s.norm, m.Gate2, l.Row)
