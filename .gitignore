@@ -24,3 +24,4 @@ tokenizer/testdata/
 run-codeserver.sh
 test-wgpu24.sh
 /PERF-INVESTIGATION.md
+internal/qwenimage/testdata/*.f32
