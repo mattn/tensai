@@ -11,8 +11,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"github.com/mattn/tensai"
 )
 
 func readF64(t *testing.T, path string, want int) []float64 {
@@ -50,11 +48,11 @@ func TestScheduleMatchesReference(t *testing.T) {
 	}
 }
 
-// TestGenerateWritesPNG runs the whole pipeline at full depth and
-// writes what it lands on. The prompt's hidden states are left at zero
-// because the text encoder is not here yet, so the picture means
-// nothing; what this checks is that 32 quantized blocks, the schedule
-// and the decoder hold together at full size, and what they cost.
+// TestGenerateWritesPNG runs the whole pipeline: the prompt through the
+// encoder, the latent through 32 quantized blocks and the schedule, and
+// the result through the decoder. Both models are seven gigabytes and
+// only one is held at a time, so the encoder is released before the
+// transformer loads.
 func TestGenerateWritesPNG(t *testing.T) {
 	out := os.Getenv("TENSAI_IMAGE_PNG")
 	if out == "" {
@@ -68,17 +66,27 @@ func TestGenerateWritesPNG(t *testing.T) {
 	side := envInt("TENSAI_IMAGE_LATENT", 16) // 16 latent rows is a 256x256 image
 
 	start := time.Now()
+
+	prompt := os.Getenv("TENSAI_IMAGE_PROMPT")
+	if prompt == "" {
+		prompt = "a red cube on a white table"
+	}
+	text, err := EncodePrompt(dir, prompt, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("prompt encoded to %d tokens in %v", text.Rows, time.Since(start).Round(time.Second))
+
+	l := NewLayout(text.Rows, side, side)
+	latents := Noise(rand.New(rand.NewPCG(5, 0)), side, side)
+	sched := NewSchedule(steps, side*side)
+
+	start = time.Now()
 	m, err := LoadTransformer(dir.Transformer(), 8)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("transformer loaded in %v", time.Since(start).Round(time.Second))
-
-	const textLen = 16
-	l := NewLayout(textLen, side, side)
-	text := tensai.NewMatrix(textLen, ditDim)
-	latents := Noise(rand.New(rand.NewPCG(5, 0)), side, side)
-	sched := NewSchedule(steps, side*side)
 
 	start = time.Now()
 	err = Generate(m, latents, text, l, sched, func(i int) {

@@ -144,3 +144,11 @@ func (d ModelDir) VAEConfig() string { return filepath.Join(string(d), "vae", "c
 
 // Transformer returns the directory holding the denoising transformer.
 func (d ModelDir) Transformer() string { return filepath.Join(string(d), "transformer") }
+
+// TextEncoder returns the directory holding the prompt encoder.
+func (d ModelDir) TextEncoder() string { return filepath.Join(string(d), "text_encoder") }
+
+// Tokenizer returns the path to the processor's tokenizer.
+func (d ModelDir) Tokenizer() string {
+	return filepath.Join(string(d), "processor", "tokenizer.json")
+}
