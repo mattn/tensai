@@ -78,6 +78,7 @@ plugins:
             Model Formats: モデルフォーマット
             Tokenizers: トークナイザ
             LLM Inference: LLM 推論
+            Image Generation: 画像生成
             Examples: サンプル
 
 nav:
@@ -95,6 +96,7 @@ nav:
   - Model Formats: formats.md
   - Tokenizers: tokenizers.md
   - LLM Inference: llm.md
+  - Image Generation: images.md
   - Examples: examples.md
 
 extra:
