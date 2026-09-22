@@ -82,9 +82,26 @@ tensai image [flags] <prompt>
   -seed int       ノイズのシード (既定 1)
   -q4             8 ビットではなく 4 ビットに量子化する
   -f32            重みを float のまま持つ。およそ 42GB 必要
+  -negative str   避けたいもの。-cfg を 1 より大きくする必要がある
+  -cfg float      どれだけ避けるか (既定 1、off)
   -q              エラー以外を出さない
 ```
 
+## ガイダンス
+
+`-cfg` を 1 より大きくすると classifier-free guidance が有効になります。各ステップで
+transformer に 2 回聞き (プロンプトが求めるものと `-negative` が求めるもの)、その差を
+前者の側に伸ばします。色が分離し質感が出て絵が締まりますが、1 ステップのコストが 2 倍に
+なるため既定では off です。
+
+```bash
+tensai image -cfg 4 -negative "blurry, low quality, watermark" \
+  "a calico cat asleep on a stack of books"
+```
+
+256x256 の 20 ステップが 3 分 46 秒から 6 分 29 秒になります。2 つのプロンプトは
+エンコーダの 1 回の読み込みで両方処理するので、そちらの追加コストはありません。
+
 ## まだ無いもの
 
-text-to-image だけです。チェックポイントは画像編集もでき、classifier-free guidance でネガティブプロンプトも取れますが、どちらも未実装です。プロンプトエンコーダは言語側だけを走らせるので vision tower は使いません。参照実装がステップ間で使い回す key-value キャッシュ (プロンプトは timestep 0 から変調するので全ステップで変わりません) も作っていません。
+text-to-image だけです。チェックポイントは画像編集もできますが、そちらは未実装です。プロンプトエンコーダは言語側だけを走らせるので vision tower は使いません。参照実装がステップ間で使い回す key-value キャッシュ (プロンプトは timestep 0 から変調するので全ステップで変わりません) も作っていません。

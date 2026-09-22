@@ -82,9 +82,27 @@ tensai image [flags] <prompt>
   -seed int       noise seed (default 1)
   -q4             quantize to four bits instead of eight
   -f32            keep the weights as floats, which needs about 42GB
+  -negative str   what to steer away from; needs -cfg above 1
+  -cfg float      how far to steer away from it (default 1, off)
   -q              print nothing but errors
 ```
 
+## Guidance
+
+`-cfg` above 1 turns on classifier-free guidance: each step asks the
+transformer twice, once for what the prompt wants and once for what
+`-negative` does, and follows the difference past the first. It sharpens
+the picture — colours separate, texture comes up — at the price of
+doubling what a step costs, which is why it is off by default.
+
+```bash
+tensai image -cfg 4 -negative "blurry, low quality, watermark" \
+  "a calico cat asleep on a stack of books"
+```
+
+A 256x256 run goes from 3m46s to 6m29s. Both prompts go through the
+encoder in one load, so guidance costs nothing extra there.
+
 ## What is not here
 
-Text-to-image only. The checkpoint also edits images and takes a negative prompt with classifier-free guidance; neither is implemented. The prompt encoder runs its language half, so the vision tower is unused, and the transformer's key-value cache — which the reference reuses across steps, since the prompt modulates from a timestep of zero and never changes — is not built either.
+Text-to-image only. The checkpoint also edits images, which is not implemented. The prompt encoder runs its language half, so the vision tower is unused, and the transformer's key-value cache — which the reference reuses across steps, since the prompt modulates from a timestep of zero and never changes — is not built either.

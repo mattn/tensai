@@ -89,7 +89,7 @@ func TestGenerateWritesPNG(t *testing.T) {
 	t.Logf("transformer loaded in %v", time.Since(start).Round(time.Second))
 
 	start = time.Now()
-	err = Generate(m, latents, text, l, sched, func(i int) {
+	err = Generate(m, latents, text, l, sched, nil, func(i int) {
 		t.Logf("step %d/%d at %v", i+1, steps, time.Since(start).Round(time.Second))
 	})
 	if err != nil {

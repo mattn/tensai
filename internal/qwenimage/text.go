@@ -351,30 +351,48 @@ func PromptTokens(tk tokenizerLike, prompt string) []int {
 }
 
 // EncodePrompt turns a prompt into the hidden states the denoising
-// transformer reads. The encoder is loaded, run and released here
-// because it is another seven gigabytes and the transformer wants them.
+// transformer reads.
 func EncodePrompt(dir ModelDir, prompt string, bits int) (*tensai.Matrix, error) {
+	out, err := EncodePrompts(dir, []string{prompt}, bits)
+	if err != nil {
+		return nil, err
+	}
+	return out[0], nil
+}
+
+// EncodePrompts encodes several prompts in one pass over the encoder,
+// which is loaded and released here because it is another seven
+// gigabytes and the denoising transformer wants them. Guidance needs two
+// prompts and there is no reason to pay for the encoder twice.
+func EncodePrompts(dir ModelDir, prompts []string, bits int) ([]*tensai.Matrix, error) {
 	tk, err := tokenizer.Load(dir.Tokenizer())
 	if err != nil {
 		return nil, err
 	}
-	ids := PromptTokens(tk, prompt)
-	if len(ids) <= PromptDrop {
-		return nil, fmt.Errorf("qwenimage: the prompt tokenized to %d tokens, all preamble", len(ids))
+	ids := make([][]int, len(prompts))
+	for i, p := range prompts {
+		ids[i] = PromptTokens(tk, p)
+		if len(ids[i]) <= PromptDrop {
+			return nil, fmt.Errorf("qwenimage: prompt %d tokenized to %d tokens, all preamble", i, len(ids[i]))
+		}
 	}
 	e, err := LoadTextEncoder(dir.TextEncoder(), bits)
 	if err != nil {
 		return nil, err
 	}
-	hidden, err := e.Encode(ids)
-	e.Close()
-	if err != nil {
-		return nil, err
+	out := make([]*tensai.Matrix, len(ids))
+	for i, id := range ids {
+		hidden, err := e.Encode(id)
+		if err != nil {
+			e.Close()
+			return nil, err
+		}
+		// What the transformer reads starts at the user's own words.
+		kept := len(id) - PromptDrop
+		out[i] = tensai.NewMatrix(kept, teDim)
+		copy(out[i].Data, hidden.Data[PromptDrop*teDim:])
 	}
-	// What the transformer reads starts at the user's own words.
-	kept := len(ids) - PromptDrop
-	out := tensai.NewMatrix(kept, teDim)
-	copy(out.Data, hidden.Data[PromptDrop*teDim:])
+	e.Close()
 	// Hand the encoder's seven gigabytes back to the system rather than
 	// keeping them on Go's free list: the transformer wants them, and a
 	// collection alone would leave them counted against us.
