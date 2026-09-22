@@ -310,3 +310,121 @@ func BenchmarkMatVecQ4Big(b *testing.B) {
 		}
 	}
 }
+
+// quantize4ColumnsRef is the column-at-a-time nibble quantizer the
+// tiled one replaced, kept as the reference it answers to.
+func quantize4ColumnsRef(m *tensai.Matrix, q *Q4Matrix, groups, colLo, colHi int) {
+	for j := colLo; j < colHi; j++ {
+		for g := 0; g < groups; g++ {
+			rlo := g * q4Group
+			rhi := min(rlo+q4Group, m.Rows)
+			var maxAbs tensai.Float
+			for i := rlo; i < rhi; i++ {
+				v := m.Data[i*m.Cols+j]
+				if v < 0 {
+					v = -v
+				}
+				if v > maxAbs {
+					maxAbs = v
+				}
+			}
+			s := maxAbs / 7
+			q.Scale[q.TableIndex(g, j)] = s
+			inv := tensai.Float(0)
+			if s != 0 {
+				inv = 1 / s
+			}
+			for i := rlo; i < rhi; i++ {
+				n := 0
+				if inv != 0 {
+					v := m.Data[i*m.Cols+j] * inv
+					if v >= 0 {
+						v += 0.5
+					} else {
+						v -= 0.5
+					}
+					n = int(v)
+					if n < -8 {
+						n = -8
+					} else if n > 7 {
+						n = 7
+					}
+				}
+				q.Q[q.Index(i, j)] |= uint8(n+8) << (4 * (i % 2))
+			}
+		}
+		for i := m.Rows; i < 4*((m.Rows+3)/4); i++ {
+			q.Q[q.Index(i, j)] |= 8 << (4 * (i % 2)) // zero pad rows
+		}
+	}
+}
+
+// TestQuantize4TiledMatchesColumns pins the tiled nibble quantizer, and
+// whichever vector body the build picks for it, to the column-at-a-time
+// reference: shapes that straddle the tile width, the row quad and the
+// scale group, with a zero column and one whose scale underflows.
+func TestQuantize4TiledMatchesColumns(t *testing.T) {
+	rng := rand.New(rand.NewPCG(29, 4))
+	for _, shape := range [][2]int{{1, 1}, {3, 5}, {4, 32}, {66, 33}, {64, 64}, {130, 97}} {
+		rows, cols := shape[0], shape[1]
+		m := tensai.NewMatrix(rows, cols)
+		for i := range m.Data {
+			m.Data[i] = tensai.Float(rng.NormFloat64())
+		}
+		for i := 0; i < rows; i++ {
+			m.Data[i*cols] = 0
+			if cols > 1 {
+				m.Data[i*cols+1] = math.Float32frombits(uint32(i%3) + 1)
+			}
+			if cols > 2 && i == rows/2 {
+				m.Data[i*cols+2] = -1e30
+			}
+		}
+		got, err := Quantize4(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		groups := (rows + q4Group - 1) / q4Group
+		want := NewQ4Matrix(rows, cols, 0, false)
+		quantize4ColumnsRef(m, want, groups, 0, cols)
+
+		for i := range want.Q {
+			if got.Q[i] != want.Q[i] {
+				t.Fatalf("%dx%d: Q[%d] = %#x want %#x", rows, cols, i, got.Q[i], want.Q[i])
+			}
+		}
+		for i := range want.Scale {
+			if got.Scale[i] != want.Scale[i] {
+				t.Fatalf("%dx%d: scale[%d] = %v want %v", rows, cols, i, got.Scale[i], want.Scale[i])
+			}
+		}
+	}
+}
+
+// BenchmarkQuantize4 sizes the nibble quantize-at-load pass against the
+// column-at-a-time body it replaced.
+func BenchmarkQuantize4(b *testing.B) {
+	const rows, cols = 4096, 4096
+	m := tensai.NewMatrix(rows, cols)
+	rng := rand.New(rand.NewPCG(8, 2))
+	for i := range m.Data {
+		m.Data[i] = tensai.Float(rng.NormFloat64())
+	}
+	groups := (rows + q4Group - 1) / q4Group
+	b.Run("tiled", func(b *testing.B) {
+		q := NewQ4Matrix(rows, cols, 0, false)
+		b.SetBytes(int64(rows) * int64(cols) * 4)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			quantize4Columns(m, q, groups, 0, cols)
+		}
+	})
+	b.Run("columns", func(b *testing.B) {
+		q := NewQ4Matrix(rows, cols, 0, false)
+		b.SetBytes(int64(rows) * int64(cols) * 4)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			quantize4ColumnsRef(m, q, groups, 0, cols)
+		}
+	})
+}

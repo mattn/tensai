@@ -213,19 +213,154 @@ func AxpyRows(out, ws []float32, rows [][]float32, off int) {
 	}
 }
 
-// DotVecs is DotVec for a stack of queries against one key row.
+// DotVecs is DotVec for a stack of queries against one key row. The
+// point of the grouped form is that the key streams once for a whole
+// group instead of once per query, which is what the decode attention
+// wants; the amd64 twin takes eight queries a pass, and four here keeps
+// one accumulator per query plus the shared key well inside the register
+// file. Per query the accumulation order is DotVec's own, so a group
+// answers bit for bit what the ungrouped calls would have.
 func DotVecs(qs, k []float32, out []float32) {
 	d := len(k)
-	for i := range out {
+	if d < 8 {
+		dotVecsGeneric(qs, k, out)
+		return
+	}
+	i := 0
+	for ; i+4 <= len(out); i += 4 {
+		dotVecs4(qs[i*d:(i+4)*d], k, out[i:i+4])
+	}
+	if i+2 <= len(out) {
+		dotVecs2(qs[i*d:(i+2)*d], k, out[i:i+2])
+		i += 2
+	}
+	if i < len(out) {
 		out[i] = DotVec(qs[i*d:(i+1)*d], k)
 	}
 }
 
-// Axpys accumulates one value row into several outputs, one weight each.
+func dotVecs4(qs, k []float32, out []float32) {
+	d := len(k)
+	q0 := qs[0*d : 1*d : 1*d]
+	q1 := qs[1*d : 2*d : 2*d]
+	q2 := qs[2*d : 3*d : 3*d]
+	q3 := qs[3*d : 4*d : 4*d]
+	n := d &^ 3
+	var a0, a1, a2, a3 archsimd.Float32x4
+	for i := 0; i < n; i += 4 {
+		kv := simd.LoadF32x4(k[i:])
+		a0 = simd.LoadF32x4(q0[i:]).MulAdd(kv, a0)
+		a1 = simd.LoadF32x4(q1[i:]).MulAdd(kv, a1)
+		a2 = simd.LoadF32x4(q2[i:]).MulAdd(kv, a2)
+		a3 = simd.LoadF32x4(q3[i:]).MulAdd(kv, a3)
+	}
+	// Stored before any is summed: reusing one buffer would chain the
+	// four horizontal sums through store-to-load latency with nothing
+	// to hide it under, which is the lesson the amd64 twin carries.
+	var b0, b1, b2, b3 [4]float32
+	simd.StoreF32x4(a0, b0[:])
+	simd.StoreF32x4(a1, b1[:])
+	simd.StoreF32x4(a2, b2[:])
+	simd.StoreF32x4(a3, b3[:])
+	s0 := b0[0] + b0[1] + b0[2] + b0[3]
+	s1 := b1[0] + b1[1] + b1[2] + b1[3]
+	s2 := b2[0] + b2[1] + b2[2] + b2[3]
+	s3 := b3[0] + b3[1] + b3[2] + b3[3]
+	for i := n; i < d; i++ {
+		s0 += q0[i] * k[i]
+		s1 += q1[i] * k[i]
+		s2 += q2[i] * k[i]
+		s3 += q3[i] * k[i]
+	}
+	out[0], out[1], out[2], out[3] = s0, s1, s2, s3
+}
+
+func dotVecs2(qs, k []float32, out []float32) {
+	d := len(k)
+	q0 := qs[0*d : 1*d : 1*d]
+	q1 := qs[1*d : 2*d : 2*d]
+	n := d &^ 3
+	var a0, a1 archsimd.Float32x4
+	for i := 0; i < n; i += 4 {
+		kv := simd.LoadF32x4(k[i:])
+		a0 = simd.LoadF32x4(q0[i:]).MulAdd(kv, a0)
+		a1 = simd.LoadF32x4(q1[i:]).MulAdd(kv, a1)
+	}
+	var b0, b1 [4]float32
+	simd.StoreF32x4(a0, b0[:])
+	simd.StoreF32x4(a1, b1[:])
+	s0 := b0[0] + b0[1] + b0[2] + b0[3]
+	s1 := b1[0] + b1[1] + b1[2] + b1[3]
+	for i := n; i < d; i++ {
+		s0 += q0[i] * k[i]
+		s1 += q1[i] * k[i]
+	}
+	out[0], out[1] = s0, s1
+}
+
+// Axpys accumulates one value row into several outputs, one weight each,
+// streaming the shared value once per group of four rather than once per
+// row. Per row it is bit-identical to Axpy.
 func Axpys(ws []float32, v, outs []float32) {
 	d := len(v)
-	for i, w := range ws {
-		Axpy(w, v, outs[i*d:(i+1)*d])
+	if d < 8 {
+		axpysGeneric(ws, v, outs)
+		return
+	}
+	i := 0
+	for ; i+4 <= len(ws); i += 4 {
+		axpys4(ws[i:i+4], v, outs[i*d:(i+4)*d])
+	}
+	if i+2 <= len(ws) {
+		axpys2(ws[i:i+2], v, outs[i*d:(i+2)*d])
+		i += 2
+	}
+	if i < len(ws) {
+		Axpy(ws[i], v, outs[i*d:(i+1)*d])
+	}
+}
+
+func axpys4(ws []float32, v, outs []float32) {
+	d := len(v)
+	o0 := outs[0*d : 1*d : 1*d]
+	o1 := outs[1*d : 2*d : 2*d]
+	o2 := outs[2*d : 3*d : 3*d]
+	o3 := outs[3*d : 4*d : 4*d]
+	w0 := archsimd.BroadcastFloat32x4(ws[0])
+	w1 := archsimd.BroadcastFloat32x4(ws[1])
+	w2 := archsimd.BroadcastFloat32x4(ws[2])
+	w3 := archsimd.BroadcastFloat32x4(ws[3])
+	n := d &^ 3
+	for i := 0; i < n; i += 4 {
+		vv := simd.LoadF32x4(v[i:])
+		simd.StoreF32x4(vv.MulAdd(w0, simd.LoadF32x4(o0[i:])), o0[i:])
+		simd.StoreF32x4(vv.MulAdd(w1, simd.LoadF32x4(o1[i:])), o1[i:])
+		simd.StoreF32x4(vv.MulAdd(w2, simd.LoadF32x4(o2[i:])), o2[i:])
+		simd.StoreF32x4(vv.MulAdd(w3, simd.LoadF32x4(o3[i:])), o3[i:])
+	}
+	for i := n; i < d; i++ {
+		o0[i] += ws[0] * v[i]
+		o1[i] += ws[1] * v[i]
+		o2[i] += ws[2] * v[i]
+		o3[i] += ws[3] * v[i]
+	}
+}
+
+func axpys2(ws []float32, v, outs []float32) {
+	d := len(v)
+	o0 := outs[0*d : 1*d : 1*d]
+	o1 := outs[1*d : 2*d : 2*d]
+	w0 := archsimd.BroadcastFloat32x4(ws[0])
+	w1 := archsimd.BroadcastFloat32x4(ws[1])
+	n := d &^ 3
+	for i := 0; i < n; i += 4 {
+		vv := simd.LoadF32x4(v[i:])
+		simd.StoreF32x4(vv.MulAdd(w0, simd.LoadF32x4(o0[i:])), o0[i:])
+		simd.StoreF32x4(vv.MulAdd(w1, simd.LoadF32x4(o1[i:])), o1[i:])
+	}
+	for i := n; i < d; i++ {
+		o0[i] += ws[0] * v[i]
+		o1[i] += ws[1] * v[i]
 	}
 }
 
@@ -266,6 +401,26 @@ func LeakyBwd(dst, grad, src []float32, alpha float32) {
 // GeluMul is Gemma's gate: gelu(gate) * up, in place on gate. The tanh
 // approximation the trained models use rewrites as a sigmoid, so this is
 // SiluMul with the argument run through the cubic first.
+// MulSigmoid scales dst by the sigmoid of src in one pass.
+func MulSigmoid(dst, src []float32) {
+	map4x2(dst, dst, src, func(d, v archsimd.Float32x4) archsimd.Float32x4 {
+		return d.Mul(sigmoid4(v))
+	})
+}
+
+// SwigluOAI is the clamped SwiGLU in place on gate.
+func SwigluOAI(gate, up []float32) {
+	one := archsimd.BroadcastFloat32x4(1)
+	alpha := archsimd.BroadcastFloat32x4(swigluAlpha)
+	hi := archsimd.BroadcastFloat32x4(swigluLimit)
+	lo := archsimd.BroadcastFloat32x4(-swigluLimit)
+	map4x2(gate, gate, up, func(g, u archsimd.Float32x4) archsimd.Float32x4 {
+		g = g.Min(hi)
+		u = u.Min(hi).Max(lo)
+		return g.Div(one.Add(vexpf4(alpha.Mul(g).Neg()))).Mul(u.Add(one))
+	})
+}
+
 func GeluMul(gate, up []float32) {
 	one := archsimd.BroadcastFloat32x4(1)
 	inner := archsimd.BroadcastFloat32x4(geluTanhInner)
