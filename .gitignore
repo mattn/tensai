@@ -27,3 +27,4 @@ test-wgpu24.sh
 internal/qwenimage/testdata/*.f32
 internal/qwenimage/testdata/*.i32
 internal/qwenimage/testdata/*.f64
+/out.png

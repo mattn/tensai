@@ -24,7 +24,10 @@ import (
 
 	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/internal/llm"
+	"github.com/mattn/tensai/internal/qwenimage"
 	"github.com/mattn/tensai/internal/simd"
+	"image/png"
+	"math/rand/v2"
 )
 
 const version = "0.0.28"
@@ -40,6 +43,7 @@ commands:
   serve    OpenAI-compatible /v1/chat/completions server
   ask      answer a question by scoring options, no generation
   bench    compare CPU and GPU prefill and decode speed
+  image    generate a picture from a prompt with Qwen-Image
   models   list cached models; "models rm <name>" deletes one
   version  print the version
 
@@ -377,6 +381,30 @@ func main() {
 	case "models":
 		if err := modelsCmd(args); err != nil {
 			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "image":
+		fs := flag.NewFlagSet("tensai image", flag.ExitOnError)
+		model := fs.String("model", "Qwen-Image-2.1", `which checkpoint to run: a name under the cache, or a path to a directory holding text_encoder, transformer and vae`)
+		prompt := fs.String("prompt", "", "what to draw; positional arguments join into one")
+		out := fs.String("o", "out.png", "where to write the picture")
+		size := fs.Int("size", 256, "width and height in pixels; rounded down to a multiple of 32")
+		steps := fs.Int("steps", 20, "denoising steps")
+		seed := fs.Int64("seed", 1, "noise seed")
+		f32 := fs.Bool("f32", false, "keep the weights as floats, which needs about 42GB of memory")
+		quiet := fs.Bool("q", false, "print nothing but errors")
+		fs.Parse(os.Args[2:])
+		text := strings.TrimSpace(*prompt + " " + strings.Join(fs.Args(), " "))
+		if text == "" {
+			fmt.Fprintln(os.Stderr, "tensai image: give it something to draw")
+			os.Exit(2)
+		}
+		bits := 8
+		if *f32 {
+			bits = 0
+		}
+		if err := generateImage(*model, text, *out, *size, *steps, *seed, bits, *quiet); err != nil {
+			fmt.Fprintln(os.Stderr, "tensai image:", err)
 			os.Exit(1)
 		}
 	case "version":
@@ -824,4 +852,94 @@ func humanSize(n int64) string {
 
 func joinArgs(a []string) string {
 	return strings.Join(a, " ")
+}
+
+// generateImage draws one picture with Qwen-Image and writes it as a
+// PNG. The two models are seven gigabytes apiece and only one is held
+// at a time: the prompt is encoded and the encoder released before the
+// denoising transformer loads.
+func generateImage(model, prompt, out string, size, steps int, seed int64, bits int, quiet bool) error {
+	dir, err := imageModelDir(model)
+	if err != nil {
+		return err
+	}
+	// The decoder turns each latent position into a sixteen-pixel
+	// square, and the checkpoint's own layout groups those in twos.
+	side := size / 32 * 2
+	if side < 2 {
+		return fmt.Errorf("a size of %d leaves nothing to draw; 64 is the smallest that works", size)
+	}
+	say := func(format string, args ...any) {
+		if !quiet {
+			fmt.Fprintf(os.Stderr, format+"\n", args...)
+		}
+	}
+
+	start := time.Now()
+	text, err := qwenimage.EncodePrompt(dir, prompt, bits)
+	if err != nil {
+		return err
+	}
+	say("prompt: %d tokens in %v", text.Rows, time.Since(start).Round(time.Second))
+
+	start = time.Now()
+	m, err := qwenimage.LoadTransformer(dir.Transformer(), bits)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	say("transformer: loaded in %v", time.Since(start).Round(time.Second))
+
+	latents := qwenimage.Noise(rand.New(rand.NewPCG(uint64(seed), 0)), side, side)
+	layout := qwenimage.NewLayout(text.Rows, side, side)
+	start = time.Now()
+	err = qwenimage.Generate(m, latents, text, layout, qwenimage.NewSchedule(steps, side*side), func(i int) {
+		say("step %d/%d in %v", i+1, steps, time.Since(start).Round(time.Second))
+	})
+	if err != nil {
+		return err
+	}
+	say("%d steps in %v", steps, time.Since(start).Round(time.Second))
+
+	stats, err := qwenimage.LoadStats(dir.VAEConfig())
+	if err != nil {
+		return err
+	}
+	dec, err := qwenimage.LoadDecoder(dir.VAE())
+	if err != nil {
+		return err
+	}
+	px, err := qwenimage.Decode(dec, stats.Denormalize(latents, side, side))
+	if err != nil {
+		return err
+	}
+	img, err := qwenimage.Image(px)
+	if err != nil {
+		return err
+	}
+	f, err := os.Create(out)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := png.Encode(f, img); err != nil {
+		return err
+	}
+	say("wrote %s, %dx%d", out, side*16, side*16)
+	return nil
+}
+
+// imageModelDir resolves a checkpoint name or path to the directory
+// holding its three components.
+func imageModelDir(name string) (qwenimage.ModelDir, error) {
+	candidates := []string{name}
+	if home, err := os.UserHomeDir(); err == nil && !filepath.IsAbs(name) {
+		candidates = append(candidates, filepath.Join(home, ".cache", "tensai", name))
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(filepath.Join(c, "transformer")); err == nil {
+			return qwenimage.ModelDir(c), nil
+		}
+	}
+	return "", fmt.Errorf("no checkpoint called %q; expected a directory with text_encoder, transformer and vae", name)
 }
