@@ -22,26 +22,11 @@ Every piece is checked against the reference implementation — diffusers for th
 
 ## Getting the checkpoint
 
-There is no downloader for it yet. Fetch the components under `~/.cache/tensai/Qwen-Image-2.1`, about 31GB in all:
-
 ```bash
-cd ~/.cache/tensai/Qwen-Image-2.1
-base=https://huggingface.co/Qwen/Qwen-Image-2.1/resolve/main
-
-mkdir -p vae transformer text_encoder processor
-curl -L -o processor/tokenizer.json $base/processor/tokenizer.json
-curl -L -o vae/config.json $base/vae/config.json
-curl -L -o vae/diffusion_pytorch_model.safetensors $base/vae/diffusion_pytorch_model.safetensors
-for f in diffusion_pytorch_model.safetensors.index.json \
-         diffusion_pytorch_model-00001-of-00002.safetensors \
-         diffusion_pytorch_model-00002-of-00002.safetensors; do
-  curl -L -o transformer/$f $base/transformer/$f
-done
-for f in model.safetensors.index.json \
-         model-0000{1,2,3,4}-of-00004.safetensors; do
-  curl -L -o text_encoder/$f $base/text_encoder/$f
-done
+tensai image -fetch "a calico cat asleep on a stack of books"
 ```
+
+`-fetch` downloads the components under `~/.cache/tensai/Qwen-Image-2.1`, about 31GB in all, and then draws. It resumes what an interrupted run left behind, and the weight files come from each component's index rather than a list, so a repository that re-splits them still resolves. A second `-fetch` finds everything in place and costs nothing.
 
 `-model` takes a name under the cache or a path to any directory holding `text_encoder`, `transformer`, `vae` and `processor`.
 
@@ -84,6 +69,7 @@ tensai image [flags] <prompt>
   -f32            keep the weights as floats, which needs about 42GB
   -negative str   what to steer away from; needs -cfg above 1
   -cfg float      how far to steer away from it (default 1, off)
+  -fetch          download the checkpoint first, about 31GB
   -q              print nothing but errors
 ```
 

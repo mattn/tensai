@@ -1142,6 +1142,11 @@ func tokenHint() string {
 // resume is guarded by If-Range against the recorded ETag, so a file that
 // changed upstream restarts instead of splicing two versions together;
 // without a recorded tag the partial is discarded rather than trusted.
+// Fetch downloads one file of a Hugging Face repository into dir, if it
+// is not there already, resuming and retrying as the private form does.
+// base ends in a slash and dir is where name lands.
+func Fetch(base, dir, name string) (string, error) { return fetch(base, dir, name) }
+
 func fetch(base, dir, name string) (string, error) {
 	path := filepath.Join(dir, name)
 	if _, err := os.Stat(path); err == nil {
