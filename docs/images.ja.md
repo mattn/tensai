@@ -63,9 +63,10 @@ tensai image -fetch "a calico cat asleep on a stack of books"
 float の重みが言う答えに**近づきます** (CPU の 7.8% に対して 4.7%)。デバイス側のほうが
 各積の活性化を細かく量子化するためです。
 
-CPU に残るのは attention と各種ノルムです。transformer の rotary embedding は位置軸が
-3 本あり隣接ペアを回す形で、同梱の GPU カーネルが持つどちらの規約とも違うため、移すには
-専用のカーネルが要ります。
+Attention のスコア計算・softmax・値の集約も GPU で実行します。テキスト部分は因果マスク、
+画像部分は全トークン参照として処理し、スコア用のメモリを抑えるためクエリを分割します。
+Attention の射影と各種ノルム、3 軸の rotary embedding は CPU に残ります。FFN の GPU 演算は
+まとめて送信します。追加の常駐重みは必要ありません。
 
 重みは実行中ずっとデバイスに置きます。気を使うのはそこです。このデバイスは 1 バッファ
 128MiB が上限で (int8 の重みは収まり float は収まりません)、常駐がおよそ 5.5GB を
@@ -89,7 +90,7 @@ tensai image [flags] <prompt>
   -negative str   避けたいもの。-cfg を 1 より大きくする必要がある
   -cfg float      どれだけ避けるか (既定 1、off)
   -fetch          先にチェックポイントを落とす。およそ 31GB
-  -gpu            feed-forward を GPU で走らせる
+  -gpu            feed-forward と attention を GPU で走らせる
   -gpu-budget num GPU に載せてよい重みの GB 数 (既定 4)
   -q              エラー以外を出さない
 ```

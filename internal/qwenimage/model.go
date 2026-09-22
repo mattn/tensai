@@ -49,6 +49,20 @@ type Transformer struct {
 // the model afterwards.
 func (m *Transformer) Close() error {
 	if m.dev != nil {
+		for _, b := range m.blocks {
+			if b.dev == nil {
+				continue
+			}
+			for _, w := range []*deviceLinear{b.dev.proj, b.dev.gate, b.dev.out} {
+				if w.q8 != nil {
+					w.q8.Free()
+				}
+				if w.q4 != nil {
+					w.q4.Free()
+				}
+			}
+			b.dev, b.g = nil, nil
+		}
 		m.dev.Close()
 		m.dev = nil
 	}

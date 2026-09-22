@@ -9,8 +9,9 @@ import (
 
 // The feed-forward is seventy per cent of a block's arithmetic and asks
 // nothing of the position scheme or the mask, so it is the part of the
-// transformer a GPU can take as it stands: three projections and a gate,
-// over weights that sit on the device for the whole run.
+// transformer moved first: three projections and a gate, over weights
+// that sit on the device for the whole run. Attention also runs on the
+// device after the host applies normalization and rotary embedding.
 //
 // What decides whether it fits is not the arithmetic but the memory. A
 // buffer here is capped at 128MiB, which int8 weights are under and
@@ -121,7 +122,15 @@ func UseGPU(m *Transformer, budget uint64) (string, uint64, error) {
 // mlpOnDevice runs the feed-forward for one block on the device: the
 // rows go up once, the three projections and the gate stay there, and
 // only the result comes back.
-func (b *Block) mlpOnDevice(dst, x *tensai.Matrix) error {
+func (b *Block) mlpOnDevice(dst, x *tensai.Matrix) (err error) {
+	if err = b.g.BeginBatch(); err != nil {
+		return err
+	}
+	defer func() {
+		if e := b.g.Flush(); err == nil {
+			err = e
+		}
+	}()
 	in := &tensai.Tensor{Shape: []int{x.Rows, x.Cols}, Data: x.Data}
 	gx, err := b.devOf().Upload(in)
 	if err != nil {
@@ -152,5 +161,94 @@ func (b *Block) mlpOnDevice(dst, x *tensai.Matrix) error {
 		return err
 	}
 	copy(dst.Data, got.Data)
+	return nil
+}
+
+// attentionOnDevice splits the block-causal mask into a causal text prefix
+// and image queries that read every key. RoPE and head normalization have
+// already run on the host. No additional model weights live on the device.
+func (b *Block) attentionOnDevice(out, q, k, v *tensai.Matrix, l *Layout, s *Scratch) error {
+	// Layout is public; preserve arbitrary masks through the host path.
+	for i, limit := range l.KeyLimit {
+		want := q.Rows
+		if i < l.TextLen {
+			want = i + 1
+		}
+		if limit != want {
+			return attention(out, q, k, v, l.KeyLimit, s)
+		}
+	}
+	for _, part := range []struct {
+		lo, hi, keys int
+		causal       bool
+	}{
+		{0, l.TextLen, l.TextLen, true},
+		{l.TextLen, q.Rows, q.Rows, false},
+	} {
+		if part.lo == part.hi {
+			continue
+		}
+		chunk := part.hi - part.lo
+		if !part.causal {
+			// The noncausal kernel materializes scores for every head.
+			// Tile queries so larger images stay under the binding limit
+			// and do not consume the remaining device memory in scores.
+			limit := uint64(16 << 20)
+			if storage := b.g.StorageLimit(); storage > 0 && storage < limit {
+				limit = storage
+			}
+			chunk = min(chunk, max(1, int(limit/(uint64(ditHeads)*uint64(part.keys)*4))))
+		}
+		for lo := part.lo; lo < part.hi; lo += chunk {
+			if err := b.attentionPart(out, q, k, v, lo, min(lo+chunk, part.hi), part.keys, part.causal); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (b *Block) attentionPart(out, q, k, v *tensai.Matrix, lo, hi, keys int, causal bool) (err error) {
+	if err = b.g.BeginBatch(); err != nil {
+		return err
+	}
+	defer func() {
+		if e := b.g.Flush(); err == nil {
+			err = e
+		}
+	}()
+	upload := func(m *tensai.Matrix, start, end int) (*gpu.Tensor, error) {
+		return b.g.Upload(&tensai.Tensor{Shape: []int{end - start, m.Cols}, Data: m.Data[start*m.Cols : end*m.Cols]})
+	}
+	gq, err := upload(q, lo, hi)
+	if err != nil {
+		return err
+	}
+	defer gq.Free()
+	gk, err := upload(k, 0, keys)
+	if err != nil {
+		return err
+	}
+	defer gk.Free()
+	gv, err := upload(v, 0, keys)
+	if err != nil {
+		return err
+	}
+	defer gv.Free()
+	var result *gpu.Tensor
+	if causal {
+		result, err = gq.CausalMultiHeadAttention(gk, gv, ditHeads)
+	} else {
+		result, err = gq.MultiHeadAttention(gk, gv, ditHeads)
+	}
+	if err != nil {
+		return err
+	}
+	defer result.Free()
+	got, err := result.Download()
+	if err != nil {
+		return err
+	}
+	copy(out.Data[lo*out.Cols:hi*out.Cols], got.Data)
 	return nil
 }
