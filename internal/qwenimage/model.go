@@ -7,6 +7,7 @@ import (
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
+	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/internal/kernels"
 )
 
@@ -39,11 +40,18 @@ type Transformer struct {
 	// release unmaps the cache the weights point into, when they came
 	// from one.
 	release func() error
+	// dev is the device the feed-forward runs on, when it does.
+	dev *gpu.Device
 }
 
-// Close releases the mapped cache a model was read from. The weights
-// point into it, so nothing may use the model afterwards.
+// Close releases the device, if one is in use, and the mapped cache a
+// model was read from. The weights point into that, so nothing may use
+// the model afterwards.
 func (m *Transformer) Close() error {
+	if m.dev != nil {
+		m.dev.Close()
+		m.dev = nil
+	}
 	if m.release == nil {
 		return nil
 	}

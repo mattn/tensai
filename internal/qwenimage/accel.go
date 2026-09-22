@@ -1,0 +1,156 @@
+package qwenimage
+
+import (
+	"fmt"
+
+	"github.com/mattn/tensai"
+	"github.com/mattn/tensai/gpu"
+)
+
+// The feed-forward is seventy per cent of a block's arithmetic and asks
+// nothing of the position scheme or the mask, so it is the part of the
+// transformer a GPU can take as it stands: three projections and a gate,
+// over weights that sit on the device for the whole run.
+//
+// What decides whether it fits is not the arithmetic but the memory. A
+// buffer here is capped at 128MiB, which int8 weights are under and
+// float ones are not, and the device is dropped somewhere past five and
+// a half gigabytes resident — by the driver, silently, with allocations
+// still reporting success afterwards and the process falling over later.
+// Nothing reports that, so the only defence is to count what is about to
+// be uploaded and refuse before asking.
+
+// deviceWeights is one block's feed-forward, resident.
+type deviceWeights struct {
+	proj, gate, out *deviceLinear
+}
+
+// deviceLinear is one weight matrix on the device, at whichever width
+// the model was loaded with.
+type deviceLinear struct {
+	q8 *gpu.QMatrix
+	q4 *gpu.Q4Matrix
+}
+
+func uploadLinear(g *gpu.Device, l *linear) (*deviceLinear, uint64, error) {
+	switch {
+	case l.q != nil:
+		q, err := g.UploadQ8(l.q)
+		return &deviceLinear{q8: q}, uint64(len(l.q.Q)), err
+	case l.q4 != nil:
+		q, err := g.UploadQ4(l.q4)
+		return &deviceLinear{q4: q}, uint64(len(l.q4.Q)), err
+	}
+	return nil, 0, fmt.Errorf("qwenimage: the device needs quantized weights; this model holds floats")
+}
+
+func (d *deviceLinear) matmul(x *gpu.Tensor) (*gpu.Tensor, error) {
+	if d.q8 != nil {
+		return d.q8.MatMul(x)
+	}
+	return d.q4.MatMul(x)
+}
+
+// bytes is what a block's feed-forward weighs at a given width.
+func mlpBytes(b *Block) uint64 {
+	n := uint64(0)
+	for _, l := range []*linear{b.mlpProj, b.mlpGate, b.mlpOut} {
+		switch {
+		case l.q != nil:
+			n += uint64(len(l.q.Q))
+		case l.q4 != nil:
+			n += uint64(len(l.q4.Q))
+		}
+	}
+	return n
+}
+
+// UseGPU moves every block's feed-forward onto a device, if what that
+// weighs fits the budget. It returns what the device is called and how
+// many bytes of weights it took, or an error that leaves the model
+// running on the CPU exactly as before.
+func UseGPU(m *Transformer, budget uint64) (string, uint64, error) {
+	if len(m.blocks) == 0 {
+		return "", 0, fmt.Errorf("qwenimage: no blocks to move")
+	}
+	var want uint64
+	for _, b := range m.blocks {
+		want += mlpBytes(b)
+	}
+	if want == 0 {
+		return "", 0, fmt.Errorf("qwenimage: the device needs quantized weights; this model holds floats")
+	}
+	if want > budget {
+		return "", 0, fmt.Errorf("qwenimage: the feed-forward weights are %.1fGiB and the budget is %.1fGiB; "+
+			"draw at four bits or raise the budget",
+			float64(want)/(1<<30), float64(budget)/(1<<30))
+	}
+	g, err := gpu.Open(gpu.HighPerformance)
+	if err != nil {
+		return "", 0, err
+	}
+	// A single buffer is capped well below what the whole model weighs,
+	// so a width whose one matrix is already too large fails here rather
+	// than part way through.
+	if lim := g.StorageLimit(); lim > 0 {
+		if one := mlpBytes(m.blocks[0]) / 3; one > lim {
+			g.Close()
+			return "", 0, fmt.Errorf("qwenimage: one feed-forward weight is %dMiB and the device binds at most %dMiB",
+				one>>20, lim>>20)
+		}
+	}
+	for _, b := range m.blocks {
+		w := &deviceWeights{}
+		for _, f := range []struct {
+			dst **deviceLinear
+			src *linear
+		}{{&w.proj, b.mlpProj}, {&w.gate, b.mlpGate}, {&w.out, b.mlpOut}} {
+			d, _, err := uploadLinear(g, f.src)
+			if err != nil {
+				g.Close()
+				return "", 0, err
+			}
+			*f.dst = d
+		}
+		b.dev, b.g = w, g
+	}
+	m.dev = g
+	return g.Name(), want, nil
+}
+
+// mlpOnDevice runs the feed-forward for one block on the device: the
+// rows go up once, the three projections and the gate stay there, and
+// only the result comes back.
+func (b *Block) mlpOnDevice(dst, x *tensai.Matrix) error {
+	in := &tensai.Tensor{Shape: []int{x.Rows, x.Cols}, Data: x.Data}
+	gx, err := b.devOf().Upload(in)
+	if err != nil {
+		return err
+	}
+	defer gx.Free()
+
+	gate, err := b.dev.gate.matmul(gx)
+	if err != nil {
+		return err
+	}
+	defer gate.Free()
+	up, err := b.dev.proj.matmul(gx)
+	if err != nil {
+		return err
+	}
+	defer up.Free()
+	if err := gate.SiluMul(up); err != nil {
+		return err
+	}
+	out, err := b.dev.out.matmul(gate)
+	if err != nil {
+		return err
+	}
+	defer out.Free()
+	got, err := out.Download()
+	if err != nil {
+		return err
+	}
+	copy(dst.Data, got.Data)
+	return nil
+}

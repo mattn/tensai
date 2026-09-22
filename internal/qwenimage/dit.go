@@ -6,6 +6,7 @@ import (
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
+	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/internal/kernels"
 	"github.com/mattn/tensai/internal/workpool"
 	"github.com/mattn/tensai/quant"
@@ -71,7 +72,14 @@ type Block struct {
 	normQ, normK         []tensai.Float
 	mlpProj, mlpGate     *linear
 	mlpOut               *linear
+	// dev holds the feed-forward's weights when they live on a device,
+	// and g is what to reach it through.
+	dev *deviceWeights
+	g   *gpu.Device
 }
+
+// devOf returns the device this block's weights were uploaded to.
+func (b *Block) devOf() *gpu.Device { return b.g }
 
 // weights is what a Block loads from: either a single file or the
 // checkpoint's two shards.
@@ -355,6 +363,13 @@ func (b *Block) Forward(x *tensai.Matrix, m *Modulation, l *Layout, rope *Rope, 
 
 	layerNorm(s.norm, x)
 	modulate(s.norm, m.Scale2, l.Row)
+	if b.dev != nil {
+		if err := b.mlpOnDevice(s.attn, s.norm); err != nil {
+			return err
+		}
+		addGated(x, s.attn, m.Gate2, l.Row)
+		return nil
+	}
 	if err := b.mlpGate.apply(s.gate, s.norm); err != nil {
 		return err
 	}
