@@ -397,6 +397,8 @@ func main() {
 		cfg := fs.Float64("cfg", 1, "how far to steer away from -negative: 1 is off, and anything above doubles what a step costs")
 		quiet := fs.Bool("q", false, "print nothing but errors")
 		fetchIt := fs.Bool("fetch", false, "download the checkpoint first: about 31GB, and it resumes if interrupted")
+		useGPU := fs.Bool("gpu", false, "run the feed-forward on the GPU (needs a wgpu build tag and quantized weights)")
+		budget := fs.Float64("gpu-budget", 4, "gigabytes of weights the GPU may hold; past what a device can take it is dropped, and nothing reports that")
 		fs.Parse(os.Args[2:])
 		text := strings.TrimSpace(*prompt + " " + strings.Join(fs.Args(), " "))
 		if text == "" {
@@ -428,7 +430,7 @@ func main() {
 				os.Exit(1)
 			}
 		}
-		if err := generateImage(*model, text, *negative, *out, *size, *steps, *seed, bits, *cfg, *quiet); err != nil {
+		if err := generateImage(*model, text, *negative, *out, *size, *steps, *seed, bits, *cfg, *budget, *useGPU, *quiet); err != nil {
 			fmt.Fprintln(os.Stderr, "tensai image:", err)
 			os.Exit(1)
 		}
@@ -883,7 +885,7 @@ func joinArgs(a []string) string {
 // PNG. The two models are seven gigabytes apiece and only one is held
 // at a time: the prompt is encoded and the encoder released before the
 // denoising transformer loads.
-func generateImage(model, prompt, negative, out string, size, steps int, seed int64, bits int, cfg float64, quiet bool) error {
+func generateImage(model, prompt, negative, out string, size, steps int, seed int64, bits int, cfg, budget float64, useGPU, quiet bool) error {
 	dir, err := imageModelDir(model)
 	if err != nil {
 		return err
@@ -932,6 +934,13 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 	}
 	defer m.Close()
 	say("transformer: loaded in %v", time.Since(start).Round(time.Second))
+	if useGPU {
+		name, held, err := qwenimage.UseGPU(m, uint64(budget*(1<<30)))
+		if err != nil {
+			return err
+		}
+		say("gpu: %s holding %.1fGiB of feed-forward weights", name, float64(held)/(1<<30))
+	}
 
 	latents := qwenimage.Noise(rand.New(rand.NewPCG(uint64(seed), 0)), side, side)
 	layout := qwenimage.NewLayout(text.Rows, side, side)
