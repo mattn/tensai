@@ -4685,17 +4685,7 @@ func (g *Device) UploadQ8(q *quant.QMatrix) (*QMatrix, error) {
 		return nil, errors.New("tensai: cannot upload an empty matrix")
 	}
 	words := (q.Cols + 3) / 4
-	// One row per stretch of packed words, so the walk splits across
-	// workers the way the int4 one does.
-	packed := make([]uint32, q.Rows*words)
-	workpool.Bulk(q.Rows, 1, func(lo, hi int) {
-		for i := lo; i < hi; i++ {
-			for j := 0; j < q.Cols; j++ {
-				b := uint32(uint8(q.Q[q.Index(i, j)]))
-				packed[i*words+j/4] |= b << (8 * (j % 4))
-			}
-		}
-	})
+	packed := q.PackRowMajor()
 	scales := make([]float32, words*4)
 	for j, s := range q.Scale {
 		scales[j] = float32(s)

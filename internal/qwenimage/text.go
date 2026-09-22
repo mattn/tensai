@@ -179,14 +179,9 @@ func rmsNormRows(x *tensai.Matrix, w []tensai.Float) {
 	workpool.Run(x.Rows, 1, func(lo, hi int) {
 		for r := lo; r < hi; r++ {
 			row := x.Data[r*x.Cols : (r+1)*x.Cols]
-			var sq float64
-			for _, v := range row {
-				sq += float64(v) * float64(v)
-			}
+			sq := kernels.SquaredDeviations64(row, 0)
 			inv := tensai.Float(1 / math.Sqrt(sq/float64(x.Cols)+teEps))
-			for i, v := range row {
-				row[i] = v * inv * w[i]
-			}
+			kernels.ScaleWeights(row, w, inv, 0)
 		}
 	})
 }
@@ -198,14 +193,9 @@ func rmsNormPerHead(x *tensai.Matrix, w []tensai.Float, heads int) {
 		for r := lo; r < hi; r++ {
 			for h := 0; h < heads; h++ {
 				head := x.Data[r*x.Cols+h*teHeadDim:][:teHeadDim]
-				var sq float64
-				for _, v := range head {
-					sq += float64(v) * float64(v)
-				}
+				sq := kernels.SquaredDeviations64(head, 0)
 				inv := tensai.Float(1 / math.Sqrt(sq/teHeadDim+teEps))
-				for i, v := range head {
-					head[i] = v * inv * w[i]
-				}
+				kernels.ScaleWeights(head, w, inv, 0)
 			}
 		}
 	})
@@ -216,19 +206,32 @@ func rmsNormPerHead(x *tensai.Matrix, w []tensai.Float, heads int) {
 // which is a different convention from the denoising transformer's
 // adjacent pairs.
 func teRope(x *tensai.Matrix, heads int) {
+	cos, sin := teRopeTable(x.Rows)
+	teRopeWithTable(x, heads, cos, sin)
+}
+
+// teRopeTable computes each position once, shared by all heads and layers.
+func teRopeTable(rows int) (cos, sin []tensai.Float) {
 	const half = teHeadDim / 2
-	for r := 0; r < x.Rows; r++ {
-		for h := 0; h < heads; h++ {
-			head := x.Data[r*x.Cols+h*teHeadDim:][:teHeadDim]
-			for j := 0; j < half; j++ {
-				angle := float64(r) * math.Pow(teRopeTheta, -2*float64(j)/teHeadDim)
-				cos, sin := tensai.Float(math.Cos(angle)), tensai.Float(math.Sin(angle))
-				lo, hi := head[j], head[half+j]
-				head[j] = lo*cos - hi*sin
-				head[half+j] = hi*cos + lo*sin
-			}
+	cos, sin = make([]tensai.Float, rows*half), make([]tensai.Float, rows*half)
+	for j := 0; j < half; j++ {
+		freq := math.Pow(teRopeTheta, -2*float64(j)/teHeadDim)
+		for r := 0; r < rows; r++ {
+			sn, cs := math.Sincos(float64(r) * freq)
+			cos[r*half+j], sin[r*half+j] = tensai.Float(cs), tensai.Float(sn)
 		}
 	}
+	return
+}
+func teRopeWithTable(x *tensai.Matrix, heads int, cos, sin []tensai.Float) {
+	const half = teHeadDim / 2
+	workpool.Run(x.Rows, 1, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			for h := 0; h < heads; h++ {
+				kernels.RopeSplit(x.Data[r*x.Cols+h*teHeadDim:][:teHeadDim], cos[r*half:][:half], sin[r*half:][:half])
+			}
+		}
+	})
 }
 
 // teAttention is causal grouped-query attention: four query heads share
@@ -243,24 +246,15 @@ func teAttention(out, q, k, v *tensai.Matrix) {
 			ko := (h / (teHeads / teKVHeads)) * teHeadDim
 			for i := 0; i < n; i++ {
 				qi := q.Data[i*q.Cols+qo:][:teHeadDim]
-				maxs := tensai.Float(math.Inf(-1))
 				for j := 0; j <= i; j++ {
 					s := tensai.DotVec(qi, k.Data[j*k.Cols+ko:][:teHeadDim]) * scale
 					scores[j] = s
-					if s > maxs {
-						maxs = s
-					}
 				}
-				var sum tensai.Float
-				for j, s := range scores[:i+1] {
-					e := tensai.Float(math.Exp(float64(s - maxs)))
-					scores[j] = e
-					sum += e
-				}
+				kernels.Softmax(scores[:i+1])
 				dst := out.Data[i*out.Cols+qo:][:teHeadDim]
 				clear(dst)
 				for j, e := range scores[:i+1] {
-					kernels.Axpy(e/sum, v.Data[j*v.Cols+ko:][:teHeadDim], dst)
+					kernels.Axpy(e, v.Data[j*v.Cols+ko:][:teHeadDim], dst)
 				}
 			}
 		}
@@ -276,6 +270,7 @@ func (t *TextEncoder) Encode(ids []int) (*tensai.Matrix, error) {
 		return nil, err
 	}
 	n := len(ids)
+	cos, sin := teRopeTable(n)
 	norm := tensai.NewMatrix(n, teDim)
 	q := tensai.NewMatrix(n, teDim)
 	k := tensai.NewMatrix(n, teKVDim)
@@ -297,8 +292,8 @@ func (t *TextEncoder) Encode(ids []int) (*tensai.Matrix, error) {
 		}
 		rmsNormPerHead(q, l.qNorm, teHeads)
 		rmsNormPerHead(k, l.kNorm, teKVHeads)
-		teRope(q, teHeads)
-		teRope(k, teKVHeads)
+		teRopeWithTable(q, teHeads, cos, sin)
+		teRopeWithTable(k, teKVHeads, cos, sin)
 		teAttention(attn, q, k, v)
 		if err := l.o.apply(norm, attn); err != nil {
 			return nil, err

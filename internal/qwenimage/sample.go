@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 
 	"github.com/mattn/tensai"
+	"github.com/mattn/tensai/internal/kernels"
 )
 
 // Generation is flow matching: the latent starts as pure noise and the
@@ -146,14 +147,12 @@ func Generate(m *Transformer, latents, text *tensai.Matrix, l *Layout, s *Schedu
 				return err
 			}
 			scale := tensai.Float(g.Scale)
-			for j, d := range u.Data {
-				v.Data[j] = d + scale*(v.Data[j]-d)
-			}
+			kernels.SubSlices(v.Data, v.Data, u.Data)
+			kernels.ScaleSlice(v.Data, scale)
+			kernels.AddSlice(v.Data, u.Data)
 		}
 		dt := tensai.Float(s.Sigmas[i+1] - s.Sigmas[i])
-		for j, d := range v.Data {
-			latents.Data[j] += dt * d
-		}
+		kernels.Axpy(dt, v.Data, latents.Data)
 		if progress != nil {
 			progress(i)
 		}

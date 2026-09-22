@@ -144,14 +144,9 @@ func rmsNorm(x *tensai.Matrix, gamma []tensai.Float) {
 	workpool.Run(x.Rows, 1, func(lo, hi int) {
 		for r := lo; r < hi; r++ {
 			row := x.Data[r*x.Cols : (r+1)*x.Cols]
-			var ss float64
-			for _, v := range row {
-				ss += float64(v) * float64(v)
-			}
+			ss := kernels.SquaredDeviations64(row, 0)
 			inv := tensai.Float(scale / math.Max(math.Sqrt(ss), 1e-12))
-			for i, v := range row {
-				row[i] = v * inv * gamma[i]
-			}
+			kernels.ScaleWeights(row, gamma, inv, 0)
 		}
 	})
 }
@@ -250,24 +245,15 @@ func (a *attnBlock) apply(x *tensai.Matrix, h, w int) (*tensai.Matrix, error) {
 	scale := tensai.Float(1 / math.Sqrt(float64(dim)))
 	for i := 0; i < n; i++ {
 		q := qkv.Data[i*3*dim : i*3*dim+dim]
-		maxs := tensai.Float(math.Inf(-1))
 		for j := 0; j < n; j++ {
 			k := qkv.Data[j*3*dim+dim : j*3*dim+2*dim]
 			s := tensai.DotVec(q, k) * scale
 			scores[j] = s
-			if s > maxs {
-				maxs = s
-			}
 		}
-		var sum tensai.Float
-		for j, s := range scores {
-			e := tensai.Float(math.Exp(float64(s - maxs)))
-			scores[j] = e
-			sum += e
-		}
+		kernels.Softmax(scores)
 		row := att.Data[i*dim : (i+1)*dim]
 		for j, e := range scores {
-			kernels.Axpy(e/sum, qkv.Data[j*3*dim+2*dim:j*3*dim+3*dim], row)
+			kernels.Axpy(e, qkv.Data[j*3*dim+2*dim:j*3*dim+3*dim], row)
 		}
 	}
 	if att, err = a.proj.apply(att, h, w); err != nil {
