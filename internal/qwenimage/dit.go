@@ -7,6 +7,7 @@ import (
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
 	"github.com/mattn/tensai/internal/kernels"
+	"github.com/mattn/tensai/internal/workpool"
 	"github.com/mattn/tensai/quant"
 )
 
@@ -168,70 +169,78 @@ func vector(w weights, name string, n int) ([]tensai.Float, error) {
 // weights of its own: the block's scale arrives through the modulation.
 func layerNorm(dst, src *tensai.Matrix) {
 	n := src.Cols
-	for r := 0; r < src.Rows; r++ {
-		row := src.Data[r*n : (r+1)*n]
-		var mean, sq float64
-		for _, v := range row {
-			mean += float64(v)
+	workpool.Run(src.Rows, 1, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			row := src.Data[r*n : (r+1)*n]
+			var mean, sq float64
+			for _, v := range row {
+				mean += float64(v)
+			}
+			mean /= float64(n)
+			for _, v := range row {
+				d := float64(v) - mean
+				sq += d * d
+			}
+			inv := 1 / math.Sqrt(sq/float64(n)+ditEps)
+			out := dst.Data[r*n : (r+1)*n]
+			for i, v := range row {
+				out[i] = tensai.Float((float64(v) - mean) * inv)
+			}
 		}
-		mean /= float64(n)
-		for _, v := range row {
-			d := float64(v) - mean
-			sq += d * d
-		}
-		inv := 1 / math.Sqrt(sq/float64(n)+ditEps)
-		out := dst.Data[r*n : (r+1)*n]
-		for i, v := range row {
-			out[i] = tensai.Float((float64(v) - mean) * inv)
-		}
-	}
+	})
 }
 
 // modulate applies a block half's scale, which the checkpoint stores
 // centred on zero so that an untrained scale leaves the row alone.
 func modulate(x *tensai.Matrix, scale [][]tensai.Float, row []int) {
-	for r := 0; r < x.Rows; r++ {
-		s := scale[row[r]]
-		out := x.Data[r*x.Cols : (r+1)*x.Cols]
-		for i, v := range out {
-			out[i] = v * (1 + s[i])
+	workpool.Run(x.Rows, 1, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			s := scale[row[r]]
+			out := x.Data[r*x.Cols : (r+1)*x.Cols]
+			for i, v := range out {
+				out[i] = v * (1 + s[i])
+			}
 		}
-	}
+	})
 }
 
 // rmsNormHeads normalizes each head's slice of every token in place.
 func rmsNormHeads(x *tensai.Matrix, w []tensai.Float) {
-	for r := 0; r < x.Rows; r++ {
-		for h := 0; h < ditHeads; h++ {
-			head := x.Data[r*x.Cols+h*ditHeadDim:][:ditHeadDim]
-			var sq float64
-			for _, v := range head {
-				sq += float64(v) * float64(v)
-			}
-			inv := tensai.Float(1 / math.Sqrt(sq/ditHeadDim+ditEps))
-			for i, v := range head {
-				head[i] = v * inv * w[i]
+	workpool.Run(x.Rows, 1, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			for h := 0; h < ditHeads; h++ {
+				head := x.Data[r*x.Cols+h*ditHeadDim:][:ditHeadDim]
+				var sq float64
+				for _, v := range head {
+					sq += float64(v) * float64(v)
+				}
+				inv := tensai.Float(1 / math.Sqrt(sq/ditHeadDim+ditEps))
+				for i, v := range head {
+					head[i] = v * inv * w[i]
+				}
 			}
 		}
-	}
+	})
 }
 
 // applyRope rotates each head's dimensions in pairs. The three position
 // axes contribute 8, 28 and 28 of the 64 pairs, which the caller has
 // already folded into one cosine and one sine per pair.
 func applyRope(x *tensai.Matrix, rope *Rope) {
-	for r := 0; r < x.Rows; r++ {
-		cos := rope.Cos.Data[r*ropePairs:][:ropePairs]
-		sin := rope.Sin.Data[r*ropePairs:][:ropePairs]
-		for h := 0; h < ditHeads; h++ {
-			head := x.Data[r*x.Cols+h*ditHeadDim:][:ditHeadDim]
-			for j := 0; j < ropePairs; j++ {
-				re, im := head[2*j], head[2*j+1]
-				head[2*j] = re*cos[j] - im*sin[j]
-				head[2*j+1] = re*sin[j] + im*cos[j]
+	workpool.Run(x.Rows, 1, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			cos := rope.Cos.Data[r*ropePairs:][:ropePairs]
+			sin := rope.Sin.Data[r*ropePairs:][:ropePairs]
+			for h := 0; h < ditHeads; h++ {
+				head := x.Data[r*x.Cols+h*ditHeadDim:][:ditHeadDim]
+				for j := 0; j < ropePairs; j++ {
+					re, im := head[2*j], head[2*j+1]
+					head[2*j] = re*cos[j] - im*sin[j]
+					head[2*j+1] = re*sin[j] + im*cos[j]
+				}
 			}
 		}
-	}
+	})
 }
 
 // attention runs every head over the sequence and writes the
@@ -240,33 +249,38 @@ func applyRope(x *tensai.Matrix, rope *Rope) {
 func attention(out, q, k, v *tensai.Matrix, keyLimit []int) {
 	n := q.Rows
 	scale := tensai.Float(1 / math.Sqrt(ditHeadDim))
-	scores := make([]tensai.Float, n)
-	for h := 0; h < ditHeads; h++ {
-		off := h * ditHeadDim
-		for i := 0; i < n; i++ {
-			lim := keyLimit[i]
-			qi := q.Data[i*q.Cols+off:][:ditHeadDim]
-			maxs := tensai.Float(math.Inf(-1))
-			for j := 0; j < lim; j++ {
-				s := tensai.DotVec(qi, k.Data[j*k.Cols+off:][:ditHeadDim]) * scale
-				scores[j] = s
-				if s > maxs {
-					maxs = s
+	// Heads are independent, and at an image's sequence length this is
+	// the rest of the step next to the projections, which already use
+	// every core. Each worker keeps its own row of scores.
+	workpool.Run(ditHeads, 1, func(lo, hi int) {
+		scores := make([]tensai.Float, n)
+		for h := lo; h < hi; h++ {
+			off := h * ditHeadDim
+			for i := 0; i < n; i++ {
+				lim := keyLimit[i]
+				qi := q.Data[i*q.Cols+off:][:ditHeadDim]
+				maxs := tensai.Float(math.Inf(-1))
+				for j := 0; j < lim; j++ {
+					s := tensai.DotVec(qi, k.Data[j*k.Cols+off:][:ditHeadDim]) * scale
+					scores[j] = s
+					if s > maxs {
+						maxs = s
+					}
+				}
+				var sum tensai.Float
+				for j, s := range scores[:lim] {
+					e := tensai.Float(math.Exp(float64(s - maxs)))
+					scores[j] = e
+					sum += e
+				}
+				dst := out.Data[i*out.Cols+off:][:ditHeadDim]
+				clear(dst)
+				for j, e := range scores[:lim] {
+					kernels.Axpy(e/sum, v.Data[j*v.Cols+off:][:ditHeadDim], dst)
 				}
 			}
-			var sum tensai.Float
-			for j, s := range scores[:lim] {
-				e := tensai.Float(math.Exp(float64(s - maxs)))
-				scores[j] = e
-				sum += e
-			}
-			dst := out.Data[i*out.Cols+off:][:ditHeadDim]
-			clear(dst)
-			for j, e := range scores[:lim] {
-				kernels.Axpy(e/sum, v.Data[j*v.Cols+off:][:ditHeadDim], dst)
-			}
 		}
-	}
+	})
 }
 
 // Forward runs one block over the joint sequence, in place.
@@ -317,14 +331,26 @@ func (b *Block) Forward(x *tensai.Matrix, m *Modulation, l *Layout, rope *Rope, 
 // addGated accumulates a block half's output, squashed by its gate. The
 // tanh keeps an untrained gate at zero and bounds what one half can add.
 func addGated(x, y *tensai.Matrix, gate [][]tensai.Float, row []int) {
-	for r := 0; r < x.Rows; r++ {
-		g := gate[row[r]]
-		dst := x.Data[r*x.Cols : (r+1)*x.Cols]
-		src := y.Data[r*y.Cols : (r+1)*y.Cols]
-		for i, v := range src {
-			dst[i] += tensai.Float(math.Tanh(float64(g[i]))) * v
+	// The gate is per row of the modulation, not per token, so the
+	// squash runs once for each of its rows rather than once a token.
+	squashed := make([][]tensai.Float, len(gate))
+	for i, g := range gate {
+		s := make([]tensai.Float, len(g))
+		for j, v := range g {
+			s[j] = tensai.Float(math.Tanh(float64(v)))
 		}
+		squashed[i] = s
 	}
+	workpool.Run(x.Rows, 1, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			g := squashed[row[r]]
+			dst := x.Data[r*x.Cols : (r+1)*x.Cols]
+			src := y.Data[r*y.Cols : (r+1)*y.Cols]
+			for i, v := range src {
+				dst[i] += g[i] * v
+			}
+		}
+	})
 }
 
 // Scratch holds a block's intermediates, reused across the 32 blocks and

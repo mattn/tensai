@@ -9,6 +9,7 @@ import (
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
 	"github.com/mattn/tensai/internal/kernels"
+	"github.com/mattn/tensai/internal/workpool"
 	"github.com/mattn/tensai/tokenizer"
 )
 
@@ -175,35 +176,39 @@ func (t *TextEncoder) embed(ids []int) (*tensai.Matrix, error) {
 // rmsNorm scales each row by its root-mean-square, the plain form with
 // the weight as stored.
 func rmsNormRows(x *tensai.Matrix, w []tensai.Float) {
-	for r := 0; r < x.Rows; r++ {
-		row := x.Data[r*x.Cols : (r+1)*x.Cols]
-		var sq float64
-		for _, v := range row {
-			sq += float64(v) * float64(v)
+	workpool.Run(x.Rows, 1, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			row := x.Data[r*x.Cols : (r+1)*x.Cols]
+			var sq float64
+			for _, v := range row {
+				sq += float64(v) * float64(v)
+			}
+			inv := tensai.Float(1 / math.Sqrt(sq/float64(x.Cols)+teEps))
+			for i, v := range row {
+				row[i] = v * inv * w[i]
+			}
 		}
-		inv := tensai.Float(1 / math.Sqrt(sq/float64(x.Cols)+teEps))
-		for i, v := range row {
-			row[i] = v * inv * w[i]
-		}
-	}
+	})
 }
 
 // rmsNormPerHead normalizes each head's slice of every token, for the
 // separate norms this checkpoint puts on queries and keys.
 func rmsNormPerHead(x *tensai.Matrix, w []tensai.Float, heads int) {
-	for r := 0; r < x.Rows; r++ {
-		for h := 0; h < heads; h++ {
-			head := x.Data[r*x.Cols+h*teHeadDim:][:teHeadDim]
-			var sq float64
-			for _, v := range head {
-				sq += float64(v) * float64(v)
-			}
-			inv := tensai.Float(1 / math.Sqrt(sq/teHeadDim+teEps))
-			for i, v := range head {
-				head[i] = v * inv * w[i]
+	workpool.Run(x.Rows, 1, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			for h := 0; h < heads; h++ {
+				head := x.Data[r*x.Cols+h*teHeadDim:][:teHeadDim]
+				var sq float64
+				for _, v := range head {
+					sq += float64(v) * float64(v)
+				}
+				inv := tensai.Float(1 / math.Sqrt(sq/teHeadDim+teEps))
+				for i, v := range head {
+					head[i] = v * inv * w[i]
+				}
 			}
 		}
-	}
+	})
 }
 
 // teRope rotates each head by its token's position. This checkpoint
@@ -231,33 +236,35 @@ func teRope(x *tensai.Matrix, heads int) {
 func teAttention(out, q, k, v *tensai.Matrix) {
 	n := q.Rows
 	scale := tensai.Float(1 / math.Sqrt(teHeadDim))
-	scores := make([]tensai.Float, n)
-	for h := 0; h < teHeads; h++ {
-		qo := h * teHeadDim
-		ko := (h / (teHeads / teKVHeads)) * teHeadDim
-		for i := 0; i < n; i++ {
-			qi := q.Data[i*q.Cols+qo:][:teHeadDim]
-			maxs := tensai.Float(math.Inf(-1))
-			for j := 0; j <= i; j++ {
-				s := tensai.DotVec(qi, k.Data[j*k.Cols+ko:][:teHeadDim]) * scale
-				scores[j] = s
-				if s > maxs {
-					maxs = s
+	workpool.Run(teHeads, 1, func(lohi, hihi int) {
+		scores := make([]tensai.Float, n)
+		for h := lohi; h < hihi; h++ {
+			qo := h * teHeadDim
+			ko := (h / (teHeads / teKVHeads)) * teHeadDim
+			for i := 0; i < n; i++ {
+				qi := q.Data[i*q.Cols+qo:][:teHeadDim]
+				maxs := tensai.Float(math.Inf(-1))
+				for j := 0; j <= i; j++ {
+					s := tensai.DotVec(qi, k.Data[j*k.Cols+ko:][:teHeadDim]) * scale
+					scores[j] = s
+					if s > maxs {
+						maxs = s
+					}
+				}
+				var sum tensai.Float
+				for j, s := range scores[:i+1] {
+					e := tensai.Float(math.Exp(float64(s - maxs)))
+					scores[j] = e
+					sum += e
+				}
+				dst := out.Data[i*out.Cols+qo:][:teHeadDim]
+				clear(dst)
+				for j, e := range scores[:i+1] {
+					kernels.Axpy(e/sum, v.Data[j*v.Cols+ko:][:teHeadDim], dst)
 				}
 			}
-			var sum tensai.Float
-			for j, s := range scores[:i+1] {
-				e := tensai.Float(math.Exp(float64(s - maxs)))
-				scores[j] = e
-				sum += e
-			}
-			dst := out.Data[i*out.Cols+qo:][:teHeadDim]
-			clear(dst)
-			for j, e := range scores[:i+1] {
-				kernels.Axpy(e/sum, v.Data[j*v.Cols+ko:][:teHeadDim], dst)
-			}
 		}
-	}
+	})
 }
 
 // Encode runs the prompt's tokens through the encoder and returns the
