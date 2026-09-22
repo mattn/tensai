@@ -49,13 +49,17 @@ type Rope struct {
 // the form it ships, so a machine that cannot hold that keeps the
 // weights quantized instead and the float form stays nil.
 type linear struct {
-	f *tensai.Matrix // (out, in), as the checkpoint stores it
-	q *quant.QMatrix // (in, out), the layout the int8 kernels want
+	f  *tensai.Matrix  // (out, in), as the checkpoint stores it
+	q  *quant.QMatrix  // (in, out), the layout the int8 kernels want
+	q4 *quant.Q4Matrix // the same at four bits
 }
 
 func (l *linear) apply(out, x *tensai.Matrix) error {
-	if l.q != nil {
+	switch {
+	case l.q != nil:
 		return l.q.MatMul(x, out)
+	case l.q4 != nil:
+		return l.q4.MatMul(x, out)
 	}
 	return tensai.DotTBInto(out, x, l.f)
 }
@@ -126,7 +130,7 @@ func loadLinear(w weights, name string, rows, cols, bits int) (*linear, error) {
 	if err != nil {
 		return nil, err
 	}
-	if bits != 8 {
+	if bits != 8 && bits != 4 {
 		return &linear{f: m}, nil
 	}
 	// The kernels contract over the stored matrix's rows, so the
@@ -138,6 +142,13 @@ func loadLinear(w weights, name string, rows, cols, bits int) (*linear, error) {
 		for i := 0; i < cols; i++ {
 			t.Data[i*rows+o] = m.Data[o*cols+i]
 		}
+	}
+	if bits == 4 {
+		q, err := quant.Quantize4(t)
+		if err != nil {
+			return nil, err
+		}
+		return &linear{q4: q}, nil
 	}
 	return &linear{q: quant.Quantize(t)}, nil
 }

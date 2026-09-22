@@ -57,7 +57,8 @@ const ditLayers = 32
 
 // LoadTransformer reads the denoising transformer. With bits set to 8
 // the weights quantize as they arrive, which takes the 14GB checkpoint
-// to around 7GB; 0 keeps them as floats, which few machines can hold.
+// to around 7GB, and 4 halves that again; 0 keeps them as floats, which
+// few machines can hold.
 func LoadTransformer(dir string, bits int) (*Transformer, error) {
 	return loadTransformer(dir, bits, ditLayers)
 }

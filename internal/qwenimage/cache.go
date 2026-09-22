@@ -151,19 +151,28 @@ func (c *cacheWriter) vec(v *[]tensai.Float) { c.blob(bytesOf(*v)) }
 
 func (c *cacheWriter) lin(l **linear) {
 	m := *l
-	if m.q == nil {
+	switch {
+	case m.q != nil:
+		c.num(1)
+		c.num(m.q.Rows)
+		c.num(m.q.Cols)
+		c.blob(bytesOf(m.q.Q))
+		c.blob(bytesOf(m.q.Scale))
+		c.blob(bytesOf(m.q.ColSum64))
+	case m.q4 != nil:
+		c.num(2)
+		c.num(m.q4.Rows)
+		c.num(m.q4.Cols)
+		c.num(m.q4.Group)
+		c.blob(bytesOf(m.q4.Q))
+		c.blob(bytesOf(m.q4.Scale))
+		c.blob(bytesOf(m.q4.ScaleMin))
+	default:
 		c.num(0)
 		c.num(m.f.Rows)
 		c.num(m.f.Cols)
 		c.blob(bytesOf(m.f.Data))
-		return
 	}
-	c.num(1)
-	c.num(m.q.Rows)
-	c.num(m.q.Cols)
-	c.blob(bytesOf(m.q.Q))
-	c.blob(bytesOf(m.q.Scale))
-	c.blob(bytesOf(m.q.ColSum64))
 }
 
 // cacheReader hands slices of the mapped file back to the slots.
@@ -219,6 +228,12 @@ func (c *cacheReader) lin(l **linear) {
 		q.Scale = sliceOf[tensai.Float](c.blob())
 		q.ColSum64 = sliceOf[int32](c.blob())
 		*l = &linear{q: q}
+	case 2:
+		q := &quant.Q4Matrix{Rows: rows, Cols: cols, Group: c.num()}
+		q.Q = sliceOf[uint8](c.blob())
+		q.Scale = sliceOf[tensai.Float](c.blob())
+		q.ScaleMin = sliceOf[uint32](c.blob())
+		*l = &linear{q4: q}
 	default:
 		c.err = errCacheStale
 	}
