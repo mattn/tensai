@@ -27,6 +27,7 @@ Despite its size, tensai reaches surprisingly far: the same kernels that train a
 - **Autograd** — a micrograd-style reverse-mode engine over n-dimensional tensors: broadcasting arithmetic, batched `MatMul`, `LayerNorm`, `Embed`, and `CrossEntropy` all differentiate, so an attention block over (batch, seq, model) is written directly. A `Tape` recycles a step's buffers, which takes the charrnn example from 22MB of allocation per step to 0.75MB. `rnn.Cell`, `rnn.LSTMCell`, and `rnn.SelfAttention` are built on top; backpropagation through time is a plain Go loop
 - **SIMD acceleration** — AVX2 kernels written with Go's experimental `simd/archsimd` package; build with `GOEXPERIMENT=simd`, and every other build uses the portable fallbacks automatically
 - **WebGPU backend** — `-tags wgpu` runs batched `MatMul`, attention, and a full quantized transformer decode step on any GPU wgpu-native reaches, through `purego` with no cgo
+- **Image generation** — `tensai image` runs Qwen-Image-2.1 end to end: the prompt encoder, 32 denoising blocks and the decoder, all in pure Go
 - **int8 / int4 quantization** — weight-only quantized matmuls that reach memory bandwidth, plus MXFP4 for gpt-oss
 - **Model formats** — TFLite and ONNX export, safetensors read/write, and a GGUF reader covering the K-quants — all with in-tree encoders, still no dependencies
 - **Tokenizers** — Hugging Face `tokenizer.json` byte-level BPE (GPT-2, cl100k, o200k families) and SentencePiece, verified to match the reference implementations exactly
@@ -38,6 +39,7 @@ Despite its size, tensai reaches surprisingly far: the same kernels that train a
 - [Guide](guide/tensors.md) — tensors, layers, training, autograd, quantization, SIMD, GPU
 - [Model Formats](formats.md) — TFLite, ONNX, safetensors, GGUF
 - [LLM Inference](llm.md) — run real language models in pure Go
+- [Image Generation](images.md) — draw a prompt with Qwen-Image-2.1, also in pure Go
 - [Examples](examples.md) — thirteen runnable examples, from hello-world to GPT-2 in pure Go
 
 ## Design notes
