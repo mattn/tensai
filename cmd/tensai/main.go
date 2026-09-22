@@ -396,6 +396,7 @@ func main() {
 		negative := fs.String("negative", "", "what to steer away from; needs -cfg above 1")
 		cfg := fs.Float64("cfg", 1, "how far to steer away from -negative: 1 is off, and anything above doubles what a step costs")
 		quiet := fs.Bool("q", false, "print nothing but errors")
+		fetchIt := fs.Bool("fetch", false, "download the checkpoint first: about 31GB, and it resumes if interrupted")
 		fs.Parse(os.Args[2:])
 		text := strings.TrimSpace(*prompt + " " + strings.Join(fs.Args(), " "))
 		if text == "" {
@@ -408,6 +409,24 @@ func main() {
 			bits = 0
 		case *q4:
 			bits = 4
+		}
+		if *fetchIt {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "tensai image:", err)
+				os.Exit(1)
+			}
+			dir := *model
+			if !filepath.IsAbs(dir) {
+				dir = filepath.Join(home, ".cache", "tensai", dir)
+			}
+			fmt.Fprintf(os.Stderr, "fetching %s into %s, about 31GB\n", imageRepo, dir)
+			if err := fetchImageModel(dir, func(f string, a ...any) {
+				fmt.Fprintf(os.Stderr, f+"\n", a...)
+			}); err != nil {
+				fmt.Fprintln(os.Stderr, "tensai image:", err)
+				os.Exit(1)
+			}
 		}
 		if err := generateImage(*model, text, *negative, *out, *size, *steps, *seed, bits, *cfg, *quiet); err != nil {
 			fmt.Fprintln(os.Stderr, "tensai image:", err)
@@ -965,5 +984,77 @@ func imageModelDir(name string) (qwenimage.ModelDir, error) {
 			return qwenimage.ModelDir(c), nil
 		}
 	}
-	return "", fmt.Errorf("no checkpoint called %q; expected a directory with text_encoder, transformer and vae", name)
+	return "", fmt.Errorf("no checkpoint called %q; run \"tensai image -fetch\" to download it, or point -model at a directory with text_encoder, transformer and vae", name)
+}
+
+// imageRepo is where the checkpoint lives.
+const imageRepo = "Qwen/Qwen-Image-2.1"
+
+// fetchImageModel downloads the checkpoint's parts into dir. The shard
+// names come from each component's index rather than a list here, so a
+// repository that re-splits its weights still resolves.
+func fetchImageModel(dir string, say func(string, ...any)) error {
+	base := "https://huggingface.co/" + imageRepo + "/resolve/main/"
+	get := func(sub, name string) (string, error) {
+		return llm.Fetch(base+sub+"/", filepath.Join(dir, sub), name)
+	}
+	for _, f := range []struct{ sub, name string }{
+		{"processor", "tokenizer.json"},
+		{"vae", "config.json"},
+		{"vae", "diffusion_pytorch_model.safetensors"},
+	} {
+		say("%s/%s", f.sub, f.name)
+		if _, err := get(f.sub, f.name); err != nil {
+			return err
+		}
+	}
+	for _, c := range []struct{ sub, index string }{
+		{"transformer", "diffusion_pytorch_model.safetensors.index.json"},
+		{"text_encoder", "model.safetensors.index.json"},
+	} {
+		say("%s/%s", c.sub, c.index)
+		path, err := get(c.sub, c.index)
+		if err != nil {
+			return err
+		}
+		shards, err := shardNames(path)
+		if err != nil {
+			return err
+		}
+		for _, n := range shards {
+			say("%s/%s", c.sub, n)
+			if _, err := get(c.sub, n); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// shardNames reads the weight files a safetensors index points at, in a
+// stable order.
+func shardNames(index string) ([]string, error) {
+	b, err := os.ReadFile(index)
+	if err != nil {
+		return nil, err
+	}
+	var idx struct {
+		Map map[string]string `json:"weight_map"`
+	}
+	if err := json.Unmarshal(b, &idx); err != nil {
+		return nil, fmt.Errorf("%s: %w", index, err)
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, v := range idx.Map {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	sort.Strings(out)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s names no weight files", index)
+	}
+	return out, nil
 }

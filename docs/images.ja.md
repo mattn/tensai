@@ -22,26 +22,11 @@ wrote out.png, 256x256
 
 ## チェックポイントの入手
 
-まだダウンローダはありません。`~/.cache/tensai/Qwen-Image-2.1` の下に自分で置いてください。合計およそ 31GB です。
-
 ```bash
-cd ~/.cache/tensai/Qwen-Image-2.1
-base=https://huggingface.co/Qwen/Qwen-Image-2.1/resolve/main
-
-mkdir -p vae transformer text_encoder processor
-curl -L -o processor/tokenizer.json $base/processor/tokenizer.json
-curl -L -o vae/config.json $base/vae/config.json
-curl -L -o vae/diffusion_pytorch_model.safetensors $base/vae/diffusion_pytorch_model.safetensors
-for f in diffusion_pytorch_model.safetensors.index.json \
-         diffusion_pytorch_model-00001-of-00002.safetensors \
-         diffusion_pytorch_model-00002-of-00002.safetensors; do
-  curl -L -o transformer/$f $base/transformer/$f
-done
-for f in model.safetensors.index.json \
-         model-0000{1,2,3,4}-of-00004.safetensors; do
-  curl -L -o text_encoder/$f $base/text_encoder/$f
-done
+tensai image -fetch "a calico cat asleep on a stack of books"
 ```
+
+`-fetch` が `~/.cache/tensai/Qwen-Image-2.1` の下に一式 (合計およそ 31GB) を落としてから描きます。中断した場合は続きから再開します。重みファイル名は各コンポーネントの index から読むので、リポジトリ側で分割数が変わっても解決できます。2 回目以降の `-fetch` は既にあるものを見つけるだけで何もしません。
 
 `-model` はキャッシュ下の名前でも、`text_encoder`・`transformer`・`vae`・`processor` を持つディレクトリへのパスでも受け付けます。
 
@@ -84,6 +69,7 @@ tensai image [flags] <prompt>
   -f32            重みを float のまま持つ。およそ 42GB 必要
   -negative str   避けたいもの。-cfg を 1 より大きくする必要がある
   -cfg float      どれだけ避けるか (既定 1、off)
+  -fetch          先にチェックポイントを落とす。およそ 31GB
   -q              エラー以外を出さない
 ```
 
