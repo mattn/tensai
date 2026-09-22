@@ -393,6 +393,8 @@ func main() {
 		seed := fs.Int64("seed", 1, "noise seed")
 		f32 := fs.Bool("f32", false, "keep the weights as floats, which needs about 42GB of memory")
 		q4 := fs.Bool("q4", false, "quantize the weights to four bits instead of eight: half the memory, about half again the error")
+		negative := fs.String("negative", "", "what to steer away from; needs -cfg above 1")
+		cfg := fs.Float64("cfg", 1, "how far to steer away from -negative: 1 is off, and anything above doubles what a step costs")
 		quiet := fs.Bool("q", false, "print nothing but errors")
 		fs.Parse(os.Args[2:])
 		text := strings.TrimSpace(*prompt + " " + strings.Join(fs.Args(), " "))
@@ -407,7 +409,7 @@ func main() {
 		case *q4:
 			bits = 4
 		}
-		if err := generateImage(*model, text, *out, *size, *steps, *seed, bits, *quiet); err != nil {
+		if err := generateImage(*model, text, *negative, *out, *size, *steps, *seed, bits, *cfg, *quiet); err != nil {
 			fmt.Fprintln(os.Stderr, "tensai image:", err)
 			os.Exit(1)
 		}
@@ -862,7 +864,7 @@ func joinArgs(a []string) string {
 // PNG. The two models are seven gigabytes apiece and only one is held
 // at a time: the prompt is encoded and the encoder released before the
 // denoising transformer loads.
-func generateImage(model, prompt, out string, size, steps int, seed int64, bits int, quiet bool) error {
+func generateImage(model, prompt, negative, out string, size, steps int, seed int64, bits int, cfg float64, quiet bool) error {
 	dir, err := imageModelDir(model)
 	if err != nil {
 		return err
@@ -879,10 +881,28 @@ func generateImage(model, prompt, out string, size, steps int, seed int64, bits 
 		}
 	}
 
+	// Both prompts go through the encoder in one load, since it is seven
+	// gigabytes and guidance needs the second one.
+	prompts := []string{prompt}
+	guide := &qwenimage.Guidance{Scale: cfg}
+	if cfg > 1 {
+		if negative == "" {
+			// Qwen has no beginning-of-sequence token, so the encoder
+			// needs something to read.
+			negative = " "
+		}
+		prompts = append(prompts, negative)
+	} else if negative != "" {
+		return fmt.Errorf("-negative does nothing without -cfg above 1")
+	}
 	start := time.Now()
-	text, err := qwenimage.EncodePrompt(dir, prompt, bits)
+	hidden, err := qwenimage.EncodePrompts(dir, prompts, bits)
 	if err != nil {
 		return err
+	}
+	text := hidden[0]
+	if len(hidden) > 1 {
+		guide.Text = hidden[1]
 	}
 	say("prompt: %d tokens in %v", text.Rows, time.Since(start).Round(time.Second))
 
@@ -897,7 +917,7 @@ func generateImage(model, prompt, out string, size, steps int, seed int64, bits 
 	latents := qwenimage.Noise(rand.New(rand.NewPCG(uint64(seed), 0)), side, side)
 	layout := qwenimage.NewLayout(text.Rows, side, side)
 	start = time.Now()
-	err = qwenimage.Generate(m, latents, text, layout, qwenimage.NewSchedule(steps, side*side), func(i int) {
+	err = qwenimage.Generate(m, latents, text, layout, qwenimage.NewSchedule(steps, side*side), guide, func(i int) {
 		say("step %d/%d in %v", i+1, steps, time.Since(start).Round(time.Second))
 	})
 	if err != nil {

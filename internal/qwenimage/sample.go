@@ -111,14 +111,44 @@ func Noise(rng *rand.Rand, height, width int) *tensai.Matrix {
 	return m
 }
 
+// Guidance steers a run away from a second prompt: each step asks the
+// transformer twice, once for what the prompt wants and once for what
+// the other one does, and follows the difference past the first. It
+// doubles what a step costs, which is why it is off unless asked for.
+type Guidance struct {
+	Text  *tensai.Matrix // the prompt to steer away from
+	Scale float64        // how far past the wanted direction to go; 1 is no guidance
+}
+
+// On returns whether the guidance does anything.
+func (g *Guidance) On() bool { return g != nil && g.Text != nil && g.Scale > 1 }
+
 // Generate runs the denoising loop and returns the latent it lands on.
 // progress, when set, is called after each step with its index.
-func Generate(m *Transformer, latents, text *tensai.Matrix, l *Layout, s *Schedule, progress func(int)) error {
-	scratch := NewScratch(l.Tokens())
+func Generate(m *Transformer, latents, text *tensai.Matrix, l *Layout, s *Schedule, g *Guidance, progress func(int)) error {
+	tokens := l.Tokens()
+	var away *Layout
+	if g.On() {
+		// The two prompts rarely tokenize to the same length, so the
+		// second gets its own layout and the buffers fit the longer.
+		away = NewLayout(g.Text.Rows, l.Height, l.Width)
+		tokens = max(tokens, away.Tokens())
+	}
+	scratch := NewScratch(tokens)
 	for i := 0; i < s.Steps(); i++ {
 		v, err := m.Velocity(latents, text, s.Sigmas[i], l, scratch)
 		if err != nil {
 			return err
+		}
+		if away != nil {
+			u, err := m.Velocity(latents, g.Text, s.Sigmas[i], away, scratch)
+			if err != nil {
+				return err
+			}
+			scale := tensai.Float(g.Scale)
+			for j, d := range u.Data {
+				v.Data[j] = d + scale*(v.Data[j]-d)
+			}
 		}
 		dt := tensai.Float(s.Sigmas[i+1] - s.Sigmas[i])
 		for j, d := range v.Data {
