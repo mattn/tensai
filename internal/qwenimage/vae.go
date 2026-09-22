@@ -17,6 +17,7 @@ import (
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
 	"github.com/mattn/tensai/internal/kernels"
+	"github.com/mattn/tensai/internal/workpool"
 )
 
 // Feature maps are channels-last: a Matrix of one row per pixel and one
@@ -140,17 +141,19 @@ func addBias(x *tensai.Matrix, b []tensai.Float) {
 // is all zeros survives.
 func rmsNorm(x *tensai.Matrix, gamma []tensai.Float) {
 	scale := math.Sqrt(float64(x.Cols))
-	for r := 0; r < x.Rows; r++ {
-		row := x.Data[r*x.Cols : (r+1)*x.Cols]
-		var ss float64
-		for _, v := range row {
-			ss += float64(v) * float64(v)
+	workpool.Run(x.Rows, 1, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			row := x.Data[r*x.Cols : (r+1)*x.Cols]
+			var ss float64
+			for _, v := range row {
+				ss += float64(v) * float64(v)
+			}
+			inv := tensai.Float(scale / math.Max(math.Sqrt(ss), 1e-12))
+			for i, v := range row {
+				row[i] = v * inv * gamma[i]
+			}
 		}
-		inv := tensai.Float(scale / math.Max(math.Sqrt(ss), 1e-12))
-		for i, v := range row {
-			row[i] = v * inv * gamma[i]
-		}
-	}
+	})
 }
 
 // resBlock is the decoder's residual unit: two normalized, activated
