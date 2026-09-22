@@ -392,6 +392,7 @@ func main() {
 		steps := fs.Int("steps", 20, "denoising steps")
 		seed := fs.Int64("seed", 1, "noise seed")
 		f32 := fs.Bool("f32", false, "keep the weights as floats, which needs about 42GB of memory")
+		q4 := fs.Bool("q4", false, "quantize the weights to four bits instead of eight: half the memory, about half again the error")
 		quiet := fs.Bool("q", false, "print nothing but errors")
 		fs.Parse(os.Args[2:])
 		text := strings.TrimSpace(*prompt + " " + strings.Join(fs.Args(), " "))
@@ -400,8 +401,11 @@ func main() {
 			os.Exit(2)
 		}
 		bits := 8
-		if *f32 {
+		switch {
+		case *f32:
 			bits = 0
+		case *q4:
+			bits = 4
 		}
 		if err := generateImage(*model, text, *out, *size, *steps, *seed, bits, *quiet); err != nil {
 			fmt.Fprintln(os.Stderr, "tensai image:", err)

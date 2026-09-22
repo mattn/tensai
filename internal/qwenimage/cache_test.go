@@ -1,6 +1,7 @@
 package qwenimage
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,9 +12,15 @@ import (
 // It writes into a temporary copy of the checkpoint's index rather than
 // the checkpoint itself, so a run leaves nothing behind.
 func TestCacheRoundTrip(t *testing.T) {
+	for _, bits := range []int{8, 4} {
+		t.Run(fmt.Sprintf("int%d", bits), func(t *testing.T) { cacheRoundTrip(t, bits) })
+	}
+}
+
+func cacheRoundTrip(t *testing.T, bits int) {
 	dir := transformerDir(t)
 	const layers = 1
-	src, err := loadTransformer(dir, 8, layers)
+	src, err := loadTransformer(dir, bits, layers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -23,20 +30,42 @@ func TestCacheRoundTrip(t *testing.T) {
 	// the checkpoint keeps the test from touching it.
 	tmp := t.TempDir()
 	writeStandIns(t, tmp)
-	if err := writeCache(tmp, 8, src.walk); err != nil {
+	if err := writeCache(tmp, bits, src.walk); err != nil {
 		t.Fatal(err)
 	}
 
 	got := &Transformer{blocks: []*Block{{}}}
-	release, err := readCache(tmp, 8, got.walk)
+	release, err := readCache(tmp, bits, got.walk)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer release()
 	same := func(name string, a, b *linear) {
 		t.Helper()
-		if (a.q == nil) != (b.q == nil) {
-			t.Fatalf("%s: one side is quantized and the other is not", name)
+		if (a.q == nil) != (b.q == nil) || (a.q4 == nil) != (b.q4 == nil) {
+			t.Fatalf("%s: the two sides are stored differently", name)
+		}
+		if a.q4 != nil {
+			if a.q4.Rows != b.q4.Rows || a.q4.Cols != b.q4.Cols || a.q4.Group != b.q4.Group {
+				t.Fatalf("%s: %dx%d group %d against %dx%d group %d", name,
+					a.q4.Rows, a.q4.Cols, a.q4.Group, b.q4.Rows, b.q4.Cols, b.q4.Group)
+			}
+			for i := range a.q4.Q {
+				if a.q4.Q[i] != b.q4.Q[i] {
+					t.Fatalf("%s: nibble pair %d is %d, wrote %d", name, i, b.q4.Q[i], a.q4.Q[i])
+				}
+			}
+			for i := range a.q4.Scale {
+				if a.q4.Scale[i] != b.q4.Scale[i] {
+					t.Fatalf("%s: scale %d is %v, wrote %v", name, i, b.q4.Scale[i], a.q4.Scale[i])
+				}
+			}
+			for i := range a.q4.ScaleMin {
+				if a.q4.ScaleMin[i] != b.q4.ScaleMin[i] {
+					t.Fatalf("%s: packed scale %d is %d, wrote %d", name, i, b.q4.ScaleMin[i], a.q4.ScaleMin[i])
+				}
+			}
+			return
 		}
 		if a.q != nil {
 			if a.q.Rows != b.q.Rows || a.q.Cols != b.q.Cols {
@@ -72,7 +101,7 @@ func TestCacheRoundTrip(t *testing.T) {
 
 	// A checkpoint that has moved on must not be read from an old cache.
 	touch(t, tmp)
-	if _, err := readCache(tmp, 8, (&Transformer{blocks: []*Block{{}}}).walk); err == nil {
+	if _, err := readCache(tmp, bits, (&Transformer{blocks: []*Block{{}}}).walk); err == nil {
 		t.Error("a cache older than its checkpoint was accepted")
 	}
 }
