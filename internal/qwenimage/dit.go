@@ -176,24 +176,9 @@ func vector(w weights, name string, n int) ([]tensai.Float, error) {
 // layerNorm normalizes each row to zero mean and unit variance, with no
 // weights of its own: the block's scale arrives through the modulation.
 func layerNorm(dst, src *tensai.Matrix) {
-	n := src.Cols
 	workpool.Run(src.Rows, 1, func(lo, hi int) {
 		for r := lo; r < hi; r++ {
-			row := src.Data[r*n : (r+1)*n]
-			var mean, sq float64
-			for _, v := range row {
-				mean += float64(v)
-			}
-			mean /= float64(n)
-			for _, v := range row {
-				d := float64(v) - mean
-				sq += d * d
-			}
-			inv := 1 / math.Sqrt(sq/float64(n)+ditEps)
-			out := dst.Data[r*n : (r+1)*n]
-			for i, v := range row {
-				out[i] = tensai.Float((float64(v) - mean) * inv)
-			}
+			kernels.LayerNorm64(dst.Data[r*src.Cols:(r+1)*src.Cols], src.Data[r*src.Cols:(r+1)*src.Cols], ditEps)
 		}
 	})
 }
@@ -205,9 +190,7 @@ func modulate(x *tensai.Matrix, scale [][]tensai.Float, row []int) {
 		for r := lo; r < hi; r++ {
 			s := scale[row[r]]
 			out := x.Data[r*x.Cols : (r+1)*x.Cols]
-			for i, v := range out {
-				out[i] = v * (1 + s[i])
-			}
+			kernels.ScaleWeights(out, s, 1, 1)
 		}
 	})
 }
@@ -218,14 +201,9 @@ func rmsNormHeads(x *tensai.Matrix, w []tensai.Float) {
 		for r := lo; r < hi; r++ {
 			for h := 0; h < ditHeads; h++ {
 				head := x.Data[r*x.Cols+h*ditHeadDim:][:ditHeadDim]
-				var sq float64
-				for _, v := range head {
-					sq += float64(v) * float64(v)
-				}
+				sq := kernels.SquaredDeviations64(head, 0)
 				inv := tensai.Float(1 / math.Sqrt(sq/ditHeadDim+ditEps))
-				for i, v := range head {
-					head[i] = v * inv * w[i]
-				}
+				kernels.ScaleWeights(head, w, inv, 0)
 			}
 		}
 	})
@@ -241,11 +219,7 @@ func applyRope(x *tensai.Matrix, rope *Rope) {
 			sin := rope.Sin.Data[r*ropePairs:][:ropePairs]
 			for h := 0; h < ditHeads; h++ {
 				head := x.Data[r*x.Cols+h*ditHeadDim:][:ditHeadDim]
-				for j := 0; j < ropePairs; j++ {
-					re, im := head[2*j], head[2*j+1]
-					head[2*j] = re*cos[j] - im*sin[j]
-					head[2*j+1] = re*sin[j] + im*cos[j]
-				}
+				kernels.RopePairs(head, cos, sin)
 			}
 		}
 	})
@@ -307,24 +281,8 @@ func softmaxRows(x *tensai.Matrix, scale tensai.Float, keyLimit []int) {
 		for r := lo; r < hi; r++ {
 			row := x.Data[r*x.Cols : (r+1)*x.Cols]
 			lim := keyLimit[r]
-			maxs := tensai.Float(math.Inf(-1))
-			for i, s := range row[:lim] {
-				s *= scale
-				row[i] = s
-				if s > maxs {
-					maxs = s
-				}
-			}
-			var sum tensai.Float
-			for i, s := range row[:lim] {
-				e := tensai.Float(math.Exp(float64(s - maxs)))
-				row[i] = e
-				sum += e
-			}
-			inv := 1 / sum
-			for i := range row[:lim] {
-				row[i] *= inv
-			}
+			kernels.ScaleSlice(row[:lim], scale)
+			kernels.Softmax(row[:lim])
 			clear(row[lim:])
 		}
 	})
@@ -396,9 +354,7 @@ func addGated(x, y *tensai.Matrix, gate [][]tensai.Float, row []int) {
 	squashed := make([][]tensai.Float, len(gate))
 	for i, g := range gate {
 		s := make([]tensai.Float, len(g))
-		for j, v := range g {
-			s[j] = tensai.Float(math.Tanh(float64(v)))
-		}
+		kernels.TanhFwd(s, g)
 		squashed[i] = s
 	}
 	workpool.Run(x.Rows, 1, func(lo, hi int) {
@@ -406,9 +362,7 @@ func addGated(x, y *tensai.Matrix, gate [][]tensai.Float, row []int) {
 			g := squashed[row[r]]
 			dst := x.Data[r*x.Cols : (r+1)*x.Cols]
 			src := y.Data[r*y.Cols : (r+1)*y.Cols]
-			for i, v := range src {
-				dst[i] += g[i] * v
-			}
+			kernels.MulAddSlice(dst, g, src)
 		}
 	})
 }

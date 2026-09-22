@@ -174,10 +174,7 @@ func silu(x *tensai.Matrix) *tensai.Matrix {
 // geluTanh is the tanh approximation of GELU, the one the text
 // projection was trained with.
 func geluTanh(x *tensai.Matrix) {
-	for i, v := range x.Data {
-		f := float64(v)
-		x.Data[i] = tensai.Float(0.5 * f * (1 + math.Tanh(0.7978845608028654*(f+0.044715*f*f*f))))
-	}
+	kernels.GeluTanh(x.Data)
 }
 
 // rmsNormZeroCentred normalizes rows by their root-mean-square and
@@ -185,14 +182,9 @@ func geluTanh(x *tensai.Matrix) {
 func rmsNormZeroCentred(x *tensai.Matrix, w []tensai.Float) {
 	for r := 0; r < x.Rows; r++ {
 		row := x.Data[r*x.Cols : (r+1)*x.Cols]
-		var sq float64
-		for _, v := range row {
-			sq += float64(v) * float64(v)
-		}
+		sq := kernels.SquaredDeviations64(row, 0)
 		inv := tensai.Float(1 / math.Sqrt(sq/float64(x.Cols)+ditEps))
-		for i, v := range row {
-			row[i] = v * inv * (1 + w[i])
-		}
+		kernels.ScaleWeights(row, w, inv, 1)
 	}
 }
 

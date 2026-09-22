@@ -72,3 +72,7 @@ func RoundEven(v archsimd.Float32x8) archsimd.Float32x8 {
 // MulSignI8x32 multiplies x by the sign of y (VPSIGNB); Go 1.26 spells
 // the method CopySign, which is what compat_go126.go calls.
 func MulSignI8x32(x, y archsimd.Int8x32) archsimd.Int8x32 { return x.MulSign(y) }
+
+func LoadF32x4(s []float32) archsimd.Float32x4     { return archsimd.LoadFloat32x4(s) }
+func StoreF32x4(v archsimd.Float32x4, s []float32) { v.Store(s) }
+func StoreF64x4(v archsimd.Float64x4, s []float64) { v.Store(s) }
