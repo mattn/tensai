@@ -423,3 +423,81 @@ func TestDecayReadWriteRead(t *testing.T) {
 		}
 	}
 }
+
+// TestGateKernels compares the two gating kernels against float64
+// references over a range that covers both sides of gpt-oss's clamp, and
+// checks the tail path writes exactly the requested elements.
+func TestGateKernels(t *testing.T) {
+	var gate, up []float32
+	for x := -20.0; x <= 20.0; x += 0.013 {
+		gate = append(gate, float32(x))
+		up = append(up, float32(-x*0.5+1))
+	}
+
+	dst := make([]float32, len(gate))
+	copy(dst, up)
+	MulSigmoid(dst, gate)
+	for i, g := range gate {
+		want := float64(up[i]) / (1 + math.Exp(-float64(g)))
+		if diff := math.Abs(float64(dst[i]) - want); diff > 2e-6*(1+math.Abs(want)) {
+			t.Fatalf("MulSigmoid(%g, %g): got %g want %g", up[i], g, dst[i], want)
+		}
+	}
+
+	got := make([]float32, len(gate))
+	copy(got, gate)
+	SwigluOAI(got, up)
+	for i, g := range gate {
+		gd := math.Min(float64(g), 7)
+		u := math.Min(math.Max(float64(up[i]), -7), 7)
+		want := gd / (1 + math.Exp(-1.702*gd)) * (u + 1)
+		if diff := math.Abs(float64(got[i]) - want); diff > 2e-6*(1+math.Abs(want)) {
+			t.Fatalf("SwigluOAI(%g, %g): got %g want %g", g, up[i], got[i], want)
+		}
+	}
+
+	for _, n := range []int{1, 3, 7, 8, 9, 31} {
+		for _, name := range []string{"MulSigmoid", "SwigluOAI"} {
+			a := make([]float32, n+1)
+			b := make([]float32, n)
+			for i := range b {
+				a[i], b[i] = float32(i)-3, float32(i)*0.25-1
+			}
+			a[n] = 42 // canary just past the writable range
+			if name == "MulSigmoid" {
+				MulSigmoid(a[:n], b)
+			} else {
+				SwigluOAI(a[:n], b)
+			}
+			if a[n] != 42 {
+				t.Fatalf("%s n=%d: kernel wrote past the slice end", name, n)
+			}
+		}
+	}
+}
+
+// BenchmarkGateKernels sizes the two gating kernels, which sit in the
+// serial stretch between a block's parallel products.
+func BenchmarkGateKernels(b *testing.B) {
+	const n = 1 << 20
+	gate := make([]float32, n)
+	up := make([]float32, n)
+	for i := range gate {
+		gate[i] = float32(i%97)*0.1 - 4
+		up[i] = float32(i%53)*0.1 - 2
+	}
+	b.Run("MulSigmoid", func(b *testing.B) {
+		b.SetBytes(n * 4)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			MulSigmoid(up, gate)
+		}
+	})
+	b.Run("SwigluOAI", func(b *testing.B) {
+		b.SetBytes(n * 4)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			SwigluOAI(gate, up)
+		}
+	})
+}

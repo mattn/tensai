@@ -754,17 +754,6 @@ func rmsnormInto(out, x, w []float32, eps float64) {
 
 // activate applies the gated activation in place: silu(gate)*up, or
 // Gemma's tanh-approximated gelu when geglu is set.
-// swigluOAI is gpt-oss's clamped SwiGLU: gate = min(gate, 7),
-// up in [-7, 7], out = gate*sigmoid(1.702*gate) * (up + 1).
-func swigluOAI(gate, up []float32) {
-	const alpha, limit = 1.702, 7.0
-	for i, g := range gate {
-		gd := math.Min(float64(g), limit)
-		u := math.Min(math.Max(float64(up[i]), -limit), limit)
-		gate[i] = float32(gd / (1 + math.Exp(-alpha*gd)) * (u + 1))
-	}
-}
-
 func activate(gate, up []float32, geglu bool) {
 	if geglu {
 		tensai.GeluMul(gate, up)
@@ -870,7 +859,7 @@ func (m *qwen) moeFFN(b *qblock, a []float32) []float32 {
 		gu := mv(a, nil, ex.qGU, ex.guBias)
 		gate, up := gu[:moeFF], gu[moeFF:]
 		if b.oaiGLU {
-			swigluOAI(gate, up)
+			kernels.SwigluOAI(gate, up)
 		} else {
 			tensai.SiluMul(gate, up)
 		}
@@ -1170,14 +1159,6 @@ func (m *qwen) splitGate(row, q, gate []float32) {
 	for h := 0; h < m.cfg.Heads; h++ {
 		copy(q[h*d:(h+1)*d], row[2*h*d:(2*h+1)*d])
 		copy(gate[h*d:(h+1)*d], row[(2*h+1)*d:(2*h+2)*d])
-	}
-}
-
-// applyGate is the gate's whole effect: it scales the attention output
-// just before the output projection.
-func applyGate(attn, gate []float32) {
-	for i := range attn {
-		attn[i] *= 1 / (1 + float32(math.Exp(float64(-gate[i]))))
 	}
 }
 
@@ -1490,7 +1471,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			wg.Wait()
 
 			if cfg.AttnOutputGate {
-				applyGate(attn.Data, gbuf)
+				kernels.MulSigmoid(attn.Data, gbuf)
 			}
 			proj := mmb(attn, b.wo, b.qo, b.bo)
 			if b.postAttn != nil {
@@ -1709,7 +1690,7 @@ func (m *qwen) step(token, pos int) []float32 {
 			}
 		}
 		if cfg.AttnOutputGate {
-			applyGate(att, gbuf[:qDim])
+			kernels.MulSigmoid(att, gbuf[:qDim])
 		}
 		mvInto(proj, att, b.wo, b.qo, b.bo)
 		if b.postAttn != nil {

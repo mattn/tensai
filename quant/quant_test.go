@@ -328,3 +328,127 @@ func BenchmarkQ4PrefillMinForm(b *testing.B) {
 		}
 	}
 }
+
+// quantizeColumnsRef is the column-at-a-time quantizer the tiled one
+// replaced: the reference the tiles and their vector bodies answer to.
+func quantizeColumnsRef(m *tensai.Matrix, q *QMatrix, colLo, colHi int) {
+	for j := colLo; j < colHi; j++ {
+		var maxAbs tensai.Float
+		for i := 0; i < m.Rows; i++ {
+			v := m.Data[i*m.Cols+j]
+			if v < 0 {
+				v = -v
+			}
+			if v > maxAbs {
+				maxAbs = v
+			}
+		}
+		s := maxAbs / 127
+		q.Scale[j] = s
+		if s == 0 {
+			continue
+		}
+		inv := 1 / s
+		var sum int32
+		for i := 0; i < m.Rows; i++ {
+			v := m.Data[i*m.Cols+j] * inv
+			if v >= 0 {
+				v += 0.5
+			} else {
+				v -= 0.5
+			}
+			w := int8(v)
+			q.Q[q.Index(i, j)] = w
+			sum += int32(w)
+		}
+		q.ColSum64[j] = 64 * sum
+	}
+}
+
+// TestQuantizeTiledMatchesColumns pins the tiled quantizer (and the
+// vector bodies the build picks for it) to the column-at-a-time
+// reference, over shapes that straddle the tile width and the row quad,
+// and over columns whose scale underflows to zero.
+func TestQuantizeTiledMatchesColumns(t *testing.T) {
+	rng := rand.New(rand.NewPCG(11, 5))
+	for _, shape := range [][2]int{{1, 1}, {3, 5}, {4, 32}, {7, 33}, {64, 31}, {65, 64}, {130, 97}} {
+		rows, cols := shape[0], shape[1]
+		m := tensai.NewMatrix(rows, cols)
+		for i := range m.Data {
+			m.Data[i] = tensai.Float(rng.NormFloat64())
+		}
+		// A zero column, a denormal one (maxAbs/127 underflows to zero),
+		// and a column carrying the largest magnitude of the matrix.
+		for i := 0; i < rows; i++ {
+			m.Data[i*cols] = 0
+			if cols > 1 {
+				m.Data[i*cols+1] = math.Float32frombits(uint32(i%3) + 1)
+			}
+			if cols > 2 && i == rows/2 {
+				m.Data[i*cols+2] = -1e30
+			}
+		}
+		got := Quantize(m)
+
+		quads := (rows + 3) / 4
+		want := &QMatrix{
+			Rows:     rows,
+			Cols:     cols,
+			Q:        make([]int8, ((cols+q4Tile-1)/q4Tile)*quads*4*q4Tile+32),
+			Scale:    make([]tensai.Float, cols),
+			ColSum64: make([]int32, cols+8),
+		}
+		quantizeColumnsRef(m, want, 0, cols)
+
+		for j := 0; j < cols; j++ {
+			if got.Scale[j] != want.Scale[j] {
+				t.Fatalf("%dx%d col %d: scale %v want %v", rows, cols, j, got.Scale[j], want.Scale[j])
+			}
+			if got.ColSum64[j] != want.ColSum64[j] {
+				t.Fatalf("%dx%d col %d: colsum %d want %d", rows, cols, j, got.ColSum64[j], want.ColSum64[j])
+			}
+			for i := 0; i < rows; i++ {
+				if g, w := got.Q[got.Index(i, j)], want.Q[want.Index(i, j)]; g != w {
+					t.Fatalf("%dx%d (%d,%d): q %d want %d", rows, cols, i, j, g, w)
+				}
+			}
+		}
+	}
+}
+
+// BenchmarkQuantize sizes the quantize-at-load pass, which a whole
+// checkpoint goes through once. quantizeColumnsRef is the old
+// column-at-a-time body, kept here as the thing to beat.
+func BenchmarkQuantize(b *testing.B) {
+	const rows, cols = 4096, 4096
+	m := tensai.NewMatrix(rows, cols)
+	rng := rand.New(rand.NewPCG(3, 9))
+	for i := range m.Data {
+		m.Data[i] = tensai.Float(rng.NormFloat64())
+	}
+	quads := (rows + 3) / 4
+	fresh := func() *QMatrix {
+		return &QMatrix{
+			Rows: rows, Cols: cols,
+			Q:        make([]int8, ((cols+q4Tile-1)/q4Tile)*quads*4*q4Tile+32),
+			Scale:    make([]tensai.Float, cols),
+			ColSum64: make([]int32, cols+8),
+		}
+	}
+	b.Run("tiled", func(b *testing.B) {
+		q := fresh()
+		b.SetBytes(int64(rows) * int64(cols) * 4)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			quantizeColumns(m, q, 0, cols)
+		}
+	})
+	b.Run("columns", func(b *testing.B) {
+		q := fresh()
+		b.SetBytes(int64(rows) * int64(cols) * 4)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			quantizeColumnsRef(m, q, 0, cols)
+		}
+	})
+}

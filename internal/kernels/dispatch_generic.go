@@ -16,6 +16,8 @@ func SigmoidFwd(dst, src []float32)              { sigmoidFwdGeneric(dst, src) }
 func SiluMul(gate, up []float32)                 { siluMulGeneric(gate, up) }
 func GeluMul(gate, up []float32)                 { geluMulGeneric(gate, up) }
 func Silu(v []float32)                           { siluGeneric(v) }
+func MulSigmoid(dst, src []float32)              { mulSigmoidGeneric(dst, src) }
+func SwigluOAI(gate, up []float32)               { swigluOAIGeneric(gate, up) }
 func SigmoidBwd(dst, grad, y []float32)          { sigmoidBwdGeneric(dst, grad, y) }
 func TanhFwd(dst, src []float32)                 { tanhFwdGeneric(dst, src) }
 func TanhBwd(dst, grad, y []float32)             { tanhBwdGeneric(dst, grad, y) }

@@ -137,6 +137,40 @@ func SiluMul(gate, up []float32) {
 // GeluMul is Gemma's gate: gelu(gate) * up, in place on gate. The tanh
 // approximation the trained models use rewrites as a sigmoid, so this is
 // SiluMul with the argument run through the cubic first.
+// MulSigmoid scales dst by the sigmoid of src, one pass over both rows
+// rather than a sigmoid into scratch and a multiply after it.
+func MulSigmoid(dst, src []float32) {
+	if !simd.HasAVX2 {
+		mulSigmoidGeneric(dst, src)
+		return
+	}
+	one := archsimd.BroadcastFloat32x8(1)
+	zero := archsimd.BroadcastFloat32x8(0)
+	mapSlices2(dst, dst, src, func(d, v archsimd.Float32x8) archsimd.Float32x8 {
+		return d.Mul(one.Div(one.Add(vexpf(zero.Sub(v)))))
+	})
+}
+
+// SwigluOAI is the clamped SwiGLU in place on gate. The clamps are
+// Min/Max rather than a select, so a NaN follows whatever the scalar
+// path's comparisons give it.
+func SwigluOAI(gate, up []float32) {
+	if !simd.HasAVX2 {
+		swigluOAIGeneric(gate, up)
+		return
+	}
+	one := archsimd.BroadcastFloat32x8(1)
+	zero := archsimd.BroadcastFloat32x8(0)
+	alpha := archsimd.BroadcastFloat32x8(swigluAlpha)
+	hi := archsimd.BroadcastFloat32x8(swigluLimit)
+	lo := archsimd.BroadcastFloat32x8(-swigluLimit)
+	mapSlices2(gate, gate, up, func(g, u archsimd.Float32x8) archsimd.Float32x8 {
+		g = g.Min(hi)
+		u = u.Min(hi).Max(lo)
+		return g.Div(one.Add(vexpf(zero.Sub(alpha.Mul(g))))).Mul(u.Add(one))
+	})
+}
+
 func GeluMul(gate, up []float32) {
 	if !simd.HasAVX2 {
 		geluMulGeneric(gate, up)

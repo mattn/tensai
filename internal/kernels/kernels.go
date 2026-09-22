@@ -95,6 +95,40 @@ const (
 	geluTanhCube  = 0.044715
 )
 
+// mulSigmoidGeneric scales dst by the sigmoid of src: the gate a model
+// puts on its attention output, where the gate is a separate projection
+// rather than the value being gated.
+func mulSigmoidGeneric(dst, src []float32) {
+	for i, v := range src {
+		dst[i] *= 1 / (1 + ExpF(-v))
+	}
+}
+
+// swigluOAIGeneric is gpt-oss's clamped SwiGLU, in place on gate:
+// the gate is capped above, the up value is clamped both ways, and the
+// shifted up value multiplies the swish. alpha scales the swish's input,
+// which the trained weights expect.
+func swigluOAIGeneric(gate, up []float32) {
+	for i, g := range gate {
+		if g > swigluLimit {
+			g = swigluLimit
+		}
+		u := up[i]
+		if u > swigluLimit {
+			u = swigluLimit
+		} else if u < -swigluLimit {
+			u = -swigluLimit
+		}
+		gate[i] = g / (1 + ExpF(-swigluAlpha*g)) * (u + 1)
+	}
+}
+
+// gpt-oss's constants: the swish input scale and the symmetric clamp.
+const (
+	swigluAlpha = 1.702
+	swigluLimit = 7.0
+)
+
 // siluGeneric applies x * sigmoid(x) in place.
 func siluGeneric(v []float32) {
 	for i, x := range v {

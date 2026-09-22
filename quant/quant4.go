@@ -120,48 +120,81 @@ func Quantize4(m *tensai.Matrix) (*Q4Matrix, error) {
 	return q, nil
 }
 
+// quantize4Columns is Quantize's tiling for the nibble layout: a tile
+// of q4Tile columns at a time, the rows of a scale group streaming past
+// once per pass, one lane per column. See quantizeColumns for why the
+// column-at-a-time shape was the wrong way round and why a zero scale
+// needs no branch of its own.
+//
+// A scale group is a whole number of row quads, so a group's rows never
+// straddle the quad a byte pairs them into, and the pad rows of a final
+// partial quad take the zero nibble as part of writing the quad rather
+// than in a pass of their own.
 func quantize4Columns(m *tensai.Matrix, q *Q4Matrix, groups, colLo, colHi int) {
-	for j := colLo; j < colHi; j++ {
+	quads := (q.Rows + 3) / 4
+	var maxAbs, inv [q4Tile]tensai.Float
+	var qs [q4Group * q4Tile]int8
+	for t := colLo &^ (q4Tile - 1); t < colHi; t += q4Tile {
+		j0, j1 := max(t, colLo), min(t+q4Tile, colHi)
+		w := j1 - j0
+		tile := (j0 / q4Tile) * quads * 2 * q4Tile
 		for g := 0; g < groups; g++ {
 			rlo := g * q4Group
 			rhi := min(rlo+q4Group, m.Rows)
-			var maxAbs tensai.Float
-			for i := rlo; i < rhi; i++ {
-				v := m.Data[i*m.Cols+j]
-				if v < 0 {
-					v = -v
-				}
-				if v > maxAbs {
-					maxAbs = v
+			rows := rhi - rlo
+			clear(maxAbs[:w])
+			maxAbsCols(maxAbs[:w], m.Data[rlo*m.Cols+j0:], m.Cols, rows)
+			for c := 0; c < w; c++ {
+				s := maxAbs[c] / 7
+				q.Scale[q.TableIndex(g, j0+c)] = s
+				if s == 0 {
+					inv[c] = 0
+				} else {
+					inv[c] = 1 / s
 				}
 			}
-			s := maxAbs / 7
-			q.Scale[q.TableIndex(g, j)] = s
-			inv := tensai.Float(0)
-			if s != 0 {
-				inv = 1 / s
-			}
-			for i := rlo; i < rhi; i++ {
-				n := 0
-				if inv != 0 {
-					v := m.Data[i*m.Cols+j] * inv
-					if v >= 0 {
-						v += 0.5
-					} else {
-						v -= 0.5
+			quant4Cols(qs[:rows*w], m.Data[rlo*m.Cols+j0:], inv[:w], m.Cols, rows, w)
+			for k := 0; k < rows; k += 4 {
+				base := tile + ((rlo+k)/4)*2*q4Tile + (j0%q4Tile)*2
+				for c := 0; c < w; c++ {
+					var n [4]uint8
+					for r := range n {
+						if k+r < rows {
+							n[r] = uint8(qs[(k+r)*w+c] + 8)
+						} else {
+							n[r] = 8 // pad row: the zero nibble
+						}
 					}
-					n = int(v)
-					if n < -8 {
-						n = -8
-					} else if n > 7 {
-						n = 7
-					}
+					q.Q[base+c*2] = n[0] | n[1]<<4
+					q.Q[base+c*2+1] = n[2] | n[3]<<4
 				}
-				q.Q[q.Index(i, j)] |= uint8(n+8) << (4 * (i % 2))
 			}
 		}
-		for i := m.Rows; i < 4*((m.Rows+3)/4); i++ {
-			q.Q[q.Index(i, j)] |= 8 << (4 * (i % 2)) // zero pad rows
+	}
+}
+
+// quant4ColsScalar rounds rows rows of a tile to the nibble range,
+// half away from zero, into dst, row-major and w wide; the portable
+// body behind quant4Cols, and the tail of the vector ones.
+func quant4ColsScalar(dst []int8, data, inv []tensai.Float, stride, rows, w int) {
+	tw := len(inv)
+	for i := 0; i < rows; i++ {
+		row := data[i*stride : i*stride+tw]
+		out := dst[i*w : i*w+tw]
+		for c, v := range row {
+			v *= inv[c]
+			if v >= 0 {
+				v += 0.5
+			} else {
+				v -= 0.5
+			}
+			n := int(v)
+			if n < -8 {
+				n = -8
+			} else if n > 7 {
+				n = 7
+			}
+			out[c] = int8(n)
 		}
 	}
 }

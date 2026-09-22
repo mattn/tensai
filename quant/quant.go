@@ -154,37 +154,118 @@ func parallelCols(rows, cols int, f func(lo, hi int)) {
 	wg.Wait()
 }
 
+// quantizeColumns quantizes a span of columns a tile at a time rather
+// than a column at a time. A column's two passes read one float every
+// m.Cols floats, so a column walk touches a cache line per element and
+// spends the rest of it; a tile of q4Tile columns keeps the whole
+// tile's state (a max, a scale, a running sum per column) live while
+// the rows stream past once, which turns both passes into sequential
+// reads of the matrix and makes every step of them lane-parallel, one
+// lane per column.
+//
+// Both passes take the row loop with them into the kernel. Called once
+// per row they spent more time entering and leaving than on the thirty-
+// two columns they were given, and the running maxima had to go back to
+// memory between rows rather than staying in registers.
+//
+// A column whose values are all zero -- or whose largest magnitude is
+// small enough that maxAbs/127 underflows -- gets a zero scale, and the
+// tile carries it as a zero reciprocal instead of branching around it:
+// v*0 rounds to the zero byte the untouched allocation already holds,
+// and contributes nothing to the column sum, which is what the
+// column-at-a-time body did by skipping.
 func quantizeColumns(m *tensai.Matrix, q *QMatrix, colLo, colHi int) {
-	for j := colLo; j < colHi; j++ {
-		var maxAbs tensai.Float
-		for i := 0; i < m.Rows; i++ {
-			v := m.Data[i*m.Cols+j]
+	quads := (q.Rows + 3) / 4
+	var maxAbs, inv [q4Tile]tensai.Float
+	var sums [q4Tile]int32
+	var qs [quantRows * q4Tile]int8
+	// Tiles follow the layout's own column tiling, so every column of a
+	// tile shares one Q base and the scatter below is a stride of four.
+	for t := colLo &^ (q4Tile - 1); t < colHi; t += q4Tile {
+		j0, j1 := max(t, colLo), min(t+q4Tile, colHi)
+		w := j1 - j0
+		clear(maxAbs[:w])
+		maxAbsCols(maxAbs[:w], m.Data[j0:], m.Cols, m.Rows)
+		for c := 0; c < w; c++ {
+			s := maxAbs[c] / 127
+			q.Scale[j0+c] = s
+			if s == 0 {
+				inv[c] = 0
+			} else {
+				inv[c] = 1 / s
+			}
+		}
+		clear(sums[:w])
+		tile := (j0 / q4Tile) * quads * 4 * q4Tile
+		// A block of rows at a time, quantized into scratch row-major
+		// and written out a quad at a time: the four rows of one column
+		// sit in four consecutive bytes, so a quad leaves as one
+		// sequential run over the tile.
+		for i0 := 0; i0 < m.Rows; i0 += quantRows {
+			n := min(quantRows, m.Rows-i0)
+			quantCols(qs[:n*w], m.Data[i0*m.Cols+j0:], inv[:w], sums[:w], m.Cols, n, w)
+			for k := 0; k < n; k += 4 {
+				rows := min(4, n-k)
+				base := tile + ((i0+k)/4)*4*q4Tile + (j0%q4Tile)*4
+				for c := 0; c < w; c++ {
+					out := q.Q[base+c*4 : base+c*4+4 : base+c*4+4]
+					for r := 0; r < rows; r++ {
+						out[r] = qs[(k+r)*w+c]
+					}
+				}
+			}
+		}
+		for c := 0; c < w; c++ {
+			q.ColSum64[j0+c] = 64 * sums[c]
+		}
+	}
+}
+
+// quantRows is how many rows of a column tile one quantizing call
+// covers. It is a multiple of the layout's row quad, and small enough
+// that the scratch it fills stays in L1 next to the tile's own state.
+const quantRows = 64
+
+// maxAbsColsScalar keeps the running per-column maximum magnitude over
+// rows rows of a tile, the portable body behind maxAbsCols. data starts
+// at the tile's first column and every row sits stride floats on.
+func maxAbsColsScalar(maxAbs, data []tensai.Float, stride, rows int) {
+	w := len(maxAbs)
+	for i := 0; i < rows; i++ {
+		row := data[i*stride : i*stride+w]
+		for c, v := range row {
 			if v < 0 {
 				v = -v
 			}
-			if v > maxAbs {
-				maxAbs = v
+			if v > maxAbs[c] {
+				maxAbs[c] = v
 			}
 		}
-		s := maxAbs / 127
-		q.Scale[j] = s
-		if s == 0 {
-			continue
-		}
-		inv := 1 / s
-		var sum int32
-		for i := 0; i < m.Rows; i++ {
-			v := m.Data[i*m.Cols+j] * inv
+	}
+}
+
+// quantColsScalar rounds rows rows of a tile half away from zero into
+// dst, row-major and w wide, and accumulates the per-column sums; the
+// portable body behind quantCols. It does len(inv) columns, which is
+// the whole width for the portable build and the leftover columns when
+// a vector body hands it a tail, so w stays the destination's stride
+// either way.
+func quantColsScalar(dst []int8, data, inv []tensai.Float, sums []int32, stride, rows, w int) {
+	tw := len(inv)
+	for i := 0; i < rows; i++ {
+		row := data[i*stride : i*stride+tw]
+		out := dst[i*w : i*w+tw]
+		for c, v := range row {
+			v *= inv[c]
 			if v >= 0 {
 				v += 0.5
 			} else {
 				v -= 0.5
 			}
-			w := int8(v)
-			q.Q[q.Index(i, j)] = w
-			sum += int32(w)
+			n := int8(v)
+			out[c] = n
+			sums[c] += int32(n)
 		}
-		q.ColSum64[j] = 64 * sum
 	}
 }
 
