@@ -397,7 +397,7 @@ func main() {
 		cfg := fs.Float64("cfg", 1, "how far to steer away from -negative: 1 is off, and anything above doubles what a step costs")
 		quiet := fs.Bool("q", false, "print nothing but errors")
 		fetchIt := fs.Bool("fetch", false, "download the checkpoint first: about 31GB, and it resumes if interrupted")
-		useGPU := fs.Bool("gpu", false, "run the feed-forward on the GPU (needs a wgpu build tag and quantized weights)")
+		useGPU := fs.Bool("gpu", false, "run feed-forward and attention on the GPU (needs a wgpu build tag and quantized weights)")
 		budget := fs.Float64("gpu-budget", 4, "gigabytes of weights the GPU may hold; past what a device can take it is dropped, and nothing reports that")
 		fs.Parse(os.Args[2:])
 		text := strings.TrimSpace(*prompt + " " + strings.Join(fs.Args(), " "))
@@ -952,6 +952,11 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 		return err
 	}
 	say("%d steps in %v", steps, time.Since(start).Round(time.Second))
+	// The decoder no longer needs the transformer. Release its mapped
+	// weights and GPU allocations before allocating full-resolution maps.
+	if err := m.Close(); err != nil {
+		return err
+	}
 
 	stats, err := qwenimage.LoadStats(dir.VAEConfig())
 	if err != nil {

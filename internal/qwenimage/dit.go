@@ -353,7 +353,11 @@ func (b *Block) Forward(x *tensai.Matrix, m *Modulation, l *Layout, rope *Rope, 
 		applyRope(s.q, rope)
 		applyRope(s.k, rope)
 	}
-	if err := attention(s.attn, s.q, s.k, s.v, l.KeyLimit, s); err != nil {
+	if b.dev != nil {
+		if err := b.attentionOnDevice(s.attn, s.q, s.k, s.v, l, s); err != nil {
+			return err
+		}
+	} else if err := attention(s.attn, s.q, s.k, s.v, l.KeyLimit, s); err != nil {
 		return err
 	}
 	if err := b.toOut.apply(s.norm, s.attn); err != nil {

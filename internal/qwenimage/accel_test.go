@@ -3,10 +3,13 @@
 package qwenimage
 
 import (
+	"fmt"
 	"math"
 	"testing"
 
 	"github.com/mattn/tensai"
+	"github.com/mattn/tensai/gpu"
+	"github.com/mattn/tensai/quant"
 )
 
 // TestGPUMatchesCPU runs the same inputs through a few blocks three
@@ -70,5 +73,80 @@ func TestGPUMatchesCPU(t *testing.T) {
 	// two, not as the two disagreeing.
 	if rd > rh*1.5+0.01 {
 		t.Errorf("the device is %.4f from float where the host is %.4f", rd, rh)
+	}
+}
+
+func TestGPUAttentionMatchesCPU(t *testing.T) {
+	g, err := gpu.Open(gpu.HighPerformance)
+	if err != nil {
+		t.Skipf("no device: %v", err)
+	}
+	defer g.Close()
+	b := &Block{g: g}
+	for _, tc := range []struct{ text, side int }{{0, 4}, {1, 4}, {11, 4}, {33, 4}, {11, 20}} {
+		t.Run(fmt.Sprintf("text%d_side%d", tc.text, tc.side), func(t *testing.T) {
+			l := NewLayout(tc.text, tc.side, tc.side)
+			n := l.Tokens()
+			q, k, v := tensai.NewMatrix(n, ditDim), tensai.NewMatrix(n, ditDim), tensai.NewMatrix(n, ditDim)
+			for i := range q.Data {
+				q.Data[i] = tensai.Float(math.Sin(float64(i) * 0.13))
+				k.Data[i] = tensai.Float(math.Cos(float64(i) * 0.17))
+				v.Data[i] = tensai.Float(math.Sin(float64(i) * 0.07))
+			}
+			want, got := tensai.NewMatrix(n, ditDim), tensai.NewMatrix(n, ditDim)
+			s := NewScratch(n)
+			check := func() {
+				t.Helper()
+				if err := attention(want, q, k, v, l.KeyLimit, s); err != nil {
+					t.Fatal(err)
+				}
+				if err := b.attentionOnDevice(got, q, k, v, l, s); err != nil {
+					t.Fatal(err)
+				}
+				for i, w := range want.Data {
+					if d := math.Abs(float64(got.Data[i] - w)); math.IsNaN(d) || d > 0.002 {
+						t.Fatalf("element %d: got %g want %g", i, got.Data[i], w)
+					}
+				}
+			}
+			check()
+			l.KeyLimit[n-1] = 1 // nonstandard masks retain the host implementation
+			check()
+		})
+	}
+}
+
+func TestGPUCloseReleasesWeights(t *testing.T) {
+	for _, bits := range []int{8, 4} {
+		t.Run(fmt.Sprint(bits), func(t *testing.T) {
+			l := &linear{}
+			w := tensai.NewMatrix(32, 32)
+			if bits == 8 {
+				l.q = quant.Quantize(w)
+			} else {
+				var err error
+				l.q4, err = quant.Quantize4(w)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			block := &Block{mlpProj: l, mlpGate: l, mlpOut: l}
+			m := &Transformer{blocks: []*Block{block}}
+			if _, _, err := UseGPU(m, 1<<20); err != nil {
+				t.Skipf("no usable device: %v", err)
+			}
+			defer m.Close()
+			releases := 0
+			m.release = func() error { releases++; return nil }
+			if err := m.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if releases != 1 || m.dev != nil || block.dev != nil || block.g != nil {
+				t.Fatal("close did not clear ownership exactly once")
+			}
+		})
 	}
 }
