@@ -246,39 +246,78 @@ func applyRope(x *tensai.Matrix, rope *Rope) {
 // attention runs every head over the sequence and writes the
 // concatenated heads into out. A query reads the keys its limit allows,
 // which is what makes the prompt causal and the image bidirectional.
-func attention(out, q, k, v *tensai.Matrix, keyLimit []int) {
-	n := q.Rows
+//
+// A head's scores are a product, not a scan: taking them one query at a
+// time spends its whole life in 128-element dot products, which at an
+// image's sequence length left attention half the step while carrying
+// two per cent of its arithmetic. Gathering a head into its own pair of
+// matrices and multiplying costs two copies and buys the same kernels
+// the projections run on.
+func attention(out, q, k, v *tensai.Matrix, keyLimit []int, s *Scratch) error {
+
 	scale := tensai.Float(1 / math.Sqrt(ditHeadDim))
-	// Heads are independent, and at an image's sequence length this is
-	// the rest of the step next to the projections, which already use
-	// every core. Each worker keeps its own row of scores.
-	workpool.Run(ditHeads, 1, func(lo, hi int) {
-		scores := make([]tensai.Float, n)
-		for h := lo; h < hi; h++ {
-			off := h * ditHeadDim
-			for i := 0; i < n; i++ {
-				lim := keyLimit[i]
-				qi := q.Data[i*q.Cols+off:][:ditHeadDim]
-				maxs := tensai.Float(math.Inf(-1))
-				for j := 0; j < lim; j++ {
-					s := tensai.DotVec(qi, k.Data[j*k.Cols+off:][:ditHeadDim]) * scale
-					scores[j] = s
-					if s > maxs {
-						maxs = s
-					}
-				}
-				var sum tensai.Float
-				for j, s := range scores[:lim] {
-					e := tensai.Float(math.Exp(float64(s - maxs)))
-					scores[j] = e
-					sum += e
-				}
-				dst := out.Data[i*out.Cols+off:][:ditHeadDim]
-				clear(dst)
-				for j, e := range scores[:lim] {
-					kernels.Axpy(e/sum, v.Data[j*v.Cols+off:][:ditHeadDim], dst)
+	for h := 0; h < ditHeads; h++ {
+		off := h * ditHeadDim
+		gather(s.qh, q, off)
+		gather(s.kh, k, off)
+		gather(s.vh, v, off)
+		if err := tensai.DotTBInto(s.scores, s.qh, s.kh); err != nil {
+			return err
+		}
+		softmaxRows(s.scores, scale, keyLimit)
+		if err := tensai.DotInto(s.oh, s.scores, s.vh); err != nil {
+			return err
+		}
+		scatter(out, s.oh, off)
+	}
+	return nil
+}
+
+// gather copies one head's slice of every token into its own matrix.
+func gather(dst, src *tensai.Matrix, off int) {
+	workpool.Run(src.Rows, 1, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			copy(dst.Data[r*ditHeadDim:(r+1)*ditHeadDim], src.Data[r*src.Cols+off:])
+		}
+	})
+}
+
+// scatter is the inverse, writing a head's output back where it belongs.
+func scatter(dst, src *tensai.Matrix, off int) {
+	workpool.Run(src.Rows, 1, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			copy(dst.Data[r*dst.Cols+off:][:ditHeadDim], src.Data[r*ditHeadDim:])
+		}
+	})
+}
+
+// softmaxRows scales a head's scores and normalizes each row over the
+// keys its limit allows, leaving the rest at zero so the value product
+// can read the whole row.
+func softmaxRows(x *tensai.Matrix, scale tensai.Float, keyLimit []int) {
+	workpool.Run(x.Rows, 1, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			row := x.Data[r*x.Cols : (r+1)*x.Cols]
+			lim := keyLimit[r]
+			maxs := tensai.Float(math.Inf(-1))
+			for i, s := range row[:lim] {
+				s *= scale
+				row[i] = s
+				if s > maxs {
+					maxs = s
 				}
 			}
+			var sum tensai.Float
+			for i, s := range row[:lim] {
+				e := tensai.Float(math.Exp(float64(s - maxs)))
+				row[i] = e
+				sum += e
+			}
+			inv := 1 / sum
+			for i := range row[:lim] {
+				row[i] *= inv
+			}
+			clear(row[lim:])
 		}
 	})
 }
@@ -306,7 +345,9 @@ func (b *Block) Forward(x *tensai.Matrix, m *Modulation, l *Layout, rope *Rope, 
 		applyRope(s.q, rope)
 		applyRope(s.k, rope)
 	}
-	attention(s.attn, s.q, s.k, s.v, l.KeyLimit)
+	if err := attention(s.attn, s.q, s.k, s.v, l.KeyLimit, s); err != nil {
+		return err
+	}
 	if err := b.toOut.apply(s.norm, s.attn); err != nil {
 		return err
 	}
@@ -358,6 +399,10 @@ func addGated(x, y *tensai.Matrix, gate [][]tensai.Float, row []int) {
 type Scratch struct {
 	norm, q, k, v, attn *tensai.Matrix
 	gate, up            *tensai.Matrix
+	// One head at a time, gathered out of the packed projections, plus
+	// its square of scores.
+	qh, kh, vh, oh *tensai.Matrix
+	scores         *tensai.Matrix
 }
 
 // NewScratch sizes the buffers for a sequence of at most n tokens.
@@ -368,15 +413,21 @@ func NewScratch(n int) *Scratch {
 	}
 	s.gate = tensai.NewMatrix(n, ditMLP)
 	s.up = tensai.NewMatrix(n, ditMLP)
+	for _, m := range []**tensai.Matrix{&s.qh, &s.kh, &s.vh, &s.oh} {
+		*m = tensai.NewMatrix(n, ditHeadDim)
+	}
+	s.scores = tensai.NewMatrix(n, n)
 	return s
 }
 
 func (s *Scratch) reset(n int) {
-	for _, m := range []*tensai.Matrix{s.norm, s.q, s.k, s.v, s.attn, s.gate, s.up} {
+	for _, m := range []*tensai.Matrix{s.norm, s.q, s.k, s.v, s.attn, s.gate, s.up, s.qh, s.kh, s.vh, s.oh} {
 		cols := m.Cols
 		m.Rows = n
 		m.Data = m.Data[:n*cols]
 	}
+	s.scores.Rows, s.scores.Cols = n, n
+	s.scores.Data = s.scores.Data[:n*n]
 }
 
 // OpenTransformer opens the checkpoint's sharded transformer weights.
