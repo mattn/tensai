@@ -47,6 +47,18 @@ jobs:
         run: go vet ./...
       - name: test
         run: go test ./...
+      # A kernel's worth is a number, and the numbers hardest to come by
+      # are the ones no desk here can take: the macOS runner is this
+      # project's only arm64 machine, and emulation answers instruction
+      # counts rather than speed. So the compute benchmarks run on every
+      # runner and leave their numbers in the log, where a change that
+      # claims a speedup can be read against the build before it and the
+      # portable job can be read against the vectorized one. Only the
+      # packages that need nothing but a CPU, which is about fifteen
+      # seconds of them; a shared runner is too noisy for small
+      # differences, and nothing here gates on the result.
+      - name: bench
+        run: go test -run '^$' -bench . -benchtime 100ms ./internal/kernels ./quant .
       - name: examples build
         run: |
           for d in _example/*/; do
