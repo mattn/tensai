@@ -399,7 +399,9 @@ func main() {
 		fetchIt := fs.Bool("fetch", false, "download the checkpoint first: about 31GB, and it resumes if interrupted")
 		useGPU := fs.Bool("gpu", false, "run feed-forward and attention on the GPU (needs a wgpu build tag and quantized weights)")
 		budget := fs.Float64("gpu-budget", 4, "gigabytes of weights the GPU may hold; past what a device can take it is dropped, and nothing reports that")
+		cpuprofile := fs.String("cpuprofile", "", "write a CPU profile of image generation to this file")
 		fs.Parse(os.Args[2:])
+		defer profileTo(*cpuprofile)()
 		text := strings.TrimSpace(*prompt + " " + strings.Join(fs.Args(), " "))
 		if text == "" {
 			fmt.Fprintln(os.Stderr, "tensai image: give it something to draw")
@@ -935,11 +937,12 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 	defer m.Close()
 	say("transformer: loaded in %v", time.Since(start).Round(time.Second))
 	if useGPU {
+		start = time.Now()
 		name, held, err := qwenimage.UseGPU(m, uint64(budget*(1<<30)))
 		if err != nil {
 			return err
 		}
-		say("gpu: %s holding %.1fGiB of feed-forward weights", name, float64(held)/(1<<30))
+		say("gpu: %s holding %.1fGiB of feed-forward weights in %v", name, float64(held)/(1<<30), time.Since(start).Round(time.Second))
 	}
 
 	latents := qwenimage.Noise(rand.New(rand.NewPCG(uint64(seed), 0)), side, side)
@@ -954,10 +957,13 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 	say("%d steps in %v", steps, time.Since(start).Round(time.Second))
 	// The decoder no longer needs the transformer. Release its mapped
 	// weights and GPU allocations before allocating full-resolution maps.
+	start = time.Now()
 	if err := m.Close(); err != nil {
 		return err
 	}
+	say("transformer: released in %v", time.Since(start).Round(time.Second))
 
+	start = time.Now()
 	stats, err := qwenimage.LoadStats(dir.VAEConfig())
 	if err != nil {
 		return err
@@ -974,6 +980,7 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 	if err != nil {
 		return err
 	}
+	say("decoder: loaded and decoded in %v", time.Since(start).Round(time.Second))
 	f, err := os.Create(out)
 	if err != nil {
 		return err
