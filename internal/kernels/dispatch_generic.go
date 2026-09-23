@@ -70,3 +70,10 @@ func DecayRead(row []float32, decay, k float32, mem []float32) { decayReadGeneri
 func WriteRead(row, delta []float32, k, q float32, out []float32) {
 	writeReadGeneric(row, delta, k, q, out)
 }
+
+// DotVecs4 is DotVecs for four vectors at once.
+func DotVecs4(qs []float32, ks, outs [4][]float32) {
+	for j := range ks {
+		DotVecs(qs, ks[j], outs[j])
+	}
+}
