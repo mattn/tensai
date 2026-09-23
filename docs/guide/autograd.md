@@ -29,6 +29,7 @@ On a node, `Value()` and `Grad()` return `*tensai.Tensor`. They are methods rath
 | Op | Shapes |
 | --- | --- |
 | `MatMul(o)` | `(…, m, k) * (…, k, n)` → `(…, m, n)`; the leading axes broadcast, so one 2-D weight applies to a whole batch |
+| `MatMulT(o)` | `(…, m, k) * (…, p, k)ᵀ` → `(…, m, p)`: `MatMul(o.T())` without copying the transpose, e.g. `q.MatMulT(k)` for attention scores or a tied output projection against the `(vocab, dim)` embedding table (CPU only; a device tape falls back to the copy) |
 | `Add`, `Sub`, `Mul` (`MulElem`), `Div` | element-wise, NumPy broadcasting |
 | `Scale(s)`, `Neg()` | element-wise by a scalar |
 | `AddRow(row)` | `(m, n) + (1, n)`; `Add` already broadcasts, this only states the intent |
