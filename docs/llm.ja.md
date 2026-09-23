@@ -288,15 +288,20 @@ tensai serve -q8 -addr 127.0.0.1:8080
 ```
 
 `models` が一覧するのは `run` / `chat` / `serve` が読めるものだけです —
-`config.json` を持つディレクトリか、`.gguf` ファイル。example はデータセットを
+`config.json` を持つディレクトリか、`.gguf` ファイル。それに加えて、
+`tensai image` が使うチェックポイント (`transformer`、`text_encoder`、`vae` を
+持つディレクトリ) も並びます。種別は `diffusers` で、言語モデルなら `tools` や
+`think` が出る列に `image` と出ます。`org/repo` の名前で取得したものは 1 階層下に
+置かれ、その名前で並びます。example はデータセットを
 同じ場所にキャッシュしますが、それらはモデルとして並べず件数だけ報告します
 (`models rm` では名前を指定して削除できます)。
 
 ```
-Qwen/Qwen3-4B-Instruct-2507                 7.5GB  qwen3    tools think 2026-08-27
-Qwen2.5-1.5B-Instruct                       2.9GB  qwen2    tools       2026-08-23
-SmolLM2-360M-Instruct                       692MB  llama    -           2026-08-24
-qwen2.5-0.5b-instruct-q8_0.gguf             531MB  gguf     tools       2026-08-25
+Qwen-Image-2.1                             52.2GB  diffusers image       2026-09-22
+Qwen/Qwen3-4B-Instruct-2507                 7.5GB  qwen3     tools think 2026-08-27
+Qwen2.5-1.5B-Instruct                       2.9GB  qwen2     tools       2026-08-23
+SmolLM2-360M-Instruct                       692MB  llama     -           2026-08-24
+qwen2.5-0.5b-instruct-q8_0.gguf             531MB  gguf      tools       2026-08-25
 ```
 
 リポジトリから落としたモデルは、組織名込みでそのリポジトリ名で並びます —
