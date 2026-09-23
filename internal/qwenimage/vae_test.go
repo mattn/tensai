@@ -2,6 +2,7 @@ package qwenimage
 
 import (
 	"encoding/binary"
+	"fmt"
 	"image/png"
 	"math"
 	"os"
@@ -11,6 +12,38 @@ import (
 
 	"github.com/mattn/tensai"
 )
+
+func TestDupUpChannelMapping(t *testing.T) {
+	for _, stage := range stages {
+		if !stage.up {
+			continue
+		}
+		t.Run(fmt.Sprintf("%d_%d_%t", stage.in, stage.out, stage.temporal), func(t *testing.T) {
+			const h, w = 3, 5
+			factorT := 1
+			if stage.temporal {
+				factorT = 2
+			}
+			repeat := stage.out * factorT * 4 / stage.in
+			x := tensai.NewMatrix(h*w, stage.in)
+			for i := range x.Data {
+				x.Data[i] = tensai.Float(i)
+			}
+			got := dupUp(x, h, w, stage.out, repeat, factorT)
+			for y := 0; y < 2*h; y++ {
+				for px := 0; px < 2*w; px++ {
+					for oc := 0; oc < stage.out; oc++ {
+						ic := (((oc*factorT+factorT-1)*2+y%2)*2 + px%2) / repeat
+						want := x.Data[((y/2)*w+px/2)*stage.in+ic]
+						if got.Data[(y*2*w+px)*stage.out+oc] != want {
+							t.Fatalf("pixel (%d,%d), channel %d: incorrect shuffle", y, px, oc)
+						}
+					}
+				}
+			}
+		})
+	}
+}
 
 // vaeDir is where the checkpoint's vae/ directory is expected. The test
 // skips without it: the weights are 1.3 GB and are not in the repo.

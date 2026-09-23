@@ -324,18 +324,28 @@ func nearest2x(x *tensai.Matrix, h, w int) *tensai.Matrix {
 func dupUp(x *tensai.Matrix, h, w, outC, repeat, factorT int) *tensai.Matrix {
 	out := tensai.NewMatrix(4*h*w, outC)
 	ft := factorT - 1
-	for oc := 0; oc < outC; oc++ {
-		for dy := 0; dy < 2; dy++ {
-			for dx := 0; dx < 2; dx++ {
-				src := (((oc*factorT+ft)*2+dy)*2 + dx) / repeat
-				for y := 0; y < h; y++ {
-					for px := 0; px < w; px++ {
-						out.Data[((2*y+dy)*2*w+2*px+dx)*outC+oc] = x.Data[(y*w+px)*x.Cols+src]
+	// Walk pixels before channels so each output cache line is filled
+	// once, rather than revisited for every channel across the whole map.
+	var channels [4][]int
+	for p := range channels {
+		channels[p] = make([]int, outC)
+		for oc := range channels[p] {
+			channels[p][oc] = (oc*factorT*4 + ft*4 + p) / repeat
+		}
+	}
+	workpool.Run(h, 1, func(lo, hi int) {
+		for y := lo; y < hi; y++ {
+			for px := 0; px < w; px++ {
+				src := x.Data[(y*w+px)*x.Cols:][:x.Cols]
+				for p, mapping := range channels {
+					dst := out.Data[((2*y+p/2)*2*w+2*px+p%2)*outC:][:outC]
+					for oc, ic := range mapping {
+						dst[oc] = src[ic]
 					}
 				}
 			}
 		}
-	}
+	})
 	return out
 }
 

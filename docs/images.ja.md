@@ -65,6 +65,7 @@ float の重みが言う答えに**近づきます** (CPU の 7.8% に対して 
 
 Attention のスコア計算・softmax・値の集約も GPU で実行します。テキスト部分は因果マスク、
 画像部分は全トークン参照として処理し、スコア用のメモリを抑えるためクエリを分割します。
+K/V はブロックごとに一度だけ転送し、分割したクエリ間で共有します。
 Attention の射影と各種ノルム、3 軸の rotary embedding は CPU に残ります。FFN の GPU 演算は
 まとめて送信します。追加の常駐重みは必要ありません。
 
@@ -92,8 +93,12 @@ tensai image [flags] <prompt>
   -fetch          先にチェックポイントを落とす。およそ 31GB
   -gpu            feed-forward と attention を GPU で走らせる
   -gpu-budget num GPU に載せてよい重みの GB 数 (既定 4)
+  -cpuprofile str CPU プロファイルの保存先
   -q              エラー以外を出さない
 ```
+
+実行ログには GPU への重み読み込み、transformer の解放、デコーダの読み込みと
+デコードの時間も表示します。`step` の時間は生成開始からの累計です。
 
 ## ガイダンス
 

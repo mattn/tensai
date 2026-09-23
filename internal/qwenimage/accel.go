@@ -178,6 +178,19 @@ func (b *Block) attentionOnDevice(out, q, k, v *tensai.Matrix, l *Layout, s *Scr
 			return attention(out, q, k, v, l.KeyLimit, s)
 		}
 	}
+	// Every image query tile reads the same keys and values. Upload them
+	// once per block; only the query tile and its result cross the bus in
+	// the loop. Text queries borrow a view of just the causal prefix.
+	gk, err := b.g.Upload(&tensai.Tensor{Shape: []int{k.Rows, k.Cols}, Data: k.Data})
+	if err != nil {
+		return err
+	}
+	defer gk.Free()
+	gv, err := b.g.Upload(&tensai.Tensor{Shape: []int{v.Rows, v.Cols}, Data: v.Data})
+	if err != nil {
+		return err
+	}
+	defer gv.Free()
 	for _, part := range []struct {
 		lo, hi, keys int
 		causal       bool
@@ -187,6 +200,14 @@ func (b *Block) attentionOnDevice(out, q, k, v *tensai.Matrix, l *Layout, s *Scr
 	} {
 		if part.lo == part.hi {
 			continue
+		}
+		pk, err := gk.View(0, part.keys, k.Cols)
+		if err != nil {
+			return err
+		}
+		pv, err := gv.View(0, part.keys, v.Cols)
+		if err != nil {
+			return err
 		}
 		chunk := part.hi - part.lo
 		if !part.causal {
@@ -200,7 +221,7 @@ func (b *Block) attentionOnDevice(out, q, k, v *tensai.Matrix, l *Layout, s *Scr
 			chunk = min(chunk, max(1, int(limit/(uint64(ditHeads)*uint64(part.keys)*4))))
 		}
 		for lo := part.lo; lo < part.hi; lo += chunk {
-			if err := b.attentionPart(out, q, k, v, lo, min(lo+chunk, part.hi), part.keys, part.causal); err != nil {
+			if err := b.attentionPart(out, q, pk, pv, lo, min(lo+chunk, part.hi), part.causal); err != nil {
 				return err
 			}
 		}
@@ -208,7 +229,7 @@ func (b *Block) attentionOnDevice(out, q, k, v *tensai.Matrix, l *Layout, s *Scr
 	return nil
 }
 
-func (b *Block) attentionPart(out, q, k, v *tensai.Matrix, lo, hi, keys int, causal bool) (err error) {
+func (b *Block) attentionPart(out, q *tensai.Matrix, gk, gv *gpu.Tensor, lo, hi int, causal bool) (err error) {
 	if err = b.g.BeginBatch(); err != nil {
 		return err
 	}
@@ -217,24 +238,11 @@ func (b *Block) attentionPart(out, q, k, v *tensai.Matrix, lo, hi, keys int, cau
 			err = e
 		}
 	}()
-	upload := func(m *tensai.Matrix, start, end int) (*gpu.Tensor, error) {
-		return b.g.Upload(&tensai.Tensor{Shape: []int{end - start, m.Cols}, Data: m.Data[start*m.Cols : end*m.Cols]})
-	}
-	gq, err := upload(q, lo, hi)
+	gq, err := b.g.Upload(&tensai.Tensor{Shape: []int{hi - lo, q.Cols}, Data: q.Data[lo*q.Cols : hi*q.Cols]})
 	if err != nil {
 		return err
 	}
 	defer gq.Free()
-	gk, err := upload(k, 0, keys)
-	if err != nil {
-		return err
-	}
-	defer gk.Free()
-	gv, err := upload(v, 0, keys)
-	if err != nil {
-		return err
-	}
-	defer gv.Free()
 	var result *gpu.Tensor
 	if causal {
 		result, err = gq.CausalMultiHeadAttention(gk, gv, ditHeads)

@@ -83,7 +83,7 @@ func TestGPUAttentionMatchesCPU(t *testing.T) {
 	}
 	defer g.Close()
 	b := &Block{g: g}
-	for _, tc := range []struct{ text, side int }{{0, 4}, {1, 4}, {11, 4}, {33, 4}, {11, 20}} {
+	for _, tc := range []struct{ text, side int }{{0, 4}, {1, 4}, {11, 4}, {33, 4}, {11, 20}, {12, 32}} {
 		t.Run(fmt.Sprintf("text%d_side%d", tc.text, tc.side), func(t *testing.T) {
 			l := NewLayout(tc.text, tc.side, tc.side)
 			n := l.Tokens()
@@ -110,6 +110,15 @@ func TestGPUAttentionMatchesCPU(t *testing.T) {
 				}
 			}
 			check()
+			if tc.side == 32 {
+				// A later block/step must upload its own K/V, while all
+				// tiles within this call share those updated values.
+				for i := range k.Data {
+					k.Data[i] *= -0.5
+					v.Data[i] += 0.25
+				}
+				check()
+			}
 			l.KeyLimit[n-1] = 1 // nonstandard masks retain the host implementation
 			check()
 		})
