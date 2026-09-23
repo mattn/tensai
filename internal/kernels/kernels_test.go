@@ -501,3 +501,35 @@ func BenchmarkGateKernels(b *testing.B) {
 		}
 	})
 }
+
+// DotVecs4 regroups the dots DotVecs computes but keeps each one's order,
+// so the two agree to the bit across every tail: d short of a multiple of
+// eight, and row counts that end on the four, two and one kernels.
+func TestDotVecs4MatchesDotVecs(t *testing.T) {
+	rng := rand.New(rand.NewPCG(3, 4))
+	for _, d := range []int{8, 16, 17, 31, 64, 100, 896} {
+		for _, n := range []int{1, 2, 5, 6, 7, 8, 9, 15, 16, 23} {
+			qs := make([]float32, n*d)
+			for i := range qs {
+				qs[i] = float32(rng.NormFloat64())
+			}
+			var ks, got, want [4][]float32
+			for j := range ks {
+				ks[j] = make([]float32, d)
+				for i := range ks[j] {
+					ks[j][i] = float32(rng.NormFloat64())
+				}
+				got[j], want[j] = make([]float32, n), make([]float32, n)
+				DotVecs(qs, ks[j], want[j])
+			}
+			DotVecs4(qs, ks, got)
+			for j := range got {
+				for i := range got[j] {
+					if math.Float32bits(got[j][i]) != math.Float32bits(want[j][i]) {
+						t.Fatalf("d=%d n=%d: out[%d][%d] = %v, DotVecs %v", d, n, j, i, got[j][i], want[j][i])
+					}
+				}
+			}
+		}
+	}
+}

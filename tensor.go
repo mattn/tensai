@@ -275,17 +275,30 @@ func dotTBRows(out, a, b *Matrix, lo, hi int) {
 				if b.Rows-c1 < 8 {
 					c1 = b.Rows
 				}
-				weights := b.Data[c0*b.Cols : c1*b.Cols]
-				for r := r0; r < min(r0+64, hi); r++ {
-					kernels.DotVecs(weights, a.Data[r*a.Cols:(r+1)*a.Cols], out.Data[r*out.Cols+c0:r*out.Cols+c1])
-				}
+				dotTBBlock(out, a, b.Data[c0*b.Cols:c1*b.Cols], r0, min(r0+64, hi), c0, c1)
 				c0 = c1
 			}
 		}
 		return
 	}
-	for r := lo; r < hi; r++ {
-		kernels.DotVecs(b.Data, a.Data[r*a.Cols:(r+1)*a.Cols], out.Data[r*out.Cols:(r+1)*out.Cols])
+	dotTBBlock(out, a, b.Data, lo, hi, 0, b.Rows)
+}
+
+// dotTBBlock dots rows lo..hi of a against the rows of b held in weights,
+// writing out columns c0..c1. Four rows of a go to DotVecs4 together, so
+// each row of weights is loaded once for the four; the results are the
+// same bits DotVecs gives one row at a time.
+func dotTBBlock(out, a *Matrix, weights []Float, lo, hi, c0, c1 int) {
+	row := func(r int) []Float { return a.Data[r*a.Cols : (r+1)*a.Cols] }
+	outRow := func(r int) []Float { return out.Data[r*out.Cols+c0 : r*out.Cols+c1] }
+	r := lo
+	for ; r+4 <= hi; r += 4 {
+		kernels.DotVecs4(weights,
+			[4][]Float{row(r), row(r + 1), row(r + 2), row(r + 3)},
+			[4][]Float{outRow(r), outRow(r + 1), outRow(r + 2), outRow(r + 3)})
+	}
+	for ; r < hi; r++ {
+		kernels.DotVecs(weights, row(r), outRow(r))
 	}
 }
 

@@ -630,6 +630,12 @@ func DotVecs(qs, k []float32, out []float32) {
 	for ; i+8 <= len(out); i += 8 {
 		dotVec8(qs[i*d:(i+8)*d], k, out[i:i+8])
 	}
+	dotVecsTail(qs, k, out, i)
+}
+
+// dotVecsTail finishes DotVecs from out[i] on, i past the eights.
+func dotVecsTail(qs, k []float32, out []float32, i int) {
+	d := len(k)
 	for ; i+4 <= len(out); i += 4 {
 		dotVec4(qs[i*d:(i+4)*d], k, out[i:i+4])
 	}
@@ -1277,5 +1283,69 @@ func WriteRead(row, delta []float32, k, q float32, out []float32) {
 		v := row[i] + k*delta[i]
 		row[i] = v
 		out[i] += q * v
+	}
+}
+
+// DotVecs4 is DotVecs for four vectors at once: outs[j][i] = qs row i .
+// ks[j], every result bit for bit what DotVecs(qs, ks[j], outs[j]) gives.
+// The rows of qs are read once for all four instead of once each, in
+// tiles of four vectors by two rows: six loads feed eight FMAs where
+// dotVec8 needs nine. Each dot still has one accumulator walked in the
+// same order and reduced the same way, so only the grouping changes.
+func DotVecs4(qs []float32, ks, outs [4][]float32) {
+	d, n := len(ks[0]), len(outs[0])
+	if !simd.HasAVX2 || d < 16 || n == 6 || n == 7 {
+		for j := range ks {
+			DotVecs(qs, ks[j], outs[j])
+		}
+		return
+	}
+	// The eights DotVecs gives dotVec8, two rows at a time; the rest goes
+	// through the same tail kernels.
+	i := 0
+	for ; i+8 <= n; i += 8 {
+		for t := i; t < i+8; t += 2 {
+			dotVecs4x2(qs[t*d:(t+1)*d:(t+1)*d], qs[(t+1)*d:(t+2)*d:(t+2)*d], ks, outs, t)
+		}
+	}
+	for j := range ks {
+		dotVecsTail(qs, ks[j], outs[j], i)
+	}
+}
+
+// dotVecs4x2 writes the eight dots of rows q0 and q1 with the four ks into
+// outs[j][i] and outs[j][i+1].
+func dotVecs4x2(q0, q1 []float32, ks, outs [4][]float32, i int) {
+	d := len(q0)
+	k0, k1, k2, k3 := ks[0][:d:d], ks[1][:d:d], ks[2][:d:d], ks[3][:d:d]
+	n := d &^ 7
+	var a00, a01, a10, a11, a20, a21, a30, a31 archsimd.Float32x8
+	for x := 0; x < n; x += 8 {
+		kv0, kv1 := simd.LoadF32x8(k0[x:]), simd.LoadF32x8(k1[x:])
+		kv2, kv3 := simd.LoadF32x8(k2[x:]), simd.LoadF32x8(k3[x:])
+		qv := simd.LoadF32x8(q0[x:])
+		a00, a10, a20, a30 = qv.MulAdd(kv0, a00), qv.MulAdd(kv1, a10), qv.MulAdd(kv2, a20), qv.MulAdd(kv3, a30)
+		qv = simd.LoadF32x8(q1[x:])
+		a01, a11, a21, a31 = qv.MulAdd(kv0, a01), qv.MulAdd(kv1, a11), qv.MulAdd(kv2, a21), qv.MulAdd(kv3, a31)
+	}
+	var buf [8][8]float32
+	simd.StoreF32x8(a00, buf[0][:])
+	simd.StoreF32x8(a01, buf[1][:])
+	simd.StoreF32x8(a10, buf[2][:])
+	simd.StoreF32x8(a11, buf[3][:])
+	simd.StoreF32x8(a20, buf[4][:])
+	simd.StoreF32x8(a21, buf[5][:])
+	simd.StoreF32x8(a30, buf[6][:])
+	simd.StoreF32x8(a31, buf[7][:])
+	archsimd.ClearAVXUpperBits()
+	for j, k := range [4][]float32{k0, k1, k2, k3} {
+		for t, q := range [2][]float32{q0, q1} {
+			b := &buf[2*j+t]
+			s := b[0] + b[1] + b[2] + b[3] + b[4] + b[5] + b[6] + b[7]
+			for x := n; x < d; x++ {
+				s += q[x] * k[x]
+			}
+			outs[j][i+t] = s
+		}
 	}
 }
