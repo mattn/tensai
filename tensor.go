@@ -3,7 +3,7 @@ package tensai
 import (
 	"errors"
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 
 	"github.com/mattn/tensai/internal/kernels"
@@ -261,6 +261,29 @@ func DotTBInto(out, a, b *Matrix) error {
 // dotTBRows computes rows lo..hi of out = a * b^T. Each output row is one
 // row of a dotted against every row of b, which is what DotVecs does.
 func dotTBRows(out, a, b *Matrix, lo, hi int) {
+	// Wide convolution filters can exceed the last-level cache. Reuse
+	// a small group of filters across several input rows instead of
+	// streaming the entire weight matrix for every pixel. DotVecs still
+	// computes each inner product in its original order.
+	if hi-lo >= 8 && b.Rows >= 16 && len(b.Data) > 1<<16 {
+		cols := max(8, (128<<10)/(a.Cols*4)/8*8)
+		for r0 := lo; r0 < hi; r0 += 64 {
+			for c0 := 0; c0 < b.Rows; {
+				c1 := min(c0+cols, b.Rows)
+				// Keep a short tail attached to the preceding group so
+				// DotVecs uses the same tail kernels as an untiled row.
+				if b.Rows-c1 < 8 {
+					c1 = b.Rows
+				}
+				weights := b.Data[c0*b.Cols : c1*b.Cols]
+				for r := r0; r < min(r0+64, hi); r++ {
+					kernels.DotVecs(weights, a.Data[r*a.Cols:(r+1)*a.Cols], out.Data[r*out.Cols+c0:r*out.Cols+c1])
+				}
+				c0 = c1
+			}
+		}
+		return
+	}
 	for r := lo; r < hi; r++ {
 		kernels.DotVecs(b.Data, a.Data[r*a.Cols:(r+1)*a.Cols], out.Data[r*out.Cols:(r+1)*out.Cols])
 	}

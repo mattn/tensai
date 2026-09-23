@@ -6,7 +6,8 @@
 // Reading is lazy: Open parses only the header, and each Tensor call reads
 // just that tensor's bytes. F32 comes back as-is; F16 and BF16 convert to
 // float32; the block-quantized types Q8_0, Q4_0, Q4_1, Q5_0, Q5_1 and the
-// K-quants Q2_K through Q6_K plus IQ4_NL and MXFP4 dequantize to float32 on the way
+// K-quants Q2_K through Q6_K plus IQ4_NL, MXFP4 and PrismML's ternary
+// PTQ1_0 and PQ2_0 dequantize to float32 on the way
 // out, which covers the encodings llama.cpp's published checkpoints
 // usually ship (the Q2_K..Q5_K_M mixes, their Q6_K tensors, and the
 // IQ4_NL blocks imatrix mixes lean on). Dimensions arrive in tensai's row-major order (GGUF stores
@@ -23,6 +24,7 @@
 package gguf
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -55,6 +57,12 @@ const (
 	typeIQ4NL = 20
 	typeBF16  = 30
 	typeMXFP4 = 39
+	// PrismML's ternary encodings, private to its llama.cpp fork: a
+	// group of 128 weights in {-1, 0, +1} under one f16 scale, the
+	// trits packed five to a byte (PTQ1_0) or one to a two-bit slot
+	// (PQ2_0).
+	typePQ2_0  = 142
+	typePTQ1_0 = 143
 )
 
 var typeNames = map[uint32]string{
@@ -64,6 +72,7 @@ var typeNames = map[uint32]string{
 	typeQ5_0: "Q5_0", typeQ5_1: "Q5_1",
 	typeQ2_K: "Q2_K", typeQ3_K: "Q3_K", typeIQ4NL: "IQ4_NL",
 	typeMXFP4: "MXFP4",
+	typePQ2_0: "PQ2_0", typePTQ1_0: "PTQ1_0",
 }
 
 // blockSpec describes one quantization block: how many values it decodes
@@ -85,6 +94,11 @@ var blockSpec = map[uint32]struct{ values, bytes int64 }{
 	typeQ4_K: {256, 2 + 2 + 12 + 128},      // d, dmin, packed scales, nibbles
 	typeQ5_K: {256, 2 + 2 + 12 + 32 + 128}, // + high bits
 	typeQ6_K: {256, 128 + 64 + 16 + 2},     // ql, qh, int8 scales, d
+	// Ternary: PTQ1_0 packs 120 trits five to a byte and the last 8
+	// four to a byte, then the f16 scale; PQ2_0 keeps a trit per
+	// two-bit slot behind its scale.
+	typePTQ1_0: {128, 24 + 2 + 2},
+	typePQ2_0:  {128, 2 + 32},
 }
 
 type tensorInfo struct {
@@ -139,7 +153,10 @@ func Open(path string) (*File, error) {
 
 // NewFile parses a GGUF checkpoint from a reader.
 func NewFile(r io.ReaderAt) (*File, error) {
-	d := &decoder{r: io.NewSectionReader(r, 0, 1<<62)}
+	// The header is read once, front to back, so a buffered reader
+	// over it turns a quarter million token strings into a few large
+	// reads instead of a small one apiece.
+	d := &decoder{r: bufio.NewReaderSize(io.NewSectionReader(r, 0, 1<<62), 1<<20)}
 	if magic := d.u32(); magic != 0x46554747 { // "GGUF"
 		return nil, fmt.Errorf("gguf: bad magic 0x%08x", magic)
 	}
@@ -247,7 +264,9 @@ func (f *File) Release(name string) {
 func (f *File) Names() []string { return append([]string(nil), f.names...) }
 
 // KV returns a metadata value: string, bool, float64, int64, uint64 (and
-// float32/uint32/... as stored) or []any for arrays.
+// float32/uint32/... as stored); an array of strings, float32, int32,
+// uint32 or bools as a slice of that type, and any other array as
+// []any. Strings, Floats, Ints and Bools read the arrays by kind.
 func (f *File) KV(key string) (any, bool) {
 	v, ok := f.kv[key]
 	return v, ok
@@ -411,45 +430,118 @@ func dequantBlocks(typ uint32, name string, dst []float32, raw []byte, n int64) 
 		for b := int64(0); b < n/256; b++ {
 			dequantQ6K(raw[b*210:b*210+210], dst[b*256:b*256+256])
 		}
+	case typePTQ1_0:
+		var w [128]int8
+		for b := int64(0); b < n/128; b++ {
+			s := DecodePTQ1_0(raw[b*28:b*28+28], &w)
+			for i, v := range w {
+				dst[b*128+int64(i)] = s * float32(v)
+			}
+		}
+	case typePQ2_0:
+		var w [128]int8
+		for b := int64(0); b < n/128; b++ {
+			s := DecodePQ2_0(raw[b*34:b*34+34], &w)
+			for i, v := range w {
+				dst[b*128+int64(i)] = s * float32(v)
+			}
+		}
 	}
 	return nil
+}
+
+// DecodePTQ1_0 unpacks one 28-byte PTQ1_0 block into its 128 weights,
+// each -1, 0 or +1, and returns the block's scale. The packing is
+// TQ1_0's at group 128: the first 24 bytes carry five trits apiece as a
+// base-3 number scaled into a byte, laid out in stages of 32, 16 and 8
+// bytes so that trit n of byte m within a stage is weight n*stage+m; the
+// next 2 bytes carry four trits apiece the same way; the scale ends the
+// block.
+func DecodePTQ1_0(blk []byte, w *[128]int8) float32 {
+	pow3 := [5]uint16{1, 3, 9, 27, 81}
+	k := 0
+	j := 0
+	for _, c := range [3]int{32, 16, 8} {
+		for ; j+c <= 24; j += c {
+			for n := 0; n < 5; n++ {
+				for m := 0; m < c; m++ {
+					q := uint16(blk[j+m]) * pow3[n]
+					w[k] = int8((q&0xFF)*3>>8) - 1
+					k++
+				}
+			}
+		}
+	}
+	for n := 0; n < 4; n++ {
+		for h := 0; h < 2; h++ {
+			q := uint16(blk[24+h]) * pow3[n]
+			w[k] = int8((q&0xFF)*3>>8) - 1
+			k++
+		}
+	}
+	return f16to32(binary.LittleEndian.Uint16(blk[26:]))
+}
+
+// DecodePQ2_0 unpacks one 34-byte PQ2_0 block: the f16 scale, then 128
+// two-bit slots holding w+1 in order, four to a byte from the low bits.
+func DecodePQ2_0(blk []byte, w *[128]int8) float32 {
+	for i := 0; i < 128; i++ {
+		w[i] = int8((blk[2+i/4]>>(2*uint(i%4)))&3) - 1
+	}
+	return f16to32(binary.LittleEndian.Uint16(blk))
 }
 
 // Ints returns an integer array metadata value, whatever width the file
 // stored its elements at, or nil when the key is absent or not an array
 // of integers. Gemma 4 states its per-layer feed-forward widths this way.
 func (f *File) Ints(key string) []int64 {
-	arr, ok := f.kv[key].([]any)
-	if !ok {
-		return nil
-	}
-	out := make([]int64, len(arr))
-	for i, v := range arr {
-		n, ok := toInt64(v)
-		if !ok {
-			return nil
+	switch arr := f.kv[key].(type) {
+	case []int32:
+		out := make([]int64, len(arr))
+		for i, v := range arr {
+			out[i] = int64(v)
 		}
-		out[i] = n
+		return out
+	case []uint32:
+		out := make([]int64, len(arr))
+		for i, v := range arr {
+			out[i] = int64(v)
+		}
+		return out
+	case []any:
+		out := make([]int64, len(arr))
+		for i, v := range arr {
+			n, ok := toInt64(v)
+			if !ok {
+				return nil
+			}
+			out[i] = n
+		}
+		return out
 	}
-	return out
+	return nil
 }
 
 // Bools returns a boolean array metadata value, or nil when the key is
 // absent or not an array of booleans -- Gemma 4's sliding-window pattern.
 func (f *File) Bools(key string) []bool {
-	arr, ok := f.kv[key].([]any)
-	if !ok {
-		return nil
-	}
-	out := make([]bool, len(arr))
-	for i, v := range arr {
-		b, ok := v.(bool)
-		if !ok {
-			return nil
-		}
-		out[i] = b
-	}
-	return out
+	arr, _ := f.kv[key].([]bool)
+	return arr
+}
+
+// Strings returns a string array metadata value, or nil when the key is
+// absent or not one: the vocabulary, the merges, the names a rotation
+// applies to.
+func (f *File) Strings(key string) []string {
+	arr, _ := f.kv[key].([]string)
+	return arr
+}
+
+// Floats returns a float32 array metadata value, or nil: a SentencePiece
+// vocabulary's scores.
+func (f *File) Floats(key string) []float32 {
+	arr, _ := f.kv[key].([]float32)
+	return arr
 }
 
 func toInt64(v any) (int64, bool) {
@@ -822,7 +914,7 @@ func f16to32(h uint16) float32 {
 // decoder reads the little-endian header sequentially, latching the first
 // error.
 type decoder struct {
-	r   *io.SectionReader
+	r   *bufio.Reader
 	off int64
 	err error
 }
@@ -831,7 +923,7 @@ func (d *decoder) read(b []byte) {
 	if d.err != nil {
 		return
 	}
-	if _, err := io.ReadFull(io.NewSectionReader(d.r, d.off, int64(len(b))), b); err != nil {
+	if _, err := io.ReadFull(d.r, b); err != nil {
 		d.err = err
 		return
 	}
@@ -904,6 +996,43 @@ func (d *decoder) value(typ uint32) any {
 		if n > 1<<24 {
 			d.err = fmt.Errorf("array of %d elements", n)
 			return nil
+		}
+		// An array of one scalar type comes back as a slice of it: a
+		// vocabulary is a quarter million strings, and boxing each one
+		// in an interface cost more than reading it.
+		switch elem {
+		case 8:
+			arr := make([]string, n)
+			for i := range arr {
+				arr[i] = d.str()
+			}
+			return arr
+		case 6:
+			arr := make([]float32, n)
+			for i := range arr {
+				arr[i] = math.Float32frombits(d.u32())
+			}
+			return arr
+		case 5:
+			arr := make([]int32, n)
+			for i := range arr {
+				arr[i] = int32(d.u32())
+			}
+			return arr
+		case 4:
+			arr := make([]uint32, n)
+			for i := range arr {
+				arr[i] = d.u32()
+			}
+			return arr
+		case 7:
+			arr := make([]bool, n)
+			for i := range arr {
+				var b [1]byte
+				d.read(b[:])
+				arr[i] = b[0] != 0
+			}
+			return arr
 		}
 		arr := make([]any, n)
 		for i := range arr {

@@ -64,12 +64,13 @@ func TestPlan(t *testing.T) {
 func TestDeltaSnapshotRoundTrip(t *testing.T) {
 	const hidden, heads, kd, vd, convK = 8, 2, 4, 4, 4
 	r := &lcg{x: 7}
-	d := &deltaWeights{heads: heads, kDim: kd, vDim: vd, convK: convK}
+	d := &deltaWeights{heads: heads, kHeads: heads, kDim: kd, vDim: vd, convK: convK}
 	d.convDim = kd*heads*2 + vd*heads
 	d.wQKV, d.wZ = r.mat(hidden, d.convDim), r.mat(hidden, vd*heads)
 	d.wA, d.wB = r.mat(hidden, heads), r.mat(hidden, heads)
 	d.wOut = r.mat(vd*heads, hidden)
 	d.conv, d.aLog, d.dtBias, d.norm = r.vec(d.convDim*convK), r.vec(heads), r.vec(heads), r.vec(vd)
+	d.fuse()
 
 	m := &qwen{blocks: []qblock{{delta: d, dstate: d.newState()}}}
 	scratch := newDeltaScratch(d, hidden)

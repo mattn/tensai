@@ -17,6 +17,7 @@
 - **Layers** - `Embedding`, `Dense`, `Conv2D`, `MaxPool2D`, `BatchNorm`, `LayerNorm`, `Dropout`, plus `ReLU`, `LeakyReLU`, `GELU`, `Sigmoid`, `Tanh`, and `Softmax` activations
 - **WebGPU backend (experimental)** - build with `-tags wgpu` (linux, macOS, Windows) and `gpu.Open()` runs batched `MatMul` as a WGSL compute shader on any GPU wgpu-native reaches (Vulkan, Metal, D3D12 — AMD, Intel, Apple, NVIDIA). The bindings go through `ebitengine/purego`, so there is still no cgo and no C compiler: the wgpu-native shared library is dlopen-ed at runtime. A `Device` also satisfies `tensai.Accelerator`: `tensai.UseAccelerator(dev)` moves every product above 4e8 multiply-accumulates — including both transposed products a backward pass needs — onto the GPU, so an autograd training step of a 2048-wide block runs 1.4x faster with nothing else changed. Resident tensors also carry the rest of a backward pass — element-wise `Binary`, `Activate`/`ActivateGrad` (ReLU, tanh, sigmoid, and the error-function GELU the CPU kernels use), `SumCols`, and an in-place `AdamStep` — so a training graph has the kernels to stay on the device. `tape.UseDevice(dev)` does exactly that — values, gradients and the Adam update all stay resident, and one step of a 2048-wide block runs 1382ms on the CPU, 442ms with products offloaded one at a time, and 193ms resident. LayerNorm, softmax, the permutes attention needs, and the embedding scatter-add have kernels too, so a whole transformer block trains without leaving the device — 209ms per step on the CPU against 54ms resident, at model width 512
 - **int8 / int4 quantization** - `quant.Quantize` / `quant.Quantize4` build weight-only quantized twins: int4 group-wise with float32 accumulation, and int8 as a full integer path — weights in interleaved row quads, activations dynamically quantized to 7 bits, and the whole dot product running on the 256-bit u8 x s8 pairwise multiply-add plus a widening pair-add — two instructions per column, four rows deep — which reaches memory bandwidth (~31GB/s of weights on 16 cores). int4 halves the weights again — the difference between a 7B model fitting in RAM or not
+- **Image generation** - `tensai image "a calico cat asleep on a stack of books"` runs [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) end to end in pure Go: the prompt through the language half of a Qwen3-VL 8B encoder, twenty flow-matching steps through a 32-block denoising transformer, and a 2D autoencoder that turns each latent position into a sixteen-pixel square with an alpha channel. The weights quantize as they load (7GB at eight bits, 3.5GB at four) and the result is cached beside the checkpoint, so a 256x256 picture takes under four minutes on a laptop. Every piece agrees with diffusers and transformers to between 6.5e-8 and 2.4e-4. [Image Generation](docs/images.md) has the rest
 - **Loss functions** - `MeanSquaredError` for regression, `SoftmaxCrossEntropy` for multi-class classification, and `BinaryCrossEntropy` for binary targets
 - **Optimizers** - momentum `SGD`, `Adam`, and `AdamW` (decoupled weight decay)
 - **k-NN baseline** - a `knn.Classifier` whose distance matrix runs on the same SIMD matmul kernel; useful as a no-training baseline next to the networks
@@ -46,6 +47,7 @@ knn                 k-NN baseline classifier
 dataset             Shuffle, split, standardize, mini-batch iteration
 quant               int8 / int4 / grouped-int8 / MXFP4 weight-only quantization
 gpu                 WebGPU backend via purego + wgpu-native (build tags wgpu / wgpu24)
+internal/qwenimage  Qwen-Image-2.1: prompt encoder, denoising transformer, VAE decoder, flow matching
 internal/kernels    Element-wise kernels: scalar bodies plus the AVX2 versions incl. vectorized exp
 internal/simd       Load/store shims over both simd/archsimd API generations
 internal/dims       Shape arithmetic shared between the core and the GPU backend
@@ -63,6 +65,7 @@ _example/dot        Graphviz DOT export of the z = x + y graph
 _example/tensor     Tour of the n-d Tensor: broadcasting, batched MatMul, attention
 _example/wgpu       WebGPU MatMul: adapter info, CPU cross-check, GPU vs CPU sweep
 _example/gpt2       The published GPT-2 (124M) checkpoint generating text in pure Go
+_example/flappy     Flappy Bird played by scoring a question each step: which question a scored token can decide
 cmd/tensai          The tensai command: run, chat, and serve subcommands over internal/llm
 ```
 
@@ -203,7 +206,7 @@ The prompt runs through the model as one batched pass; with `-gpu` (built with `
 
 `-q8` quantizes the decode-path weights to int8 (weight-only, per-column scales) and doubles generation — 23 to 46 tok/s on the same machine — because decode streams the whole checkpoint per token and int8 pulls a quarter of the bytes. The text stays coherent but greedy decoding no longer reproduces the float32 reference tokens exactly; use the default float32 path for the reference check.
 
-The `tensai` command does the same for modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file — `-model ./qwen2.5-0.5b-instruct-q8_0.gguf -q8` chats with nothing else on disk. One runtime speaks ten architectures, each contributing its own twist:
+The `tensai` command does the same for modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file — `-model ./qwen2.5-0.5b-instruct-q8_0.gguf -q8` chats with nothing else on disk. One runtime speaks eleven architectures, each contributing its own twist:
 
 | family | models | what it adds |
 |---|---|---|
@@ -213,9 +216,11 @@ The `tensai` command does the same for modern instruction-tuned models: RMSNorm,
 | llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | the block everyone forked |
 | smollm3 | SmolLM3-3B | RoPE skipped every fourth layer |
 | gemma3 | Gemma 3 | sliding windows on 5/6 layers, sandwich norms, gelu-tanh gate, SentencePiece |
+| gemma4 | Gemma 4 E2B/E4B/12b | per-layer embeddings read from disk a token at a time, two head widths, the deeper layers attending against an earlier layer's cache, logits through a tanh cap |
 | phi3 | Phi-3/3.5-mini | q/k/v and gate/up shipped pre-fused |
 | qwen2moe / qwen3moe | Qwen1.5-MoE-A2.7B, Qwen3-30B-A3B | top-k routed experts, a shared expert on qwen2moe |
 | gpt-oss | gpt-oss-20b | MXFP4 experts, attention sinks, YaRN rope, harmony channels |
+| k2-horizon | K2-Horizon-7B | RMSNorm taken over four groups of the row, a word class that keeps combining marks and joiners together, a 512K context. GGUF only, and CPU only |
 
 The DeepSeek-R1 distills need no family of their own — they are stock qwen2/llama blocks wearing DeepSeek's turn markers, which the loader spots in the embedded chat template and switches automatically, `<think>` reasoning included. Mixture-of-experts blocks route each token through its top-k experts, repacked per expert straight from the GGUF's 3D tensors: Qwen1.5-MoE-A2.7B (14B total, 2.7B active) answers at ~9 tok/s from a 20-second load, and gpt-oss-20b — its experts kept in their native MXFP4 blocks, expanded through a one-shuffle table-lookup kernel — reasons in its harmony analysis channel and answers on the same 15GB machine.
 
@@ -444,6 +449,7 @@ tensai run -q8 "What is the capital of France?"
 tensai chat -q8 -model ./model.gguf
 tensai serve -q8 -addr :8080                      # OpenAI-compatible API
 tensai run -q4 -tool wikipedia "Who is Linus Torvalds?"   # the model looks it up itself
+tensai image -fetch -size 256 "a calico cat asleep on a stack of books"   # -fetch downloads the checkpoint (~31GB) once
 GOEXPERIMENT=simd go run -tags wgpu24 ./cmd/tensai bench -q8   # CPU vs GPU
 go run -tags wgpu ./_example/wgpu          # needs wgpu-native, see above
 go run -tags wgpu ./_example/wgpu -sweep  # GPU vs CPU across sizes
@@ -493,7 +499,7 @@ has the full breakdown; the short version:
 | linux/amd64 | AVX2 | Vulkan | yes, this is where the kernels are developed and benchmarked |
 | linux/arm64 | NEON | Vulkan | tests and a generation run, under emulation |
 | darwin/amd64 | AVX2 | Metal | — |
-| darwin/arm64 | NEON | Metal | not yet on the hardware |
+| darwin/arm64 | NEON | Metal | tests, on Apple Silicon in CI |
 | windows/amd64 | AVX2 | D3D12, Vulkan | yes |
 | windows/arm64 | NEON | D3D12, Vulkan | not yet |
 | others | portable | none | — |
@@ -504,9 +510,9 @@ and falls back on a CPU without it; NEON is mandatory on AArch64, so there is
 nothing to check. The GPU comes from a build tag and a wgpu-native shared
 library loaded at runtime.
 
-The arm64 kernels are newer and narrower than the amd64 ones: they vectorize
-the decode path, not yet the 4-bit and grouped-int8 matvecs, the batched
-prefill, or the dense float matmul.
+The arm64 kernels cover the same ground as the amd64 ones at half the
+lane width: every quantized matvec and prefill fold, the attention and
+element-wise rows, the dense float matmul and the training kernels.
 
 ## SIMD Coverage
 

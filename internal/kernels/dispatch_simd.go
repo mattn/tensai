@@ -137,6 +137,40 @@ func SiluMul(gate, up []float32) {
 // GeluMul is Gemma's gate: gelu(gate) * up, in place on gate. The tanh
 // approximation the trained models use rewrites as a sigmoid, so this is
 // SiluMul with the argument run through the cubic first.
+// MulSigmoid scales dst by the sigmoid of src, one pass over both rows
+// rather than a sigmoid into scratch and a multiply after it.
+func MulSigmoid(dst, src []float32) {
+	if !simd.HasAVX2 {
+		mulSigmoidGeneric(dst, src)
+		return
+	}
+	one := archsimd.BroadcastFloat32x8(1)
+	zero := archsimd.BroadcastFloat32x8(0)
+	mapSlices2(dst, dst, src, func(d, v archsimd.Float32x8) archsimd.Float32x8 {
+		return d.Mul(one.Div(one.Add(vexpf(zero.Sub(v)))))
+	})
+}
+
+// SwigluOAI is the clamped SwiGLU in place on gate. The clamps are
+// Min/Max rather than a select, so a NaN follows whatever the scalar
+// path's comparisons give it.
+func SwigluOAI(gate, up []float32) {
+	if !simd.HasAVX2 {
+		swigluOAIGeneric(gate, up)
+		return
+	}
+	one := archsimd.BroadcastFloat32x8(1)
+	zero := archsimd.BroadcastFloat32x8(0)
+	alpha := archsimd.BroadcastFloat32x8(swigluAlpha)
+	hi := archsimd.BroadcastFloat32x8(swigluLimit)
+	lo := archsimd.BroadcastFloat32x8(-swigluLimit)
+	mapSlices2(gate, gate, up, func(g, u archsimd.Float32x8) archsimd.Float32x8 {
+		g = g.Min(hi)
+		u = u.Min(hi).Max(lo)
+		return g.Div(one.Add(vexpf(zero.Sub(alpha.Mul(g))))).Mul(u.Add(one))
+	})
+}
+
 func GeluMul(gate, up []float32) {
 	if !simd.HasAVX2 {
 		geluMulGeneric(gate, up)
@@ -1125,5 +1159,123 @@ func AxpyRows(out, ws []float32, rows [][]float32, off int) {
 		for k := n; k < d; k++ {
 			out[k] += w * r[k]
 		}
+	}
+}
+
+// Hadamard is the Walsh-Hadamard transform of v in place, times scale,
+// Sylvester order, for a power-of-two length. The three stages within a
+// lane group of eight go through the scalar butterfly, unrolled by
+// eight; every stage from a stride of eight up is a vector add and
+// subtract across whole lanes.
+func Hadamard(v []float32, scale float32) {
+	n := len(v)
+	if !simd.HasAVX2 || n < 16 {
+		hadamardGeneric(v, scale)
+		return
+	}
+	sv := archsimd.BroadcastFloat32x8(scale)
+	for i := 0; i+8 <= n; i += 8 {
+		b := v[i : i+8 : i+8]
+		a0, a1, a2, a3, a4, a5, a6, a7 := b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]
+		a0, a1 = a0+a1, a0-a1
+		a2, a3 = a2+a3, a2-a3
+		a4, a5 = a4+a5, a4-a5
+		a6, a7 = a6+a7, a6-a7
+		a0, a2 = a0+a2, a0-a2
+		a1, a3 = a1+a3, a1-a3
+		a4, a6 = a4+a6, a4-a6
+		a5, a7 = a5+a7, a5-a7
+		b[0], b[4] = a0+a4, a0-a4
+		b[1], b[5] = a1+a5, a1-a5
+		b[2], b[6] = a2+a6, a2-a6
+		b[3], b[7] = a3+a7, a3-a7
+	}
+	// Two stages per pass, radix-4: four loads and four stores serve
+	// strides h and 2h, halving the passes over the block.
+	// The scale rides on whichever pass is last: the radix-2 tail when
+	// there is one, else the final radix-4 pass.
+	hEnd := 8
+	for 4*hEnd <= n {
+		hEnd *= 4
+	}
+	tail := 2*hEnd <= n
+	h := 8
+	for ; 4*h <= n; h *= 4 {
+		s := archsimd.BroadcastFloat32x8(1)
+		if !tail && 4*h == hEnd {
+			s = sv
+		}
+		for i := 0; i < n; i += 4 * h {
+			for j := i; j < i+h; j += 8 {
+				a := simd.LoadF32x8(v[j:])
+				b := simd.LoadF32x8(v[j+h:])
+				c := simd.LoadF32x8(v[j+2*h:])
+				d := simd.LoadF32x8(v[j+3*h:])
+				ab, abd := a.Add(b), a.Sub(b)
+				cd, cdd := c.Add(d), c.Sub(d)
+				simd.StoreF32x8(ab.Add(cd).Mul(s), v[j:])
+				simd.StoreF32x8(abd.Add(cdd).Mul(s), v[j+h:])
+				simd.StoreF32x8(ab.Sub(cd).Mul(s), v[j+2*h:])
+				simd.StoreF32x8(abd.Sub(cdd).Mul(s), v[j+3*h:])
+			}
+		}
+	}
+	if tail {
+		for j := 0; j < h; j += 8 {
+			x := simd.LoadF32x8(v[j:])
+			y := simd.LoadF32x8(v[j+h:])
+			simd.StoreF32x8(x.Add(y).Mul(sv), v[j:])
+			simd.StoreF32x8(x.Sub(y).Mul(sv), v[j+h:])
+		}
+	} else if h == 8 {
+		// Sixteen or fewer lanes never reached a vector pass.
+		mapSlices(v, v, func(x archsimd.Float32x8) archsimd.Float32x8 { return x.Mul(sv) })
+	}
+	archsimd.ClearAVXUpperBits()
+}
+
+// DecayRead scales row by decay in place and adds k times the scaled
+// row into mem, one read and one write of the row.
+func DecayRead(row []float32, decay, k float32, mem []float32) {
+	if !simd.HasAVX2 || len(row) < 16 {
+		decayReadGeneric(row, decay, k, mem)
+		return
+	}
+	dv := archsimd.BroadcastFloat32x8(decay)
+	kv := archsimd.BroadcastFloat32x8(k)
+	n := len(row) &^ 7
+	for i := 0; i < n; i += 8 {
+		v := simd.LoadF32x8(row[i:]).Mul(dv)
+		simd.StoreF32x8(v, row[i:])
+		simd.StoreF32x8(v.MulAdd(kv, simd.LoadF32x8(mem[i:])), mem[i:])
+	}
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < len(row); i++ {
+		v := row[i] * decay
+		row[i] = v
+		mem[i] += k * v
+	}
+}
+
+// WriteRead adds k times delta into row in place and q times the
+// updated row into out, one read and one write of the row.
+func WriteRead(row, delta []float32, k, q float32, out []float32) {
+	if !simd.HasAVX2 || len(row) < 16 {
+		writeReadGeneric(row, delta, k, q, out)
+		return
+	}
+	kv := archsimd.BroadcastFloat32x8(k)
+	qv := archsimd.BroadcastFloat32x8(q)
+	n := len(row) &^ 7
+	for i := 0; i < n; i += 8 {
+		v := simd.LoadF32x8(delta[i:]).MulAdd(kv, simd.LoadF32x8(row[i:]))
+		simd.StoreF32x8(v, row[i:])
+		simd.StoreF32x8(v.MulAdd(qv, simd.LoadF32x8(out[i:])), out[i:])
+	}
+	archsimd.ClearAVXUpperBits()
+	for i := n; i < len(row); i++ {
+		v := row[i] + k*delta[i]
+		row[i] = v
+		out[i] += q * v
 	}
 }

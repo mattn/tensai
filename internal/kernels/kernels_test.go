@@ -2,7 +2,7 @@ package kernels
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -108,7 +108,7 @@ func TestGELUKernelAccuracy(t *testing.T) {
 // TestLayerNormKernelMatchesGeneric compares the dispatched LayerNorm row
 // kernels against the scalar reference, including non-multiple-of-8 tails.
 func TestLayerNormKernelMatchesGeneric(t *testing.T) {
-	rng := rand.New(rand.NewSource(83))
+	rng := rand.New(rand.NewPCG(83, 0))
 	for _, cols := range []int{3, 8, 13, 64, 100} {
 		src := make([]float32, cols)
 		g := make([]float32, cols)
@@ -159,7 +159,7 @@ func TestLayerNormKernelMatchesGeneric(t *testing.T) {
 }
 
 func TestSiluMul(t *testing.T) {
-	rng := rand.New(rand.NewSource(21))
+	rng := rand.New(rand.NewPCG(21, 0))
 	for _, n := range []int{1, 7, 8, 33, 1000} {
 		gate := make([]float32, n)
 		up := make([]float32, n)
@@ -183,7 +183,7 @@ func TestSiluMul(t *testing.T) {
 // twins bit for bit, across group widths, head sizes, and both the
 // vector and sub-16 generic paths.
 func TestDotVecsAxpys(t *testing.T) {
-	rng := rand.New(rand.NewSource(63))
+	rng := rand.New(rand.NewPCG(63, 0))
 	for _, d := range []int{8, 16, 64, 128, 130} {
 		for nq := 1; nq <= 8; nq++ {
 			qs := make([]float32, nq*d)
@@ -226,7 +226,7 @@ func TestDotVecsAxpys(t *testing.T) {
 }
 
 func TestSoftmaxBwdAdd(t *testing.T) {
-	rng := rand.New(rand.NewSource(81))
+	rng := rand.New(rand.NewPCG(81, 0))
 	for _, n := range []int{1, 7, 8, 15, 16, 127, 128, 130, 4096} {
 		dst := make([]float32, n)
 		grad := make([]float32, n)
@@ -253,7 +253,7 @@ func TestSoftmaxBwdAdd(t *testing.T) {
 }
 
 func TestSGDStepKernelMatchesGeneric(t *testing.T) {
-	rng := rand.New(rand.NewSource(29))
+	rng := rand.New(rand.NewPCG(29, 0))
 	for _, n := range []int{1, 3, 7, 8, 9, 31, 64} {
 		w := make([]float32, n)
 		vel := make([]float32, n)
@@ -376,4 +376,128 @@ func TestGeluMulMatchesTanhForm(t *testing.T) {
 			t.Errorf("geluMulGeneric(%v) = %v, want %v", gate[i], plain[i], want[i])
 		}
 	}
+}
+
+func TestHadamardAgreesWithGeneric(t *testing.T) {
+	for _, n := range []int{8, 16, 32, 64, 128, 256, 512, 1024, 2048} {
+		a := make([]float32, n)
+		for i := range a {
+			a[i] = float32(i%7) - 3 + float32(i)/float32(n)
+		}
+		b := append([]float32(nil), a...)
+		Hadamard(a, 0.25)
+		hadamardGeneric(b, 0.25)
+		for i := range a {
+			if a[i] != b[i] {
+				t.Fatalf("n=%d: [%d] = %v, generic %v", n, i, a[i], b[i])
+			}
+		}
+	}
+}
+
+func BenchmarkHadamard1024(b *testing.B) {
+	v := make([]float32, 1024)
+	for i := range v {
+		v[i] = float32(i)
+	}
+	for i := 0; i < b.N; i++ {
+		Hadamard(v, 0.03125)
+	}
+}
+
+func TestDecayReadWriteRead(t *testing.T) {
+	const n = 37
+	row, mem, delta, out := make([]float32, n), make([]float32, n), make([]float32, n), make([]float32, n)
+	row2, mem2, out2 := make([]float32, n), make([]float32, n), make([]float32, n)
+	for i := 0; i < n; i++ {
+		row[i], mem[i], delta[i], out[i] = float32(i)-7, float32(i%5), float32(i%3)-1, float32(i%4)
+		row2[i], mem2[i], out2[i] = row[i], mem[i], out[i]
+	}
+	DecayRead(row, 0.75, 1.5, mem)
+	decayReadGeneric(row2, 0.75, 1.5, mem2)
+	WriteRead(row, delta, -0.5, 2, out)
+	writeReadGeneric(row2, delta, -0.5, 2, out2)
+	for i := 0; i < n; i++ {
+		if row[i] != row2[i] || mem[i] != mem2[i] || out[i] != out2[i] {
+			t.Fatalf("[%d]: row %v/%v mem %v/%v out %v/%v", i, row[i], row2[i], mem[i], mem2[i], out[i], out2[i])
+		}
+	}
+}
+
+// TestGateKernels compares the two gating kernels against float64
+// references over a range that covers both sides of gpt-oss's clamp, and
+// checks the tail path writes exactly the requested elements.
+func TestGateKernels(t *testing.T) {
+	var gate, up []float32
+	for x := -20.0; x <= 20.0; x += 0.013 {
+		gate = append(gate, float32(x))
+		up = append(up, float32(-x*0.5+1))
+	}
+
+	dst := make([]float32, len(gate))
+	copy(dst, up)
+	MulSigmoid(dst, gate)
+	for i, g := range gate {
+		want := float64(up[i]) / (1 + math.Exp(-float64(g)))
+		if diff := math.Abs(float64(dst[i]) - want); diff > 2e-6*(1+math.Abs(want)) {
+			t.Fatalf("MulSigmoid(%g, %g): got %g want %g", up[i], g, dst[i], want)
+		}
+	}
+
+	got := make([]float32, len(gate))
+	copy(got, gate)
+	SwigluOAI(got, up)
+	for i, g := range gate {
+		gd := math.Min(float64(g), 7)
+		u := math.Min(math.Max(float64(up[i]), -7), 7)
+		want := gd / (1 + math.Exp(-1.702*gd)) * (u + 1)
+		if diff := math.Abs(float64(got[i]) - want); diff > 2e-6*(1+math.Abs(want)) {
+			t.Fatalf("SwigluOAI(%g, %g): got %g want %g", g, up[i], got[i], want)
+		}
+	}
+
+	for _, n := range []int{1, 3, 7, 8, 9, 31} {
+		for _, name := range []string{"MulSigmoid", "SwigluOAI"} {
+			a := make([]float32, n+1)
+			b := make([]float32, n)
+			for i := range b {
+				a[i], b[i] = float32(i)-3, float32(i)*0.25-1
+			}
+			a[n] = 42 // canary just past the writable range
+			if name == "MulSigmoid" {
+				MulSigmoid(a[:n], b)
+			} else {
+				SwigluOAI(a[:n], b)
+			}
+			if a[n] != 42 {
+				t.Fatalf("%s n=%d: kernel wrote past the slice end", name, n)
+			}
+		}
+	}
+}
+
+// BenchmarkGateKernels sizes the two gating kernels, which sit in the
+// serial stretch between a block's parallel products.
+func BenchmarkGateKernels(b *testing.B) {
+	const n = 1 << 20
+	gate := make([]float32, n)
+	up := make([]float32, n)
+	for i := range gate {
+		gate[i] = float32(i%97)*0.1 - 4
+		up[i] = float32(i%53)*0.1 - 2
+	}
+	b.Run("MulSigmoid", func(b *testing.B) {
+		b.SetBytes(n * 4)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			MulSigmoid(up, gate)
+		}
+	})
+	b.Run("SwigluOAI", func(b *testing.B) {
+		b.SetBytes(n * 4)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			SwigluOAI(gate, up)
+		}
+	})
 }

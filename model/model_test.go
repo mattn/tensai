@@ -3,7 +3,7 @@ package model
 import (
 	"bytes"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"strings"
 	"testing"
 
@@ -14,7 +14,7 @@ import (
 )
 
 func randomInput(rows, cols int, seed int64) *tensai.Matrix {
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(uint64(seed), 0))
 	m := tensai.NewMatrix(rows, cols)
 	for i := range m.Data {
 		m.Data[i] = tensai.Float(rng.NormFloat64())
@@ -268,14 +268,14 @@ func BenchmarkFitStepMLP(b *testing.B) {
 	if err := model.Compile(10, loss.SoftmaxCrossEntropy{}, optim.NewAdam(0.005)); err != nil {
 		b.Fatal(err)
 	}
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	in := tensai.NewMatrix(64, 10)
 	tgt := tensai.NewMatrix(64, 1)
 	for i := range in.Data {
-		in.Data[i] = tensai.Float(rng.Intn(2))
+		in.Data[i] = tensai.Float(rng.IntN(2))
 	}
 	for i := range tgt.Data {
-		tgt.Data[i] = tensai.Float(rng.Intn(4))
+		tgt.Data[i] = tensai.Float(rng.IntN(4))
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

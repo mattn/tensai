@@ -3,7 +3,7 @@ package llm
 import (
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -54,7 +54,7 @@ func BenchmarkSample(b *testing.B) {
 	for i := range logits {
 		logits[i] = float32((i*7919)%10000)/1000 - 10
 	}
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

@@ -14,6 +14,7 @@ package llm
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -42,12 +43,12 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 	default:
 		return nil, fmt.Errorf("unsupported tokenizer model %q", model)
 	}
-	toksAny, ok := g.KV("tokenizer.ggml.tokens")
-	if !ok {
+	tokens := g.Strings("tokenizer.ggml.tokens")
+	if tokens == nil {
 		return nil, fmt.Errorf("gguf has no embedded tokenizer")
 	}
-	mergesAny, _ := g.KV("tokenizer.ggml.merges")
-	typesAny, _ := g.KV("tokenizer.ggml.token_type")
+	merges := g.Strings("tokenizer.ggml.merges")
+	types := g.Ints("tokenizer.ggml.token_type")
 
 	pre, _ := g.String("tokenizer.ggml.pre")
 	var preJSON string
@@ -56,6 +57,14 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 		preJSON = `{"type":"Sequence","pretokenizers":[{"type":"Digits","individual_digits":true},{"type":"ByteLevel","use_regex":true}]}`
 	case "qwen2", "llama-bpe", "llama3", "smaug-bpe", "deepseek-r1-qwen":
 		preJSON = `{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}}`
+	case "qwen35":
+		// Qwen2's split with the word run taking combining marks and
+		// numbers one digit at a time.
+		preJSON = `{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}}`
+	case "k2-horizon":
+		// Llama 3's split with the word run widened to take combining
+		// marks and the zero-width joiners along with the letters.
+		preJSON = `{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?(?:\\p{L}|\\p{M}|\\u200C|\\u200D)+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}}`
 	case "gpt-4o":
 		preJSON = `{"type":"Split","pattern":{"Regex":"[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))*((?=[\\p{L}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\\r\\n\\p{L}\\p{N}]?((?=[\\p{L}])([^a-z]))+((?=[\\p{L}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"}}`
 	case "gpt-2", "olmo", "":
@@ -64,51 +73,19 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 		return nil, fmt.Errorf("unsupported pre-tokenizer tag %q", pre)
 	}
 
-	tokens := toksAny.([]any)
 	vocab := make(map[string]int, len(tokens))
 	for id, t := range tokens {
-		s, ok := t.(string)
-		if !ok {
-			return nil, fmt.Errorf("token %d is not a string", id)
-		}
-		vocab[s] = id
+		vocab[t] = id
 	}
-	var merges []string
-	if arr, ok := mergesAny.([]any); ok {
-		merges = make([]string, len(arr))
-		for i, m := range arr {
-			merges[i], _ = m.(string)
+	var specials []tokenizer.AddedToken
+	for id, n := range types {
+		// Type 3 marks control tokens (<|im_start|> and friends), type
+		// 4 user-defined added tokens (Qwen3's <think> tags).
+		if (n == 3 || n == 4) && id < len(tokens) {
+			specials = append(specials, tokenizer.AddedToken{ID: id, Content: tokens[id]})
 		}
 	}
-	type added struct {
-		ID      int    `json:"id"`
-		Content string `json:"content"`
-	}
-	var specials []added
-	if arr, ok := typesAny.([]any); ok {
-		for id, tp := range arr {
-			// Type 3 marks control tokens (<|im_start|> and friends), type
-			// 4 user-defined added tokens (Qwen3's <think> tags).
-			if n, ok := tp.(int32); ok && (n == 3 || n == 4) && id < len(tokens) {
-				specials = append(specials, added{ID: id, Content: tokens[id].(string)})
-			}
-		}
-	}
-
-	spec := map[string]any{
-		"pre_tokenizer": json.RawMessage(preJSON),
-		"added_tokens":  specials,
-		"model": map[string]any{
-			"type":   "BPE",
-			"vocab":  vocab,
-			"merges": merges,
-		},
-	}
-	raw, err := json.Marshal(spec)
-	if err != nil {
-		return nil, err
-	}
-	return tokenizer.Parse(raw)
+	return tokenizer.NewBPE(vocab, merges, specials, json.RawMessage(preJSON))
 }
 
 // ggufSPMBPETokenizer builds Gemma 4's tokenizer: SentencePiece
@@ -117,33 +94,24 @@ func ggufTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
 // merged, which matters here beyond the turn markers: the vocabulary
 // spells ordinary tokens like <div> and <=> the same way.
 func ggufSPMBPETokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
-	toksAny, ok := g.KV("tokenizer.ggml.tokens")
-	if !ok {
+	tokens := g.Strings("tokenizer.ggml.tokens")
+	if tokens == nil {
 		return nil, fmt.Errorf("gguf has no embedded tokenizer")
 	}
-	mergesAny, ok := g.KV("tokenizer.ggml.merges")
-	if !ok {
+	merges := g.Strings("tokenizer.ggml.merges")
+	if merges == nil {
 		return nil, fmt.Errorf("gguf spm-bpe tokenizer has no merges")
 	}
-	typesAny, ok := g.KV("tokenizer.ggml.token_type")
-	if !ok {
+	types64 := g.Ints("tokenizer.ggml.token_type")
+	if types64 == nil {
 		return nil, fmt.Errorf("gguf spm-bpe tokenizer has no token types")
 	}
-	ta, _ := toksAny.([]any)
-	ya, _ := typesAny.([]any)
-	ma, _ := mergesAny.([]any)
-	if len(ta) != len(ya) {
-		return nil, fmt.Errorf("gguf has %d tokens but %d token types", len(ta), len(ya))
+	if len(tokens) != len(types64) {
+		return nil, fmt.Errorf("gguf has %d tokens but %d token types", len(tokens), len(types64))
 	}
-	tokens := make([]string, len(ta))
-	types := make([]int32, len(ta))
-	for i := range ta {
-		tokens[i], _ = ta[i].(string)
-		types[i], _ = ya[i].(int32)
-	}
-	merges := make([]string, len(ma))
-	for i := range ma {
-		merges[i], _ = ma[i].(string)
+	types := make([]int32, len(types64))
+	for i, v := range types64 {
+		types[i] = int32(v)
 	}
 	// llama.cpp defaults SentencePiece space-prefixing on when the key is
 	// absent; Gemma 4 writes an explicit false.
@@ -304,25 +272,18 @@ func repackQ504(dst *quant.Q4Matrix, raw []byte, out, in, colOff int, colMap fun
 // ggufSPMTokenizer builds a SentencePiece tokenizer from the embedded
 // vocabulary, scores, and token types.
 func ggufSPMTokenizer(g *gguf.File) (*tokenizer.Tokenizer, error) {
-	toksAny, ok := g.KV("tokenizer.ggml.tokens")
-	if !ok {
+	tokens := g.Strings("tokenizer.ggml.tokens")
+	if tokens == nil {
 		return nil, fmt.Errorf("gguf has no embedded tokenizer")
 	}
-	scoresAny, ok := g.KV("tokenizer.ggml.scores")
-	if !ok {
+	scores := g.Floats("tokenizer.ggml.scores")
+	if scores == nil {
 		return nil, fmt.Errorf("gguf spm tokenizer has no scores")
 	}
-	typesAny, _ := g.KV("tokenizer.ggml.token_type")
-	ta := toksAny.([]any)
-	sa := scoresAny.([]any)
-	ya := typesAny.([]any)
-	tokens := make([]string, len(ta))
-	scores := make([]float32, len(ta))
-	types := make([]int32, len(ta))
-	for i := range ta {
-		tokens[i], _ = ta[i].(string)
-		scores[i], _ = sa[i].(float32)
-		types[i], _ = ya[i].(int32)
+	types64 := g.Ints("tokenizer.ggml.token_type")
+	types := make([]int32, len(types64))
+	for i, v := range types64 {
+		types[i] = int32(v)
 	}
 	// llama.cpp defaults SentencePiece space-prefixing on when the key is
 	// absent (Phi-3, the Llama-2 family); Gemma writes an explicit false.
@@ -707,6 +668,59 @@ func repackMXFP4(dst *quant.MXFP4Matrix, raw []byte, out, in, colOff int) {
 	}
 }
 
+// repackPTQ1_0 copies a PTQ1_0 or PQ2_0 tensor's blocks -- laid out
+// [out, in] with 128 trits under one f16 scale -- into columns [colOff,
+// colOff+out) of a transposed TernaryMatrix. colMap permutes output
+// rows on the way in.
+func repackTernary(dst *quant.TernaryMatrix, typ string, raw []byte, out, in, colOff int, colMap func(int) int) {
+	nb := in / 128
+	bytes, decode := 28, gguf.DecodePTQ1_0
+	if typ == "PQ2_0" {
+		bytes, decode = 34, gguf.DecodePQ2_0
+	}
+	var w [128]int8
+	for r := 0; r < out; r++ {
+		j := colOff + r
+		if colMap != nil {
+			j = colOff + colMap(r)
+		}
+		for b := 0; b < nb; b++ {
+			blk := raw[(r*nb+b)*bytes:]
+			dst.Scale[dst.TableIndex(b, j)] = decode(blk[:bytes], &w)
+			dst.SetGroup(b, j, &w)
+		}
+	}
+}
+
+// embedTable reads token embeddings from the file a row at a time,
+// for a table too large to expand into float32.
+type embedTable struct {
+	f       *gguf.File
+	name    string
+	inverse *hadamard
+}
+
+// newEmbedTable reads rows from an open file, which stays open for the
+// model's life: the load's own handle is handed over rather than the
+// header being parsed a second time.
+func newEmbedTable(g *gguf.File, name string) *embedTable {
+	return &embedTable{f: g, name: name}
+}
+
+// row writes one token's embedding into dst, rotated back to the
+// model's basis when the table stores rotated rows.
+func (e *embedTable) row(token int, dst []float32) error {
+	t, err := e.f.TensorRows(e.name, token, token+1)
+	if err != nil {
+		return err
+	}
+	copy(dst, t.Data)
+	if e.inverse != nil {
+		e.inverse.invert(dst)
+	}
+	return nil
+}
+
 // unpermuteMap returns the llama rope unpermutation as a row index map,
 // or nil when heads is zero.
 func unpermuteMap(rows, heads int) func(int) int {
@@ -838,20 +852,32 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	if err != nil {
 		return nil, nil, err
 	}
-	defer g.Close()
+	// The handle outlives the load when the embedding table reads
+	// through it; the layers' pages are released as they repack.
+	keep := false
+	defer func() {
+		if !keep {
+			g.Close()
+		}
+	}()
 
 	if st, err := os.Stat(path); err == nil {
 		fmt.Fprintf(vlog, "reading %s (%.1f GiB)\n", path, float64(st.Size())/(1<<30))
 	}
 	arch, _ := g.String("general.architecture")
 	switch arch {
-	case "llama", "qwen2", "qwen3", "smollm3", "gemma3", "gemma4", "phi3", "qwen2moe", "qwen3moe", "gpt-oss":
+	case "llama", "qwen2", "qwen3", "qwen35", "smollm3", "gemma3", "gemma4", "phi3", "qwen2moe", "qwen3moe", "gpt-oss", "k2-horizon":
 	default:
-		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2(+moe), qwen3(+moe), llama, smollm3, gemma3, gemma4, and phi3)", arch)
+		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2(+moe), qwen3(+moe), qwen35, llama, smollm3, gemma3, gemma4, phi3, gpt-oss, and k2-horizon)", arch)
 	}
 	meta := func(key string) int64 {
 		n, _ := g.Int(arch + "." + key)
 		return n
+	}
+	if bits == BitsAuto {
+		var why string
+		bits, why = ggufBits(g)
+		fmt.Fprintf(vlog, "width: int%d, %s\n", bits, why)
 	}
 	var cfg config
 	cfg.ModelType = arch
@@ -865,6 +891,9 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	cfg.HeadDim = int(meta("attention.key_length"))
 	cfg.SlidingWin = int(meta("attention.sliding_window"))
 	cfg.RMSEps, _ = g.Float(arch + ".attention.layer_norm_rms_epsilon")
+	// K2-Horizon takes the RMS over groups of the row rather than the
+	// whole of it (layernorm_num_groups); absent, the row is one group.
+	cfg.NormGroups = int(meta("attention.group_norm_groups"))
 	cfg.RopeTheta, _ = g.Float(arch + ".rope.freq_base")
 	if cfg.RopeTheta == 0 {
 		cfg.RopeTheta = 10000
@@ -873,6 +902,11 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		// gemma4 states several of its dimensions per layer, kv head
 		// counts included, so it fills them in before the check below.
 		if err := gemma4Config(g, &cfg); err != nil {
+			return nil, nil, err
+		}
+	}
+	if arch == "qwen35" {
+		if err := qwen35Config(g, &cfg); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -926,9 +960,10 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		if cfg.HeadDim != 0 {
 			hs = cfg.HeadDim
 		}
-		if rd != hs {
+		if rd != hs && arch != "qwen35" {
 			return nil, nil, fmt.Errorf("partial rotary (%d of %d dims) is not supported", rd, hs)
 		}
+		cfg.PartialRotary = float64(rd) / float64(hs)
 	}
 
 	fmt.Fprintf(vlog, "%s: %d layers, hidden %d, %d heads over %d kv, head %d, ff %s, ctx %d, vocab %d\n",
@@ -1217,11 +1252,49 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		return qmatQ8G(dst)
 	}
 
+	// allTernary reports whether every named tensor is a ternary
+	// encoding, which always repacks directly: there is no width to
+	// quantize it to, and expanding a 27B of them is not an option.
+	allTernary := func(names ...string) bool {
+		for _, name := range names {
+			typ, shape, ok := g.Info(name)
+			if !ok || (typ != "PTQ1_0" && typ != "PQ2_0") || shape[1]%128 != 0 {
+				return false
+			}
+		}
+		return true
+	}
+	linDirectT := func(names []string, perms []int) *qmat {
+		var outs []int
+		var in int
+		for _, name := range names {
+			_, shape, _ := g.Info(name)
+			outs = append(outs, shape[0])
+			in = shape[1]
+		}
+		total := 0
+		for _, o := range outs {
+			total += o
+		}
+		dst := quant.NewTernaryMatrix(in, total)
+		colOff := 0
+		for i, name := range names {
+			typ, raw, err := g.RawTensor(name)
+			if err != nil {
+				panic(err)
+			}
+			repackTernary(dst, typ, raw, outs[i], in, colOff, unpermuteMap(outs[i], perms[i]))
+			colOff += outs[i]
+		}
+		return qmatT(dst)
+	}
 	// linDirectAuto picks the direct repack a fused weight group
 	// qualifies for — stored blocks lining up with a runtime layout —
 	// or nil when it must take the float detour.
 	linDirectAuto := func(names []string, perms []int) *qmat {
 		switch {
+		case allTernary(names...):
+			return linDirectT(names, perms)
 		case allQ8(names...):
 			return linDirect(names, perms)
 		case allQ4(names...):
@@ -1235,9 +1308,51 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		}
 		return nil
 	}
+	// A file in a rotated basis names the weights whose input the
+	// transform applies to; each is wrapped as it is repacked, and
+	// every name is checked off so an unapplied one is caught at load
+	// rather than heard as noise.
+	hspec, err := readHadamardSpec(g)
+	if err != nil {
+		return nil, nil, err
+	}
+	var rotMu sync.Mutex
+	rotated := map[string]bool{}
+	rotate := func(q *qmat, names []string) {
+		if hspec == nil || !hspec.weights[names[0]] {
+			for _, n := range names {
+				if hspec != nil && hspec.weights[n] {
+					panic(fmt.Sprintf("prism.hadamard: %s is rotated but is fused with %s, which is not", n, names[0]))
+				}
+			}
+			return
+		}
+		h, err := hspec.forWidth(q.rows())
+		if err != nil {
+			panic(err)
+		}
+		rot := rotPlain
+		if hspec.vGrouped && strings.HasSuffix(names[0], ".ssm_out.weight") && cfg.LinearKeyHeads != cfg.LinearValueHeads {
+			h.perm = tiledToGrouped(cfg.LinearValueDim, cfg.LinearKeyHeads, cfg.LinearValueHeads/cfg.LinearKeyHeads)
+			rot = rotGrouped
+		}
+		q.rotate(h, rot)
+		rotMu.Lock()
+		for _, n := range names {
+			if !hspec.weights[n] {
+				panic(fmt.Sprintf("prism.hadamard: %s is fused with rotated %s but is not rotated", n, names[0]))
+			}
+			rotated[n] = true
+		}
+		rotMu.Unlock()
+	}
 	linAuto := func(names []string, perms []int) (*tensai.Matrix, *qmat) {
 		if q := linDirectAuto(names, perms); q != nil {
+			rotate(q, names)
 			return nil, q
+		}
+		if hspec != nil && hspec.weights[names[0]] {
+			panic(fmt.Sprintf("prism.hadamard: %s is rotated but not stored ternary", names[0]))
 		}
 		var parts []*tensai.Matrix
 		for i, name := range names {
@@ -1357,8 +1472,13 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		headSz = cfg.HeadDim
 	}
 	// A valid repack cache stands in for the whole tensor load: the
-	// weights map straight from the cache file as clean pages.
-	useCache := cache && bits != 0
+	// weights map straight from the cache file as clean pages. A
+	// ternary file caches under its own name whatever width was asked.
+	ternary := allTernary("output.weight") || allTernary("token_embd.weight")
+	if ternary {
+		bits, direct = 0, true
+	}
+	useCache := cache && (bits != 0 || ternary)
 	// Requantization's per-column scales decode materially faster than
 	// the direct Q8_0 group scales. Once a user has paid its one-time
 	// conversion cost, prefer that valid cache on ordinary -q8 runs too.
@@ -1367,7 +1487,9 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	fmt.Fprintf(vlog, "repack cache: %s\n", map[bool]string{true: cachePath(path, bits, direct), false: "off"}[useCache])
 	if useCache && direct && bits == 8 {
 		fastPath := cachePath(path, bits, false)
-		if m, err := loadWeightCache(fastPath, path, bits, false, cfg, headSz); err == nil {
+		if m, err := loadWeightCache(fastPath, path, g, bits, false, cfg, headSz, hspec); err == nil {
+			keep = true
+			m.bits = bits
 			fmt.Fprintf(os.Stderr, "using faster requantized cache: %s\n", fastPath)
 			m.layout = layoutName(bits, false)
 			return m, tok, nil
@@ -1375,9 +1497,14 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	}
 	cpath := cachePath(path, bits, direct)
 	if useCache {
-		if m, err := loadWeightCache(cpath, path, bits, direct, cfg, headSz); err == nil {
+		if m, err := loadWeightCache(cpath, path, g, bits, direct, cfg, headSz, hspec); err == nil {
+			keep = true
+			m.bits = bits
 			fmt.Fprintln(vlog, "weights mapped from the repack cache")
 			m.layout = layoutName(bits, direct)
+			if ternary {
+				m.layout = "ternary"
+			}
 			return m, tok, nil
 		} else if !os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "repack cache unusable (%v); repacking\n", err)
@@ -1387,16 +1514,38 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	if direct {
 		how = "repacking the stored blocks"
 	}
-	fmt.Fprintf(vlog, "%s into int%d weights, %d layers over %d workers\n",
-		how, bits, cfg.Layers, min(runtime.NumCPU(), 8))
+	into := fmt.Sprintf("int%d", bits)
+	// A ternary file has no width to choose: its blocks repack as they
+	// are, whatever the flags asked for.
+	if ternary {
+		how, into = "repacking the stored blocks", "ternary"
+	}
+	fmt.Fprintf(vlog, "%s into %s weights, %d layers over %d workers\n",
+		how, into, cfg.Layers, min(runtime.NumCPU(), 8))
 	repackStart := time.Now()
-	m := &qwen{cfg: cfg, headSz: headSz, layout: layoutName(bits, direct)}
-	m.embed = tensor("token_embd.weight")
+	m := &qwen{cfg: cfg, headSz: headSz, layout: layoutName(bits, direct), bits: bits}
+	if ternary {
+		m.layout = "ternary"
+	}
+	// The embedding table stays in the file and is read a row at a
+	// time: a step needs one row, and a 262144-row table expanded to
+	// float32 is a gigabyte in the cache and in memory for nothing.
+	m.embedRows = newEmbedTable(g, "token_embd.weight")
+	keep = true
+	if hspec != nil && hspec.inverses["token_embd.weight"] {
+		if m.embedRows.inverse, err = hspec.forWidth(cfg.HiddenSize); err != nil {
+			return nil, nil, err
+		}
+	}
 	var ropeFF []float32
+	// Gemma scales embeddings by sqrt(hidden); embedScale does it per
+	// token, since scaling the table would scale the tied lm head with
+	// it. (gemma3 once scaled the table here: the direct repack read
+	// the head from the stored blocks and never noticed, the
+	// requantized path built it from the table and every logit came
+	// out sqrt(hidden) times too large — the argmax it generates by
+	// unchanged, the probabilities ask reads absurd.)
 	if arch == "gemma4" {
-		// Gemma scales embeddings by sqrt(hidden). Doing it per token
-		// rather than to the table leaves the tied lm head the values it
-		// was trained with.
 		ropeFF = tensor("rope_freqs.weight").Data
 		// Only the E-series carries per-layer embeddings; the dense
 		// models state a width of zero and ship none of the tensors.
@@ -1407,13 +1556,6 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 			if err != nil {
 				return nil, nil, err
 			}
-		}
-	}
-	if arch == "gemma3" {
-		// Gemma scales embeddings by sqrt(hidden) before the first block.
-		s := float32(math.Sqrt(float64(cfg.HiddenSize)))
-		for i := range m.embed.Data {
-			m.embed.Data[i] *= s
 		}
 	}
 	m.normW = tensor("output_norm.weight").Data
@@ -1430,6 +1572,7 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		defer g.Release("output.weight")
 		if _, _, ok := g.Info("output.weight"); ok {
 			if q := linDirectAuto([]string{"output.weight"}, []int{0}); q != nil {
+				rotate(q, []string{"output.weight"})
 				m.qLmT = q
 				return
 			}
@@ -1444,10 +1587,12 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 			m.qLmT = q
 			return
 		}
+		// A tied table stored in a form with no direct repack goes
+		// through float32 for the head alone.
 		lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
 		got := loadGate.acquire(lmStage)
 		defer loadGate.release(got)
-		em, err := m.embed.Matrix()
+		em, err := tensor("token_embd.weight").Matrix()
 		if err != nil {
 			panic(err)
 		}
@@ -1479,12 +1624,31 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 				b.sinks = vecOpt(p + "attn_sinks.weight")
 				b.bo = vecOpt(p + "attn_output.bias")
 			} else {
-				b.ln2 = tensor(p + "ffn_norm.weight").Data
+				b.ln2 = vecOpt(p + "ffn_norm.weight")
 				b.postAttn = vecOpt(p + "post_attention_norm.weight")
 				b.postFFN = vecOpt(p + "post_ffw_norm.weight")
+				if b.ln2 == nil && arch != "qwen35" {
+					panic(fmt.Sprintf("%s: no ffn_norm.weight", p))
+				}
 			}
 			b.qNorm = vecOpt(p + "attn_q_norm.weight")
 			b.kNorm = vecOpt(p + "attn_k_norm.weight")
+			if arch == "qwen35" {
+				// The norm ahead of the feed-forward is named for what
+				// it follows; there is no sandwich norm.
+				b.ln2, b.postAttn = b.postAttn, nil
+				if cfg.linearLayer(i) {
+					b.delta = loadDeltaGGUF(cfg, p, tensor, trans, linAuto)
+					b.wGU, b.qGU = linAuto([]string{p + "ffn_gate.weight", p + "ffn_up.weight"}, []int{0, 0})
+					b.wDown, b.qDown = linAuto([]string{p + "ffn_down.weight"}, []int{0})
+					for _, name := range g.Names() {
+						if strings.HasPrefix(name, p) {
+							g.Release(name)
+						}
+					}
+					return
+				}
+			}
 			if _, _, ok := g.Info(p + "attn_qkv.weight"); ok {
 				// Phi-3 ships q/k/v pre-fused in that order — the layout
 				// the runtime wants, no permutation (NEOX rope).
@@ -1569,6 +1733,14 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	}
 	wg.Wait()
 	fmt.Fprintf(vlog, "weights ready in %v\n", time.Since(repackStart).Round(time.Millisecond))
+	if hspec != nil {
+		for n := range hspec.weights {
+			if !rotated[n] {
+				return nil, nil, fmt.Errorf("prism.hadamard: %s was not transformed at load", n)
+			}
+		}
+		fmt.Fprintf(vlog, "hadamard: %d weights read through a %d-block rotation\n", len(rotated), hspec.block)
+	}
 	m.initRopeFreqs()
 	if useCache {
 		// Write the cache and serve this run from it too: the freshly
@@ -1577,11 +1749,103 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 		// clean, droppable pages.
 		if err := writeWeightCache(cpath, path, bits, direct, m); err != nil {
 			fmt.Fprintf(os.Stderr, "repack cache not written: %v\n", err)
-		} else if m2, err := loadWeightCache(cpath, path, bits, direct, cfg, headSz); err == nil {
+		} else if m2, err := loadWeightCache(cpath, path, g, bits, direct, cfg, headSz, hspec); err == nil {
 			fmt.Fprintf(os.Stderr, "repack cache written: %s\n", cpath)
+			m2.layout, m2.bits = m.layout, m.bits
 			m = m2
 			debug.FreeOSMemory()
 		}
 	}
 	return m, tok, nil
+}
+
+// qwen35Config reads what a Qwen3.5 gguf says about its linear-attention
+// layers, in the ssm.* keys llama.cpp's converter borrowed from Mamba:
+// group_count is the key heads, time_step_rank the value heads,
+// state_size the key width, inner_size the value width times its heads.
+// Which layers are linear follows full_attention_interval, every
+// interval-th layer attending; the tensors say the same, and are
+// believed when they disagree.
+func qwen35Config(g *gguf.File, cfg *config) error {
+	meta := func(key string) int {
+		n, _ := g.Int("qwen35." + key)
+		return int(n)
+	}
+	cfg.ModelType = "qwen3_5"
+	cfg.LinearKeyHeads = meta("ssm.group_count")
+	cfg.LinearValueHeads = meta("ssm.time_step_rank")
+	cfg.LinearKeyDim = meta("ssm.state_size")
+	cfg.LinearConvK = meta("ssm.conv_kernel")
+	if cfg.LinearKeyHeads == 0 || cfg.LinearValueHeads == 0 || cfg.LinearKeyDim == 0 || cfg.LinearConvK == 0 {
+		return errors.New("gguf is missing qwen35.ssm.* dimensions")
+	}
+	cfg.LinearValueDim = meta("ssm.inner_size") / cfg.LinearValueHeads
+	interval := meta("full_attention_interval")
+	cfg.LayerTypes = make([]string, cfg.Layers)
+	for i := range cfg.LayerTypes {
+		linear := interval > 0 && (i+1)%interval != 0
+		if _, _, ok := g.Info(fmt.Sprintf("blk.%d.ssm_out.weight", i)); ok {
+			linear = true
+		} else if _, _, ok := g.Info(fmt.Sprintf("blk.%d.attn_q.weight", i)); ok {
+			linear = false
+		}
+		cfg.LayerTypes[i] = map[bool]string{true: "linear_attention", false: "full_attention"}[linear]
+	}
+	// The query projection carries the attention gate beside the queries
+	// when it is twice as wide as they are.
+	for i := range cfg.LayerTypes {
+		if cfg.LayerTypes[i] == "full_attention" {
+			if _, shape, ok := g.Info(fmt.Sprintf("blk.%d.attn_q.weight", i)); ok {
+				cfg.AttnOutputGate = shape[0] == 2*cfg.Heads*cfg.HeadDim
+			}
+			break
+		}
+	}
+	return nil
+}
+
+// newDeltaHeader is a gguf delta layer's geometry, before its weights:
+// what the config says, with the value heads in the tiled order a
+// converter leaves them in whenever they outnumber the key heads.
+func newDeltaHeader(cfg config) *deltaWeights {
+	return &deltaWeights{
+		heads:   cfg.LinearValueHeads,
+		kHeads:  cfg.LinearKeyHeads,
+		tiled:   cfg.LinearKeyHeads != cfg.LinearValueHeads,
+		kDim:    cfg.LinearKeyDim,
+		vDim:    cfg.LinearValueDim,
+		convK:   cfg.LinearConvK,
+		convDim: cfg.LinearKeyHeads*cfg.LinearKeyDim*2 + cfg.LinearValueHeads*cfg.LinearValueDim,
+	}
+}
+
+// loadDeltaGGUF reads a linear-attention layer from a gguf. The names are
+// llama.cpp's: attn_qkv fuses q, k and v, attn_gate is z, ssm_alpha and
+// ssm_beta the decay and write projections, and ssm_a holds -exp(A_log)
+// rather than A_log itself. A converter tiles the value heads whenever
+// there are more of them than key heads, and the layer reads them that
+// way rather than the weights being put back.
+func loadDeltaGGUF(cfg config, p string, tensor func(string) *tensai.Tensor,
+	trans func(string, int) *tensai.Matrix,
+	linAuto func([]string, []int) (*tensai.Matrix, *qmat)) *deltaWeights {
+	d := newDeltaHeader(cfg)
+	d.dtBias = tensor(p + "ssm_dt.bias").Data
+	d.norm = tensor(p + "ssm_norm.weight").Data
+	d.conv = tensor(p + "ssm_conv1d.weight").Data
+	a := tensor(p + "ssm_a").Data
+	d.aLog = make([]float32, len(a))
+	for i, v := range a {
+		d.aLog[i] = float32(math.Log(float64(-v)))
+	}
+	d.wQKV, d.qQKV = linAuto([]string{p + "attn_qkv.weight"}, []int{0})
+	d.wZ, d.qZ = linAuto([]string{p + "attn_gate.weight"}, []int{0})
+	d.wOut, d.qOut = linAuto([]string{p + "ssm_out.weight"}, []int{0})
+	d.wA = trans(p+"ssm_alpha.weight", 0)
+	d.wB = trans(p+"ssm_beta.weight", 0)
+	d.wQZ, d.qQZ = linAuto([]string{p + "attn_qkv.weight", p + "attn_gate.weight"}, []int{0, 0})
+	d.wAB = hcat([]*tensai.Matrix{d.wA, d.wB})
+	if err := d.check(); err != nil {
+		panic(err)
+	}
+	return d
 }

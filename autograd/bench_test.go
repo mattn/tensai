@@ -1,7 +1,7 @@
 package autograd
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -26,8 +26,8 @@ func benchModel(rng *rand.Rand) (params []*Node, loss func() *Node) {
 	tokens := make([]int, batch*seq)
 	labels := make([]int, batch*seq)
 	for i := range tokens {
-		tokens[i] = rng.Intn(vocab)
-		labels[i] = rng.Intn(vocab)
+		tokens[i] = rng.IntN(vocab)
+		labels[i] = rng.IntN(vocab)
 	}
 	loss = func() *Node {
 		x := embed.Embed(tokens, batch, seq).LayerNorm(nil, nil, 1e-5)
@@ -39,7 +39,7 @@ func benchModel(rng *rand.Rand) (params []*Node, loss func() *Node) {
 }
 
 func BenchmarkStep(b *testing.B) {
-	params, loss := benchModel(rand.New(rand.NewSource(1)))
+	params, loss := benchModel(rand.New(rand.NewPCG(1, 0)))
 	trainer := NewTrainer(optim.NewAdam(0.01), params...)
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -50,7 +50,7 @@ func BenchmarkStep(b *testing.B) {
 
 // BenchmarkStepTaped is the same step with the buffers recycled.
 func BenchmarkStepTaped(b *testing.B) {
-	params, loss := benchModel(rand.New(rand.NewSource(1)))
+	params, loss := benchModel(rand.New(rand.NewPCG(1, 0)))
 	trainer := NewTrainer(optim.NewAdam(0.01), params...)
 	tape := NewTape()
 	tape.Bind(params...)

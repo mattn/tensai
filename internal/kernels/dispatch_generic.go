@@ -16,6 +16,8 @@ func SigmoidFwd(dst, src []float32)              { sigmoidFwdGeneric(dst, src) }
 func SiluMul(gate, up []float32)                 { siluMulGeneric(gate, up) }
 func GeluMul(gate, up []float32)                 { geluMulGeneric(gate, up) }
 func Silu(v []float32)                           { siluGeneric(v) }
+func MulSigmoid(dst, src []float32)              { mulSigmoidGeneric(dst, src) }
+func SwigluOAI(gate, up []float32)               { swigluOAIGeneric(gate, up) }
 func SigmoidBwd(dst, grad, y []float32)          { sigmoidBwdGeneric(dst, grad, y) }
 func TanhFwd(dst, src []float32)                 { tanhFwdGeneric(dst, src) }
 func TanhBwd(dst, grad, y []float32)             { tanhBwdGeneric(dst, grad, y) }
@@ -56,4 +58,15 @@ func AxpyRows(out, ws []float32, rows [][]float32, off int) {
 	for i, w := range ws {
 		axpyGeneric(w, rows[i][off:off+len(out)], out)
 	}
+}
+
+// Hadamard is the Walsh-Hadamard transform of v in place, times scale.
+func Hadamard(v []float32, scale float32) { hadamardGeneric(v, scale) }
+
+// DecayRead scales row by decay and adds k times it into mem.
+func DecayRead(row []float32, decay, k float32, mem []float32) { decayReadGeneric(row, decay, k, mem) }
+
+// WriteRead adds k times delta into row and q times the result into out.
+func WriteRead(row, delta []float32, k, q float32, out []float32) {
+	writeReadGeneric(row, delta, k, q, out)
 }

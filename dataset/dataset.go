@@ -2,7 +2,7 @@ package dataset
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"sort"
 
 	"github.com/mattn/tensai"
@@ -42,7 +42,7 @@ func (d *Dataset) Shuffle(rng *rand.Rand) {
 	tmpIn := make([]tensai.Float, inCols)
 	tmpTgt := make([]tensai.Float, tgtCols)
 	for i := d.Len() - 1; i > 0; i-- {
-		j := rng.Intn(i + 1)
+		j := rng.IntN(i + 1)
 		if i == j {
 			continue
 		}

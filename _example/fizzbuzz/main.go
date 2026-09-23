@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/dataset"
@@ -101,7 +101,7 @@ func main() {
 		epochs    = 40
 		batchSize = 128
 	)
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	ds, err := dataset.New(trainIn, trainTgt)
 	if err != nil {
 		panic(err)

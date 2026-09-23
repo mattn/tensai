@@ -19,6 +19,7 @@ import (
 	"unsafe"
 
 	tensai "github.com/mattn/tensai"
+	"github.com/mattn/tensai/encoding/gguf"
 	"github.com/mattn/tensai/internal/mmapfile"
 	"github.com/mattn/tensai/quant"
 )
@@ -27,8 +28,13 @@ const cacheMagic = "TSAICCH\x00"
 
 // cacheFormat names the serialized layouts and the walk order; bump it
 // whenever either changes so stale caches rewrite instead of decoding
-// garbage.
-const cacheFormat = 2
+// garbage. 3: gemma3's embedding table is cached unscaled, the way
+// gemma4's always was, so a format-2 gemma3 cache would be scaled twice.
+// 4: a delta layer's weights follow its block's, a ternary matrix is a
+// record, and a quantized weight records the rotation its input takes.
+// 5: the embedding table is left in the gguf and read a row at a time,
+// so it is no longer in the cache.
+const cacheFormat = 5
 
 // Record kinds, one per weight representation the model can hold.
 const (
@@ -40,6 +46,7 @@ const (
 	kindQ4
 	kindQ8G
 	kindMX
+	kindT
 )
 
 var errCacheCorrupt = errors.New("repack cache is truncated or corrupt")
@@ -48,6 +55,10 @@ func cachePath(gguf string, bits int, direct bool) string {
 	mode := fmt.Sprintf("q%d", bits)
 	if !direct {
 		mode += "r"
+	}
+	if bits == 0 {
+		// A ternary file has no width; its one layout is its own.
+		mode = "ternary"
 	}
 	return gguf + ".tensai-" + mode + ".cache"
 }
@@ -126,6 +137,25 @@ func walkWeights(m *qwen, c weightCodec) {
 			c.qmat(&x.qDown)
 			c.vec(&x.guBias)
 			c.vec(&x.downBias)
+		}
+		// A delta layer's header (its head geometry) comes from the
+		// config; the reader has built it before walking.
+		if d := b.delta; d != nil {
+			c.vec(&d.conv)
+			c.vec(&d.aLog)
+			c.vec(&d.dtBias)
+			c.vec(&d.norm)
+			c.mat(&d.wQKV)
+			c.qmat(&d.qQKV)
+			c.mat(&d.wZ)
+			c.qmat(&d.qZ)
+			c.mat(&d.wOut)
+			c.qmat(&d.qOut)
+			c.mat(&d.wA)
+			c.mat(&d.wB)
+			c.mat(&d.wQZ)
+			c.qmat(&d.qQZ)
+			c.mat(&d.wAB)
 		}
 	}
 }
@@ -220,9 +250,21 @@ func (w *cacheWriter) tensor(p **tensai.Tensor) {
 
 func (w *cacheWriter) qmat(p **qmat) {
 	q := *p
+	if q != nil {
+		// The rotation is rebuilt from the source's declaration on
+		// the way back; only which kind it was is recorded, after the
+		// record kind.
+		defer func() { w.u64(uint64(q.rot)) }()
+	}
 	switch {
 	case q == nil:
 		w.u64(kindNil)
+	case q.t != nil:
+		w.u64(kindT)
+		w.u64(uint64(q.t.Rows))
+		w.u64(uint64(q.t.Cols))
+		w.blob(bytesOf(q.t.Q))
+		w.blob(bytesOf(q.t.Scale))
 	case q.q8 != nil:
 		w.u64(kindQ)
 		w.u64(uint64(q.q8.Rows))
@@ -262,6 +304,9 @@ type cacheReader struct {
 	b   []byte
 	off int
 	err error
+	// rotate rebuilds a quantized weight's input transform from the
+	// kind the writer recorded; nil when the source declares none.
+	rotate func(q *qmat, rot int)
 }
 
 func (r *cacheReader) take(n int) []byte {
@@ -339,8 +384,29 @@ func (r *cacheReader) tensor(p **tensai.Tensor) {
 }
 
 func (r *cacheReader) qmat(p **qmat) {
-	switch r.u64() {
+	// The rotation kind follows every record but a nil one.
+	k := r.u64()
+	defer func() {
+		if k == kindNil || r.err != nil {
+			return
+		}
+		rot := r.num()
+		if rot == rotNone {
+			return
+		}
+		if r.rotate == nil {
+			r.err = errors.New("repack cache holds a rotated weight but the source declares no rotation")
+			return
+		}
+		r.rotate(*p, rot)
+	}()
+	switch k {
 	case kindNil:
+	case kindT:
+		q := &quant.TernaryMatrix{Rows: r.num(), Cols: r.num()}
+		q.Q = sliceOf[uint8](r.blob())
+		q.Scale = sliceOf[float32](r.blob())
+		*p = qmatT(q)
 	case kindQ:
 		q := &quant.QMatrix{Rows: r.num(), Cols: r.num()}
 		q.Q = sliceOf[int8](r.blob())
@@ -370,16 +436,35 @@ func (r *cacheReader) qmat(p **qmat) {
 	}
 }
 
-// cacheFiles pins the mmap'd cache files' descriptors for the life of
-// the process, so the finalizer on os.File never closes one under a
-// live mapping.
-var cacheFiles []*os.File
+// cacheFiles pins the mmap'd cache files for the life of the process,
+// so the finalizer on os.File never closes one under a live mapping.
+// Each entry keeps the unmap alongside the descriptor for
+// releaseWeightCaches, which a test calls once its model is gone:
+// Windows will not delete a file that is still mapped.
+var cacheFiles []cacheFile
+
+type cacheFile struct {
+	f     *os.File
+	unmap func() error
+}
+
+// releaseWeightCaches unmaps and closes every cache file loaded so far.
+// The models built from them must be dead by then; only tests, which
+// build a model in a temporary directory and then remove it, have a
+// moment where that is known.
+func releaseWeightCaches() {
+	for _, c := range cacheFiles {
+		c.unmap()
+		c.f.Close()
+	}
+	cacheFiles = nil
+}
 
 // loadWeightCache maps cpath and rebuilds the model's weights from it.
 // Any error means the caller should do the normal load (and rewrite
 // the cache); a stale or corrupt file is reported, a missing one is
 // just os.IsNotExist.
-func loadWeightCache(cpath, src string, bits int, direct bool, cfg config, headSz int) (*qwen, error) {
+func loadWeightCache(cpath, src string, g *gguf.File, bits int, direct bool, cfg config, headSz int, hspec *hadamardSpec) (*qwen, error) {
 	st, err := os.Stat(src)
 	if err != nil {
 		return nil, err
@@ -393,6 +478,10 @@ func loadWeightCache(cpath, src string, bits int, direct bool, cfg config, headS
 		f.Close()
 		return nil, err
 	}
+	// The first token sweeps every weight, so the pages are wanted now,
+	// and mapped in bulk they arrive several times faster than faulted
+	// in one by one under the kernels.
+	mmapfile.Populate(data)
 	bad := func(err error) (*qwen, error) {
 		closer()
 		f.Close()
@@ -410,14 +499,48 @@ func loadWeightCache(cpath, src string, bits int, direct bool, cfg config, headS
 	m.blocks = make([]qblock, cfg.Layers)
 	for i := range m.blocks {
 		blockShape(&m.blocks[i], cfg, i)
+		if cfg.linearLayer(i) {
+			m.blocks[i].delta = newDeltaHeader(cfg)
+		}
 	}
 	r := &cacheReader{b: data, off: 64}
+	if hspec != nil {
+		r.rotate = func(q *qmat, rot int) {
+			h, err := hspec.forWidth(q.rows())
+			if err != nil {
+				r.err = err
+				return
+			}
+			if rot == rotGrouped {
+				h.perm = tiledToGrouped(cfg.LinearValueDim, cfg.LinearKeyHeads, cfg.LinearValueHeads/cfg.LinearKeyHeads)
+			}
+			q.rotate(h, rot)
+		}
+	}
 	walkWeights(m, r)
 	if r.err != nil {
 		return bad(r.err)
 	}
 	if r.off != len(data) {
 		return bad(errCacheCorrupt)
+	}
+	for i := range m.blocks {
+		if d := m.blocks[i].delta; d != nil {
+			if err := d.check(); err != nil {
+				return bad(err)
+			}
+		}
+	}
+	// The embedding table is never in the cache: it is read from the
+	// source a row at a time. (A cache from before that holds one, and
+	// it is simply not used.)
+	if m.embed == nil {
+		m.embedRows = newEmbedTable(g, "token_embd.weight")
+		if hspec != nil && hspec.inverses["token_embd.weight"] {
+			if m.embedRows.inverse, err = hspec.forWidth(cfg.HiddenSize); err != nil {
+				return bad(err)
+			}
+		}
 	}
 	// The per-layer embedding table is never copied into the cache: it
 	// is the largest tensor in the file and a step reads one row of it,
@@ -428,7 +551,7 @@ func loadWeightCache(cpath, src string, bits int, direct bool, cfg config, headS
 		}
 	}
 	m.initRopeFreqs()
-	cacheFiles = append(cacheFiles, f)
+	cacheFiles = append(cacheFiles, cacheFile{f, closer})
 	return m, nil
 }
 

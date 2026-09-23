@@ -17,7 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"os/signal"
 	"strconv"
@@ -55,7 +55,7 @@ func buildCPPN(seed int64, gain float32) *model.Sequential {
 	if err := model.Compile(features, loss.MeanSquaredError{}, optim.NewSGD(0, 0)); err != nil {
 		panic(err)
 	}
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(uint64(seed), 0))
 	for _, d := range denses {
 		w, _ := d.Params()
 		scale := gain / float32(math.Sqrt(float64(w.Rows)))

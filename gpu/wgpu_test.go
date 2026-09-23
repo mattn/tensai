@@ -4,7 +4,7 @@ package gpu
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -26,7 +26,7 @@ func TestGPUMatMul(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
 
-	rng := rand.New(rand.NewSource(7))
+	rng := rand.New(rand.NewPCG(7, 0))
 	cases := [][2][]int{
 		{{3, 4}, {4, 5}},
 		{{2, 3, 4}, {2, 4, 5}},
@@ -95,7 +95,7 @@ func TestGPUAdapterSelection(t *testing.T) {
 func TestGPUTensorResident(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(11))
+	rng := rand.New(rand.NewPCG(11, 0))
 
 	// A weight uploaded once serves several MatMuls without re-upload.
 	w := randTensor(rng, 64, 32)
@@ -141,7 +141,7 @@ func TestGPUTensorResident(t *testing.T) {
 func TestGPUTensorChain(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(12))
+	rng := rand.New(rand.NewPCG(12, 0))
 
 	// (a @ b) @ c entirely on the Device: the intermediate never touches the
 	// host.
@@ -227,7 +227,7 @@ func cpuSoftmaxLast(x *tensai.Tensor) {
 func TestGPUKernels(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(15))
+	rng := rand.New(rand.NewPCG(15, 0))
 
 	// MatMulT against MatMul on a materialized transpose, batched.
 	a, b := randTensor(rng, 3, 5, 8), randTensor(rng, 3, 7, 8)
@@ -308,7 +308,7 @@ func TestGPUKernels(t *testing.T) {
 func TestGPUAttention(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(16))
+	rng := rand.New(rand.NewPCG(16, 0))
 
 	// Batched single-head attention entirely on the Device vs the same math
 	// on the CPU tensor ops.
@@ -377,7 +377,7 @@ func cpuAttention(t *testing.T, q, k, v *tensai.Tensor) *tensai.Tensor {
 func TestGPUMultiHeadAttention(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(17))
+	rng := rand.New(rand.NewPCG(17, 0))
 
 	const batch, seq, seqKV, heads, dh = 2, 5, 7, 3, 4
 	const d = heads * dh
@@ -508,7 +508,7 @@ func cpuCausalAttention(t *testing.T, q, k, v *tensai.Tensor) *tensai.Tensor {
 func TestGPUCausalAttention(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(19))
+	rng := rand.New(rand.NewPCG(19, 0))
 
 	// Prefill shape: seqQ == seqKV, single head.
 	q, k, v := randTensor(rng, 6, 8), randTensor(rng, 6, 8), randTensor(rng, 6, 8)
@@ -569,7 +569,7 @@ func TestGPUCausalAttention(t *testing.T) {
 func TestGPUCausalMultiHead(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(20))
+	rng := rand.New(rand.NewPCG(20, 0))
 
 	const seq, seqKV, heads, dh = 5, 9, 3, 4
 	const d = heads * dh
@@ -615,7 +615,7 @@ func TestGPUCausalMultiHead(t *testing.T) {
 func TestGPUDispatch2D(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(18))
+	rng := rand.New(rand.NewPCG(18, 0))
 
 	// 70000 rows exceed the 65535 single-axis dispatch limit, exercising
 	// the 2-D workgroup grid in softmax.
@@ -666,7 +666,7 @@ func TestGPUMatMulLarge(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
 
-	rng := rand.New(rand.NewSource(8))
+	rng := rand.New(rand.NewPCG(8, 0))
 	a, b := randTensor(rng, 8, 64, 96), randTensor(rng, 8, 96, 80)
 	got, err := g.MatMul(a, b)
 	if err != nil {
@@ -688,7 +688,7 @@ func TestGPUQ8MatMul(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
 
-	rng := rand.New(rand.NewSource(61))
+	rng := rand.New(rand.NewPCG(61, 0))
 	for _, c := range []struct{ m, rows, cols int }{
 		{1, 256, 512},
 		{3, 64, 33},   // cols not a multiple of 4: guarded tail
@@ -776,7 +776,7 @@ func TestGPUQ8MatMul(t *testing.T) {
 func TestGPUWindowedAttention(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(73))
+	rng := rand.New(rand.NewPCG(73, 0))
 
 	const heads, kvHeads, dh = 2, 1, 8
 	const d, kvDim = heads * dh, kvHeads * dh
@@ -860,7 +860,7 @@ func BenchmarkGPUQ8GEMM(b *testing.B) {
 	if !g.IntDot() {
 		b.Skip("no integer dot")
 	}
-	rng := rand.New(rand.NewSource(63))
+	rng := rand.New(rand.NewPCG(63, 0))
 	w := tensai.RandomMatrix(4864, 896, rng)
 	gq, err := g.UploadQ8(quant.Quantize(w))
 	if err != nil {
@@ -889,7 +889,7 @@ func BenchmarkGPUQ8MatVec(b *testing.B) {
 		b.Skipf("wgpu unavailable: %v", err)
 	}
 	defer g.Close()
-	rng := rand.New(rand.NewSource(62))
+	rng := rand.New(rand.NewPCG(62, 0))
 	w := tensai.RandomMatrix(2048, 8192, rng)
 	gq, err := g.UploadQ8(quant.Quantize(w))
 	if err != nil {
@@ -918,7 +918,7 @@ func BenchmarkGPUF32MatVec(b *testing.B) {
 		b.Skipf("wgpu unavailable: %v", err)
 	}
 	defer g.Close()
-	rng := rand.New(rand.NewSource(62))
+	rng := rand.New(rand.NewPCG(62, 0))
 	wt := randTensor(rng, 2048, 8192)
 	gw, err := g.Upload(wt)
 	if err != nil {
@@ -944,7 +944,7 @@ func BenchmarkGPUF32MatVec(b *testing.B) {
 func TestGPUDecodeOps(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(71))
+	rng := rand.New(rand.NewPCG(71, 0))
 
 	// RMSNorm against the scalar definition.
 	x := randTensor(rng, 3, 64)
@@ -1086,7 +1086,7 @@ func TestGPUDecodeOps(t *testing.T) {
 func TestGPUGroupedCausalAttention(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
-	rng := rand.New(rand.NewSource(72))
+	rng := rand.New(rand.NewPCG(72, 0))
 
 	const heads, kvHeads, dh = 4, 2, 8
 	const d, kvDim = heads * dh, kvHeads * dh
@@ -1174,7 +1174,7 @@ func TestGPUQ4MatMul(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
 
-	rng := rand.New(rand.NewSource(63))
+	rng := rand.New(rand.NewPCG(63, 0))
 	for _, c := range []struct{ m, rows, cols int }{
 		{1, 256, 512}, // multiple full groups
 		{3, 100, 33},  // partial final group, guarded column tail
@@ -1251,7 +1251,7 @@ func TestGPUMatMulTN(t *testing.T) {
 	g := openTestGPU(t)
 	defer g.Close()
 
-	rng := rand.New(rand.NewSource(23))
+	rng := rand.New(rand.NewPCG(23, 0))
 	cases := [][2][]int{
 		{{4, 3}, {4, 5}},       // (3,4)^T-shaped weight gradient
 		{{2, 4, 3}, {2, 4, 5}}, // batched

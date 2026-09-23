@@ -31,7 +31,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"time"
 
@@ -113,7 +113,7 @@ func timeOp(fn func() error) (time.Duration, error) {
 // that consumes its final output on the host; only repeated input uploads are
 // removed. The first calls warm the driver's caches and are not timed.
 func measure(gpu *gpu.Device, s shape, reps int) (transferTime, residentTime, cpuTime time.Duration, diff float64, err error) {
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	a := randTensor(rng, s.batch, s.m, s.k)
 	w := randTensor(rng, s.k, s.n)
 

@@ -2,7 +2,7 @@ package model
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -39,7 +39,7 @@ func TestGraphMatchesPredict(t *testing.T) {
 				t.Fatal(err)
 			}
 			return net
-		}, randMatrix(rand.New(rand.NewSource(1)), 4, 5)},
+		}, randMatrix(rand.New(rand.NewPCG(1, 0)), 4, 5)},
 		{"conv", func() *Sequential {
 			net := NewSequential()
 			net.Add(layer.NewConv2D(4, 3, 1, 1))
@@ -50,7 +50,7 @@ func TestGraphMatchesPredict(t *testing.T) {
 				t.Fatal(err)
 			}
 			return net
-		}, randMatrix(rand.New(rand.NewSource(2)), 3, 2*8*8)},
+		}, randMatrix(rand.New(rand.NewPCG(2, 0)), 3, 2*8*8)},
 	}
 	for _, tc := range cases {
 		net := tc.build()
@@ -78,7 +78,7 @@ func TestGraphMatchesPredict(t *testing.T) {
 // model itself learned: the parameters are the layers' own buffers, so
 // Predict sees the result without any copying.
 func TestGraphTrainsTheModel(t *testing.T) {
-	rng := rand.New(rand.NewSource(7))
+	rng := rand.New(rand.NewPCG(7, 0))
 	inputs, err := tensai.NewMatrixFromSlice(4, 2, []tensai.Float{0, 0, 0, 1, 1, 0, 1, 1})
 	if err != nil {
 		t.Fatal(err)
@@ -136,11 +136,11 @@ func TestGraphTrainsTheModel(t *testing.T) {
 // backward: the ids arrive as an ordinary matrix of whole numbers and the
 // gradient scatters back into the rows they named.
 func TestGraphEmbedding(t *testing.T) {
-	rng := rand.New(rand.NewSource(17))
+	rng := rand.New(rand.NewPCG(17, 0))
 	const vocab, dim, batch, tokens = 6, 4, 3, 5
 	ids := tensai.NewMatrix(batch, tokens)
 	for i := range ids.Data {
-		ids.Data[i] = tensai.Float(rng.Intn(vocab))
+		ids.Data[i] = tensai.Float(rng.IntN(vocab))
 	}
 	ids.Data[1] = ids.Data[0] // a repeat, so the scatter has to accumulate
 
@@ -184,7 +184,7 @@ func TestGraphEmbedding(t *testing.T) {
 // pass-through at inference, and about the right fraction of survivors
 // scaled to keep the expected value during training.
 func TestGraphDropout(t *testing.T) {
-	rng := rand.New(rand.NewSource(11))
+	rng := rand.New(rand.NewPCG(11, 0))
 	x := randMatrix(rng, 64, 32)
 
 	net := NewSequential()
@@ -226,7 +226,7 @@ func TestGraphDropout(t *testing.T) {
 // for: the same output, the same gradients, and the same running
 // estimates after a step.
 func TestGraphBatchNorm(t *testing.T) {
-	rng := rand.New(rand.NewSource(13))
+	rng := rand.New(rand.NewPCG(13, 0))
 	x := randMatrix(rng, 8, 5)
 	upstream := randMatrix(rng, 8, 5)
 

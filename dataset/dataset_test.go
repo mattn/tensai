@@ -2,7 +2,7 @@ package dataset
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -27,7 +27,7 @@ func makeDataset(t *testing.T, n int) *Dataset {
 
 func TestDatasetShuffleKeepsRowsPaired(t *testing.T) {
 	ds := makeDataset(t, 50)
-	ds.Shuffle(rand.New(rand.NewSource(97)))
+	ds.Shuffle(rand.New(rand.NewPCG(97, 0)))
 	seen := map[int]bool{}
 	for i := 0; i < ds.Len(); i++ {
 		id := int(ds.Targets.Data[i])
@@ -101,7 +101,7 @@ func TestDatasetBatches(t *testing.T) {
 
 	// Shuffled epochs visit each sample at most once.
 	seen := map[int]int{}
-	if err := ds.Batches(5, rand.New(rand.NewSource(3)), func(in, tgt *tensai.Matrix) error {
+	if err := ds.Batches(5, rand.New(rand.NewPCG(3, 0)), func(in, tgt *tensai.Matrix) error {
 		for i := 0; i < tgt.Rows; i++ {
 			seen[int(tgt.Data[i])]++
 		}
@@ -119,7 +119,7 @@ func TestDatasetBatches(t *testing.T) {
 }
 
 func TestDatasetStandardize(t *testing.T) {
-	rng := rand.New(rand.NewSource(101))
+	rng := rand.New(rand.NewPCG(101, 0))
 	in := tensai.NewMatrix(200, 2)
 	for i := range in.Data {
 		in.Data[i] = tensai.Float(rng.NormFloat64()*3 + 5)

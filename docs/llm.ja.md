@@ -18,13 +18,13 @@ greedy の続きは GPT-2 のよく知られたリファレンス出力とトー
 
 ## Qwen とその仲間たち: 10 のモデルファミリー
 
-`tensai` コマンドは現代の instruction-tuned モデルを動かします: RMSNorm、RoPE、grouped-query attention、SwiGLU MLP。safetensors から (config.json が次元を決め、シャーディングされたチェックポイントは index.json 経由) でも、config・トークナイザ・重みを 1 ファイルに収めた llama.cpp の GGUF からでもロードできます。1 つのランタイムが 10 のアーキテクチャを話します:
+`tensai` コマンドは現代の instruction-tuned モデルを動かします: RMSNorm、RoPE、grouped-query attention、SwiGLU MLP。safetensors から (config.json が次元を決め、シャーディングされたチェックポイントは index.json 経由) でも、config・トークナイザ・重みを 1 ファイルに収めた llama.cpp の GGUF からでもロードできます。1 つのランタイムが 11 のアーキテクチャを話します:
 
 | ファミリー | モデル | 何が加わるか |
 |---|---|---|
 | qwen2 | Qwen 1.5/2/2.5, Qwen2.5-Coder, R1-Distill-Qwen 系 | attention バイアス |
 | qwen3 | Qwen3 dense | ヘッドごとの QK-norm、明示的 head_dim、`-think` |
-| qwen3_5 | Qwen3.5 / 3.6 / 3.8 | 4 層に 3 層が gated delta rule、残り 1 層が通常の attention。正規化は 1 + w、RoPE はヘッドの 1/4 だけ回し、クエリが attention 出力のゲートを連れる。CPU のみ、`-draft` 不可 |
+| qwen3_5 | Qwen3.5 / 3.6 / 3.8 | 4 層に 3 層が gated delta rule、残り 1 層が通常の attention。正規化は 1 + w、RoPE はヘッドの 1/4 だけ回し、クエリが attention 出力のゲートを連れる。大きいものは 1 つの key head を複数の value head で共有する。CPU のみ、`-draft` 不可 |
 
 `qwen3_5` のプレフィルは、モデルの大きさから想像するより高くつきます。delta 層は
 状態をトークンごとに引き継ぐので、バッチが効くのは再帰の周りの射影だけで、長い
@@ -39,6 +39,7 @@ greedy の続きは GPT-2 のよく知られたリファレンス出力とトー
 | phi3 | Phi-3/3.5-mini | q/k/v と gate/up が融合済みで配布 |
 | qwen2moe / qwen3moe | Qwen1.5-MoE-A2.7B, Qwen3-30B-A3B | top-k ルーティングのエキスパート、qwen2moe は共有エキスパートも |
 | gpt-oss | gpt-oss-20b | MXFP4 エキスパート、attention sinks、YaRN rope、harmony チャンネル |
+| k2-horizon | K2-Horizon-7B | 行を 4 グループに分けて取る RMSNorm、結合文字と ZWJ を語に含める分割、512K の文脈。GGUF のみ、CPU のみ |
 
 密モデルの 12b はまた別で、per-layer embedding を持たず、KV ヘッド数を層ごとに宣言し (ローカル層 8、グローバル層 1)、狭くなる層には V の射影がありません。その層は K を V として使います。最後の 1 点だけ GPU デコードは対象外です。
 
@@ -63,17 +64,46 @@ The capital of France is Paris.
 
 ## 量子化ロード
 
-`-q8`/`-q4` では各重みがロードと同時に量子化され、float32 コピーは即座に破棄されます。フル精度のモデルがメモリに収まる必要はありません。量子化済み GGUF チェックポイントは float32 の回り道を完全にスキップします: Q8_0, Q4_0, Q5_0, Q4_K/Q5_K/Q6_K の K-quant 系、MXFP4 がメモリマップしたファイルから直接リパックされ、llama.cpp 自身の量子化がそのまま保たれます。1.5B の Q4_K_M は約 8 秒が約 3 秒に、3B の Q8_0 は 32 秒が 5 秒で開きます (`-requant` は float 経由に戻し、ずっと遅いロードと引き換えにデコードが約 10% 速くなります)。
+`-q8` も `-q4` も付けなければローダが幅を自分で選びます。ファイルが持つ精度が上限で (Q4_K のような int4 ブロックは int4 にそのままリパックでき int8 にしても得るものがない、Q8_0 や Q5_K/Q6_K や float のチェックポイントは int8 でないと精度を保てない)、int8 がマシンの空きメモリ (重み + 表ぶん 1/4 + 0.5GB) に収まらないときはスワップするより int4 に落とします。`-v` がどちらをなぜ選んだかを言い、`-f32` は float32 の重みを明示的に頼みます。`-q8`/`-q4` では各重みがロードと同時に量子化され、float32 コピーは即座に破棄されます。フル精度のモデルがメモリに収まる必要はありません。量子化済み GGUF チェックポイントは float32 の回り道を完全にスキップします: Q8_0, Q4_0, Q5_0, Q4_K/Q5_K/Q6_K の K-quant 系、MXFP4、PrismML の三値 PTQ1_0/PQ2_0 がメモリマップしたファイルから直接リパックされ、llama.cpp 自身の量子化がそのまま保たれます。1.5B の Q4_K_M は約 8 秒が約 3 秒に、3B の Q8_0 は 32 秒が 5 秒で開きます (`-requant` は float 経由に戻し、ずっと遅いロードと引き換えにデコードが約 10% 速くなります)。
 
 最初の `.gguf` ロードはリパック済みの重みをモデルの隣のキャッシュファイルに書き (`-nocache` でオプトアウト)、以後のロードはそれをメモリマップするだけです: 1.5B Q4_K_M は約 0.3 秒で、Mistral 7B は 1 秒未満で、gpt-oss-20b は 2 秒未満で再オープンします。マップされた重みはカーネルがいつでも破棄・再読込できるクリーンなファイルバックのページなので、モデルがぎりぎり収まるマシンではスワップのスラッシングが普通のページキャッシュの挙動に置き換わります。
 
 15GB のマシンでの階段はこうなります: 0.5B が `-q8` で約 40 tok/s、1.5B Q4_K_M が `-q4` で約 25 tok/s (タイル化整数カーネル、ネイティブ Windows)、そして Qwen2.5-**7B**-Instruct — 15GB の BF16 シャードを 2 分のロード中にオンザフライで int4 量子化して常駐約 6GB に — が 3.5 tok/s で正しく答えます。
+
+### 三値の重み
+
+PrismML の Bonsai (`Ternary-Bonsai-2-27B`、Qwen3.8-27B ベース) は全重みを -1, 0, +1 の
+三値で持ち、128 個ごとに f16 のスケールを 1 つ添えます。エンコードは独自の 2 種で、素の
+llama.cpp は読めません: `PTQ1_0` は trit を 1 バイトに 5 つ詰め (27B で 5.95 GB)、`PQ2_0` は
+2 ビットのスロットに 1 つずつ置きます (7.21 GB)。どちらも 1 重み 2 ビットの三値レイアウトに
+リパックされ、27B が 8 GB 未満でデコードできます。幅の選択はありません。`-q8` や `-q4` は
+受け付けますが無視されます (量子化するものがないので)。
+
+```bash
+tensai run -model prism-ml/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf "What is the capital of France?"
+```
+
+重みは回転した基底に置かれています。各行列は丸める前に、入力次元に沿ってブロック単位の
+Walsh-Hadamard 変換 (固定の符号反転つき) を掛けられていて、これが活性のエネルギーをブロック
+全体に均し、3 段階で足りる理由です。ファイルは `prism.hadamard.*` でそれを宣言し、ローダは
+その行列が読む活性すべてに同じ変換を、引いた埋め込み行には逆変換を適用します。ローダの知らない
+変換を宣言するファイルは、ノイズを吐く代わりに拒否されます。埋め込みテーブルはファイルに
+置いたまま 1 行ずつ読みます。回転済みの 25 万行を展開すると数 GB になるからです。
+
+三値カーネルはコードを積和の符号なし側、活性を符号つき側として読むので、必要な補正は
+グループの活性の和 1 つで、全列に共通です。列ごとの補正表を重みの隣に流す必要がありません。
+Ryzen 7735HS で 27B はプレフィル約 6 tok/s、デコード 3.4 tok/s で、これはメモリ帯域そのもの
+です (1 トークンあたり約 28 GB/s の重み読み)。試したプロンプトでは PrismML の llama.cpp ビルドと
+トークン単位で一致します。初回ロードは 270 億個の重みのリパックに 1 分ほどかけてリパック
+キャッシュ (モデルの隣に 8.5 GB) を書き、以後のロードは 1 秒未満でそれをマップします。
+他の qwen3_5 と同じく CPU で走ります。
 
 ## プレフィル、投機的デコード、サンプリング
 
 - **バッチプレフィル** — プロンプトは 8 トークン行のブロックでモデルを通り、トークンごとではなくブロックごとに重みを 1 回ストリームするので、最初のトークンまでの待ちが約 6 分の 1 になります
 - **投機的デコード** — `-draft` に同系統の小さいモデルを指定します (greedy のみ): ドラフトが数トークン提案し、大きいモデルの 1 回のバッチパスが検証し、却下ならキャッシュをロールバックします。出力は大きいモデル単独とまったく同じです
 - **サンプリング** — `-temp` が 0 より大きいと nucleus からサンプリングします: `-topp 0.9` は確率順で 90% の質量を持つ最小のトークン集合だけを残すので、繰り返しループの住処であるロングテールにくじが回りません
+- **繰り返しペナルティ** — `-frequency` と `-presence` は OpenAI 流で、この生成で出したトークンは出現 1 回ごとに `-frequency`、出現していれば一律に `-presence` だけ logit を下げます。小さいモデルが同じ段落を繰り返し始めたときに効くのはこちらです。`-repeat` は llama.cpp 流で、直近 `-repeat-last` 位置 (プロンプト込み) に現れたトークンの logit をその値で割ります (1.1 が軽め、1 で無効)。3 つともサンプリング前の logits を変えるので greedy にも効きます。`-repeat` がプロンプトを数える点は諸刃で、プロンプトの言語ごと罰するため、日本語で答えていた 7B が中国語に流れることがあります。`-frequency` は言語に触りません。API では `frequency_penalty`、`presence_penalty`、`repetition_penalty` として同じものを受けます。`-draft` の下ではどれも効きません
 
 ## `tensai` コマンド
 
@@ -93,7 +123,7 @@ commands:
   version  print the version
 ```
 
-モデルを使うコマンドは同じフラグを共有します: `-model` (どのモデルを実行するか)、`-q8`/`-q4`、`-gpu`、`-draft`、`-think`、`-tool`、`-system`、`-temp`、`-topp`、`-seed` など — 完全なリストは `tensai <command> -h` で。
+モデルを使うコマンドは同じフラグを共有します: `-model` (どのモデルを実行するか)、`-q8`/`-q4`/`-f32` (重みの幅。指定がなければファイルとメモリから選ぶ)、`-gpu`、`-draft`、`-think`、`-tool`、`-system`、`-temp`、`-topp`、`-seed` など — 完全なリストは `tensai <command> -h` で。
 
 `-v` は、黙って待つだけだった時間に何をしているかを喋らせます。ファイルが名乗る内容 (アーキテクチャ、層数とヘッド数、コンテキスト、語彙)、重みの読み方 (repack したのかキャッシュから mmap したのか、それぞれ何秒かかったか)、選ばれたテンプレートファミリーとシステムプロンプト、そして他の手段では見えない**実際に組み上がったプロンプト**をマーカーごと出します。`serve` ではリクエストが着いた時点でメッセージ数とツール数を報告し、続けてプレフィルしたトークン数と速度を出します。行が増えるだけで、他は何も変わりません。
 
@@ -134,6 +164,7 @@ tensai run -q8 -json "Explain RoPE briefly"      # 補完と使用量を 1 つ�
 tensai chat -q8 -model ./model.gguf              # マルチターン。KV キャッシュが対話全体を運ぶ
 tensai models                                    # キャッシュ一覧。"models rm <name>" で削除
 tensai bench -q8                                 # CPU vs GPU のプレフィル/デコード比較
+tensai ask -q8 -yesno "Is Paris in France?"      # 生成せず確率で答える
 ```
 
 ### CPU と GPU の比較
@@ -169,6 +200,87 @@ gpu/cpu      5.20x                   0.75x
 ます。プレフィルの t/s は attention が二次なのでプロンプトが長いほど下がり
 ます。比較は同じ長さで行ってください。
 
+### 生成せずに答える
+
+`tensai ask` は生成ではなく計測で答えます。質問は `run` と同じチャットテンプレートを
+通り、各選択肢は「モデルがその選択肢を答えの書き出しとして書く対数尤度」として採点され、
+その softmax が答えです。トークンは一切サンプリングしないので、モデルは選択肢の外の
+ものを答えられず、知らないことは自信ありげな作り話ではなく選択肢間の確率の散らばりとして
+現れます。
+
+```bash
+tensai ask -q8 -yesno "Is Paris the capital of France? Answer yes or no."
+tensai ask -q8 -choice "positive,negative,neutral" "Sentiment of: 'cold food, rude waiter'. One word."
+tensai ask -q8 -state "仕事終わり" -choice "コーヒー,ビール,紅茶" "いま何を飲む？ 一語で答えて。"
+tensai ask -q8 -json -choice "spam,ham" "Classify: 'You have won a prize'. One word."
+```
+
+```
+ 99.9%  yes
+  0.1%  no
+```
+
+`-state` は質問の前提となる状況で、ユーザーターンの先頭に置かれます。`-json` は選ばれた
+選択肢と各選択肢の確率を返すので、型付きの質問をして型付きの答えを受け取りたい呼び出し元
+向けです。コストはプレフィル 1 回と選択肢のトークン数ぶんの decode step で、0.5B なら
+数十ミリ秒。プロンプトのキャッシュは選択肢ごとに巻き戻して使い回します。
+
+注意が 2 つ。選択肢は与えた表記のまま採点されます。`yes` と `Yes` は別のトークンで、
+モデルがどちらを書きたがるかはモデルの性質なので、「Answer yes or no.」で終わる質問文には
+意味があります。もう 1 つ、数値はキャリブレーション込みでモデルのものです。7B に「パリは
+ドイツの首都か」と聞くと yes に 20% 置くことがあるので、選択肢間の差を信号として読み、
+絶対値はモデルの癖を踏まえて読んでください。知らないことを聞かれた同じ 7B は、`run` では
+経歴を自信ありげに捏造しますが、ここでは候補すべてを 50% 付近に置きます。それが散文では
+言えない正直な答えです。
+
+#### 1 つの状況に型つきの質問をする
+
+分類器は同じ状況についていくつも聞きます。メッセージは急ぎか、どのチームの担当か、
+書き手はどれくらい怒っているか。`-batch` はそれらを TypeSafe の Jev API と同じ形の
+1 つのリクエストとして標準入力から受け取り、同じ形で答えます:
+
+```bash
+tensai ask -q8 -batch -json <<'EOF'
+{
+  "state": "Help! My payouts have been failing for 3 days.",
+  "questions": {
+    "is_urgent":   {"type": "noul",   "instructions": "Does this convey urgency?",
+                    "criteria": {"true": "Explicitly time-sensitive", "false": "No urgency expressed"}},
+    "department":  {"type": "choice", "instructions": "Which team should handle this?",
+                    "criteria": {"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations", "sales": "Pricing, upgrades, new accounts"}},
+    "frustration": {"type": "score",  "instructions": "How frustrated is the customer?",
+                    "criteria": ["Calm", "Frustrated", "Very angry"]}
+  }
+}
+EOF
+```
+
+```json
+{"model":"tensai","answers":{
+  "is_urgent":   {"type":"noul","noul":0.93},
+  "department":  {"type":"choice","choice":"technical","probabilities":{"billing":0.22,"sales":0.12,"technical":0.66},"confidence":0.21},
+  "frustration": {"type":"score","score":0.93,"legend":{"0":"Calm","1":"Frustrated","2":"Very angry"},"probabilities":{"0":0.07,"1":0.93,"2":0.00},"confidence":0.76}},
+ "usage":{"input_tokens":174,"output_tokens":8}}
+```
+
+質問は 3 種類です。`noul` は yes/no で、yes の確率を返します。`criteria` で yes と no
+の意味を補足できます。`choice` は `criteria` に選択肢の名前と説明を並べ、選ばれた名前と
+選択肢ごとの確率、confidence を返します。`score` は `criteria` に順序つきのレベルを低い方
+から最大 10 個並べ、期待値としてのレベル (2 つのレベルの間の小数になりえます) と凡例、
+分布を返します。`confidence` は分布のエントロピーを最大値で割って 1 から引いたもので、
+Jev が公開している数値を再現します。`state`、`instructions`、各 criteria は文字列でも
+任意の JSON でもよく、文字列でないものは JSON のままモデルに見せます。
+
+内部ではどの質問も A, B, C と文字を振った多肢選択に描画して文字を採点するので、説明が
+どれだけ長くても選択肢 1 つは 1 トークンで、答えは質問直後の logits を 1 回読むだけです。
+状況は 1 回だけプレフィルされ、各質問はそのキャッシュを延長するので、N 問のコストは
+状況 1 回と各質問 1 回ぶんで、状況を N 回読み直しません。同じ描画は 1 問の `ask` でも
+`-label` で使えます (なければ選択肢の本文をトークンごとに採点します)。小さいモデルは
+質問によらず A に寄るので、0.5B では 1 つの値を鵜呑みにせず選択肢同士を比べてください。
+
+`serve` は同じものを `POST /v1/systemone` として出すので、Jev 向けに書かれた
+クライアントを手元のモデルに向けられます。
+
 ### OpenAI 互換 API の提供
 
 ```bash
@@ -202,7 +314,7 @@ qwen2.5-0.5b-instruct-q8_0.gguf             531MB  gguf     tools       2026-08-
 チェックポイントも、実際に扱われるとおりに並びます。読み取りコストは `.gguf`
 1 つあたり約 80ms のメタデータ解析で、ディレクトリはタダです。
 
-`serve` は `/v1/chat/completions` (messages 配列、SSE ストリーミング、使用量カウント) を公開するので、OpenAI クライアントを向ければ何でも純 Go のモデルとチャットできます。組み込みのチャットデモページが `GET /` で提供されます。
+`serve` は `/v1/chat/completions` (messages 配列、SSE ストリーミング、使用量カウント) を公開するので、OpenAI クライアントを向ければ何でも純 Go のモデルとチャットできます。`ask -batch` の型つき質問を HTTP で受ける `/v1/systemone` もあります。組み込みのチャットデモページが `GET /` で提供されます。
 
 ### 思考の分離
 

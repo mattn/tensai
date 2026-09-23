@@ -3,7 +3,7 @@
 package gpu
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -18,7 +18,7 @@ func benchAttnAt(b *testing.B, seqKV int) {
 		b.Skipf("wgpu unavailable: %v", err)
 	}
 	defer g.Close()
-	rng := rand.New(rand.NewSource(9))
+	rng := rand.New(rand.NewPCG(9, 0))
 	const heads, kvHeads, dh = 14, 2, 64
 	const d, kvDim = heads * dh, kvHeads * dh
 	const seqQ = 512

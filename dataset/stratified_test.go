@@ -1,7 +1,7 @@
 package dataset
 
 import (
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -58,7 +58,7 @@ func TestSubsetRejectsBadRows(t *testing.T) {
 func TestSplitStratifiedKeepsClassBalance(t *testing.T) {
 	const n, classes = 150, 3
 	ds := makeClassDataset(t, n, classes)
-	train, test, err := ds.SplitStratified(0.2, rand.New(rand.NewSource(7)))
+	train, test, err := ds.SplitStratified(0.2, rand.New(rand.NewPCG(7, 0)))
 	if err != nil {
 		t.Fatal(err)
 	}

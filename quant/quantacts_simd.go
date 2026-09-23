@@ -72,7 +72,9 @@ func quantizeActsInto(x []tensai.Float, xu []uint8) tensai.Float {
 	archsimd.ClearAVXUpperBits()
 	invs := 1 / sx
 	for i, v := range x[vecEnd:] {
-		f := v * invs
+		// The conversion keeps the product and the nudge as two roundings,
+		// which the vector bodies also do; arm64 would otherwise fuse them.
+		f := tensai.Float(v * invs)
 		if f >= 0 {
 			f += 0.5
 		} else {

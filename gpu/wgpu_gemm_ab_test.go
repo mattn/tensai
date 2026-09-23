@@ -4,7 +4,7 @@ package gpu
 
 import (
 	"fmt"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -19,7 +19,7 @@ func BenchmarkGemmWide(b *testing.B) {
 		b.Skipf("wgpu unavailable: %v", err)
 	}
 	defer g.Close()
-	rng := rand.New(rand.NewSource(29))
+	rng := rand.New(rand.NewPCG(29, 0))
 	for _, size := range []int{512, 1024, 2048} {
 		x, err := g.Upload(randTensor(rng, size, size))
 		if err != nil {

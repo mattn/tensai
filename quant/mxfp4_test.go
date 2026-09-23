@@ -2,14 +2,14 @@ package quant
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
 )
 
 func TestMXFP4MatVecAndMatMul(t *testing.T) {
-	rng := rand.New(rand.NewSource(63))
+	rng := rand.New(rand.NewPCG(63, 0))
 	for _, c := range []struct{ rows, cols int }{
 		{768, 2304}, // parallel path, many groups
 		{100, 33},   // partial final group and tile, scalar tails
@@ -18,10 +18,10 @@ func TestMXFP4MatVecAndMatMul(t *testing.T) {
 		q := NewMXFP4Matrix(c.rows, c.cols)
 		for j := 0; j < c.cols; j++ {
 			for g := 0; g*32 < c.rows; g++ {
-				q.Scale[q.TableIndex(g, j)] = MXFP4Scale(uint8(120 + rng.Intn(12)))
+				q.Scale[q.TableIndex(g, j)] = MXFP4Scale(uint8(120 + rng.IntN(12)))
 				var sum int32
 				for i := g * 32; i < min((g+1)*32, c.rows); i++ {
-					code := uint8(rng.Intn(16))
+					code := uint8(rng.IntN(16))
 					q.Q[q.Index(i, j)] |= code << (4 * (i % 2))
 					sum += int32(MXFP4Value(code))
 				}

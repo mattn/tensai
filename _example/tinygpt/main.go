@@ -26,7 +26,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"strings"
 	"time"
@@ -160,7 +160,7 @@ func (m *model) batchAt(text []rune, rng *rand.Rand) (tokens, labels []int) {
 	tokens = make([]int, 0, batchSize*seqLen)
 	labels = make([]int, 0, batchSize*seqLen)
 	for i := 0; i < batchSize; i++ {
-		p := rng.Intn(len(text) - seqLen - 1)
+		p := rng.IntN(len(text) - seqLen - 1)
 		for t := 0; t < seqLen; t++ {
 			tokens = append(tokens, m.index[text[p+t]])
 			labels = append(labels, m.index[text[p+t+1]])
@@ -263,7 +263,7 @@ func main() {
 
 	text := []rune(corpus)
 	vocab := vocabOf(text)
-	rng := rand.New(rand.NewSource(*seed))
+	rng := rand.New(rand.NewPCG(uint64(*seed), 0))
 	m := newModel(vocab, rng)
 
 	params := m.params()
@@ -311,7 +311,7 @@ func main() {
 	}
 	prompt := text[:seqLen]
 	fmt.Printf("\nprompt: %q\n\ngenerated:\n%s\n", string(prompt),
-		string(prompt)+m.generate(prompt, *n, float32(*temp), rand.New(rand.NewSource(*seed+1))))
+		string(prompt)+m.generate(prompt, *n, float32(*temp), rand.New(rand.NewPCG(uint64(*seed+1), 0))))
 }
 
 // The opening of "Alice's Adventures in Wonderland" by Lewis Carroll

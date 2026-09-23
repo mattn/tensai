@@ -8,10 +8,11 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"os/user"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/mattn/tensai/encoding/gguf"
 	"github.com/mattn/tensai/gpu"
+	"github.com/mattn/tensai/internal/sysmem"
 	"github.com/mattn/tensai/tokenizer"
 )
 
@@ -68,7 +70,7 @@ type Options struct {
 	Data string // directory for downloaded model files
 	Repo string // Hugging Face repo for missing files; DefaultRepo if empty
 	GGUF string // load model and tokenizer from a single .gguf instead
-	Bits int    // decode weights: 0 float32, 8 int8, 4 int4
+	Bits int    // decode weights: 0 float32, 8 int8, 4 int4, BitsAuto to choose
 	GPU  bool   // decode on the GPU (needs Bits and a wgpu build tag)
 	// Verbose narrates what the model is doing to Log: what the file
 	// says it is, how it is being read, what prompt it was handed, and
@@ -86,29 +88,40 @@ type Options struct {
 	Temp   float64
 	TopP   float64
 	Seed   int64
-	Log    io.Writer // load/timing chatter; nil silences it
+	// Repetition control, applied to the logits before sampling. Repeat
+	// is llama.cpp's repeat penalty over the last RepeatLastN tokens
+	// (1 or 0 is off; 64 positions when RepeatLastN is 0); Presence and
+	// Frequency are OpenAI's penalties over what this completion has
+	// generated. Ignored under speculative decoding.
+	Repeat      float64
+	RepeatLastN int
+	Presence    float64
+	Frequency   float64
+	Log         io.Writer // load/timing chatter; nil silences it
 }
 
 // Engine is a loaded model ready to generate: the tokenizer, the chat
 // template, optionally a draft model and a GPU residency.
 type Engine struct {
-	opts    Options
-	model   *qwen
-	draft   *qwen
-	tok     *tokenizer.Tokenizer
-	tm      tmpl
-	system  string
-	imEnd   int
-	eot     int
-	nCtx    int
-	g       *gpu.Device
-	gq      *gpuQwen
-	vlog    io.Writer
-	tools   []toolDef
-	prefill func([]int, int) []float32
-	step    func(int, int) []float32
-	reset   func()
-	rng     *rand.Rand
+	opts     Options
+	model    *qwen
+	draft    *qwen
+	tok      *tokenizer.Tokenizer
+	tm       tmpl
+	system   string
+	imEnd    int
+	eot      int
+	nCtx     int
+	g        *gpu.Device
+	gq       *gpuQwen
+	vlog     io.Writer
+	tools    []toolDef
+	prefill  func([]int, int) []float32
+	step     func(int, int) []float32
+	reset    func()
+	truncate func(int)
+	context  []int // the tail of what was fed, for the repeat penalty
+	rng      *rand.Rand
 
 	steps  int
 	logits []float32
@@ -140,6 +153,11 @@ func gpuCannotRun(path string) string {
 	}
 	defer g.Close()
 	arch, _ := g.String("general.architecture")
+	// K2-Horizon normalizes a row in groups, and the device kernels fold
+	// one whole-row RMS into every projection's prologue.
+	if n, _ := g.Int(arch + ".attention.group_norm_groups"); n > 1 {
+		return fmt.Sprintf("this %s normalizes in %d groups, which the GPU path cannot do yet", arch, n)
+	}
 	if arch != "gemma4" {
 		return ""
 	}
@@ -198,10 +216,17 @@ func Open(o Options) (*Engine, error) {
 		if err != nil {
 			return nil, err
 		}
+		o.Bits = model.bits
 	} else {
 		weights, err := fetchWeights(base, o.Data)
 		if err != nil {
 			return nil, err
+		}
+		if o.Bits == BitsAuto {
+			// A float checkpoint's weight count is its bytes over two.
+			var why string
+			o.Bits, why = pickBits("", weightBytes(weights)/2, sysmem.Available())
+			fmt.Fprintf(vlog, "width: int%d, %s\n", o.Bits, why)
 		}
 		var paths [2]string
 		for i, name := range []string{"tokenizer.json", "config.json"} {
@@ -235,6 +260,9 @@ func Open(o Options) (*Engine, error) {
 	how := "float32"
 	if o.Bits != 0 {
 		how = fmt.Sprintf("int%d", o.Bits)
+	}
+	if model.layout == "ternary" {
+		how = "ternary"
 	}
 	fmt.Fprintf(o.Log, "loaded %s (%d layers, hidden %d) as %s in %v\n",
 		model.cfg.ModelType, model.cfg.Layers, model.cfg.HiddenSize, how, time.Since(start).Round(time.Millisecond))
@@ -306,7 +334,7 @@ func Open(o Options) (*Engine, error) {
 	e := &Engine{
 		opts: o, model: model, draft: draftM, tok: tok, tm: tm,
 		system: system, imEnd: stopID(0), eot: stopID(1),
-		rng:  rand.New(rand.NewSource(o.Seed)),
+		rng:  rand.New(rand.NewPCG(uint64(o.Seed), 0)),
 		vlog: vlog,
 	}
 	if e.tools, err = resolveTools(o.Tools); err != nil {
@@ -325,6 +353,7 @@ func Open(o Options) (*Engine, error) {
 	}
 	e.prefill, e.step = model.prefill, model.step
 	e.reset = model.reset
+	e.truncate = model.truncate
 
 	if o.GPU {
 		if o.Bits == 0 {
@@ -376,6 +405,12 @@ func Open(o Options) (*Engine, error) {
 			model.reset()
 			gq.gpuLen = 0
 		}
+		e.truncate = func(n int) {
+			model.truncate(n)
+			if gq.gpuLen > n {
+				gq.gpuLen = n
+			}
+		}
 	}
 	return e, nil
 }
@@ -390,6 +425,7 @@ func (e *Engine) Reset() {
 	}
 	e.steps = 0
 	e.logits = nil
+	e.context = e.context[:0]
 }
 
 // GPUName reports the adapter the engine is running on, empty when
@@ -429,7 +465,18 @@ func (e *Engine) Close() {
 // feed pushes tokens through the model, extending the KV cache; generate
 // then samples until an end token, which is also fed so the cache stays
 // aligned with the template for the next turn.
+// penalty is the run's repetition control as the sampler wants it.
+func (e *Engine) penalty() penalty {
+	return penalty{Repeat: e.opts.Repeat, LastN: e.opts.RepeatLastN, Presence: e.opts.Presence, Frequency: e.opts.Frequency}
+}
+
 func (e *Engine) feed(ids []int) {
+	// The repeat penalty looks back over the prompt as well as the
+	// answer, so the engine keeps the tail of everything it fed.
+	e.context = append(e.context, ids...)
+	if n := len(e.context) - 4096; n > 0 {
+		e.context = e.context[n:]
+	}
 	if len(ids) > 1 {
 		if e.draft != nil {
 			e.draft.prefill(ids, e.steps)
@@ -494,7 +541,9 @@ func (e *Engine) sample(w io.Writer, limit int) (int, string) {
 		return gen, finish
 	}
 	finish := "length"
+	pen := newPenaltyState(e.penalty(), e.context)
 	for ; gen < limit && e.steps < e.nCtx-1; gen++ {
+		pen.apply(e.logits)
 		next := sample(e.logits, e.opts.Temp, e.opts.TopP, e.rng)
 		if next == e.imEnd || next == e.eot {
 			e.feed([]int{next})
@@ -503,6 +552,7 @@ func (e *Engine) sample(w io.Writer, limit int) (int, string) {
 		}
 		fmt.Fprint(w, e.tok.Decode([]int{next}))
 		e.feed([]int{next})
+		pen.push([]int{next}, true)
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintf(e.opts.Log, "(%d tokens, %.1f tok/s)\n",
@@ -726,6 +776,232 @@ func (e *Engine) runTool(c toolCall) string {
 	return "No tool by that name is available."
 }
 
+// Question is one multiple-choice question for ScoreMany: the text the
+// model reads and the options it chooses among.
+type Question struct {
+	Text    string   `json:"question"`
+	Options []string `json:"options"`
+}
+
+// Score answers a question by measuring rather than generating. The
+// question goes through the chat template exactly as Generate's would,
+// and each option is scored as the log-likelihood the model assigns to
+// writing it, token by token, as the opening of its answer; the result
+// is the softmax over those, one probability per option. No token is
+// sampled, so the model cannot answer anything outside the list, and
+// what it does not know shows up as probability spread across the
+// options rather than as a confident invention.
+//
+// The prompt's cache is computed once and rolled back between options,
+// so the cost is one prefill plus a step per option token. Options are
+// scored in the form given: "yes" and "Yes" are different tokens, and
+// which one a model reaches for is a property of the model.
+func (e *Engine) Score(question string, options []string) ([]float64, error) {
+	res, err := e.ScoreMany("", []Question{{Text: question, Options: options}}, false)
+	if err != nil {
+		return nil, err
+	}
+	return res.Probs[0], nil
+}
+
+// ScoreResult is what ScoreMany measured: one probability per option of
+// each question, and what it cost in tokens.
+type ScoreResult struct {
+	Probs [][]float64
+	// PromptTokens is what was prefilled: the state once, then each
+	// question. OptionTokens is what was scored: one per label, or the
+	// length of each option's text.
+	PromptTokens, OptionTokens int
+}
+
+// ScoreMany answers several questions about one state. The state opens
+// the user turn and is prefilled once; each question is then appended
+// to that cached prefix, scored the way Score scores, and rolled back,
+// so N questions cost one prefill of the state plus one of each
+// question, not N of the state. A question with no state is Score.
+//
+// With label set, the options are listed under the question lettered A,
+// B, C and the model is asked for the letter, so every option costs one
+// token however long its text: the answer is one read of the logits
+// after the question, restricted to the letters. That is the form a
+// classifier wants; the unlabeled form scores the option text itself,
+// which is what a question that asks for a word in a particular form
+// wants.
+func (e *Engine) ScoreMany(state string, qs []Question, label bool) (ScoreResult, error) {
+	var res ScoreResult
+	if len(qs) == 0 {
+		return res, errors.New("tensai: no questions to score")
+	}
+	for _, q := range qs {
+		if len(q.Options) == 0 {
+			return res, errors.New("tensai: no options to score")
+		}
+		if label && len(q.Options) > len(labels) {
+			return res, fmt.Errorf("tensai: %d options, and only %d labels", len(q.Options), len(labels))
+		}
+	}
+	if e.tm.foldSystem && e.system != "" {
+		if state != "" {
+			state = e.system + "\n\n" + state
+		} else {
+			state = e.system
+		}
+	}
+	prefix := e.tm.bos + e.systemTurn() + e.tm.userOpen
+	if state != "" {
+		prefix += state + "\n\n"
+	}
+	pids := e.tok.Encode(prefix)
+	e.Reset()
+	start := time.Now()
+	var live []int // what the cache holds
+	if len(pids) > 0 {
+		e.prefill(pids, 0)
+		live = pids
+	}
+	e.steps = len(pids)
+	res.PromptTokens = len(pids)
+	snap := snapshotDelta(e.model)
+	fmt.Fprintf(e.opts.Log, "state: %d tokens, prefill: %v\n", len(pids), time.Since(start).Round(time.Millisecond))
+	res.Probs = make([][]float64, len(qs))
+	for qi, q := range qs {
+		text := prefix + q.Text
+		options := q.Options
+		if label {
+			text += renderLabels(q.Options)
+			options = labels[:len(q.Options)]
+		}
+		text += e.tm.userClose + e.tm.asstOpen + scorePrefill(e.tm, e.opts.Think)
+		ids := e.tok.Encode(text)
+		if qi == 0 {
+			fmt.Fprintf(e.vlog, "rendered prompt: %s\n", clip(text, 600))
+		}
+		// The question extends the state's cache when the tokens agree
+		// that far, which they do unless the tokenizer merged across
+		// the boundary; then the whole prompt is prefilled, and the
+		// next question finds the state's rows gone and does the same.
+		// Two questions opening with the same words agree further, but
+		// the recurrent state was only kept at the boundary.
+		n := min(commonPrefix(live, ids), len(pids))
+		if n == len(pids) && n < len(ids) {
+			e.truncate(n)
+			restoreDelta(e.model, snap)
+		} else {
+			e.Reset()
+			n = 0
+		}
+		start = time.Now()
+		base := e.prefill(ids[n:], n)
+		e.steps = len(ids)
+		live = ids
+		res.PromptTokens += len(ids) - n
+		fmt.Fprintf(e.opts.Log, "question %d: %d tokens, %d prefilled in %v\n",
+			qi+1, len(ids), len(ids)-n, time.Since(start).Round(time.Millisecond))
+		// The question's logits and any recurrent state are what every
+		// option starts from; the KV cache rolls back by truncation.
+		first := append([]float32(nil), base...)
+		qsnap := snapshotDelta(e.model)
+		ll := make([]float64, len(options))
+		for i, opt := range options {
+			toks := e.tok.Encode(opt)
+			if len(toks) == 0 {
+				return res, fmt.Errorf("tensai: option %q tokenizes to nothing", opt)
+			}
+			res.OptionTokens += len(toks)
+			logits := first
+			for j, id := range toks {
+				ll[i] += logProb(logits, id)
+				if j+1 < len(toks) {
+					logits = e.step(id, e.steps)
+					e.steps++
+				}
+			}
+			fmt.Fprintf(e.vlog, "option %q: %d tokens, log-likelihood %.3f\n", opt, len(toks), ll[i])
+			e.truncate(len(ids))
+			e.steps = len(ids)
+			restoreDelta(e.model, qsnap)
+		}
+		e.logits = first
+		res.Probs[qi] = softmax64(ll)
+	}
+	return res, nil
+}
+
+// scorePrefill is what the assistant turn opens with when the next
+// token is to be read as the answer. A thinking model writes its block
+// first, empty when thinking is off: a gemma4 opens its channel and
+// closes it before every answer, so the logits after the turn marker
+// are for the channel opener and say nothing about the options. The
+// empty block goes into the prompt so the read lands on the answer.
+// A template whose prefill already holds the block is left alone, and
+// so is one asked to think, since there is no scoring what it would
+// have thought.
+func scorePrefill(tm tmpl, think bool) string {
+	pre := tm.asstPrefill
+	if tm.reasonOpen == "" || think || strings.Contains(pre, tm.reasonClose) {
+		return pre
+	}
+	return pre + tm.reasonOpen + tm.reasonClose
+}
+
+// labels are what the options are called when the model answers by
+// label: the letters, the form a multiple-choice question takes in the
+// text a model was trained on, and one token each in every tokenizer
+// tried.
+var labels = []string{
+	"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+	"N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+}
+
+// renderLabels lists the options under a question, one per line behind
+// its letter, and asks for the letter back.
+func renderLabels(options []string) string {
+	var sb strings.Builder
+	for i, o := range options {
+		sb.WriteString("\n" + labels[i] + ". " + o)
+	}
+	sb.WriteString("\nAnswer with the letter only.")
+	return sb.String()
+}
+
+// logProb is log softmax of logits at id, in float64 for the sum.
+func logProb(logits []float32, id int) float64 {
+	if id < 0 || id >= len(logits) {
+		return math.Inf(-1)
+	}
+	m := float64(logits[0])
+	for _, v := range logits[1:] {
+		if float64(v) > m {
+			m = float64(v)
+		}
+	}
+	var sum float64
+	for _, v := range logits {
+		sum += math.Exp(float64(v) - m)
+	}
+	return float64(logits[id]) - m - math.Log(sum)
+}
+
+// softmax64 normalizes log-likelihoods into probabilities.
+func softmax64(ll []float64) []float64 {
+	m := math.Inf(-1)
+	for _, v := range ll {
+		if v > m {
+			m = v
+		}
+	}
+	out := make([]float64, len(ll))
+	var sum float64
+	for i, v := range ll {
+		out[i] = math.Exp(v - m)
+		sum += out[i]
+	}
+	for i := range out {
+		out[i] /= sum
+	}
+	return out
+}
+
 // Generate runs one completion: the prompt goes through the model's chat
 // template (or verbatim when raw), and up to n sampled tokens stream to w.
 func (e *Engine) Generate(w io.Writer, prompt string, raw bool, n int) RunResult {
@@ -793,9 +1069,9 @@ func (e *Engine) Chat(in io.Reader, w io.Writer, n int) {
 // behind an Authorization: Bearer header.
 func (e *Engine) Serve(addr, apiKey string) error {
 	s := &server{
-		apiKey: apiKey,
-		model:  e.model, tok: e.tok, system: e.system, nCtx: e.nCtx,
-		temp: e.opts.Temp, topP: e.opts.TopP, imEnd: e.imEnd, eot: e.eot,
+		apiKey: apiKey, engine: e,
+		model: e.model, tok: e.tok, system: e.system, nCtx: e.nCtx,
+		temp: e.opts.Temp, topP: e.opts.TopP, penalty: e.penalty(), imEnd: e.imEnd, eot: e.eot,
 		tm: e.tm, prefill: e.prefill, step: e.step, reset: e.reset,
 		draft: e.draft, specK: e.opts.SpecK, vlog: e.vlog,
 	}
@@ -866,6 +1142,11 @@ func tokenHint() string {
 // resume is guarded by If-Range against the recorded ETag, so a file that
 // changed upstream restarts instead of splicing two versions together;
 // without a recorded tag the partial is discarded rather than trusted.
+// Fetch downloads one file of a Hugging Face repository into dir, if it
+// is not there already, resuming and retrying as the private form does.
+// base ends in a slash and dir is where name lands.
+func Fetch(base, dir, name string) (string, error) { return fetch(base, dir, name) }
+
 func fetch(base, dir, name string) (string, error) {
 	path := filepath.Join(dir, name)
 	if _, err := os.Stat(path); err == nil {
@@ -1051,6 +1332,40 @@ func (p *progressReader) Read(b []byte) (int, error) {
 
 // fetchWeights returns the checkpoint path: a plain model.safetensors, or
 // for sharded models the index file after downloading every shard.
+// weightBytes is the size of a checkpoint's weight files: the one file,
+// or every shard an index names.
+func weightBytes(weights string) int64 {
+	if !strings.HasSuffix(weights, ".index.json") {
+		st, err := os.Stat(weights)
+		if err != nil {
+			return 0
+		}
+		return st.Size()
+	}
+	raw, err := os.ReadFile(weights)
+	if err != nil {
+		return 0
+	}
+	var parsed struct {
+		WeightMap map[string]string `json:"weight_map"`
+	}
+	if json.Unmarshal(raw, &parsed) != nil {
+		return 0
+	}
+	seen := map[string]bool{}
+	var total int64
+	for _, shard := range parsed.WeightMap {
+		if seen[shard] {
+			continue
+		}
+		seen[shard] = true
+		if st, err := os.Stat(filepath.Join(filepath.Dir(weights), shard)); err == nil {
+			total += st.Size()
+		}
+	}
+	return total
+}
+
 func fetchWeights(base, dir string) (string, error) {
 	if p := filepath.Join(dir, "model.safetensors"); exists(p) {
 		return p, nil
@@ -1453,6 +1768,30 @@ func templateFor(modelType string, think bool) tmpl {
 			reasonOpen:  "<think>",
 			reasonClose: "</think>",
 		}
+	}
+	if modelType == "k2-horizon" || modelType == "k2_horizon" {
+		// K2-Horizon speaks ChatML with an ifm| prefix on the turn
+		// markers and nothing between turns. Its template opens every
+		// answer with a thinking block: <ifm|think> for the model to fill
+		// when thinking is wanted, an empty one when it is not, exactly
+		// the way Qwen3 is switched. The tags are plain text, not tokens.
+		t := tmpl{
+			bos:     "<|ifm|begin_of_text|>",
+			sysOpen: "<|ifm|im_start|>system\n", sysClose: "<|ifm|im_end|>",
+			userOpen: "<|ifm|im_start|>user\n", userClose: "<|ifm|im_end|>",
+			asstOpen: "<|ifm|im_start|>assistant\n", asstClose: "<|ifm|im_end|>",
+			stops: []string{"<|ifm|im_end|>", "<|ifm|endoftext|>"},
+		}
+		if think {
+			// The open tag comes from the prompt, newline included, so
+			// the turn starts inside the block; the marker carries the
+			// newline so a prompt ending in it reads as opened.
+			t.reasonOpen, t.reasonClose = "<ifm|think>\n", "</ifm|think>"
+			t.asstPrefill = t.reasonOpen
+		} else {
+			t.asstPrefill = "<ifm|think>\n</ifm|think>\n"
+		}
+		return t
 	}
 	if modelType == "phi3" {
 		// Phi-3's template has no system role either; its official

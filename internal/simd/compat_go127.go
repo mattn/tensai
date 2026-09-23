@@ -14,9 +14,19 @@ func LoadF32x8(s []float32) archsimd.Float32x8 {
 	return archsimd.LoadFloat32x8(s)
 }
 
+// LoadF32x8Part loads up to eight floats, zero-filling the rest. It does
+// not call archsimd's part load: through Go 1.27.1 that is a full 32-byte
+// load masked afterwards, which reads past the slice and faults when the
+// slice ends at a page boundary (Windows heaps expose this on every run,
+// Linux ones rarely). Copying the tail through an array keeps the read
+// inside the slice.
 func LoadF32x8Part(s []float32) archsimd.Float32x8 {
-	v, _ := archsimd.LoadFloat32x8Part(s)
-	return v
+	if len(s) >= 8 {
+		return archsimd.LoadFloat32x8(s)
+	}
+	var buf [8]float32
+	copy(buf[:], s)
+	return archsimd.LoadFloat32x8(buf[:])
 }
 
 func StoreF32x8(v archsimd.Float32x8, s []float32) {
@@ -47,6 +57,10 @@ func LoadI8x32(s []int8) archsimd.Int8x32 {
 	return archsimd.LoadInt8x32(s)
 }
 
+func LoadU8x32(s []uint8) archsimd.Uint8x32 {
+	return archsimd.LoadUint8x32(s)
+}
+
 func StoreF32x8Part(v archsimd.Float32x8, s []float32) {
 	v.StorePart(s)
 }
@@ -58,3 +72,7 @@ func RoundEven(v archsimd.Float32x8) archsimd.Float32x8 {
 // MulSignI8x32 multiplies x by the sign of y (VPSIGNB); Go 1.26 spells
 // the method CopySign, which is what compat_go126.go calls.
 func MulSignI8x32(x, y archsimd.Int8x32) archsimd.Int8x32 { return x.MulSign(y) }
+
+func LoadF32x4(s []float32) archsimd.Float32x4     { return archsimd.LoadFloat32x4(s) }
+func StoreF32x4(v archsimd.Float32x4, s []float32) { v.Store(s) }
+func StoreF64x4(v archsimd.Float64x4, s []float64) { v.Store(s) }

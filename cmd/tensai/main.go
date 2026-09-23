@@ -24,10 +24,13 @@ import (
 
 	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/internal/llm"
+	"github.com/mattn/tensai/internal/qwenimage"
 	"github.com/mattn/tensai/internal/simd"
+	"image/png"
+	"math/rand/v2"
 )
 
-const version = "0.0.26"
+const version = "0.0.30"
 
 // revision is stamped by the release build (-X main.revision=...).
 var revision = "HEAD"
@@ -38,7 +41,9 @@ commands:
   run      generate a completion for a prompt
   chat     interactive multi-turn chat on stdin
   serve    OpenAI-compatible /v1/chat/completions server
+  ask      answer a question by scoring options, no generation
   bench    compare CPU and GPU prefill and decode speed
+  image    generate a picture from a prompt with Qwen-Image
   models   list cached models; "models rm <name>" deletes one
   version  print the version
 
@@ -51,7 +56,8 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 	model := fs.String("model", "", `which model to run: a name from "tensai models", a path to a directory or .gguf, a Hugging Face repo to download, or org/repo/file.gguf for one of its gguf files`)
 	q8 := fs.Bool("q8", false, "decode against int8-quantized weights")
 	q4 := fs.Bool("q4", false, "decode against int4-quantized weights (group-wise)")
-	fs.BoolVar(&o.GPU, "gpu", false, "decode on the GPU (requires -q8 or -q4 and a wgpu build tag)")
+	f32 := fs.Bool("f32", false, "decode against float32 weights")
+	fs.BoolVar(&o.GPU, "gpu", false, "decode on the GPU (quantized weights and a wgpu build tag)")
 	fs.BoolVar(&o.Verbose, "v", false, "narrate what the model is doing: what the file says it is, how it is read, the prompt it was handed, and where a request's time went")
 	fs.BoolVar(&o.Verbose, "verbose", false, "same as -v")
 	fs.BoolVar(&o.Requant, "requant", false, "requantize gguf weights through float32 instead of repacking their stored blocks")
@@ -64,13 +70,22 @@ func modelFlags(fs *flag.FlagSet) (*llm.Options, func()) {
 	fs.Float64Var(&o.Temp, "temp", 0, "sampling temperature; 0 = greedy")
 	fs.Float64Var(&o.TopP, "topp", 0.9, "nucleus sampling: keep the smallest set of tokens with this much probability mass (1 disables)")
 	fs.Int64Var(&o.Seed, "seed", 1, "sampling seed for -temp > 0")
+	fs.Float64Var(&o.Repeat, "repeat", 1, "repeat penalty over the recent context, llama.cpp style: 1 = off, 1.1 = mild")
+	fs.IntVar(&o.RepeatLastN, "repeat-last", 64, "how many recent tokens the repeat penalty looks back over")
+	fs.Float64Var(&o.Presence, "presence", 0, "presence penalty on tokens already generated (OpenAI style)")
+	fs.Float64Var(&o.Frequency, "frequency", 0, "frequency penalty per occurrence of a generated token (OpenAI style)")
 	// Bits and the model reference resolve only after Parse.
 	finish := func() {
-		if *q8 {
+		// Without a width the loader picks one: what the file stores,
+		// narrowed to int4 when int8 would not fit the machine.
+		o.Bits = llm.BitsAuto
+		switch {
+		case *q8:
 			o.Bits = 8
-		}
-		if *q4 {
+		case *q4:
 			o.Bits = 4
+		case *f32:
+			o.Bits = 0
 		}
 		if err := resolveModel(o, *model); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -283,6 +298,72 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+	case "ask":
+		fs := flag.NewFlagSet("tensai ask", flag.ExitOnError)
+		o, finish := modelFlags(fs)
+		choice := fs.String("choice", "", "comma-separated answers to choose among")
+		yesno := fs.Bool("yesno", false, "score yes against no")
+		state := fs.String("state", "", "the situation the question is asked about, given ahead of it")
+		label := fs.Bool("label", false, "list the options under the question lettered A, B, C and score the letter, one token each, instead of the option text")
+		batch := fs.Bool("batch", false, `read a System One request from stdin: {"state": ..., "questions": {id: {"type": "noul"|"choice"|"score", "instructions": ..., "criteria": ...}}}`)
+		jsonOut := fs.Bool("json", false, "print the probabilities as one JSON object")
+		fs.Parse(args)
+		question := joinArgs(fs.Args())
+		if *batch {
+			if *yesno || *choice != "" || *label || question != "" {
+				fmt.Fprintln(os.Stderr, "-batch takes its questions from stdin, and -state only when the request has none")
+				os.Exit(2)
+			}
+			var req llm.SystemOneRequest
+			if err := json.NewDecoder(os.Stdin).Decode(&req); err != nil {
+				fmt.Fprintln(os.Stderr, "reading the request:", err)
+				os.Exit(2)
+			}
+			if len(req.State) == 0 && *state != "" {
+				req.State, _ = json.Marshal(*state)
+			}
+			e := openEngine(o, finish)
+			defer e.Close()
+			resp, err := e.SystemOne(req)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			answersPrint(resp, *jsonOut)
+			return
+		}
+		var options []string
+		switch {
+		case *yesno && *choice != "":
+			fmt.Fprintln(os.Stderr, "give -yesno or -choice, not both")
+			os.Exit(2)
+		case *yesno:
+			options = []string{"yes", "no"}
+		case *choice != "":
+			for _, c := range strings.Split(*choice, ",") {
+				if c = strings.TrimSpace(c); c != "" {
+					options = append(options, c)
+				}
+			}
+		}
+		// The state is the context a decision is made in, and the model
+		// reads it as the first part of the user turn. A state with no
+		// question after it is the question.
+		if *state != "" && question == "" {
+			question, *state = *state, ""
+		}
+		if question == "" || len(options) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: tensai ask [flags] (-choice a,b,c | -yesno | -batch) [-state <situation>] [<question>]")
+			os.Exit(2)
+		}
+		e := openEngine(o, finish)
+		defer e.Close()
+		res, err := e.ScoreMany(*state, []llm.Question{{Text: question, Options: options}}, *label)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		askPrint(options, res.Probs[0], *jsonOut)
 	case "bench":
 		fs := flag.NewFlagSet("tensai bench", flag.ExitOnError)
 		o, finish := modelFlags(fs)
@@ -291,7 +372,7 @@ func main() {
 		reps := fs.Int("r", 5, "timed repetitions per side, after one warm-up")
 		fs.Parse(args)
 		finish()
-		if o.Bits == 0 {
+		if o.Bits <= 0 {
 			// The GPU path needs quantized weights; bench both sides
 			// the same way.
 			o.Bits = 8
@@ -302,6 +383,59 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+	case "image":
+		fs := flag.NewFlagSet("tensai image", flag.ExitOnError)
+		model := fs.String("model", "Qwen-Image-2.1", `which checkpoint to run: a name under the cache, or a path to a directory holding text_encoder, transformer and vae`)
+		prompt := fs.String("prompt", "", "what to draw; positional arguments join into one")
+		out := fs.String("o", "out.png", "where to write the picture")
+		size := fs.Int("size", 256, "width and height in pixels; rounded down to a multiple of 32")
+		steps := fs.Int("steps", 20, "denoising steps")
+		seed := fs.Int64("seed", 1, "noise seed")
+		f32 := fs.Bool("f32", false, "keep the weights as floats, which needs about 42GB of memory")
+		q4 := fs.Bool("q4", false, "quantize the weights to four bits instead of eight: half the memory, about half again the error")
+		negative := fs.String("negative", "", "what to steer away from; needs -cfg above 1")
+		cfg := fs.Float64("cfg", 1, "how far to steer away from -negative: 1 is off, and anything above doubles what a step costs")
+		quiet := fs.Bool("q", false, "print nothing but errors")
+		fetchIt := fs.Bool("fetch", false, "download the checkpoint first: about 31GB, and it resumes if interrupted")
+		useGPU := fs.Bool("gpu", false, "run feed-forward and attention on the GPU (needs a wgpu build tag and quantized weights)")
+		budget := fs.Float64("gpu-budget", 4, "gigabytes of weights the GPU may hold; past what a device can take it is dropped, and nothing reports that")
+		cpuprofile := fs.String("cpuprofile", "", "write a CPU profile of image generation to this file")
+		fs.Parse(os.Args[2:])
+		defer profileTo(*cpuprofile)()
+		text := strings.TrimSpace(*prompt + " " + strings.Join(fs.Args(), " "))
+		if text == "" {
+			fmt.Fprintln(os.Stderr, "tensai image: give it something to draw")
+			os.Exit(2)
+		}
+		bits := 8
+		switch {
+		case *f32:
+			bits = 0
+		case *q4:
+			bits = 4
+		}
+		if *fetchIt {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "tensai image:", err)
+				os.Exit(1)
+			}
+			dir := *model
+			if !filepath.IsAbs(dir) {
+				dir = filepath.Join(home, ".cache", "tensai", dir)
+			}
+			fmt.Fprintf(os.Stderr, "fetching %s into %s, about 31GB\n", imageRepo, dir)
+			if err := fetchImageModel(dir, func(f string, a ...any) {
+				fmt.Fprintf(os.Stderr, f+"\n", a...)
+			}); err != nil {
+				fmt.Fprintln(os.Stderr, "tensai image:", err)
+				os.Exit(1)
+			}
+		}
+		if err := generateImage(*model, text, *negative, *out, *size, *steps, *seed, bits, *cfg, *budget, *useGPU, *quiet); err != nil {
+			fmt.Fprintln(os.Stderr, "tensai image:", err)
+			os.Exit(1)
+		}
 	case "version":
 		fmt.Printf("tensai v%s (%s)\n", version, revision)
 	case "-h", "--help", "help":
@@ -309,6 +443,89 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "tensai: unknown command %q\n\n%s\n", cmd, usage)
 		os.Exit(2)
+	}
+}
+
+// answersPrint shows a System One response: as the JSON a program
+// reads, or one block per question for the eye, in id order.
+func answersPrint(resp *llm.SystemOneResponse, asJSON bool) {
+	if asJSON {
+		out, _ := json.Marshal(resp)
+		fmt.Println(string(out))
+		return
+	}
+	ids := make([]string, 0, len(resp.Answers))
+	for id := range resp.Answers {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for i, id := range ids {
+		if i > 0 {
+			fmt.Println()
+		}
+		a := resp.Answers[id]
+		switch a.Type {
+		case "noul":
+			fmt.Printf("%s: %5.1f%%  yes\n", id, 100**a.Noul)
+			continue
+		case "choice":
+			fmt.Printf("%s: %s  (confidence %.2f)\n", id, a.Choice, *a.Confidence)
+		case "score":
+			fmt.Printf("%s: %.2f  (confidence %.2f)\n", id, *a.Score, *a.Confidence)
+		}
+		names := make([]string, 0, len(a.Probabilities))
+		for n := range a.Probabilities {
+			names = append(names, n)
+		}
+		sort.SliceStable(names, func(x, y int) bool {
+			if a.Type == "score" {
+				return names[x] < names[y]
+			}
+			return a.Probabilities[names[x]] > a.Probabilities[names[y]]
+		})
+		for _, n := range names {
+			line := n
+			if a.Legend != nil {
+				line += "  " + a.Legend[n]
+			}
+			fmt.Printf("%5.1f%%  %s\n", 100*a.Probabilities[n], line)
+		}
+	}
+}
+
+// askPrint lists the options by probability, the way a reader wants
+// them, or as one JSON object in the order given, the way a program
+// does: the text form is for the eye, the JSON for the caller that asked
+// a typed question and wants a typed answer back.
+func askPrint(options []string, probs []float64, asJSON bool) {
+	if asJSON {
+		m := make(map[string]float64, len(options))
+		for i, o := range options {
+			m[o] = probs[i]
+		}
+		best := 0
+		for i := range probs {
+			if probs[i] > probs[best] {
+				best = i
+			}
+		}
+		out, _ := json.Marshal(struct {
+			Answer        string             `json:"answer"`
+			Probabilities map[string]float64 `json:"probabilities"`
+		}{options[best], m})
+		fmt.Println(string(out))
+		return
+	}
+	idx := make([]int, len(options))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(a, b int) bool { return probs[idx[a]] > probs[idx[b]] })
+	// The number leads: it has a fixed width, and the label after it
+	// needs none, which spares this code guessing at how wide a string
+	// is on a terminal.
+	for _, i := range idx {
+		fmt.Printf("%5.1f%%  %s\n", 100*probs[i], options[i])
 	}
 }
 
@@ -663,9 +880,202 @@ func humanSize(n int64) string {
 }
 
 func joinArgs(a []string) string {
-	s := a[0]
-	for _, w := range a[1:] {
-		s += " " + w
+	return strings.Join(a, " ")
+}
+
+// generateImage draws one picture with Qwen-Image and writes it as a
+// PNG. The two models are seven gigabytes apiece and only one is held
+// at a time: the prompt is encoded and the encoder released before the
+// denoising transformer loads.
+func generateImage(model, prompt, negative, out string, size, steps int, seed int64, bits int, cfg, budget float64, useGPU, quiet bool) error {
+	dir, err := imageModelDir(model)
+	if err != nil {
+		return err
 	}
-	return s
+	// The decoder turns each latent position into a sixteen-pixel
+	// square, and the checkpoint's own layout groups those in twos.
+	side := size / 32 * 2
+	if side < 2 {
+		return fmt.Errorf("a size of %d leaves nothing to draw; 64 is the smallest that works", size)
+	}
+	say := func(format string, args ...any) {
+		if !quiet {
+			fmt.Fprintf(os.Stderr, format+"\n", args...)
+		}
+	}
+
+	// Both prompts go through the encoder in one load, since it is seven
+	// gigabytes and guidance needs the second one.
+	prompts := []string{prompt}
+	guide := &qwenimage.Guidance{Scale: cfg}
+	if cfg > 1 {
+		if negative == "" {
+			// Qwen has no beginning-of-sequence token, so the encoder
+			// needs something to read.
+			negative = " "
+		}
+		prompts = append(prompts, negative)
+	} else if negative != "" {
+		return fmt.Errorf("-negative does nothing without -cfg above 1")
+	}
+	start := time.Now()
+	hidden, err := qwenimage.EncodePrompts(dir, prompts, bits)
+	if err != nil {
+		return err
+	}
+	text := hidden[0]
+	if len(hidden) > 1 {
+		guide.Text = hidden[1]
+	}
+	say("prompt: %d tokens in %v", text.Rows, time.Since(start).Round(time.Second))
+
+	start = time.Now()
+	m, err := qwenimage.LoadTransformer(dir.Transformer(), bits)
+	if err != nil {
+		return err
+	}
+	defer m.Close()
+	say("transformer: loaded in %v", time.Since(start).Round(time.Second))
+	if useGPU {
+		start = time.Now()
+		name, held, err := qwenimage.UseGPU(m, uint64(budget*(1<<30)))
+		if err != nil {
+			return err
+		}
+		say("gpu: %s holding %.1fGiB of feed-forward weights in %v", name, float64(held)/(1<<30), time.Since(start).Round(time.Second))
+	}
+
+	latents := qwenimage.Noise(rand.New(rand.NewPCG(uint64(seed), 0)), side, side)
+	layout := qwenimage.NewLayout(text.Rows, side, side)
+	start = time.Now()
+	err = qwenimage.Generate(m, latents, text, layout, qwenimage.NewSchedule(steps, side*side), guide, func(i int) {
+		say("step %d/%d in %v", i+1, steps, time.Since(start).Round(time.Second))
+	})
+	if err != nil {
+		return err
+	}
+	say("%d steps in %v", steps, time.Since(start).Round(time.Second))
+	// The decoder no longer needs the transformer. Release its mapped
+	// weights and GPU allocations before allocating full-resolution maps.
+	start = time.Now()
+	if err := m.Close(); err != nil {
+		return err
+	}
+	say("transformer: released in %v", time.Since(start).Round(time.Second))
+
+	start = time.Now()
+	stats, err := qwenimage.LoadStats(dir.VAEConfig())
+	if err != nil {
+		return err
+	}
+	dec, err := qwenimage.LoadDecoder(dir.VAE())
+	if err != nil {
+		return err
+	}
+	px, err := qwenimage.Decode(dec, stats.Denormalize(latents, side, side))
+	if err != nil {
+		return err
+	}
+	img, err := qwenimage.Image(px)
+	if err != nil {
+		return err
+	}
+	say("decoder: loaded and decoded in %v", time.Since(start).Round(time.Second))
+	f, err := os.Create(out)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := png.Encode(f, img); err != nil {
+		return err
+	}
+	say("wrote %s, %dx%d", out, side*16, side*16)
+	return nil
+}
+
+// imageModelDir resolves a checkpoint name or path to the directory
+// holding its three components.
+func imageModelDir(name string) (qwenimage.ModelDir, error) {
+	candidates := []string{name}
+	if home, err := os.UserHomeDir(); err == nil && !filepath.IsAbs(name) {
+		candidates = append(candidates, filepath.Join(home, ".cache", "tensai", name))
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(filepath.Join(c, "transformer")); err == nil {
+			return qwenimage.ModelDir(c), nil
+		}
+	}
+	return "", fmt.Errorf("no checkpoint called %q; run \"tensai image -fetch\" to download it, or point -model at a directory with text_encoder, transformer and vae", name)
+}
+
+// imageRepo is where the checkpoint lives.
+const imageRepo = "Qwen/Qwen-Image-2.1"
+
+// fetchImageModel downloads the checkpoint's parts into dir. The shard
+// names come from each component's index rather than a list here, so a
+// repository that re-splits its weights still resolves.
+func fetchImageModel(dir string, say func(string, ...any)) error {
+	base := "https://huggingface.co/" + imageRepo + "/resolve/main/"
+	get := func(sub, name string) (string, error) {
+		return llm.Fetch(base+sub+"/", filepath.Join(dir, sub), name)
+	}
+	for _, f := range []struct{ sub, name string }{
+		{"processor", "tokenizer.json"},
+		{"vae", "config.json"},
+		{"vae", "diffusion_pytorch_model.safetensors"},
+	} {
+		say("%s/%s", f.sub, f.name)
+		if _, err := get(f.sub, f.name); err != nil {
+			return err
+		}
+	}
+	for _, c := range []struct{ sub, index string }{
+		{"transformer", "diffusion_pytorch_model.safetensors.index.json"},
+		{"text_encoder", "model.safetensors.index.json"},
+	} {
+		say("%s/%s", c.sub, c.index)
+		path, err := get(c.sub, c.index)
+		if err != nil {
+			return err
+		}
+		shards, err := shardNames(path)
+		if err != nil {
+			return err
+		}
+		for _, n := range shards {
+			say("%s/%s", c.sub, n)
+			if _, err := get(c.sub, n); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// shardNames reads the weight files a safetensors index points at, in a
+// stable order.
+func shardNames(index string) ([]string, error) {
+	b, err := os.ReadFile(index)
+	if err != nil {
+		return nil, err
+	}
+	var idx struct {
+		Map map[string]string `json:"weight_map"`
+	}
+	if err := json.Unmarshal(b, &idx); err != nil {
+		return nil, fmt.Errorf("%s: %w", index, err)
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, v := range idx.Map {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	sort.Strings(out)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s names no weight files", index)
+	}
+	return out, nil
 }

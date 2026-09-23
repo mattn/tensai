@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -219,7 +219,7 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "prompt tokens: %v\n", ids)
-	rng := rand.New(rand.NewSource(*seed))
+	rng := rand.New(rand.NewPCG(uint64(*seed), 0))
 
 	fmt.Print(*prompt)
 	start = time.Now()

@@ -34,7 +34,7 @@ func NewSPM(tokens []string, scores []float32, types []int32, addSpacePrefix boo
 	}
 	t := &Tokenizer{
 		vocab:       make(map[string]int, len(tokens)),
-		inverse:     make(map[int]string, len(tokens)),
+		inverse:     make([]string, len(tokens)),
 		byID:        map[int]string{},
 		ranks:       map[[2]string]int{},
 		byteDec:     map[rune]byte{},
@@ -184,7 +184,7 @@ func (t *Tokenizer) spmDecode(ids []int) string {
 			sb.WriteString(sp)
 			continue
 		}
-		piece := t.inverse[id]
+		piece := t.piece(id)
 		var b byte
 		if _, err := fmt.Sscanf(piece, "<0x%02X>", &b); err == nil && t.byteID[b] == id {
 			sb.WriteByte(b)
@@ -212,7 +212,7 @@ func NewSPMBPE(tokens, merges []string, types []int32, addSpacePrefix bool) (*To
 	}
 	t := &Tokenizer{
 		vocab:       make(map[string]int, len(tokens)),
-		inverse:     make(map[int]string, len(tokens)),
+		inverse:     make([]string, len(tokens)),
 		byID:        map[int]string{},
 		ranks:       make(map[[2]string]int, len(merges)),
 		byteDec:     map[rune]byte{},

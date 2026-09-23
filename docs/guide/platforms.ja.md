@@ -44,28 +44,37 @@ Linux でも macOS でも Windows でも同じ NEON カーネルが使われま�
 |---|---|---|
 | linux/amd64 | AVX2 | 済。開発と計測はここで行っています |
 | linux/arm64 | NEON | 済。エミュレータ上でテストと生成を確認 |
-| darwin/arm64 | NEON | 未。実機での計測がありません |
+| darwin/arm64 | NEON | CI の Apple Silicon でテスト済。計測は未 |
 | windows/amd64 | AVX2 | 済 |
 | windows/arm64 | NEON | 未 |
 
-エミュレータでの確認は、arm64 の**計算結果**を信頼する根拠にはなりますが、**速度**の
-根拠にはなりません。全パッケージのテストが通り、量子化 matvec のチェックサムが
-ポータブル実装とも AVX2 とも一致し、0.5B が amd64 と同じテキストを生成します。
-しかし実機でどれだけ速いかは、実機で動かさないと分かりません。
+エミュレータでの確認と CI の Apple Silicon ジョブは、arm64 の**計算結果**を信頼する
+根拠にはなりますが、**速度**の根拠にはなりません。全パッケージのテストが通り、量子化
+matvec のチェックサムがポータブル実装とも AVX2 とも一致し、0.5B が amd64 と同じ
+テキストを生成します。しかし実機でどれだけ速いかは、実機で計測しないと分かりません。
 
-NEON でベクトル化されている範囲は AVX2 より狭いです。
+AVX2 ビルドがベクトル化しているカーネルには、すべて NEON 版があります
+(128 ビット、float 4 レーンまたは 16 バイトで、AVX2 の半分の幅)。
 
 | カーネル | amd64 | arm64 |
 |---|---|---|
 | int8 matvec (`-q8`、requant 済みの重み) | AVX2 | NEON |
+| grouped int8 matvec (gguf ブロックの直接リパック) | AVX2 | NEON |
+| 4bit matvec (`-q4`) | AVX2 | NEON |
+| 三値 matvec (PTQ1_0) | AVX2 | NEON |
+| MXFP4 (gpt-oss) | AVX2 | NEON |
+| プレフィルのバッチ畳み込み | AVX2 | NEON |
+| 活性化の量子化 | AVX2 | NEON |
 | attention の内積・値累算・softmax の `exp` | AVX2 | NEON |
-| 要素ごとの演算 (加算、スケール、SwiGLU ゲート) | AVX2 | NEON |
-| 4bit matvec (`-q4`) | AVX2 | ポータブル |
-| grouped int8 matvec (gguf ブロックの直接リパック) | AVX2 | ポータブル |
-| プレフィルのバッチ畳み込み | AVX2 | ポータブル |
-| MXFP4 (gpt-oss) | AVX2 | ポータブル |
-| 活性化の量子化 | AVX2 | ポータブル |
-| 密行列積 (学習) | AVX2 | ポータブル |
+| 要素ごとの演算 (加算、スケール、SwiGLU と GELU のゲート) | AVX2 | NEON |
+| Hadamard 回転、delta rule の読み出し | AVX2 | NEON |
+| 密行列積 (学習) | AVX2 | NEON |
+| 学習側カーネル (活性化、LayerNorm、Adam、SGD) | AVX2 | NEON |
+
+NEON には符号なし×符号つきのバイト積和 (`VPMADDUBSW`) が無いので、整数
+カーネルは符号つきの拡張乗算とペア加算で 16 ビットに手で広げます。グループの
+スケールは fused multiply-add で畳み込みます。arm64 のコンパイラはポータブル
+実装でも同じ融合をするので、ベクトル列とスカラ列の結果がビット単位で一致します。
 
 `tensai bench` はどの系統で走ったかを最初の行に出力するので、意図せず
 フォールバックしているビルドはすぐ分かります。

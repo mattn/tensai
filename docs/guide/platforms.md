@@ -47,29 +47,41 @@ build system selects, and worth keeping separate:
 |---|---|---|
 | linux/amd64 | AVX2 | Yes, this is where the kernels are developed and benchmarked |
 | linux/arm64 | NEON | Yes, tests and a generation run under emulation |
-| darwin/arm64 | NEON | Not yet: no measurement on the hardware |
+| darwin/arm64 | NEON | Tests pass on Apple Silicon in CI; no measurement yet |
 | windows/amd64 | AVX2 | Yes |
 | windows/arm64 | NEON | Not yet |
 
-The emulated run is the reason to trust the arm64 arithmetic and not its
-speed: every package's tests pass, a quantized matvec checksums identically
-against both the portable bodies and AVX2, and a 0.5B produces the same text
-as it does on amd64. None of that says how fast the kernels are on real
-silicon, which only a run on the hardware can answer.
+The emulated run and the CI job on Apple Silicon are the reason to trust
+the arm64 arithmetic and not its speed: every package's tests pass, a
+quantized matvec checksums identically against both the portable bodies and
+AVX2, and a 0.5B produces the same text as it does on amd64. None of that
+says how fast the kernels are on real silicon, which only a benchmark on the
+hardware can answer.
 
-What the NEON build vectorizes today is narrower than the AVX2 one:
+Every kernel the AVX2 build vectorizes has a NEON form, at half the lane
+width (128-bit vectors, four floats or sixteen bytes):
 
 | Kernel | amd64 | arm64 |
 |---|---|---|
 | int8 matvec (`-q8`, requantized weights) | AVX2 | NEON |
+| Grouped int8 matvec (gguf blocks repacked) | AVX2 | NEON |
+| 4-bit matvec (`-q4`) | AVX2 | NEON |
+| Ternary matvec (PTQ1_0) | AVX2 | NEON |
+| MXFP4 (gpt-oss) | AVX2 | NEON |
+| Batched prefill folds | AVX2 | NEON |
+| Activation quantizer | AVX2 | NEON |
 | Attention dot products, value accumulation, softmax `exp` | AVX2 | NEON |
-| Element-wise rows (add, scale, SwiGLU gate) | AVX2 | NEON |
-| 4-bit matvec (`-q4`) | AVX2 | portable |
-| Grouped int8 matvec (gguf blocks repacked) | AVX2 | portable |
-| Batched prefill folds | AVX2 | portable |
-| MXFP4 (gpt-oss) | AVX2 | portable |
-| Activation quantizer | AVX2 | portable |
-| Dense float matmul (training) | AVX2 | portable |
+| Element-wise rows (add, scale, SwiGLU and GELU gates) | AVX2 | NEON |
+| Hadamard rotation, delta-rule reads | AVX2 | NEON |
+| Dense float matmul (training) | AVX2 | NEON |
+| Training kernels (activations, LayerNorm, Adam, SGD) | AVX2 | NEON |
+
+NEON has no unsigned-by-signed byte multiply-add, so the integer kernels
+widen to 16 bits by hand (a signed widening multiply and pairwise adds)
+where AVX2 uses `VPMADDUBSW`; the group scale then folds in through a
+fused multiply-add, which is also what the arm64 compiler makes of the
+portable bodies, so the vector and scalar columns of one product agree
+bit for bit.
 
 `tensai bench` prints which family it ran, so a build that quietly fell back
 is visible in the first lines of its output.

@@ -187,3 +187,21 @@ func TestGemma4E4BShape(t *testing.T) {
 			blocks[23].headSz, blocks[24].headSz)
 	}
 }
+
+// Both Gemma generations scale a token's embedding by sqrt(hidden) on
+// the way in, per token: the table itself stays as stored, because a
+// tied lm head reads the same table and its logits must not be scaled
+// with it.
+func TestEmbedScale(t *testing.T) {
+	for _, tt := range []struct {
+		arch string
+		want float32
+	}{
+		{"gemma3", 4}, {"gemma4", 4}, {"llama", 0}, {"qwen2", 0},
+	} {
+		m := &qwen{cfg: config{ModelType: tt.arch, HiddenSize: 16}}
+		if got := m.embedScale(); got != tt.want {
+			t.Errorf("%s: embedScale %v, want %v", tt.arch, got, tt.want)
+		}
+	}
+}

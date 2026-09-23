@@ -95,6 +95,40 @@ const (
 	geluTanhCube  = 0.044715
 )
 
+// mulSigmoidGeneric scales dst by the sigmoid of src: the gate a model
+// puts on its attention output, where the gate is a separate projection
+// rather than the value being gated.
+func mulSigmoidGeneric(dst, src []float32) {
+	for i, v := range src {
+		dst[i] *= 1 / (1 + ExpF(-v))
+	}
+}
+
+// swigluOAIGeneric is gpt-oss's clamped SwiGLU, in place on gate:
+// the gate is capped above, the up value is clamped both ways, and the
+// shifted up value multiplies the swish. alpha scales the swish's input,
+// which the trained weights expect.
+func swigluOAIGeneric(gate, up []float32) {
+	for i, g := range gate {
+		if g > swigluLimit {
+			g = swigluLimit
+		}
+		u := up[i]
+		if u > swigluLimit {
+			u = swigluLimit
+		} else if u < -swigluLimit {
+			u = -swigluLimit
+		}
+		gate[i] = g / (1 + ExpF(-swigluAlpha*g)) * (u + 1)
+	}
+}
+
+// gpt-oss's constants: the swish input scale and the symmetric clamp.
+const (
+	swigluAlpha = 1.702
+	swigluLimit = 7.0
+)
+
 // siluGeneric applies x * sigmoid(x) in place.
 func siluGeneric(v []float32) {
 	for i, x := range v {
@@ -294,5 +328,46 @@ func axpysGeneric(ws []float32, v, outs []float32) {
 	d := len(v)
 	for i := range ws {
 		axpyGeneric(ws[i], v, outs[i*d:(i+1)*d])
+	}
+}
+
+// hadamardGeneric is the Walsh-Hadamard butterfly of v in place,
+// Sylvester order, scaled at the end; len(v) is a power of two.
+func hadamardGeneric(v []float32, scale float32) {
+	n := len(v)
+	for h := 1; h < n; h *= 2 {
+		for i := 0; i < n; i += 2 * h {
+			for j := i; j < i+h; j++ {
+				a, b := v[j], v[j+h]
+				v[j], v[j+h] = a+b, a-b
+			}
+		}
+	}
+	if scale != 1 {
+		for i := range v {
+			v[i] *= scale
+		}
+	}
+}
+
+// decayReadGeneric scales row by decay in place and adds k times the
+// scaled row into mem: the delta rule's read of a state row, fused with
+// the decay ahead of it so the row is read and written once.
+func decayReadGeneric(row []float32, decay, k float32, mem []float32) {
+	for i, v := range row {
+		v *= decay
+		row[i] = v
+		mem[i] += k * v
+	}
+}
+
+// writeReadGeneric adds k times delta into row in place and q times the
+// updated row into out: the delta rule's write of a state row and the
+// query's read of it, fused.
+func writeReadGeneric(row, delta []float32, k, q float32, out []float32) {
+	for i, v := range row {
+		v += k * delta[i]
+		row[i] = v
+		out[i] += q * v
 	}
 }

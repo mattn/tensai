@@ -2,7 +2,7 @@ package tensai
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai/internal/dims"
@@ -61,7 +61,7 @@ func tensorsClose(t *testing.T, got, want *Tensor, tol float64) {
 }
 
 func TestTensorBroadcastOps(t *testing.T) {
-	rng := rand.New(rand.NewSource(1))
+	rng := rand.New(rand.NewPCG(1, 0))
 	add := func(x, y Float) Float { return x + y }
 	cases := [][2][]int{
 		{{2, 3}, {2, 3}},
@@ -110,7 +110,7 @@ func TestTensorBroadcastOps(t *testing.T) {
 }
 
 func TestTensorMatMul2D(t *testing.T) {
-	rng := rand.New(rand.NewSource(2))
+	rng := rand.New(rand.NewPCG(2, 0))
 	a, b := randTensor(rng, 3, 4), randTensor(rng, 4, 5)
 	got, err := MatMul(a, b)
 	if err != nil {
@@ -159,7 +159,7 @@ func refMatMul(t *testing.T, a, b *Tensor) *Tensor {
 }
 
 func TestTensorMatMulBatched(t *testing.T) {
-	rng := rand.New(rand.NewSource(3))
+	rng := rand.New(rand.NewPCG(3, 0))
 	cases := [][2][]int{
 		{{2, 3, 4}, {2, 4, 5}},       // plain batch
 		{{3, 4}, {6, 4, 5}},          // a broadcast across b's batch
@@ -196,7 +196,7 @@ func TestTensorMatMulBatched(t *testing.T) {
 }
 
 func TestTensorTranspose(t *testing.T) {
-	rng := rand.New(rand.NewSource(4))
+	rng := rand.New(rand.NewPCG(4, 0))
 
 	a := randTensor(rng, 3, 5)
 	got, err := a.Transpose()
@@ -330,7 +330,7 @@ func TestTensorReshapeAndViews(t *testing.T) {
 // same result built with an explicit Transpose, for plain and batched
 // shapes and for a broadcast operand.
 func TestMatMulTransposedModes(t *testing.T) {
-	rng := rand.New(rand.NewSource(97))
+	rng := rand.New(rand.NewPCG(97, 0))
 	cases := []struct {
 		a, b []int
 	}{
@@ -392,7 +392,7 @@ func TestMatMulTransposedModes(t *testing.T) {
 
 // TestTensorClone checks that a clone shares no memory with its source.
 func TestTensorClone(t *testing.T) {
-	rng := rand.New(rand.NewSource(5))
+	rng := rand.New(rand.NewPCG(5, 0))
 	a := randTensor(rng, 2, 3, 4)
 	b := a.Clone()
 	tensorsClose(t, b, a, 0)

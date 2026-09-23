@@ -2,7 +2,7 @@ package llm
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"sort"
 )
 

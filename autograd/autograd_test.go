@@ -2,7 +2,7 @@ package autograd
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"strings"
 	"testing"
 
@@ -46,7 +46,7 @@ func checkParamGrad(t *testing.T, param *tensai.Tensor, build func() (*Node, *No
 }
 
 func TestAutogradOps(t *testing.T) {
-	rng := rand.New(rand.NewSource(31))
+	rng := rand.New(rand.NewPCG(31, 0))
 	w := tensai.RandomMatrix(3, 4, rng).Tensor()
 	x := tensai.RandomMatrix(5, 3, rng).Tensor()
 	b := tensai.RandomMatrix(1, 4, rng).Tensor()
@@ -85,12 +85,12 @@ func TestAutogradOps(t *testing.T) {
 }
 
 func TestAutogradSoftmaxCE(t *testing.T) {
-	rng := rand.New(rand.NewSource(37))
+	rng := rand.New(rand.NewPCG(37, 0))
 	w := tensai.RandomMatrix(3, 4, rng).Tensor()
 	x := tensai.RandomMatrix(6, 3, rng).Tensor()
 	target := tensai.NewMatrix(6, 1).Tensor()
 	for i := range target.Data {
-		target.Data[i] = tensai.Float(rng.Intn(4))
+		target.Data[i] = tensai.Float(rng.IntN(4))
 	}
 	checkParamGrad(t, w, func() (*Node, *Node) {
 		p := Param(w)
@@ -112,7 +112,7 @@ func TestAutogradSharedParam(t *testing.T) {
 }
 
 func TestAutogradTrainsXOR(t *testing.T) {
-	rng := rand.New(rand.NewSource(0))
+	rng := rand.New(rand.NewPCG(0, 0))
 	inputs, err := tensai.NewMatrixFromSlice(4, 2, []tensai.Float{0, 0, 0, 1, 1, 0, 1, 1})
 	if err != nil {
 		t.Fatal(err)
@@ -150,7 +150,7 @@ func TestAutogradTrainsXOR(t *testing.T) {
 }
 
 func TestToDot(t *testing.T) {
-	rng := rand.New(rand.NewSource(71))
+	rng := rand.New(rand.NewPCG(71, 0))
 	x := Input(tensai.RandomMatrix(3, 2, rng)).Named("x")
 	w := Param(tensai.RandomMatrix(2, 4, rng)).Named("w")
 	root := x.MatMul(w).Tanh().Sum()
@@ -172,7 +172,7 @@ func TestToDot(t *testing.T) {
 }
 
 func TestAutogradTransposeAndSoftmax(t *testing.T) {
-	rng := rand.New(rand.NewSource(41))
+	rng := rand.New(rand.NewPCG(41, 0))
 	w := tensai.RandomMatrix(3, 4, rng).Tensor()
 	x := tensai.RandomMatrix(5, 3, rng).Tensor()
 

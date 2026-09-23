@@ -18,13 +18,13 @@ The greedy continuation matches GPT-2's well-known reference output token for to
 
 ## Qwen and friends: ten model families
 
-The `tensai` command runs modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file. One runtime speaks ten architectures:
+The `tensai` command runs modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file. One runtime speaks eleven architectures:
 
 | family | models | what it adds |
 |---|---|---|
 | qwen2 | Qwen 1.5/2/2.5, Qwen2.5-Coder, the R1-Distill-Qwen line | attention biases |
 | qwen3 | Qwen3 dense | per-head QK-norm, explicit head_dim, `-think` |
-| qwen3_5 | Qwen3.5, Qwen3.6, Qwen3.8 | a gated delta rule on three layers in four, ordinary attention on the fourth; norms scale by 1 + w, RoPE turns a quarter of each head, and the queries carry a gate for the attention output. CPU only, and no `-draft` |
+| qwen3_5 | Qwen3.5, Qwen3.6, Qwen3.8 | a gated delta rule on three layers in four, ordinary attention on the fourth; norms scale by 1 + w, RoPE turns a quarter of each head, and the queries carry a gate for the attention output. The larger ones share each key head among several value heads. CPU only, no `-draft` |
 
 A `qwen3_5` prompt costs more to prefill than its size suggests: the delta
 layers carry state token by token, so only the projections around the
@@ -40,6 +40,7 @@ architecture allows would close most of that and is not implemented yet.
 | phi3 | Phi-3/3.5-mini | q/k/v and gate/up shipped pre-fused |
 | qwen2moe / qwen3moe | Qwen1.5-MoE-A2.7B, Qwen3-30B-A3B | top-k routed experts, a shared expert on qwen2moe |
 | gpt-oss | gpt-oss-20b | MXFP4 experts, attention sinks, YaRN rope, harmony channels |
+| k2-horizon | K2-Horizon-7B | RMSNorm taken over four groups of the row, a word class that keeps combining marks and joiners together, a 512K context. GGUF only, and CPU only |
 
 The dense 12b differs from the E-series again: no per-layer embeddings, a kv head count stated per layer (eight on the local layers, one on the global), and no value projection on the layers that narrow, which take their values from their keys. GPU decode sits that last one out.
 
@@ -66,17 +67,54 @@ The capital of France is Paris.
 
 ## Quantized loading
 
-With `-q8`/`-q4` each weight quantizes as it loads and its float32 copy dies immediately, so the full-precision model never has to fit in memory. Quantized GGUF checkpoints skip the float32 detour entirely: Q8_0, Q4_0, Q5_0, the Q4_K/Q5_K/Q6_K K-quant family, and MXFP4 repack straight from the memory-mapped file, keeping llama.cpp's own quantization intact. A 1.5B Q4_K_M loads in about 3 seconds instead of 8; a 3B Q8_0 opens in 5 seconds instead of 32 (`-requant` restores the float detour, trading a much slower load for about 10% more decode speed).
+Without `-q8` or `-q4` the loader chooses the width itself: what the file stores sets the ceiling (int4 blocks such as Q4_K repack into int4 exactly and gain nothing from int8; Q8_0, Q5_K, Q6_K and float checkpoints keep their precision only at int8), and when int8 would not fit the memory the machine has available (the weights plus a quarter for the tables, and half a gigabyte over) the model narrows to int4 rather than swap. `-v` says which was picked and why; `-f32` asks for float32 weights outright. With `-q8`/`-q4` each weight quantizes as it loads and its float32 copy dies immediately, so the full-precision model never has to fit in memory. Quantized GGUF checkpoints skip the float32 detour entirely: Q8_0, Q4_0, Q5_0, the Q4_K/Q5_K/Q6_K K-quant family, MXFP4, and PrismML's ternary PTQ1_0/PQ2_0 repack straight from the memory-mapped file, keeping llama.cpp's own quantization intact. A 1.5B Q4_K_M loads in about 3 seconds instead of 8; a 3B Q8_0 opens in 5 seconds instead of 32 (`-requant` restores the float detour, trading a much slower load for about 10% more decode speed).
 
 The first `.gguf` load also writes the repacked weights to a cache file next to the model (`-nocache` opts out), and every later load just memory-maps it: the 1.5B Q4_K_M reopens in ~0.3 seconds, a Mistral 7B in well under a second, and gpt-oss-20b in under two. Mapped weights are clean file-backed pages the kernel can drop and re-read at will — on a machine where the model barely fits, that replaces swap thrashing with ordinary page cache behavior.
 
 On a 15GB machine the ladder looks like: a 0.5B at ~40 tok/s with `-q8`, a 1.5B Q4_K_M at ~25 tok/s with `-q4` (tiled integer kernels, native Windows), and Qwen2.5-**7B**-Instruct — 15GB of BF16 shards, int4-quantized on the fly during a two-minute load into ~6GB resident — answering correctly at 3.5 tok/s.
+
+### Ternary weights
+
+PrismML's Bonsai checkpoints (`Ternary-Bonsai-2-27B`, a Qwen3.8-27B) keep
+every weight at -1, 0 or +1 with one f16 scale per 128, in two encodings of
+their own that stock llama.cpp does not read: `PTQ1_0` packs the trits five
+to a byte (5.95 GB for the 27B), `PQ2_0` one to a two-bit slot (7.21 GB).
+Both repack into a ternary layout of two bits a weight, so a 27B decodes in
+under 8 GB, with no width to choose: `-q8` and `-q4` are accepted and
+ignored, since there is nothing to quantize.
+
+```bash
+tensai run -model prism-ml/Ternary-Bonsai-2-27B-gguf/Ternary-Bonsai-2-27B-PTQ1_0.gguf "What is the capital of France?"
+```
+
+The weights sit in a rotated basis: each matrix was multiplied along its
+input by a blockwise Walsh-Hadamard transform with fixed sign flips before
+the rounding, which spreads an activation's energy evenly across a block
+and is what makes three levels enough. The file declares it under
+`prism.hadamard.*`, and the loader applies the matching transform to every
+activation those matrices read, and the inverse to each embedding row it
+looks up; a file that declares a transform the loader does not know is
+refused rather than run into noise. The embedding table stays in the file
+and is read a row at a time, since a quarter million rotated rows would be
+gigabytes expanded.
+
+The ternary kernel reads the codes as the unsigned operand of the
+multiply-add and the activations as the signed one, so the correction it
+needs is the sum of a group's activations, shared by every column, and no
+per-column table streams beside the weights. On a Ryzen 7735HS the 27B
+prefills at about 6 tokens/s and decodes at 3.4, which is the memory
+bandwidth (about 28 GB/s of weights a token); its answers match the
+PrismML llama.cpp build token for token on the prompts tried. The first
+load repacks 27 billion weights, about a minute, and writes the repack
+cache (8.5 GB beside the model); later loads map it in under a second.
+The model runs on the CPU, as every qwen3_5 does.
 
 ## Prefill, speculative decoding, sampling
 
 - **Batched prefill** — prompts feed through the model in blocks of eight token rows, streaming the weights once per block instead of once per token, cutting time-to-first-token by around 6x
 - **Speculative decoding** — `-draft` points at a smaller same-family model (greedy only): the draft proposes a few tokens, one batched pass of the big model verifies them, and rejections roll the caches back, so the output is exactly what the big model alone would produce
 - **Sampling** — `-temp` above 0 samples from the nucleus: `-topp 0.9` keeps the smallest probability-sorted set of tokens holding 90% of the mass, so the long tail where repetition loops live never gets a lottery ticket
+- **Repetition penalties** — `-frequency` and `-presence` are OpenAI's: a token this completion has generated loses `-frequency` per occurrence and `-presence` once, which is what breaks a small model out of repeating a paragraph. `-repeat` is llama.cpp's: every token in the last `-repeat-last` positions, prompt included, has its logit divided by it (1.1 is mild, 1 is off). All three shape the logits before sampling, so they steer greedy decoding too. The prompt counting for `-repeat` is a known double edge: it penalizes the language of the prompt along with everything else, and a 7B answering Japanese can drift into Chinese under it where `-frequency` leaves the language alone. The API takes the same three as `frequency_penalty`, `presence_penalty` and `repetition_penalty`. None apply under `-draft`
 
 ## The `tensai` command
 
@@ -96,7 +134,7 @@ commands:
   version  print the version
 ```
 
-All model commands share the same flags: `-model` (which model to run), `-q8`/`-q4`, `-gpu`, `-draft`, `-think`, `-tool`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
+All model commands share the same flags: `-model` (which model to run), `-q8`/`-q4`/`-f32` (the weight width, chosen from the file and the memory when none is given), `-gpu`, `-draft`, `-think`, `-tool`, `-system`, `-temp`, `-topp`, `-seed`, and more — run `tensai <command> -h` for the full list.
 
 `-v` narrates what is otherwise a silent wait. It says what the file claims to be (architecture, layer and head counts, context, vocabulary), how the weights are being read (repacked or mapped from the cache, and how long each took), which template family and system prompt were chosen, and — the one thing a caller cannot otherwise see — the prompt as rendered, markers and all. Under `serve` each request announces itself on arrival with its message and tool counts, then reports how many tokens it prefilled and how fast. It adds lines and changes nothing else.
 
@@ -141,6 +179,7 @@ tensai run -q8 -json "Explain RoPE briefly"      # one JSON object with usage co
 tensai chat -q8 -model ./model.gguf              # multi-turn; the KV cache carries the dialogue
 tensai models                                    # list the cache; "models rm <name>" deletes
 tensai bench -q8                                 # CPU vs GPU, prefill and decode
+tensai ask -q8 -yesno "Is Paris in France?"      # a probability, no generation
 ```
 
 ### Measuring CPU against GPU
@@ -178,6 +217,100 @@ can read 30% low, which is what makes an unwarmed number unfair to compare
 against a tool that reports steady state. Prefill throughput still falls as
 the prompt grows, since attention is quadratic, so compare at one length.
 
+### Asking without generating
+
+`tensai ask` answers a question by measuring rather than generating. The
+question goes through the chat template like `run`'s would, and each option
+is scored as the log-likelihood the model assigns to writing it as the start
+of its answer; the softmax over those is the answer. No token is sampled, so
+the model cannot reply with anything outside the list, and what it does not
+know shows up as probability spread across the options rather than as a
+confident invention.
+
+```bash
+tensai ask -q8 -yesno "Is Paris the capital of France? Answer yes or no."
+tensai ask -q8 -choice "positive,negative,neutral" "Sentiment of: 'cold food, rude waiter'. One word."
+tensai ask -q8 -state "just finished work" -choice "coffee,beer,tea" "What to drink? One word."
+tensai ask -q8 -json -choice "spam,ham" "Classify: 'You have won a prize'. One word."
+```
+
+```
+ 99.9%  yes
+  0.1%  no
+```
+
+`-state` is the situation the question is asked about, rendered ahead of it
+in the user turn; `-json` returns the chosen option and the probability of
+each, for a caller that asked a typed question and wants a typed answer.
+The cost is one prefill plus a decode step per option token, so a 0.5B
+answers in a few tens of milliseconds and the prompt's cache is rolled back
+between options rather than recomputed.
+
+Two things to know. Options are scored in the form given: `yes` and `Yes`
+are different tokens, and which one a model reaches for is a property of the
+model, so a question that ends in "Answer yes or no." is worth the words. And
+the numbers are the model's, calibration included: a 7B asked whether Paris
+is the capital of Germany can put twenty percent on yes, so read a spread
+between options as the signal and a single absolute value with the model's
+biases in mind. Asked about something it does not know, the same 7B that
+confidently invents a biography under `run` puts every candidate near fifty
+percent here, which is the honest answer it cannot give in prose.
+
+#### Typed questions about one state
+
+A classifier asks the same situation several things: whether a message is
+urgent, which team it belongs to, how angry its writer is. `-batch` takes
+those as one request on stdin, in the shape of TypeSafe's Jev API, and
+answers in the same shape:
+
+```bash
+tensai ask -q8 -batch -json <<'EOF'
+{
+  "state": "Help! My payouts have been failing for 3 days.",
+  "questions": {
+    "is_urgent":   {"type": "noul",   "instructions": "Does this convey urgency?",
+                    "criteria": {"true": "Explicitly time-sensitive", "false": "No urgency expressed"}},
+    "department":  {"type": "choice", "instructions": "Which team should handle this?",
+                    "criteria": {"billing": "Payments, invoicing, refunds", "technical": "Bugs, outages, integrations", "sales": "Pricing, upgrades, new accounts"}},
+    "frustration": {"type": "score",  "instructions": "How frustrated is the customer?",
+                    "criteria": ["Calm", "Frustrated", "Very angry"]}
+  }
+}
+EOF
+```
+
+```json
+{"model":"tensai","answers":{
+  "is_urgent":   {"type":"noul","noul":0.93},
+  "department":  {"type":"choice","choice":"technical","probabilities":{"billing":0.22,"sales":0.12,"technical":0.66},"confidence":0.21},
+  "frustration": {"type":"score","score":0.93,"legend":{"0":"Calm","1":"Frustrated","2":"Very angry"},"probabilities":{"0":0.07,"1":0.93,"2":0.00},"confidence":0.76}},
+ "usage":{"input_tokens":174,"output_tokens":8}}
+```
+
+Three question types. A `noul` is yes or no and answers with the
+probability of yes; its `criteria` may say what each means. A `choice`
+names its options in `criteria`, each with a description, and answers with
+the chosen name, a probability per option and a confidence. A `score` lists
+its levels in `criteria` from low to high, up to ten, and answers with the
+expected level as a number that can land between two, plus the legend and
+the distribution. `confidence` is one minus the distribution's entropy as a
+fraction of its maximum, which reproduces Jev's published numbers. `state`,
+`instructions` and each criterion may be a string or any JSON value; what is
+not a string is shown to the model as JSON.
+
+Underneath, every question is rendered as a multiple choice lettered A, B,
+C and the letter is scored, so each option costs one token however long its
+description, and the answer is one read of the logits after the question.
+The state is prefilled once and each question extends that cache, so N
+questions cost one prefill of the state plus one of each question rather
+than N of the state. The same rendering is available on a single question
+as `-label`, where the option text would otherwise be scored token by
+token. Small models lean on A whatever the question, so with a 0.5B compare
+the options against each other rather than trusting one in isolation.
+
+`serve` offers the same as `POST /v1/systemone`, so a client written
+against Jev can be pointed at a local model instead.
+
 ### Serving an OpenAI-compatible API
 
 ```bash
@@ -211,7 +344,7 @@ family fallback included, so a checkpoint whose own template is not on disk is
 listed the way it will be treated. Reading it costs a `.gguf` about 80ms of
 metadata parsing; directories are free.
 
-`serve` exposes `/v1/chat/completions` (messages array, SSE streaming, usage counts), so any OpenAI client pointed at it chats with a pure-Go model. A built-in chat demo page is served on `GET /`.
+`serve` exposes `/v1/chat/completions` (messages array, SSE streaming, usage counts), so any OpenAI client pointed at it chats with a pure-Go model, and `/v1/systemone`, the typed questions of `ask -batch` over HTTP. A built-in chat demo page is served on `GET /`.
 
 ### Thinking
 

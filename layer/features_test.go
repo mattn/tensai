@@ -2,7 +2,7 @@ package layer
 
 import (
 	"math"
-	"math/rand"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/mattn/tensai"
@@ -95,7 +95,7 @@ func checkLayerGrad(t *testing.T, layer Layer, input *tensai.Matrix, tol float64
 }
 
 func randomInput(rows, cols int, seed int64) *tensai.Matrix {
-	rng := rand.New(rand.NewSource(seed))
+	rng := rand.New(rand.NewPCG(uint64(seed), 0))
 	m := tensai.NewMatrix(rows, cols)
 	for i := range m.Data {
 		m.Data[i] = tensai.Float(rng.NormFloat64())
@@ -196,7 +196,7 @@ func TestBatchNormEvalUsesRunningStats(t *testing.T) {
 }
 
 func TestConv2DGradient(t *testing.T) {
-	rng := rand.New(rand.NewSource(7))
+	rng := rand.New(rand.NewPCG(7, 0))
 	conv := NewConv2D(3, 3, 1, 1)
 	outImg, err := conv.InitImage(Image{H: 5, W: 5, C: 2}, rng)
 	if err != nil {
@@ -252,7 +252,7 @@ func TestMaxPool2DGradient(t *testing.T) {
 	}
 	// Distinct values avoid ties, where max is not differentiable.
 	in := tensai.NewMatrix(2, 4*4*2)
-	perm := rand.New(rand.NewSource(3)).Perm(len(in.Data))
+	perm := rand.New(rand.NewPCG(3, 0)).Perm(len(in.Data))
 	for i, p := range perm {
 		in.Data[i] = tensai.Float(p)
 	}
@@ -261,7 +261,7 @@ func TestMaxPool2DGradient(t *testing.T) {
 
 func TestDropout(t *testing.T) {
 	d := NewDropout(0.5)
-	if _, err := d.Init(100, rand.New(rand.NewSource(11))); err != nil {
+	if _, err := d.Init(100, rand.New(rand.NewPCG(11, 0))); err != nil {
 		t.Fatal(err)
 	}
 	in := tensai.NewMatrix(10, 100)
@@ -321,7 +321,7 @@ func TestDropout(t *testing.T) {
 
 func TestEmbeddingForwardBackward(t *testing.T) {
 	emb := NewEmbedding(4, 2)
-	if outCols, err := emb.Init(3, rand.New(rand.NewSource(17))); err != nil {
+	if outCols, err := emb.Init(3, rand.New(rand.NewPCG(17, 0))); err != nil {
 		t.Fatal(err)
 	} else if outCols != 6 {
 		t.Fatalf("expected out cols 6, got %d", outCols)

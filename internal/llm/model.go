@@ -36,6 +36,10 @@ type config struct {
 	Heads        int     `json:"num_attention_heads"`
 	KVHeads      int     `json:"num_key_value_heads"`
 	RMSEps       float64 `json:"rms_norm_eps"`
+	// NormGroups splits a hidden-state row into this many equal groups,
+	// each normalized by its own RMS (K2-Horizon); 0 or 1 is the usual
+	// single group. The weights stay one per element either way.
+	NormGroups   int     `json:"layernorm_num_groups"`
 	RopeTheta    float64 `json:"rope_theta"`
 	MaxPos       int     `json:"max_position_embeddings"`
 	Vocab        int     `json:"vocab_size"`
@@ -112,10 +116,12 @@ type qmat struct {
 	cols int
 	f    func(x, out []float32) error
 	mm   func(x, out *tensai.Matrix) error
-	q8   *quant.QMatrix     // retained for GPU upload
-	q4   *quant.Q4Matrix    // likewise, for the int4 twin
-	q8g  *quant.Q8GMatrix   // retained for the repack cache
-	mx   *quant.MXFP4Matrix // likewise
+	rot  int                  // the rotation wrapped around f and mm, for the cache
+	q8   *quant.QMatrix       // retained for GPU upload
+	q4   *quant.Q4Matrix      // likewise, for the int4 twin
+	q8g  *quant.Q8GMatrix     // retained for the repack cache
+	mx   *quant.MXFP4Matrix   // likewise
+	t    *quant.TernaryMatrix // likewise
 }
 
 func qmatQ8(q *quant.QMatrix) *qmat {
@@ -132,6 +138,27 @@ func qmatQ8G(q *quant.Q8GMatrix) *qmat {
 
 func qmatMX(q *quant.MXFP4Matrix) *qmat {
 	return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, mx: q}
+}
+
+func qmatT(q *quant.TernaryMatrix) *qmat {
+	return &qmat{cols: q.Cols, f: q.MatVec, mm: q.MatMul, t: q}
+}
+
+// rows is the input width of the weight.
+func (q *qmat) rows() int {
+	switch {
+	case q.q8 != nil:
+		return q.q8.Rows
+	case q.q4 != nil:
+		return q.q4.Rows
+	case q.q8g != nil:
+		return q.q8g.Rows
+	case q.mx != nil:
+		return q.mx.Rows
+	case q.t != nil:
+		return q.t.Rows
+	}
+	return 0
 }
 
 func quantizeMat(m *tensai.Matrix, bits int) *qmat {
@@ -238,6 +265,25 @@ type qwen struct {
 	// dscratch is one token's working set for the delta layers, which all
 	// share the same shapes; nil until a delta layer runs.
 	dscratch *deltaScratch
+	// embedRows stands in for embed when the table is read from the
+	// file a row at a time rather than expanded: a ternary table of a
+	// quarter million rows would be gigabytes in float32.
+	embedRows *embedTable
+	// bits is the width the weights were loaded at, which the loader
+	// chose itself when asked to.
+	bits int
+}
+
+// embedRow copies token's embedding into dst.
+func (m *qwen) embedRow(token int, dst []float32) {
+	if m.embedRows != nil {
+		if err := m.embedRows.row(token, dst); err != nil {
+			panic(err)
+		}
+		return
+	}
+	hs := m.cfg.HiddenSize
+	copy(dst, m.embed.Data[token*hs:(token+1)*hs])
 }
 
 func loadConfig(path string) (config, error) {
@@ -673,6 +719,21 @@ func catVec(vs ...[]float32) []float32 {
 	return out
 }
 
+// rmsnorm normalizes one hidden-state row with the model's norm shape.
+// K2-Horizon divides the row into NormGroups equal parts and takes each
+// part's own RMS, with the weight still one per element, so a grouped
+// norm is the plain one run once per part over the matching slices.
+func (m *qwen) rmsnorm(out, x, w []float32) {
+	if g := m.cfg.NormGroups; g > 1 && len(x)%g == 0 {
+		n := len(x) / g
+		for i := 0; i < g; i++ {
+			rmsnormInto(out[i*n:(i+1)*n], x[i*n:(i+1)*n], w[i*n:(i+1)*n], m.cfg.RMSEps)
+		}
+		return
+	}
+	rmsnormInto(out, x, w, m.cfg.RMSEps)
+}
+
 func rmsnormInto(out, x, w []float32, eps float64) {
 	var ss float64
 	for _, v := range x {
@@ -693,17 +754,6 @@ func rmsnormInto(out, x, w []float32, eps float64) {
 
 // activate applies the gated activation in place: silu(gate)*up, or
 // Gemma's tanh-approximated gelu when geglu is set.
-// swigluOAI is gpt-oss's clamped SwiGLU: gate = min(gate, 7),
-// up in [-7, 7], out = gate*sigmoid(1.702*gate) * (up + 1).
-func swigluOAI(gate, up []float32) {
-	const alpha, limit = 1.702, 7.0
-	for i, g := range gate {
-		gd := math.Min(float64(g), limit)
-		u := math.Min(math.Max(float64(up[i]), -limit), limit)
-		gate[i] = float32(gd / (1 + math.Exp(-alpha*gd)) * (u + 1))
-	}
-}
-
 func activate(gate, up []float32, geglu bool) {
 	if geglu {
 		tensai.GeluMul(gate, up)
@@ -809,7 +859,7 @@ func (m *qwen) moeFFN(b *qblock, a []float32) []float32 {
 		gu := mv(a, nil, ex.qGU, ex.guBias)
 		gate, up := gu[:moeFF], gu[moeFF:]
 		if b.oaiGLU {
-			swigluOAI(gate, up)
+			kernels.SwigluOAI(gate, up)
 		} else {
 			tensai.SiluMul(gate, up)
 		}
@@ -1042,10 +1092,11 @@ func (m *qwen) qkScale(b *qblock, d int) float64 {
 // was trained with. Derived rather than stored, because a model reaches
 // the decoder through three loaders and two of them once forgot.
 func (m *qwen) embedScale() float32 {
-	if m.cfg.ModelType != "gemma4" {
-		return 0
+	switch m.cfg.ModelType {
+	case "gemma3", "gemma4":
+		return float32(math.Sqrt(float64(m.cfg.HiddenSize)))
 	}
-	return float32(math.Sqrt(float64(m.cfg.HiddenSize)))
+	return 0
 }
 
 // kvHeadCount is the layer's kv head count. gemma4's larger models
@@ -1108,14 +1159,6 @@ func (m *qwen) splitGate(row, q, gate []float32) {
 	for h := 0; h < m.cfg.Heads; h++ {
 		copy(q[h*d:(h+1)*d], row[2*h*d:(2*h+1)*d])
 		copy(gate[h*d:(h+1)*d], row[(2*h+1)*d:(2*h+2)*d])
-	}
-}
-
-// applyGate is the gate's whole effect: it scales the attention output
-// just before the output projection.
-func applyGate(attn, gate []float32) {
-	for i := range attn {
-		attn[i] *= 1 / (1 + float32(math.Exp(float64(-gate[i]))))
 	}
 }
 
@@ -1195,7 +1238,7 @@ func (m *qwen) prefill(tokens []int, startPos int) []float32 {
 	hs := m.cfg.HiddenSize
 	last := x.Data[(len(tokens)-1)*hs : len(tokens)*hs]
 	a := make([]float32, hs)
-	rmsnormInto(a, last, m.normW, m.cfg.RMSEps)
+	m.rmsnorm(a, last, m.normW)
 	return m.capLogits(mv(a, m.lmT, m.qLmT, nil))
 }
 
@@ -1207,7 +1250,7 @@ func (m *qwen) prefillLogits(tokens []int, startPos int) *tensai.Matrix {
 	hs := m.cfg.HiddenSize
 	a := tensai.NewMatrix(x.Rows, hs)
 	for t := 0; t < x.Rows; t++ {
-		rmsnormInto(a.Data[t*hs:(t+1)*hs], x.Data[t*hs:(t+1)*hs], m.normW, m.cfg.RMSEps)
+		m.rmsnorm(a.Data[t*hs:(t+1)*hs], x.Data[t*hs:(t+1)*hs], m.normW)
 	}
 	logits := mmb(a, m.lmT, m.qLmT, nil)
 	m.capLogits(logits.Data)
@@ -1235,7 +1278,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 
 	x := tensai.NewMatrix(n, hs)
 	for t, tk := range tokens {
-		copy(x.Data[t*hs:(t+1)*hs], m.embed.Data[tk*hs:(tk+1)*hs])
+		m.embedRow(tk, x.Data[t*hs:(t+1)*hs])
 	}
 	if s := m.embedScale(); s != 0 {
 		for i := range x.Data {
@@ -1255,7 +1298,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 	a := tensai.NewMatrix(n, hs)
 	norm := func(w []float32) {
 		for t := 0; t < n; t++ {
-			rmsnormInto(a.Data[t*hs:(t+1)*hs], x.Data[t*hs:(t+1)*hs], w, cfg.RMSEps)
+			m.rmsnorm(a.Data[t*hs:(t+1)*hs], x.Data[t*hs:(t+1)*hs], w)
 		}
 	}
 	var qbuf, gbuf []float32
@@ -1428,7 +1471,7 @@ func (m *qwen) forwardBatch(tokens []int, startPos int) *tensai.Matrix {
 			wg.Wait()
 
 			if cfg.AttnOutputGate {
-				applyGate(attn.Data, gbuf)
+				kernels.MulSigmoid(attn.Data, gbuf)
 			}
 			proj := mmb(attn, b.wo, b.qo, b.bo)
 			if b.postAttn != nil {
@@ -1504,7 +1547,7 @@ func (m *qwen) step(token, pos int) []float32 {
 	hs := cfg.HiddenSize
 
 	x := make([]float32, hs)
-	copy(x, m.embed.Data[token*hs:(token+1)*hs])
+	m.embedRow(token, x)
 	if s := m.embedScale(); s != 0 {
 		for i := range x {
 			x[i] *= s
@@ -1569,7 +1612,7 @@ func (m *qwen) step(token, pos int) []float32 {
 		case b.vFromK:
 			qkvW = qProjW + kvDim
 		}
-		rmsnormInto(a, x, b.ln1, cfg.RMSEps)
+		m.rmsnorm(a, x, b.ln1)
 		if b.delta != nil {
 			if b.dstate == nil {
 				b.dstate = b.delta.newState()
@@ -1647,7 +1690,7 @@ func (m *qwen) step(token, pos int) []float32 {
 			}
 		}
 		if cfg.AttnOutputGate {
-			applyGate(att, gbuf[:qDim])
+			kernels.MulSigmoid(att, gbuf[:qDim])
 		}
 		mvInto(proj, att, b.wo, b.qo, b.bo)
 		if b.postAttn != nil {
@@ -1668,7 +1711,7 @@ func (m *qwen) step(token, pos int) []float32 {
 		}
 	}
 
-	rmsnormInto(a, x, m.normW, cfg.RMSEps)
+	m.rmsnorm(a, x, m.normW)
 	return m.capLogits(mv(a, m.lmT, m.qLmT, nil))
 }
 
@@ -1677,7 +1720,7 @@ func (m *qwen) step(token, pos int) []float32 {
 // kinds of first half — attention and the delta rule — end here.
 func (m *qwen) blockFFN(b *qblock, x, a, gu, downBuf []float32) {
 	cfg := m.cfg
-	rmsnormInto(a, x, b.ln2, cfg.RMSEps)
+	m.rmsnorm(a, x, b.ln2)
 	var down []float32
 	if len(b.experts) > 0 {
 		down = m.moeFFN(b, a)
