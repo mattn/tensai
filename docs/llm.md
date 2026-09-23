@@ -318,15 +318,20 @@ tensai serve -q8 -addr 127.0.0.1:8080
 ```
 
 `models` lists only what `run`, `chat`, and `serve` can load — a directory
-with a `config.json`, or a `.gguf` file. The examples cache their datasets in
-the same place, and those are counted separately rather than listed as models;
-`models rm` still removes them by name.
+with a `config.json`, or a `.gguf` file. It also lists the checkpoints
+`tensai image` draws with (a directory holding `transformer`, `text_encoder`
+and `vae`): their kind is `diffusers`, and the column that says `tools` or
+`think` for a language model says `image`. One fetched under its `org/repo`
+name sits a level down and lists under that name. The examples cache their datasets in the same place, and those are
+counted separately rather than listed as models; `models rm` still removes
+them by name.
 
 ```
-Qwen/Qwen3-4B-Instruct-2507                 7.5GB  qwen3    tools think 2026-08-27
-Qwen2.5-1.5B-Instruct                       2.9GB  qwen2    tools       2026-08-23
-SmolLM2-360M-Instruct                       692MB  llama    -           2026-08-24
-qwen2.5-0.5b-instruct-q8_0.gguf             531MB  gguf     tools       2026-08-25
+Qwen-Image-2.1                             52.2GB  diffusers image       2026-09-22
+Qwen/Qwen3-4B-Instruct-2507                 7.5GB  qwen3     tools think 2026-08-27
+Qwen2.5-1.5B-Instruct                       2.9GB  qwen2     tools       2026-08-23
+SmolLM2-360M-Instruct                       692MB  llama     -           2026-08-24
+qwen2.5-0.5b-instruct-q8_0.gguf             531MB  gguf      tools       2026-08-25
 ```
 
 A model downloaded from a repo is named by that repo, organization included,

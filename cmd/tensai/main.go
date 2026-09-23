@@ -710,8 +710,22 @@ func modelsCmd(args []string) error {
 			}
 			if org, base, ok := strings.Cut(name, "/"); ok {
 				if org == "" || org != filepath.Base(org) || org == "." || org == ".." ||
-					strings.Contains(base, "/") {
+					base == "" || base != filepath.Base(base) || base == "." || base == ".." {
 					return fmt.Errorf("invalid model name %q", name)
+				}
+				// A checkpoint fetched under its org/repo name sits in
+				// a directory for the org; one fetched otherwise is
+				// cached under the repo alone.
+				if nested := filepath.Join(root, org, base); isDir(nested) {
+					if err := os.RemoveAll(nested); err != nil {
+						return err
+					}
+					fmt.Println("removed", nested)
+					// The org directory goes too once nothing is left in it.
+					if rest, err := os.ReadDir(filepath.Join(root, org)); err == nil && len(rest) == 0 {
+						os.Remove(filepath.Join(root, org))
+					}
+					continue
 				}
 				name = base
 			}
@@ -787,55 +801,46 @@ func modelsCmd(args []string) error {
 			if repo := llm.GGUFOrigin(filepath.Join(root, ent.Name())); repo != "" {
 				name = repo + "/" + ent.Name()
 			}
-			emit(name, fmt.Sprintf("%8s  %-8s %-11s %s", humanSize(size), "gguf",
+			emit(name, fmt.Sprintf("%8s  %-9s %-11s %s", humanSize(size), "gguf",
 				llm.Inspect(filepath.Join(root, ent.Name())), newest.Format("2006-01-02")))
 			total += size
 			found = true
 			continue
 		}
 		dir := filepath.Join(root, ent.Name())
-		// The cache root is shared with the examples, which park their
-		// datasets (iris, mnist) beside the checkpoints. What run, chat,
-		// and serve can load is a directory with a config.json, so
-		// anything without one is not a model and does not belong in a
-		// model listing.
-		raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
-		if err != nil {
-			others++
+		if rest, size, ok := describeModelDir(dir); ok {
+			// Naming the repo rather than the directory keeps the
+			// listing usable on another machine, where the model is not
+			// cached yet; -model takes either form against a cache that
+			// already has it.
+			name := ent.Name()
+			if repo := llm.Origin(dir); repo != "" {
+				name = repo
+			}
+			emit(name, rest)
+			total += size
+			found = true
 			continue
 		}
-		kind := "?"
-		var cfg struct {
-			ModelType string `json:"model_type"`
-		}
-		if json.Unmarshal(raw, &cfg) == nil && cfg.ModelType != "" {
-			kind = cfg.ModelType
-		}
-		var size int64
-		newest := time.Time{}
-		filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
-				return nil
+		// A checkpoint fetched by its org/repo name (tensai image does
+		// this) sits one level down, under a directory named for the
+		// org; it lists under that same org/repo, which is what -model
+		// and "models rm" take.
+		nested := false
+		subs, _ := os.ReadDir(dir)
+		for _, sub := range subs {
+			if !sub.IsDir() {
+				continue
 			}
-			if info, err := d.Info(); err == nil {
-				size += info.Size()
-				if info.ModTime().After(newest) {
-					newest = info.ModTime()
-				}
+			if rest, size, ok := describeModelDir(filepath.Join(dir, sub.Name())); ok {
+				emit(ent.Name()+"/"+sub.Name(), rest)
+				total += size
+				found, nested = true, true
 			}
-			return nil
-		})
-		// Naming the repo rather than the directory keeps the listing
-		// usable on another machine, where the model is not cached yet;
-		// -model takes either form against a cache that already has it.
-		name := ent.Name()
-		if repo := llm.Origin(dir); repo != "" {
-			name = repo
 		}
-		emit(name, fmt.Sprintf("%8s  %-8s %-11s %s", humanSize(size), kind,
-			llm.Inspect(dir), newest.Format("2006-01-02")))
-		total += size
-		found = true
+		if !nested {
+			others++
+		}
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		a, b := strings.ToLower(rows[i].name), strings.ToLower(rows[j].name)
@@ -866,6 +871,55 @@ func modelsCmd(args []string) error {
 		fmt.Fprintln(os.Stderr, what)
 	}
 	return nil
+}
+
+// describeModelDir reports whether dir holds a model and, if so, its
+// listing columns and size on disk. The cache root is shared with the
+// examples, which park their datasets (iris, mnist) beside the
+// checkpoints, so a directory counts only when something can load it: a
+// config.json for run, chat and serve, or the transformer directory a
+// diffusers checkpoint keeps for tensai image.
+func describeModelDir(dir string) (rest string, size int64, ok bool) {
+	kind, caps := "", "-"
+	if raw, err := os.ReadFile(filepath.Join(dir, "config.json")); err == nil {
+		kind = "?"
+		var cfg struct {
+			ModelType string `json:"model_type"`
+		}
+		if json.Unmarshal(raw, &cfg) == nil && cfg.ModelType != "" {
+			kind = cfg.ModelType
+		}
+		caps = llm.Inspect(dir).String()
+	} else if isDir(filepath.Join(dir, "transformer")) {
+		// What it can do sits in the same column as tools and think do
+		// for a language model: it makes images.
+		kind, caps = "diffusers", "image"
+	} else {
+		return "", 0, false
+	}
+	newest := time.Time{}
+	filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			size += info.Size()
+			if info.ModTime().After(newest) {
+				newest = info.ModTime()
+			}
+		}
+		return nil
+	})
+	date := "-" // a checkpoint whose download has not written a file yet
+	if !newest.IsZero() {
+		date = newest.Format("2006-01-02")
+	}
+	return fmt.Sprintf("%8s  %-9s %-11s %s", humanSize(size), kind, caps, date), size, true
+}
+
+func isDir(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
 }
 
 func humanSize(n int64) string {
