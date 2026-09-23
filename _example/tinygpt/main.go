@@ -20,21 +20,33 @@
 //	-model 256 -heads 8 -batch 16 -seq 64  282ms/step 129ms/step
 //
 // The losses are identical either way, which is the point of the check.
+//
+// It trains on its own page of Alice unless -data names a text file, and
+// splits the text into characters unless -tokenizer names a tokenizer.json,
+// in which case it learns BPE tokens (only the ids the corpus uses, so the
+// embedding stays small). -save writes one checkpoint holding the shape,
+// the vocabulary, the tokenizer and the weights; -load starts from it,
+// generating from -prompt on its own or training on when given -data:
+//
+//	go run ./_example/tinygpt -data notes.txt -tokenizer tokenizer.json -save notes.json
+//	go run ./_example/tinygpt -load notes.json -prompt "The tape" -n 60
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"math"
 	"math/rand/v2"
 	"os"
-	"strings"
 	"time"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/autograd"
 	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/optim"
+	"github.com/mattn/tensai/tokenizer"
 )
 
 // The shape of the model. They are variables rather than constants so the
@@ -104,7 +116,10 @@ func (b *block) forward(x, mask *autograd.Node, batch int) *autograd.Node {
 	return x.Add(h.MatMul(b.w1).GELU().MatMul(b.w2))
 }
 
-// model is the whole network.
+// model is the whole network. Its vocabulary is the token ids that occur
+// in the text it learns, packed down to 0..len(vocab)-1: a rune per entry
+// in character mode, a tokenizer id per entry with -tokenizer, so a 50k
+// entry BPE vocabulary costs only the ids the corpus actually uses.
 type model struct {
 	tok        *autograd.Node // (vocab, dModel)
 	pos        *autograd.Node // (1, seq, dModel)
@@ -113,11 +128,11 @@ type model struct {
 	wOut       *autograd.Node // (dModel, vocab)
 	mask       *autograd.Node // (1, 1, seq, seq)
 	tape       *autograd.Tape
-	vocab      []rune
-	index      map[rune]int
+	vocab      []int       // model index -> token id
+	index      map[int]int // token id -> model index
 }
 
-func newModel(vocab []rune, rng *rand.Rand) *model {
+func newModel(vocab []int, rng *rand.Rand) *model {
 	m := &model{
 		tok:   autograd.Param(tensai.RandomMatrix(len(vocab), dModel, rng)),
 		pos:   autograd.Param(reshape(tensai.RandomMatrix(seqLen, dModel, rng).Tensor(), 1, seqLen, dModel)),
@@ -126,10 +141,10 @@ func newModel(vocab []rune, rng *rand.Rand) *model {
 		wOut:  autograd.Param(tensai.RandomMatrix(dModel, len(vocab), rng)),
 		mask:  autograd.Input(causalMask(seqLen)),
 		vocab: vocab,
-		index: make(map[rune]int, len(vocab)),
+		index: make(map[int]int, len(vocab)),
 	}
-	for i, r := range vocab {
-		m.index[r] = i
+	for i, id := range vocab {
+		m.index[id] = i
 	}
 	for i := 0; i < nBlocks; i++ {
 		m.blocks = append(m.blocks, newBlock(rng))
@@ -145,7 +160,21 @@ func (m *model) params() []*autograd.Node {
 	return ps
 }
 
-// forward maps batch*seqLen token ids to (batch, seq, vocab) logits.
+// indexes maps token ids to model indexes, failing on an id the
+// vocabulary does not have (text outside what a loaded checkpoint saw).
+func (m *model) indexes(ids []int, dec func([]int) string) ([]int, error) {
+	out := make([]int, len(ids))
+	for i, id := range ids {
+		x, ok := m.index[id]
+		if !ok {
+			return nil, fmt.Errorf("token %q is not in the model's vocabulary", dec([]int{id}))
+		}
+		out[i] = x
+	}
+	return out, nil
+}
+
+// forward maps batch*seqLen token indexes to (batch, seq, vocab) logits.
 func (m *model) forward(tokens []int, batch int) *autograd.Node {
 	x := m.tok.Embed(tokens, batch, seqLen).Add(m.pos) // the position row broadcasts over the batch
 	for _, b := range m.blocks {
@@ -155,40 +184,44 @@ func (m *model) forward(tokens []int, batch int) *autograd.Node {
 }
 
 // batchAt draws random windows out of the text: each row predicts the next
-// character at every position.
-func (m *model) batchAt(text []rune, rng *rand.Rand) (tokens, labels []int) {
+// token at every position.
+func (m *model) batchAt(text []int, rng *rand.Rand) (tokens, labels []int) {
 	tokens = make([]int, 0, batchSize*seqLen)
 	labels = make([]int, 0, batchSize*seqLen)
 	for i := 0; i < batchSize; i++ {
 		p := rng.IntN(len(text) - seqLen - 1)
-		for t := 0; t < seqLen; t++ {
-			tokens = append(tokens, m.index[text[p+t]])
-			labels = append(labels, m.index[text[p+t+1]])
-		}
+		tokens = append(tokens, text[p:p+seqLen]...)
+		labels = append(labels, text[p+1:p+seqLen+1]...)
 	}
 	return tokens, labels
 }
 
-// generate continues the seed text one character at a time. The window is
-// always seqLen tokens wide, so the position embedding always lines up.
-func (m *model) generate(seed []rune, n int, temperature float32, rng *rand.Rand) string {
+// generate continues the prompt one token at a time and returns the new
+// token indexes. A prompt shorter than the context window sits at its
+// start: attention is causal, so the next token read at the prompt's last
+// position never sees the unused slots after it. Once the window is full
+// it slides, and the position embedding still lines up.
+func (m *model) generate(prompt []int, n int, temperature float32, rng *rand.Rand) []int {
 	window := make([]int, seqLen)
-	for i, r := range seed[len(seed)-seqLen:] {
-		window[i] = m.index[r]
-	}
-	var sb strings.Builder
+	cur := copy(window, prompt[max(0, len(prompt)-seqLen):])
+	out := make([]int, 0, n)
 	vocab := len(m.vocab)
 	for i := 0; i < n; i++ {
 		logits := m.forward(window, 1).Scale(1 / temperature).Softmax().Value()
-		// The next character is the distribution at the last position. It
-		// is read before the tape recycles the buffer it lives in.
-		next := sample(logits.Data[(seqLen-1)*vocab:], rng)
+		// The next token is the distribution at the last filled position.
+		// It is read before the tape recycles the buffer it lives in.
+		next := sample(logits.Data[(cur-1)*vocab:cur*vocab], rng)
 		m.tape.Reset()
-		sb.WriteRune(m.vocab[next])
-		copy(window, window[1:])
-		window[seqLen-1] = next
+		out = append(out, next)
+		if cur < seqLen {
+			window[cur] = next
+			cur++
+		} else {
+			copy(window, window[1:])
+			window[seqLen-1] = next
+		}
 	}
-	return sb.String()
+	return out
 }
 
 func sample(probs []tensai.Float, rng *rand.Rand) int {
@@ -230,60 +263,208 @@ func reshape(t *tensai.Tensor, shape ...int) *tensai.Tensor {
 	return out
 }
 
-func vocabOf(text []rune) []rune {
-	seen := map[rune]bool{}
-	var vocab []rune
-	for _, r := range text {
-		if !seen[r] {
-			seen[r] = true
-			vocab = append(vocab, r)
+// vocabOf lists the distinct token ids in the order they first appear.
+func vocabOf(ids []int) []int {
+	seen := map[int]bool{}
+	var vocab []int
+	for _, id := range ids {
+		if !seen[id] {
+			seen[id] = true
+			vocab = append(vocab, id)
 		}
 	}
 	return vocab
+}
+
+// codec turns text into token ids and back: runes by default, or a
+// tokenizer.json's BPE with -tokenizer.
+type codec struct {
+	tok *tokenizer.Tokenizer
+	raw json.RawMessage // the tokenizer.json, kept for the checkpoint
+}
+
+func newCodec(raw []byte) (*codec, error) {
+	if len(raw) == 0 {
+		return &codec{}, nil
+	}
+	tok, err := tokenizer.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	return &codec{tok: tok, raw: raw}, nil
+}
+
+func (c *codec) encode(s string) []int {
+	if c.tok != nil {
+		return c.tok.Encode(s)
+	}
+	ids := make([]int, 0, len(s))
+	for _, r := range s {
+		ids = append(ids, int(r))
+	}
+	return ids
+}
+
+func (c *codec) decode(ids []int) string {
+	if c.tok != nil {
+		return c.tok.Decode(ids)
+	}
+	rs := make([]rune, len(ids))
+	for i, id := range ids {
+		rs[i] = rune(id)
+	}
+	return string(rs)
+}
+
+// checkpoint is everything -load needs to rebuild the model without the
+// flags or files it was trained with: the shape, the vocabulary, the
+// tokenizer itself and the parameters. The Adam moments are not kept, so
+// training on from a checkpoint starts them over.
+type checkpoint struct {
+	Model     int             `json:"model"`
+	Heads     int             `json:"heads"`
+	Blocks    int             `json:"blocks"`
+	Seq       int             `json:"seq"`
+	Vocab     []int           `json:"vocab"`
+	Tokenizer json.RawMessage `json:"tokenizer,omitempty"`
+	Params    json.RawMessage `json:"params"`
+}
+
+func save(path string, m *model, c *codec) error {
+	var params bytes.Buffer
+	if err := autograd.SaveParams(&params, m.params()...); err != nil {
+		return err
+	}
+	b, err := json.Marshal(&checkpoint{
+		Model: dModel, Heads: nHeads, Blocks: nBlocks, Seq: seqLen,
+		Vocab: m.vocab, Tokenizer: c.raw, Params: params.Bytes(),
+	})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o644)
+}
+
+func readCheckpoint(path string) (*checkpoint, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var ck checkpoint
+	if err := json.Unmarshal(b, &ck); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return &ck, nil
 }
 
 func main() {
 	iters := flag.Int("iters", 1000, "training steps")
 	lr := flag.Float64("lr", 0.003, "Adam learning rate")
 	temp := flag.Float64("temp", 0.8, "sampling temperature")
-	n := flag.Int("n", 400, "characters to generate")
+	n := flag.Int("n", 400, "tokens to generate")
 	seed := flag.Int64("seed", 7, "random seed")
 	useGPU := flag.Bool("gpu", false, "train on the GPU (needs -tags wgpu24 or wgpu)")
+	dataPath := flag.String("data", "", "train on this text file instead of the built-in corpus")
+	tokPath := flag.String("tokenizer", "", "tokenize with this tokenizer.json (BPE) instead of by character")
+	savePath := flag.String("save", "", "write a checkpoint here after training")
+	loadPath := flag.String("load", "", "start from this checkpoint; without -data it only generates")
+	prompt := flag.String("prompt", "", "text to continue (default: the start of the corpus)")
 	flag.IntVar(&dModel, "model", dModel, "model width")
 	flag.IntVar(&nHeads, "heads", nHeads, "attention heads")
 	flag.IntVar(&nBlocks, "blocks", nBlocks, "transformer blocks")
 	flag.IntVar(&batchSize, "batch", batchSize, "sequences per step")
 	flag.IntVar(&seqLen, "seq", seqLen, "tokens the model sees at once")
 	flag.Parse()
-	if dModel%nHeads != 0 {
-		fmt.Fprintf(os.Stderr, "tinygpt: model width %d is not divisible by %d heads\n", dModel, nHeads)
+	if err := run(*iters, *lr, *temp, *n, *seed, *useGPU, *dataPath, *tokPath, *savePath, *loadPath, *prompt); err != nil {
+		fmt.Fprintf(os.Stderr, "tinygpt: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func run(iters int, lr, temp float64, n int, seed int64, useGPU bool, dataPath, tokPath, savePath, loadPath, prompt string) error {
+	// The checkpoint, when there is one, decides the shape and the
+	// tokenizer; the flags that would change them are ignored.
+	var ck *checkpoint
+	var tokJSON []byte
+	if loadPath != "" {
+		var err error
+		if ck, err = readCheckpoint(loadPath); err != nil {
+			return err
+		}
+		if tokPath != "" {
+			return fmt.Errorf("-tokenizer cannot change the tokenizer of a checkpoint")
+		}
+		dModel, nHeads, nBlocks, seqLen = ck.Model, ck.Heads, ck.Blocks, ck.Seq
+		tokJSON = ck.Tokenizer
+	} else if tokPath != "" {
+		var err error
+		if tokJSON, err = os.ReadFile(tokPath); err != nil {
+			return err
+		}
+	}
+	if dModel%nHeads != 0 {
+		return fmt.Errorf("model width %d is not divisible by %d heads", dModel, nHeads)
+	}
 	headDim, dFF = dModel/nHeads, 4*dModel
+	c, err := newCodec(tokJSON)
+	if err != nil {
+		return err
+	}
 
-	text := []rune(corpus)
+	// A checkpoint alone only generates; anything else trains, on the
+	// built-in corpus unless -data names a file.
+	var text []int
+	switch {
+	case dataPath != "":
+		b, err := os.ReadFile(dataPath)
+		if err != nil {
+			return err
+		}
+		text = c.encode(string(b))
+	case ck == nil:
+		text = c.encode(corpus)
+	}
+
 	vocab := vocabOf(text)
-	rng := rand.New(rand.NewPCG(uint64(*seed), 0))
+	if ck != nil {
+		vocab = ck.Vocab
+	}
+	rng := rand.New(rand.NewPCG(uint64(seed), 0))
 	m := newModel(vocab, rng)
-
 	params := m.params()
+	if ck != nil {
+		if err := autograd.LoadParams(bytes.NewReader(ck.Params), params...); err != nil {
+			return fmt.Errorf("%s: %w", loadPath, err)
+		}
+	}
 	var count int
 	for _, p := range params {
 		count += len(p.Value().Data)
 	}
-	fmt.Printf("corpus: %d chars, vocab: %d, parameters: %d\n", len(text), len(vocab), count)
+	if text != nil {
+		fmt.Printf("corpus: %d tokens, ", len(text))
+	}
+	fmt.Printf("vocab: %d, parameters: %d\n", len(vocab), count)
 
-	trainer := autograd.NewTrainer(optim.NewAdam(tensai.Float(*lr)), params...)
+	var data []int // the corpus as model indexes; nil when only generating
+	if text != nil {
+		if data, err = m.indexes(text, c.decode); err != nil {
+			return err
+		}
+	}
+	if data != nil && len(data) <= seqLen {
+		return fmt.Errorf("corpus of %d tokens is not longer than the %d token context window", len(data), seqLen)
+	}
+
 	// Every step builds a fresh graph and drops it; the tape hands the last
 	// step's buffers back instead of allocating them again.
 	tape := autograd.NewTape()
-	if *useGPU {
+	if useGPU {
 		// With a device the whole block stays there: values, gradients and
 		// the Adam update. Only the loss comes back each step.
 		dev, err := gpu.Open(gpu.HighPerformance)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "tinygpt: %v\n", err)
-			os.Exit(1)
+			return err
 		}
 		defer dev.Close()
 		tape.UseDevice(dev)
@@ -292,26 +473,49 @@ func main() {
 	tape.Bind(params...)
 	m.tape = tape
 
-	start := time.Now()
-	for it := 1; it <= *iters; it++ {
-		tokens, labels := m.batchAt(text, rng)
-		lossVal := trainer.Step(m.forward(tokens, batchSize).CrossEntropy(labels))
-		tape.Reset()
-		if it == 1 || it%50 == 0 {
-			fmt.Printf("iter %4d: loss=%.4f\n", it, lossVal)
+	if data != nil && iters > 0 {
+		trainer := autograd.NewTrainer(optim.NewAdam(tensai.Float(lr)), params...)
+		start := time.Now()
+		for it := 1; it <= iters; it++ {
+			tokens, labels := m.batchAt(data, rng)
+			lossVal := trainer.Step(m.forward(tokens, batchSize).CrossEntropy(labels))
+			tape.Reset()
+			if it == 1 || it%50 == 0 {
+				fmt.Printf("iter %4d: loss=%.4f\n", it, lossVal)
+			}
 		}
+		took := time.Since(start)
+		fmt.Printf("trained %d steps in %v (%.1fms/step)\n",
+			iters, took.Round(time.Millisecond), float64(took.Milliseconds())/float64(iters))
 	}
-	took := time.Since(start)
-	fmt.Printf("trained %d steps in %v (%.1fms/step)\n",
-		*iters, took.Round(time.Millisecond), float64(took.Milliseconds())/float64(*iters))
+	if savePath != "" {
+		if err := save(savePath, m, c); err != nil {
+			return err
+		}
+		fmt.Printf("saved %s\n", savePath)
+	}
+	if n <= 0 {
+		return nil
+	}
 
-	if len(text) < seqLen {
-		fmt.Fprintln(os.Stderr, "tinygpt: corpus shorter than the context window")
-		os.Exit(1)
+	var seedIdx []int
+	if prompt != "" {
+		if seedIdx, err = m.indexes(c.encode(prompt), c.decode); err != nil {
+			return fmt.Errorf("prompt: %w", err)
+		}
+	} else if data != nil {
+		seedIdx = data[:seqLen]
 	}
-	prompt := text[:seqLen]
-	fmt.Printf("\nprompt: %q\n\ngenerated:\n%s\n", string(prompt),
-		string(prompt)+m.generate(prompt, *n, float32(*temp), rand.New(rand.NewPCG(uint64(*seed+1), 0))))
+	if len(seedIdx) == 0 {
+		return fmt.Errorf("nothing to continue: give -prompt")
+	}
+	gen := m.generate(seedIdx, n, float32(temp), rand.New(rand.NewPCG(uint64(seed+1), 0)))
+	ids := make([]int, 0, len(seedIdx)+len(gen))
+	for _, x := range append(seedIdx, gen...) {
+		ids = append(ids, m.vocab[x])
+	}
+	fmt.Printf("\nprompt: %q\n\ngenerated:\n%s\n", c.decode(ids[:len(seedIdx)]), c.decode(ids))
+	return nil
 }
 
 // The opening of "Alice's Adventures in Wonderland" by Lewis Carroll
