@@ -42,6 +42,9 @@ func cacheRoundTrip(t *testing.T, bits int) {
 	defer release()
 	same := func(name string, a, b *linear) {
 		t.Helper()
+		if a.rot != b.rot {
+			t.Fatalf("%s: rotation width %d became %d", name, a.rot, b.rot)
+		}
 		if (a.q == nil) != (b.q == nil) || (a.q4 == nil) != (b.q4 == nil) {
 			t.Fatalf("%s: the two sides are stored differently", name)
 		}

@@ -399,8 +399,22 @@ func main() {
 		fs.Bool("fetch", false, "no longer needed: a repo named by -model downloads, or finishes downloading, on its own")
 		useGPU := fs.Bool("gpu", false, "run feed-forward and attention on the GPU (needs a wgpu build tag and quantized weights)")
 		budget := fs.Float64("gpu-budget", 4, "gigabytes of weights the GPU may hold; past what a device can take it is dropped, and nothing reports that")
+		gpuProjections := fs.Bool("gpu-projections", false, "stream attention projection weights to the GPU (requires -gpu)")
+		gpuVAE := fs.Bool("gpu-vae", false, "run decoder convolutions on the GPU")
+		turboLoRA := fs.String("turbo-lora", "", "path to a Viggle Qwen-Image-2.1 six-step LoRA; uses 6 steps and cfg=1")
 		cpuprofile := fs.String("cpuprofile", "", "write a CPU profile of image generation to this file")
 		fs.Parse(os.Args[2:])
+		if *turboLoRA != "" {
+			explicitSteps := false
+			fs.Visit(func(f *flag.Flag) {
+				if f.Name == "steps" {
+					explicitSteps = true
+				}
+			})
+			if !explicitSteps {
+				*steps = 6
+			}
+		}
 		defer profileTo(*cpuprofile)()
 		text := strings.TrimSpace(*prompt + " " + strings.Join(fs.Args(), " "))
 		if text == "" {
@@ -414,7 +428,7 @@ func main() {
 		case *q4:
 			bits = 4
 		}
-		if err := generateImage(*model, text, *negative, *out, *size, *steps, *seed, bits, *cfg, *budget, *useGPU, *quiet); err != nil {
+		if err := generateImage(*model, text, *negative, *out, *size, *steps, *seed, bits, *cfg, *budget, *useGPU, *quiet, imageAcceleration{*gpuProjections, *gpuVAE, *turboLoRA}); err != nil {
 			fmt.Fprintln(os.Stderr, "tensai image:", err)
 			os.Exit(1)
 		}
@@ -922,11 +936,28 @@ func joinArgs(a []string) string {
 	return strings.Join(a, " ")
 }
 
-// generateImage draws one picture with Qwen-Image and writes it as a
+type imageAcceleration struct {
+	projections, vae bool
+	turboLoRA        string
+}
+
+// generateImage runs Qwen-Image-2.1 from a text prompt to a square RGBA
 // PNG. The two models are seven gigabytes apiece and only one is held
 // at a time: the prompt is encoded and the encoder released before the
 // denoising transformer loads.
-func generateImage(model, prompt, negative, out string, size, steps int, seed int64, bits int, cfg, budget float64, useGPU, quiet bool) error {
+func generateImage(model, prompt, negative, out string, size, steps int, seed int64, bits int, cfg, budget float64, useGPU, quiet bool, accel imageAcceleration) error {
+	if accel.projections && !useGPU {
+		return fmt.Errorf("-gpu-projections requires -gpu")
+	}
+	if (useGPU || accel.vae) && gpu.Backend() == "" {
+		return fmt.Errorf("GPU image generation requires a build with -tags wgpu or wgpu24")
+	}
+	if steps < 2 {
+		return fmt.Errorf("-steps must be at least 2")
+	}
+	if accel.turboLoRA != "" && (steps != 6 || cfg != 1 || negative != "") {
+		return fmt.Errorf("-turbo-lora requires 6 steps, -cfg 1 and no negative prompt")
+	}
 	say := func(format string, args ...any) {
 		if !quiet {
 			fmt.Fprintf(os.Stderr, format+"\n", args...)
@@ -975,6 +1006,13 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 	}
 	defer m.Close()
 	say("transformer: loaded in %v", time.Since(start).Round(time.Second))
+	if accel.turboLoRA != "" {
+		start = time.Now()
+		if err := qwenimage.LoadTurboLoRA(m, accel.turboLoRA); err != nil {
+			return err
+		}
+		say("turbo: adapter loaded in %v", time.Since(start).Round(time.Second))
+	}
 	if useGPU {
 		start = time.Now()
 		name, held, err := qwenimage.UseGPU(m, uint64(budget*(1<<30)))
@@ -982,12 +1020,22 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 			return err
 		}
 		say("gpu: %s holding %.1fGiB of feed-forward weights in %v", name, float64(held)/(1<<30), time.Since(start).Round(time.Second))
+		if accel.projections {
+			if err := qwenimage.UseGPUProjections(m, uint64(budget*(1<<30))); err != nil {
+				return err
+			}
+			say("gpu: streaming attention projections")
+		}
 	}
 
 	latents := qwenimage.Noise(rand.New(rand.NewPCG(uint64(seed), 0)), side, side)
 	layout := qwenimage.NewLayout(text.Rows, side, side)
 	start = time.Now()
-	err = qwenimage.Generate(m, latents, text, layout, qwenimage.NewSchedule(steps, side*side), guide, func(i int) {
+	schedule := qwenimage.NewSchedule(steps, side*side)
+	if accel.turboLoRA != "" {
+		schedule = qwenimage.NewTurboSchedule(side * side)
+	}
+	err = qwenimage.Generate(m, latents, text, layout, schedule, guide, func(i int) {
 		say("step %d/%d in %v", i+1, steps, time.Since(start).Round(time.Second))
 	})
 	if err != nil {
@@ -1011,7 +1059,11 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 	if err != nil {
 		return err
 	}
-	px, err := qwenimage.Decode(dec, stats.Denormalize(latents, side, side))
+	decode := qwenimage.Decode
+	if accel.vae {
+		decode = qwenimage.DecodeGPU
+	}
+	px, err := decode(dec, stats.Denormalize(latents, side, side))
 	if err != nil {
 		return err
 	}

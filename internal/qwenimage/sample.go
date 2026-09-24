@@ -56,6 +56,19 @@ func NewSchedule(steps, tokens int) *Schedule {
 	return s
 }
 
+// NewTurboSchedule is the Viggle six-step schedule. It uses the same
+// resolution shift as the base model, but deliberately no terminal stretch.
+func NewTurboSchedule(tokens int) *Schedule {
+	const slope = (0.9 - 0.5) / (8192.0 - 256.0)
+	mu := math.Exp(float64(tokens)*slope + 0.5 - slope*256)
+	s := &Schedule{Sigmas: []float64{1, 0.9375, 0.875, 0.75, 0.5, 0.25, 0}}
+	for i := 0; i < 6; i++ {
+		t := s.Sigmas[i]
+		s.Sigmas[i] = mu / (mu + (1/t - 1))
+	}
+	return s
+}
+
 // Steps is how many denoising steps the schedule runs.
 func (s *Schedule) Steps() int { return len(s.Sigmas) - 1 }
 
