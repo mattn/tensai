@@ -89,3 +89,30 @@ func BenchmarkQ8DownProjectionCold(b *testing.B) {
 		}
 	}
 }
+
+func benchmarkQ4Shape(b *testing.B, rows, cols int) {
+	q := NewQ4Matrix(rows, cols, 0, false)
+	for i := range q.Q {
+		q.Q[i] = uint8(i)
+	}
+	for i := range q.Scale {
+		q.Scale[i] = 1.0 / 7
+	}
+	x := make([]tensai.Float, rows)
+	for i := range x {
+		x[i] = tensai.Float(i%31-15) / 16
+	}
+	out := make([]tensai.Float, cols)
+	b.SetBytes(int64(rows * cols / 2))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := q.MatVec(x, out); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkQ4QKVProjection(b *testing.B)    { benchmarkQ4Shape(b, 896, 1152) }
+func BenchmarkQ4GateUpProjection(b *testing.B) { benchmarkQ4Shape(b, 896, 9728) }
+func BenchmarkQ4DownProjection(b *testing.B)   { benchmarkQ4Shape(b, 4864, 896) }
+func BenchmarkQ4VocabProjection(b *testing.B)  { benchmarkQ4Shape(b, 896, 151936) }
