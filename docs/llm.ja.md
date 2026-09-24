@@ -290,7 +290,7 @@ tensai serve -q8 -addr 127.0.0.1:8080
 `models` が一覧するのは `run` / `chat` / `serve` が読めるものだけです —
 `config.json` を持つディレクトリか、`.gguf` ファイル。それに加えて、
 `tensai image` が使うチェックポイント (`transformer`、`text_encoder`、`vae` を
-持つディレクトリ) も並びます。種別は `diffusers` で、言語モデルなら `tools` や
+持つディレクトリ、または ComfyUI 形式のファイル群) も並びます。種別は `diffusers` か `comfyui` で、言語モデルなら `tools` や
 `think` が出る列に `image` と出ます。`org/repo` の名前で取得したものは 1 階層下に
 置かれ、その名前で並びます。example はデータセットを
 同じ場所にキャッシュしますが、それらはモデルとして並べず件数だけ報告します

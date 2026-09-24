@@ -77,6 +77,18 @@ func (m *Transformer) Close() error {
 // ditLayers is how many blocks the checkpoint has.
 const ditLayers = 32
 
+// openTransformerSource opens the transformer at path: a directory of
+// shards, or one ComfyUI file.
+func openTransformerSource(path string) (interface {
+	weights
+	Close() error
+}, error) {
+	if singleFile(path) {
+		return openComfy(path, nil)
+	}
+	return safetensors.OpenSharded(filepath.Join(path, "diffusion_pytorch_model.safetensors.index.json"))
+}
+
 // LoadTransformer reads the denoising transformer. With bits set to 8
 // the weights quantize as they arrive, which takes the 14GB checkpoint
 // to around 7GB, and 4 halves that again; 0 keeps them as floats, which
@@ -105,7 +117,7 @@ func loadTransformer(dir string, bits, layers int) (*Transformer, error) {
 		}
 	}
 
-	w, err := safetensors.OpenSharded(filepath.Join(dir, "diffusion_pytorch_model.safetensors.index.json"))
+	w, err := openTransformerSource(dir)
 	if err != nil {
 		return nil, err
 	}

@@ -160,22 +160,62 @@ func Generate(m *Transformer, latents, text *tensai.Matrix, l *Layout, s *Schedu
 	return nil
 }
 
-// ModelDir is where a downloaded checkpoint's components sit.
+// ModelDir is where a downloaded checkpoint's components sit. Two
+// layouts are understood: the diffusers one, a directory per component,
+// and ComfyUI's, a file per component under diffusion_models,
+// text_encoders and vae (with the diffusers vae/config.json and
+// processor/tokenizer.json beside them, which ComfyUI does not ship).
 type ModelDir string
+
+// Comfy reports whether the directory holds ComfyUI's layout.
+func (d ModelDir) Comfy() bool {
+	fi, err := os.Stat(filepath.Join(string(d), "diffusion_models"))
+	return err == nil && fi.IsDir()
+}
+
+// comfyFile picks a component's file out of a ComfyUI directory: the
+// int8 one when it is there, else the bfloat16 one. Either path is a
+// name the loaders reject clearly when the file is missing.
+func (d ModelDir) comfyFile(sub, stem string) string {
+	int8 := filepath.Join(string(d), sub, stem+"_int8_convrot.safetensors")
+	if _, err := os.Stat(int8); err == nil {
+		return int8
+	}
+	bf16 := filepath.Join(string(d), sub, stem+"_bf16.safetensors")
+	if _, err := os.Stat(bf16); err == nil {
+		return bf16
+	}
+	return int8
+}
 
 // VAE returns the path to the VAE's weights.
 func (d ModelDir) VAE() string {
+	if d.Comfy() {
+		return d.comfyFile("vae", "qwen_image_2.1_vae")
+	}
 	return filepath.Join(string(d), "vae", "diffusion_pytorch_model.safetensors")
 }
 
 // VAEConfig returns the path to the VAE's config.
 func (d ModelDir) VAEConfig() string { return filepath.Join(string(d), "vae", "config.json") }
 
-// Transformer returns the directory holding the denoising transformer.
-func (d ModelDir) Transformer() string { return filepath.Join(string(d), "transformer") }
+// Transformer returns where the denoising transformer is: a directory of
+// shards, or one ComfyUI file.
+func (d ModelDir) Transformer() string {
+	if d.Comfy() {
+		return d.comfyFile("diffusion_models", "qwen_image_2.1")
+	}
+	return filepath.Join(string(d), "transformer")
+}
 
-// TextEncoder returns the directory holding the prompt encoder.
-func (d ModelDir) TextEncoder() string { return filepath.Join(string(d), "text_encoder") }
+// TextEncoder returns where the prompt encoder is: a directory of
+// shards, or one ComfyUI file.
+func (d ModelDir) TextEncoder() string {
+	if d.Comfy() {
+		return d.comfyFile("text_encoders", "qwen3vl_8b")
+	}
+	return filepath.Join(string(d), "text_encoder")
+}
 
 // Tokenizer returns the path to the processor's tokenizer.
 func (d ModelDir) Tokenizer() string {

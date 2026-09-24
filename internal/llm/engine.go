@@ -1594,6 +1594,11 @@ func recordOrigin(dir, repo string) {
 	os.WriteFile(p, []byte(repo), 0o644)
 }
 
+// RecordOrigin notes that dir was downloaded from repo, so the listing
+// can name it by the repo. Commands that fetch a checkpoint of their own
+// (tensai image) call it the way the loader does for its downloads.
+func RecordOrigin(dir, repo string) { recordOrigin(dir, repo) }
+
 // Origin returns the repo a cached model was downloaded from, or "" for
 // one that predates the record or was never downloaded at all.
 func Origin(dir string) string {

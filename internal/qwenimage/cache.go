@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"unsafe"
 
 	"github.com/mattn/tensai"
@@ -73,6 +74,10 @@ func (t *TextEncoder) walk(c codec) {
 // stamp identifies a checkpoint by what its files look like on disk.
 func stamp(dir string) ([]byte, error) {
 	names, err := filepath.Glob(filepath.Join(dir, "*.safetensors"))
+	if singleFile(dir) {
+		// A single-file checkpoint (ComfyUI's layout) is its own source.
+		names, err = []string{dir}, nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -93,10 +98,20 @@ func stamp(dir string) ([]byte, error) {
 	return out, nil
 }
 
-// cachePath is where a checkpoint's quantized form lives.
+// cachePath is where a checkpoint's quantized form lives: in its
+// directory, or beside it when the checkpoint is a single file. A
+// directory of single files can hold more than one precision of the same
+// model, and each gets its own cache.
 func cachePath(dir string, bits int) string {
+	if singleFile(dir) {
+		return fmt.Sprintf("%s.tensai-q%d.cache", dir, bits)
+	}
 	return filepath.Join(dir, fmt.Sprintf("tensai-q%d.cache", bits))
 }
+
+// singleFile reports whether a checkpoint path names one weights file
+// rather than a directory of shards.
+func singleFile(path string) bool { return strings.HasSuffix(path, ".safetensors") }
 
 // bytesOf views a slice's backing array as bytes.
 func bytesOf[T any](s []T) []byte {
@@ -248,7 +263,11 @@ func writeCache(dir string, bits int, walk func(codec)) error {
 		return err
 	}
 	path := cachePath(dir, bits)
-	tmp, err := os.CreateTemp(dir, "tensai-cache-*")
+	tmpDir := dir
+	if singleFile(dir) {
+		tmpDir = filepath.Dir(dir)
+	}
+	tmp, err := os.CreateTemp(tmpDir, "tensai-cache-*")
 	if err != nil {
 		return err
 	}

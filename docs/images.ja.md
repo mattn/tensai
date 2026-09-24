@@ -23,12 +23,16 @@ wrote out.png, 256x256
 ## チェックポイントの入手
 
 ```bash
-tensai image -fetch "a calico cat asleep on a stack of books"
+tensai image "a calico cat asleep on a stack of books"
+tensai image -model Comfy-Org/Qwen-Image-2.1 "a calico cat asleep on a stack of books"
 ```
 
-`-fetch` が `~/.cache/tensai/Qwen-Image-2.1` の下に一式 (合計およそ 31GB) を落としてから描きます。中断した場合は続きから再開します。重みファイル名は各コンポーネントの index から読むので、リポジトリ側で分割数が変わっても解決できます。2 回目以降の `-fetch` は既にあるものを見つけるだけで何もしません。
+`-model` は `run` や `chat` と同じ形でチェックポイントを指定します。リポジトリ名、`tensai models` が表示する名前、パスのどれでも受け付けます。次の 2 つのリポジトリは初回に自動でダウンロードします。中断などでファイルが欠けていれば、次の実行でそのファイルだけを取り直します。すべて揃っていれば通信はしません。
 
-`-model` はキャッシュ下の名前でも、`text_encoder`・`transformer`・`vae`・`processor` を持つディレクトリへのパスでも受け付けます。
+- `Qwen/Qwen-Image-2.1` (既定): diffusers 形式のチェックポイントで、およそ 31GB です。`~/.cache/tensai/Qwen-Image-2.1` に置きます。重みファイル名は各コンポーネントの index から読むので、リポジトリ側で分割数が変わっても解決できます。
+- `Comfy-Org/Qwen-Image-2.1`: ComfyUI 向けに詰め直したもので、`~/.cache/tensai/Comfy-Org/Qwen-Image-2.1` に置きます。transformer とプロンプトエンコーダが最初から 8 ビットなので、int8 版の合計はおよそ 17GB です。重みは入力 256 列ごとに Hadamard 行列で回転させてから、行ごとのスケール付き int8 にしてあります。ローダーはこの 2 つを戻してから自前の量子化をかけるので、どちらのチェックポイントも同じコードで動きます。ComfyUI 版にはトークナイザと VAE の潜在統計が含まれないため、この小さな 2 ファイルだけは Qwen のリポジトリから取ります。
+
+パスにはどちらの配置のディレクトリも指定できます。diffusers なら `text_encoder`・`transformer`・`vae`・`processor`、ComfyUI なら `text_encoders`・`diffusion_models`・`vae` に `processor/tokenizer.json` と `vae/config.json` を加えたものです。ComfyUI の配置では `_int8_convrot` のファイルを選び、無ければ `_bf16` を使います。以前ダウンロードに使っていた `-fetch` は、指定しても何もしません。
 
 ## 幅とメモリ
 
@@ -81,7 +85,7 @@ Attention の射影と各種ノルム、3 軸の rotary embedding は CPU に残
 ```
 tensai image [flags] <prompt>
 
-  -model string   キャッシュ下の名前、またはパス (既定 "Qwen-Image-2.1")
+  -model string   リポジトリ名、キャッシュ内の名前、またはパス (既定 "Qwen/Qwen-Image-2.1")
   -o string       書き出し先 (既定 "out.png")
   -size int       幅と高さ、ピクセル (既定 256)
   -steps int      デノイジングのステップ数 (既定 20)
@@ -90,7 +94,6 @@ tensai image [flags] <prompt>
   -f32            重みを float のまま持つ。およそ 42GB 必要
   -negative str   避けたいもの。-cfg を 1 より大きくする必要がある
   -cfg float      どれだけ避けるか (既定 1、off)
-  -fetch          先にチェックポイントを落とす。およそ 31GB
   -gpu            feed-forward と attention を GPU で走らせる
   -gpu-budget num GPU に載せてよい重みの GB 数 (既定 4)
   -cpuprofile str CPU プロファイルの保存先
