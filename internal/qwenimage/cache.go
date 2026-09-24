@@ -28,7 +28,7 @@ import (
 
 const (
 	cacheMagic   = "tensai-qwenimage\x00"
-	cacheVersion = 1
+	cacheVersion = 2
 	// Every payload starts on an eight-byte boundary so the mapped bytes
 	// can be viewed as floats and int32s where they lie.
 	cacheAlign = 8
@@ -166,6 +166,7 @@ func (c *cacheWriter) vec(v *[]tensai.Float) { c.blob(bytesOf(*v)) }
 
 func (c *cacheWriter) lin(l **linear) {
 	m := *l
+	c.num(m.rot)
 	switch {
 	case m.q != nil:
 		c.num(1)
@@ -229,6 +230,12 @@ func (c *cacheReader) num() int {
 func (c *cacheReader) vec(v *[]tensai.Float) { *v = sliceOf[tensai.Float](c.blob()) }
 
 func (c *cacheReader) lin(l **linear) {
+	rot := c.num()
+	defer func() {
+		if c.err == nil && *l != nil {
+			(*l).rot = rot
+		}
+	}()
 	kind := c.num()
 	rows, cols := c.num(), c.num()
 	if c.err != nil {
