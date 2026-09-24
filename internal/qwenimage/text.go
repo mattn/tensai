@@ -108,7 +108,7 @@ func loadTextEncoder(dir string, bits, layers int) (*TextEncoder, error) {
 			{&l.up, p + "mlp.up_proj.weight", teMLP, teDim},
 			{&l.down, p + "mlp.down_proj.weight", teDim, teMLP},
 		} {
-			if *f.dst, err = loadLinear(w, f.name, f.rows, f.cols, bits); err != nil {
+			if *f.dst, err = loadLinear(w, f.name, f.rows, f.cols, bits, convRotGroup); err != nil {
 				w.Close()
 				return nil, err
 			}

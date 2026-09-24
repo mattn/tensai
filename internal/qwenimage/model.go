@@ -61,6 +61,9 @@ func (m *Transformer) Close() error {
 					w.q4.Free()
 				}
 			}
+			if b.dev.rot != nil && b == m.blocks[0] {
+				b.dev.rot.Free() // shared by every block
+			}
 			b.dev, b.g = nil, nil
 		}
 		m.dev.Close()
@@ -140,7 +143,7 @@ func loadTransformer(dir string, bits, layers int) (*Transformer, error) {
 		// The pieces outside the blocks are a rounding error of the
 		// model's size and sit on every token's path, so they stay in
 		// float whatever the blocks do.
-		if *f.dst, err = loadLinear(w, f.name, f.rows, f.cols, 0); err != nil {
+		if *f.dst, err = loadLinear(w, f.name, f.rows, f.cols, 0, 0); err != nil {
 			return nil, err
 		}
 	}

@@ -179,16 +179,17 @@ func dequantRow(dst []tensai.Float, q []byte, scale tensai.Float, cq comfyQuant)
 		return
 	}
 	for g := 0; g+cq.GroupSize <= len(dst); g += cq.GroupSize {
-		unrotate(dst[g : g+cq.GroupSize])
+		hadamard(dst[g : g+cq.GroupSize])
 	}
 }
 
-// unrotate multiplies a group by ConvRot's Hadamard matrix H, the
+// hadamard multiplies a group by ConvRot's Hadamard matrix H, the
 // Kronecker power of the 4x4 regular Hadamard below scaled to be
-// orthonormal. The weight was stored as W H^T and H is symmetric, so
-// this is what undoes it. H is applied one base-4 digit of the index at a
+// orthonormal. H is symmetric and its own inverse, so the one product
+// both rotates and rotates back: a ComfyUI weight was stored as W H^T,
+// and this undoes it. H is applied one base-4 digit of the index at a
 // time, 4 adds a value per digit rather than a group-wide product.
-func unrotate(x []tensai.Float) {
+func hadamard(x []tensai.Float) {
 	n := len(x)
 	for s := 1; s < n; s *= 4 {
 		for b := 0; b < n; b += 4 * s {

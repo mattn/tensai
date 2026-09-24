@@ -13,9 +13,9 @@ import (
 	"github.com/mattn/tensai"
 )
 
-// hadamard builds ConvRot's matrix the way comfy-kitchen does: Kronecker
+// hadamardMatrix builds ConvRot's matrix the way comfy-kitchen does: Kronecker
 // powers of the 4x4 regular Hadamard, divided by sqrt(n).
-func hadamard(n int) [][]float64 {
+func hadamardMatrix(n int) [][]float64 {
 	h4 := [][]float64{{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}}
 	h := h4
 	for len(h) < n {
@@ -38,10 +38,10 @@ func hadamard(n int) [][]float64 {
 }
 
 // The fast transform must be the product with the matrix itself.
-func TestUnrotateIsHadamardProduct(t *testing.T) {
+func TestHadamardIsTheMatrixProduct(t *testing.T) {
 	rng := rand.New(rand.NewPCG(1, 2))
 	for _, n := range []int{4, 16, 64, 256} {
-		h := hadamard(n)
+		h := hadamardMatrix(n)
 		x := make([]tensai.Float, n)
 		for i := range x {
 			x[i] = tensai.Float(rng.NormFloat64())
@@ -53,7 +53,7 @@ func TestUnrotateIsHadamardProduct(t *testing.T) {
 			}
 		}
 		got := append([]tensai.Float(nil), x...)
-		unrotate(got)
+		hadamard(got)
 		for j := range got {
 			if math.Abs(float64(got[j])-want[j]) > 1e-5 {
 				t.Fatalf("n=%d: element %d = %v, want %v", n, j, got[j], want[j])
@@ -113,7 +113,7 @@ func bf16Bytes(v []float32) []byte {
 // quantizeConvRot stores w (rows x cols) the way comfy-kitchen does:
 // rotate each group of columns by H^T, then int8 with a scale per row.
 func quantizeConvRot(w []float64, rows, cols, group int) (q []byte, scale []float32) {
-	h := hadamard(group)
+	h := hadamardMatrix(group)
 	rot := make([]float64, len(w))
 	for r := 0; r < rows; r++ {
 		for g := 0; g < cols; g += group {
@@ -240,4 +240,67 @@ func TestComfyVAEName(t *testing.T) {
 			t.Errorf("%s -> %s, want %s", diffusers, got, wan)
 		}
 	}
+}
+
+// A layer quantized rotated computes the same x W^T as one quantized
+// plain, closer to the floats when a column stands out.
+func TestRotatedLinear(t *testing.T) {
+	const out, in, n = 64, 512, 8
+	rng := rand.New(rand.NewPCG(5, 6))
+	w := tensai.NewMatrix(out, in)
+	for i := range w.Data {
+		w.Data[i] = tensai.Float(rng.NormFloat64())
+	}
+	for c := 0; c < out; c++ { // an outlier column, the case rotation is for
+		w.Data[c*in+7] *= 40
+	}
+	x := tensai.NewMatrix(n, in)
+	for i := range x.Data {
+		x.Data[i] = tensai.Float(rng.NormFloat64())
+	}
+	want := tensai.NewMatrix(n, out)
+	if err := tensai.DotTBInto(want, x, w); err != nil {
+		t.Fatal(err)
+	}
+	rel := func(l *linear) float64 {
+		got := tensai.NewMatrix(n, out)
+		if err := l.apply(got, x); err != nil {
+			t.Fatal(err)
+		}
+		var num, den float64
+		for i, v := range want.Data {
+			d := float64(got.Data[i] - v)
+			num += d * d
+			den += float64(v) * float64(v)
+		}
+		return math.Sqrt(num / den)
+	}
+	src := func() weights { return tensorsOf{"w": w} }
+	for _, bits := range []int{8, 4} {
+		plain, err := loadLinear(src(), "w", out, in, bits, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rot, err := loadLinear(src(), "w", out, in, bits, convRotGroup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ePlain, eRot := rel(plain), rel(rot)
+		t.Logf("int%d: plain %.3f%%, rotated %.3f%%", bits, 100*ePlain, 100*eRot)
+		if rot.rot != convRotGroup || plain.rot != 0 {
+			t.Fatalf("int%d: rot %d and %d, want %d and 0", bits, rot.rot, plain.rot, convRotGroup)
+		}
+		if !(eRot < ePlain) {
+			t.Errorf("int%d: rotation did not help: %.4f against %.4f", bits, eRot, ePlain)
+		}
+	}
+}
+
+// tensorsOf serves tensors from memory, copying so a loader's in-place
+// work does not reach the next reader.
+type tensorsOf map[string]*tensai.Matrix
+
+func (m tensorsOf) Tensor(name string) (*tensai.Tensor, error) {
+	w := m[name]
+	return &tensai.Tensor{Shape: []int{w.Rows, w.Cols}, Data: append([]tensai.Float(nil), w.Data...)}, nil
 }

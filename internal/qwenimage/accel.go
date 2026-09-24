@@ -24,6 +24,9 @@ import (
 // deviceWeights is one block's feed-forward, resident.
 type deviceWeights struct {
 	proj, gate, out *deviceLinear
+	// rot is the Hadamard matrix the output projection's input is
+	// rotated by, shared by every block, nil when it is not rotated.
+	rot *gpu.Tensor
 }
 
 // deviceLinear is one weight matrix on the device, at whichever width
@@ -100,8 +103,24 @@ func UseGPU(m *Transformer, budget uint64) (string, uint64, error) {
 				one>>20, lim>>20)
 		}
 	}
+	// The output projection's input, the gated product, is made on the
+	// device, so its rotation happens there: one product with H over
+	// the rows viewed in groups, a few per cent of the projection.
+	var rot *gpu.Tensor
+	if r := m.blocks[0].mlpOut.rot; r > 0 {
+		h := tensai.NewMatrix(r, r)
+		for i := 0; i < r; i++ {
+			h.Data[i*r+i] = 1
+		}
+		rotateRows(h, r) // the rows of I H are H
+		var err error
+		if rot, err = g.Upload(h.Tensor()); err != nil {
+			g.Close()
+			return "", 0, err
+		}
+	}
 	for _, b := range m.blocks {
-		w := &deviceWeights{}
+		w := &deviceWeights{rot: rot}
 		for _, f := range []struct {
 			dst **deviceLinear
 			src *linear
@@ -131,6 +150,13 @@ func (b *Block) mlpOnDevice(dst, x *tensai.Matrix) (err error) {
 			err = e
 		}
 	}()
+	// The gate and the projection were quantized rotated, and read the
+	// same input; its rotation is done here before it goes up.
+	if rot := b.mlpGate.rot; rot > 0 {
+		r := rotatedCopy(x, rot)
+		defer rotPool.Put(r)
+		x = r
+	}
 	in := &tensai.Tensor{Shape: []int{x.Rows, x.Cols}, Data: x.Data}
 	gx, err := b.devOf().Upload(in)
 	if err != nil {
@@ -151,7 +177,23 @@ func (b *Block) mlpOnDevice(dst, x *tensai.Matrix) (err error) {
 	if err := gate.SiluMul(up); err != nil {
 		return err
 	}
-	out, err := b.dev.out.matmul(gate)
+	in2 := gate
+	if b.dev.rot != nil {
+		rows, cols, g := x.Rows, b.mlpOut.inputs(), b.mlpOut.rot
+		grouped, err := gate.View(0, rows*cols/g, g)
+		if err != nil {
+			return err
+		}
+		r, err := grouped.MatMul(b.dev.rot)
+		if err != nil {
+			return err
+		}
+		defer r.Free()
+		if in2, err = r.View(0, rows, cols); err != nil {
+			return err
+		}
+	}
+	out, err := b.dev.out.matmul(in2)
 	if err != nil {
 		return err
 	}
