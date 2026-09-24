@@ -12,9 +12,9 @@ import (
 	"github.com/mattn/tensai/quant"
 )
 
-// TestGPUMatchesCPU runs the same inputs through a few blocks three
-// ways -- in float, with the feed-forward quantized on the host, and
-// with it quantized on the device -- and asks that the device is no
+// TestGPUMatchesCPU runs the same inputs through a few blocks four
+// ways -- in float, quantized on the host, and quantized on the device
+// (with and without streamed projections) -- and asks that the device is no
 // further from the float answer than the host is.
 //
 // Device and host are not expected to agree with each other: both
@@ -37,7 +37,7 @@ func TestGPUMatchesCPU(t *testing.T) {
 	for i := range lat.Data {
 		lat.Data[i] = tensai.Float(math.Cos(float64(i) * 0.07))
 	}
-	run := func(bits int, onGPU bool) []tensai.Float {
+	run := func(bits int, onGPU, projections bool) []tensai.Float {
 		m, err := loadTransformer(dir, bits, layers)
 		if err != nil {
 			t.Fatal(err)
@@ -48,15 +48,21 @@ func TestGPUMatchesCPU(t *testing.T) {
 				t.Skipf("no usable device: %v", err)
 			}
 		}
+		if projections {
+			if err := UseGPUProjections(m, 4<<30); err != nil {
+				t.Fatal(err)
+			}
+		}
 		v, err := m.Velocity(lat, text, 0.7, l, NewScratch(l.Tokens()))
 		if err != nil {
 			t.Fatal(err)
 		}
 		return append([]tensai.Float(nil), v.Data...)
 	}
-	exact := run(0, false)
-	host := run(8, false)
-	dev := run(8, true)
+	exact := run(0, false, false)
+	host := run(8, false, false)
+	dev := run(8, true, false)
+	stream := run(8, true, true)
 
 	rel := func(a []tensai.Float) float64 {
 		var sq, ref float64
@@ -73,6 +79,11 @@ func TestGPUMatchesCPU(t *testing.T) {
 	// two, not as the two disagreeing.
 	if rd > rh*1.5+0.01 {
 		t.Errorf("the device is %.4f from float where the host is %.4f", rd, rh)
+	}
+	rs := rel(stream)
+	t.Logf("against float: streamed projections %.4f", rs)
+	if math.IsNaN(rs) || rs > rh*1.5+0.01 {
+		t.Errorf("streamed projections are %.4f from float where the host is %.4f", rs, rh)
 	}
 }
 
@@ -157,5 +168,60 @@ func TestGPUCloseReleasesWeights(t *testing.T) {
 				t.Fatal("close did not clear ownership exactly once")
 			}
 		})
+	}
+}
+
+// Compare the adapter contribution against an unrotated CPU reference.
+// This catches both a missed input rotation and applying H twice to A.
+func TestGPUStreamingRotatedLoRA(t *testing.T) {
+	g, err := gpu.Open(gpu.HighPerformance)
+	if err != nil {
+		t.Skip(err)
+	}
+	defer g.Close()
+	for _, bits := range []int{8, 4} {
+		w := tensai.NewMatrix(256, 32)
+		for i := range w.Data {
+			w.Data[i] = tensai.Float(math.Sin(float64(i)*0.17)) * 0.1
+		}
+		l := &linear{rot: 256}
+		if bits == 8 {
+			l.q = quant.Quantize(w)
+		} else {
+			l.q4, err = quant.Quantize4(w)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		x := tensai.NewMatrix(257, 256)
+		for i := range x.Data {
+			x.Data[i] = tensai.Float(math.Cos(float64(i) * 0.13))
+		}
+		want, got := tensai.NewMatrix(x.Rows, 32), tensai.NewMatrix(x.Rows, 32)
+		if err := streamProjection(g, l, want, x); err != nil {
+			t.Fatal(err)
+		}
+		a, b := tensai.NewMatrix(7, 256), tensai.NewMatrix(32, 7)
+		for i := range a.Data {
+			a.Data[i] = tensai.Float(math.Sin(float64(i)*0.09)) * 0.1
+		}
+		for i := range b.Data {
+			b.Data[i] = tensai.Float(math.Cos(float64(i)*0.13)) * 0.1
+		}
+		lr := &lowRank{a: a, b: b, scale: 0.7}
+		if err := lr.add(want, x); err != nil {
+			t.Fatal(err)
+		}
+		ra := clone(a)
+		rotateRows(ra, 256)
+		l.lora = &lowRank{a: ra, b: b, scale: 0.7}
+		if err := streamProjection(g, l, got, x); err != nil {
+			t.Fatal(err)
+		}
+		for i, v := range got.Data {
+			if math.IsNaN(float64(v)) || math.Abs(float64(v-want.Data[i])) > 1e-4 {
+				t.Fatalf("q%d element %d: got %g want %g", bits, i, v, want.Data[i])
+			}
+		}
 	}
 }

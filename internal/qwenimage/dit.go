@@ -60,7 +60,8 @@ type linear struct {
 	// before the product: H is orthogonal, so x W^T = (x H)(W H)^T, and
 	// the rotation spreads the outlier columns of both across their
 	// group, which is where eight bits lose the most.
-	rot int
+	rot  int
+	lora *lowRank
 }
 
 // inputs is how many input features the layer reads.
@@ -84,13 +85,19 @@ func (l *linear) apply(out, x *tensai.Matrix) error {
 		defer rotPool.Put(r)
 		x = r
 	}
+	var err error
 	switch {
 	case l.q != nil:
-		return l.q.MatMul(x, out)
+		err = l.q.MatMul(x, out)
 	case l.q4 != nil:
-		return l.q4.MatMul(x, out)
+		err = l.q4.MatMul(x, out)
+	default:
+		err = tensai.DotTBInto(out, x, l.f)
 	}
-	return tensai.DotTBInto(out, x, l.f)
+	if err == nil && l.lora != nil {
+		err = l.lora.add(out, x)
+	}
+	return err
 }
 
 // Block is one of the transformer's 32 layers.
@@ -101,8 +108,9 @@ type Block struct {
 	mlpOut               *linear
 	// dev holds the feed-forward's weights when they live on a device,
 	// and g is what to reach it through.
-	dev *deviceWeights
-	g   *gpu.Device
+	dev               *deviceWeights
+	g                 *gpu.Device
+	streamProjections bool
 }
 
 // devOf returns the device this block's weights were uploaded to.
@@ -369,7 +377,7 @@ func (b *Block) Forward(x *tensai.Matrix, m *Modulation, l *Layout, rope *Rope, 
 		dst *tensai.Matrix
 		w   *linear
 	}{{s.q, b.toQ}, {s.k, b.toK}, {s.v, b.toV}} {
-		if err := p.w.apply(p.dst, s.norm); err != nil {
+		if err := b.project(p.dst, s.norm, p.w); err != nil {
 			return err
 		}
 	}
@@ -386,7 +394,7 @@ func (b *Block) Forward(x *tensai.Matrix, m *Modulation, l *Layout, rope *Rope, 
 	} else if err := attention(s.attn, s.q, s.k, s.v, l.KeyLimit, s); err != nil {
 		return err
 	}
-	if err := b.toOut.apply(s.norm, s.attn); err != nil {
+	if err := b.project(s.norm, s.attn, b.toOut); err != nil {
 		return err
 	}
 	addGated(x, s.norm, m.Gate1, l.Row)

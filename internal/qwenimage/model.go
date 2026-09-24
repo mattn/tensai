@@ -65,6 +65,7 @@ func (m *Transformer) Close() error {
 				b.dev.rot.Free() // shared by every block
 			}
 			b.dev, b.g = nil, nil
+			b.streamProjections = false
 		}
 		m.dev.Close()
 		m.dev = nil
