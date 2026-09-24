@@ -43,6 +43,14 @@ Trains a character-level LSTM on an embedded public-domain text, saves the param
 
 Trains a small character-level transformer -- token and position embeddings, two pre-norm blocks with four-head causal attention and a GELU feed-forward, a final norm and an output projection -- on the same embedded text charrnn uses, then samples from it. About 106k parameters and a minute of training with `GOEXPERIMENT=simd`, after which it reproduces whole sentences of the corpus. The whole model is written against the n-dimensional autograd engine: activations are `(batch, sequence, model)` tensors, the per-head split is a `Reshape` plus a `Transpose`, and a `Tape` recycles each step's buffers. Flags: `-iters`, `-lr`, `-temp`, `-n`, `-seed`, plus `-model`, `-heads`, `-blocks`, `-batch` and `-seq` to change the shape.
 
+`-data` trains on a text file instead of the embedded page, and `-tokenizer` splits it with a `tokenizer.json` (BPE) instead of by character. The vocabulary is only the token ids the corpus uses, so GPT-2's tokenizer on 100KB of text gives 2656 entries, not 50257. `-save` writes a single JSON checkpoint holding the shape, vocabulary, tokenizer and weights; `-load` rebuilds the model from it alone, generating from `-prompt` or, with `-data`, training further (Adam's moments start over). A prompt shorter than the context window works: attention is causal, so the slots after it never reach the next token.
+
+```sh
+go run ./_example/tinygpt -data notes.txt -tokenizer _example/gpt2/data/tokenizer.json \
+    -model 128 -seq 64 -save notes.json
+go run ./_example/tinygpt -load notes.json -prompt "The tape" -n 60
+```
+
 `-gpu` (on a wgpu build) trains the whole block on the device: values, gradients and the Adam update stay there and only the loss comes back each step. Whether it is faster depends on the shape — at the default size the tensors are too small to keep a GPU busy and the AVX2 kernels win, while a wider model crosses over. On an AMD 780M, 24ms/step against 72ms with `-gpu` at the default size, and 282ms against 129ms at `-model 256 -heads 8 -batch 16 -seq 64`. The losses match to the digit either way.
 
 ## flappy

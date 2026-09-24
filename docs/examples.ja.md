@@ -43,6 +43,14 @@ go run ./_example/mnist -model cnn -export mnist.tflite  # TFLite へエクス�
 
 charrnn と同じ埋め込みテキストで、小さな文字レベル transformer (トークン埋め込みと位置埋め込み、4 ヘッドの因果 attention と GELU の feed-forward を持つ pre-norm ブロック 2 段、最終 norm と出力射影) を学習し、そこからサンプリングします。パラメータは約 106k、`GOEXPERIMENT=simd` で 1 分ほど学習すれば、コーパスの文をそのまま再現するようになります。モデル全体が n 次元自動微分エンジンで書かれています: 活性は `(batch, sequence, model)` のテンソル、ヘッド分割は `Reshape` と `Transpose`、各ステップのバッファは `Tape` が再利用します。フラグは `-iters`, `-lr`, `-temp`, `-n`, `-seed`、それに形を変える `-model`, `-heads`, `-blocks`, `-batch`, `-seq`。
 
+`-data` を指定すると埋め込みの 1 ページの代わりにテキストファイルで学習し、`-tokenizer` を指定すると文字単位ではなく `tokenizer.json` (BPE) で分割します。語彙はコーパスに出てくるトークン ID だけなので、GPT-2 のトークナイザで 100KB のテキストを学習しても 50257 ではなく 2656 エントリで済みます。`-save` は形・語彙・トークナイザ・重みをまとめた 1 つの JSON チェックポイントを書き出し、`-load` はそれだけからモデルを組み立て直します。`-prompt` から生成するか、`-data` を付ければ追加で学習します (Adam のモーメントは初期化されます)。コンテキスト窓より短いプロンプトも使えます。attention は因果的なので、プロンプトより後ろの空きスロットは次のトークンに影響しません。
+
+```sh
+go run ./_example/tinygpt -data notes.txt -tokenizer _example/gpt2/data/tokenizer.json \
+    -model 128 -seq 64 -save notes.json
+go run ./_example/tinygpt -load notes.json -prompt "The tape" -n 60
+```
+
 `-gpu` (wgpu ビルド時) はブロック全体をデバイスで学習します。値も勾配も Adam の更新もデバイスに留まり、毎ステップ帰ってくるのは損失だけです。速くなるかは形次第で、既定のサイズではテンソルが小さすぎて GPU が埋まらず AVX2 カーネルが勝ち、モデルを広げるとクロスオーバーします。AMD 780M では既定サイズで 24ms/step に対し `-gpu` が 72ms/step、`-model 256 -heads 8 -batch 16 -seq 64` では 282ms に対し 129ms でした。損失はどちらでも桁まで一致します。
 
 ## flappy
