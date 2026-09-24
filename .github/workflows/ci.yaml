@@ -46,7 +46,9 @@ jobs:
       - name: vet
         run: go vet ./...
       - name: test
-        run: go test ./...
+        run: |
+          go test ./...
+          go test ./_example/tinygpt
       # A kernel's worth is a number, and the numbers hardest to come by
       # are the ones no desk here can take: the macOS runner is this
       # project's only arm64 machine, and emulation answers instruction

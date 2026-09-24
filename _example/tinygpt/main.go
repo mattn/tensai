@@ -189,7 +189,7 @@ func (m *model) batchAt(text []int, rng *rand.Rand) (tokens, labels []int) {
 	tokens = make([]int, 0, batchSize*seqLen)
 	labels = make([]int, 0, batchSize*seqLen)
 	for i := 0; i < batchSize; i++ {
-		p := rng.IntN(len(text) - seqLen - 1)
+		p := rng.IntN(len(text) - seqLen)
 		tokens = append(tokens, text[p:p+seqLen]...)
 		labels = append(labels, text[p+1:p+seqLen+1]...)
 	}
@@ -402,6 +402,9 @@ func run(iters int, lr, temp float64, n int, seed int64, useGPU bool, dataPath, 
 			return err
 		}
 	}
+	if dModel <= 0 || nHeads <= 0 || seqLen <= 0 || batchSize <= 0 || nBlocks < 0 {
+		return fmt.Errorf("model width, heads, context window and batch size must be positive; blocks must be non-negative")
+	}
 	if dModel%nHeads != 0 {
 		return fmt.Errorf("model width %d is not divisible by %d heads", dModel, nHeads)
 	}
@@ -425,9 +428,15 @@ func run(iters int, lr, temp float64, n int, seed int64, useGPU bool, dataPath, 
 		text = c.encode(corpus)
 	}
 
+	if (dataPath != "" || ck == nil) && len(text) <= seqLen {
+		return fmt.Errorf("corpus of %d tokens is not longer than the %d token context window", len(text), seqLen)
+	}
 	vocab := vocabOf(text)
 	if ck != nil {
 		vocab = ck.Vocab
+	}
+	if len(vocab) == 0 {
+		return fmt.Errorf("model vocabulary must not be empty")
 	}
 	rng := rand.New(rand.NewPCG(uint64(seed), 0))
 	m := newModel(vocab, rng)
@@ -451,9 +460,6 @@ func run(iters int, lr, temp float64, n int, seed int64, useGPU bool, dataPath, 
 		if data, err = m.indexes(text, c.decode); err != nil {
 			return err
 		}
-	}
-	if data != nil && len(data) <= seqLen {
-		return fmt.Errorf("corpus of %d tokens is not longer than the %d token context window", len(data), seqLen)
 	}
 
 	// Every step builds a fresh graph and drops it; the tape hands the last
