@@ -385,7 +385,7 @@ func main() {
 		}
 	case "image":
 		fs := flag.NewFlagSet("tensai image", flag.ExitOnError)
-		model := fs.String("model", "Qwen-Image-2.1", `which checkpoint to run: a name under the cache, or a path to a directory holding text_encoder, transformer and vae`)
+		model := fs.String("model", imageRepo, `which checkpoint to run, named the way run and chat take a model: a repo (Qwen/Qwen-Image-2.1, or Comfy-Org/Qwen-Image-2.1 for ComfyUI's int8 repackaging), downloaded on first use; a name from "tensai models"; or a path to a directory in either layout`)
 		prompt := fs.String("prompt", "", "what to draw; positional arguments join into one")
 		out := fs.String("o", "out.png", "where to write the picture")
 		size := fs.Int("size", 256, "width and height in pixels; rounded down to a multiple of 32")
@@ -396,11 +396,25 @@ func main() {
 		negative := fs.String("negative", "", "what to steer away from; needs -cfg above 1")
 		cfg := fs.Float64("cfg", 1, "how far to steer away from -negative: 1 is off, and anything above doubles what a step costs")
 		quiet := fs.Bool("q", false, "print nothing but errors")
-		fetchIt := fs.Bool("fetch", false, "download the checkpoint first: about 31GB, and it resumes if interrupted")
+		fs.Bool("fetch", false, "no longer needed: a repo named by -model downloads, or finishes downloading, on its own")
 		useGPU := fs.Bool("gpu", false, "run feed-forward and attention on the GPU (needs a wgpu build tag and quantized weights)")
 		budget := fs.Float64("gpu-budget", 4, "gigabytes of weights the GPU may hold; past what a device can take it is dropped, and nothing reports that")
+		gpuProjections := fs.Bool("gpu-projections", false, "stream attention projection weights to the GPU (requires -gpu)")
+		gpuVAE := fs.Bool("gpu-vae", false, "run decoder convolutions on the GPU")
+		turboLoRA := fs.String("turbo-lora", "", "path to a Viggle Qwen-Image-2.1 six-step LoRA; uses 6 steps and cfg=1")
 		cpuprofile := fs.String("cpuprofile", "", "write a CPU profile of image generation to this file")
 		fs.Parse(os.Args[2:])
+		if *turboLoRA != "" {
+			explicitSteps := false
+			fs.Visit(func(f *flag.Flag) {
+				if f.Name == "steps" {
+					explicitSteps = true
+				}
+			})
+			if !explicitSteps {
+				*steps = 6
+			}
+		}
 		defer profileTo(*cpuprofile)()
 		text := strings.TrimSpace(*prompt + " " + strings.Join(fs.Args(), " "))
 		if text == "" {
@@ -414,25 +428,7 @@ func main() {
 		case *q4:
 			bits = 4
 		}
-		if *fetchIt {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "tensai image:", err)
-				os.Exit(1)
-			}
-			dir := *model
-			if !filepath.IsAbs(dir) {
-				dir = filepath.Join(home, ".cache", "tensai", dir)
-			}
-			fmt.Fprintf(os.Stderr, "fetching %s into %s, about 31GB\n", imageRepo, dir)
-			if err := fetchImageModel(dir, func(f string, a ...any) {
-				fmt.Fprintf(os.Stderr, f+"\n", a...)
-			}); err != nil {
-				fmt.Fprintln(os.Stderr, "tensai image:", err)
-				os.Exit(1)
-			}
-		}
-		if err := generateImage(*model, text, *negative, *out, *size, *steps, *seed, bits, *cfg, *budget, *useGPU, *quiet); err != nil {
+		if err := generateImage(*model, text, *negative, *out, *size, *steps, *seed, bits, *cfg, *budget, *useGPU, *quiet, imageAcceleration{*gpuProjections, *gpuVAE, *turboLoRA}); err != nil {
 			fmt.Fprintln(os.Stderr, "tensai image:", err)
 			os.Exit(1)
 		}
@@ -710,8 +706,22 @@ func modelsCmd(args []string) error {
 			}
 			if org, base, ok := strings.Cut(name, "/"); ok {
 				if org == "" || org != filepath.Base(org) || org == "." || org == ".." ||
-					strings.Contains(base, "/") {
+					base == "" || base != filepath.Base(base) || base == "." || base == ".." {
 					return fmt.Errorf("invalid model name %q", name)
+				}
+				// A checkpoint fetched under its org/repo name sits in
+				// a directory for the org; one fetched otherwise is
+				// cached under the repo alone.
+				if nested := filepath.Join(root, org, base); isDir(nested) {
+					if err := os.RemoveAll(nested); err != nil {
+						return err
+					}
+					fmt.Println("removed", nested)
+					// The org directory goes too once nothing is left in it.
+					if rest, err := os.ReadDir(filepath.Join(root, org)); err == nil && len(rest) == 0 {
+						os.Remove(filepath.Join(root, org))
+					}
+					continue
 				}
 				name = base
 			}
@@ -787,55 +797,46 @@ func modelsCmd(args []string) error {
 			if repo := llm.GGUFOrigin(filepath.Join(root, ent.Name())); repo != "" {
 				name = repo + "/" + ent.Name()
 			}
-			emit(name, fmt.Sprintf("%8s  %-8s %-11s %s", humanSize(size), "gguf",
+			emit(name, fmt.Sprintf("%8s  %-9s %-11s %s", humanSize(size), "gguf",
 				llm.Inspect(filepath.Join(root, ent.Name())), newest.Format("2006-01-02")))
 			total += size
 			found = true
 			continue
 		}
 		dir := filepath.Join(root, ent.Name())
-		// The cache root is shared with the examples, which park their
-		// datasets (iris, mnist) beside the checkpoints. What run, chat,
-		// and serve can load is a directory with a config.json, so
-		// anything without one is not a model and does not belong in a
-		// model listing.
-		raw, err := os.ReadFile(filepath.Join(dir, "config.json"))
-		if err != nil {
-			others++
+		if rest, size, ok := describeModelDir(dir); ok {
+			// Naming the repo rather than the directory keeps the
+			// listing usable on another machine, where the model is not
+			// cached yet; -model takes either form against a cache that
+			// already has it.
+			name := ent.Name()
+			if repo := llm.Origin(dir); repo != "" {
+				name = repo
+			}
+			emit(name, rest)
+			total += size
+			found = true
 			continue
 		}
-		kind := "?"
-		var cfg struct {
-			ModelType string `json:"model_type"`
-		}
-		if json.Unmarshal(raw, &cfg) == nil && cfg.ModelType != "" {
-			kind = cfg.ModelType
-		}
-		var size int64
-		newest := time.Time{}
-		filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
-				return nil
+		// A checkpoint fetched by its org/repo name (tensai image does
+		// this) sits one level down, under a directory named for the
+		// org; it lists under that same org/repo, which is what -model
+		// and "models rm" take.
+		nested := false
+		subs, _ := os.ReadDir(dir)
+		for _, sub := range subs {
+			if !sub.IsDir() {
+				continue
 			}
-			if info, err := d.Info(); err == nil {
-				size += info.Size()
-				if info.ModTime().After(newest) {
-					newest = info.ModTime()
-				}
+			if rest, size, ok := describeModelDir(filepath.Join(dir, sub.Name())); ok {
+				emit(ent.Name()+"/"+sub.Name(), rest)
+				total += size
+				found, nested = true, true
 			}
-			return nil
-		})
-		// Naming the repo rather than the directory keeps the listing
-		// usable on another machine, where the model is not cached yet;
-		// -model takes either form against a cache that already has it.
-		name := ent.Name()
-		if repo := llm.Origin(dir); repo != "" {
-			name = repo
 		}
-		emit(name, fmt.Sprintf("%8s  %-8s %-11s %s", humanSize(size), kind,
-			llm.Inspect(dir), newest.Format("2006-01-02")))
-		total += size
-		found = true
+		if !nested {
+			others++
+		}
 	}
 	sort.Slice(rows, func(i, j int) bool {
 		a, b := strings.ToLower(rows[i].name), strings.ToLower(rows[j].name)
@@ -868,6 +869,58 @@ func modelsCmd(args []string) error {
 	return nil
 }
 
+// describeModelDir reports whether dir holds a model and, if so, its
+// listing columns and size on disk. The cache root is shared with the
+// examples, which park their datasets (iris, mnist) beside the
+// checkpoints, so a directory counts only when something can load it: a
+// config.json for run, chat and serve, or the transformer directory a
+// diffusers checkpoint keeps for tensai image.
+func describeModelDir(dir string) (rest string, size int64, ok bool) {
+	kind, caps := "", "-"
+	if raw, err := os.ReadFile(filepath.Join(dir, "config.json")); err == nil {
+		kind = "?"
+		var cfg struct {
+			ModelType string `json:"model_type"`
+		}
+		if json.Unmarshal(raw, &cfg) == nil && cfg.ModelType != "" {
+			kind = cfg.ModelType
+		}
+		caps = llm.Inspect(dir).String()
+	} else if isImageModel(dir) {
+		// What it can do sits in the same column as tools and think do
+		// for a language model: it makes images.
+		kind, caps = "diffusers", "image"
+		if qwenimage.ModelDir(dir).Comfy() {
+			kind = "comfyui"
+		}
+	} else {
+		return "", 0, false
+	}
+	newest := time.Time{}
+	filepath.WalkDir(dir, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		if info, err := d.Info(); err == nil {
+			size += info.Size()
+			if info.ModTime().After(newest) {
+				newest = info.ModTime()
+			}
+		}
+		return nil
+	})
+	date := "-" // a checkpoint whose download has not written a file yet
+	if !newest.IsZero() {
+		date = newest.Format("2006-01-02")
+	}
+	return fmt.Sprintf("%8s  %-9s %-11s %s", humanSize(size), kind, caps, date), size, true
+}
+
+func isDir(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.IsDir()
+}
+
 func humanSize(n int64) string {
 	switch {
 	case n >= 1<<30:
@@ -883,12 +936,34 @@ func joinArgs(a []string) string {
 	return strings.Join(a, " ")
 }
 
-// generateImage draws one picture with Qwen-Image and writes it as a
+type imageAcceleration struct {
+	projections, vae bool
+	turboLoRA        string
+}
+
+// generateImage runs Qwen-Image-2.1 from a text prompt to a square RGBA
 // PNG. The two models are seven gigabytes apiece and only one is held
 // at a time: the prompt is encoded and the encoder released before the
 // denoising transformer loads.
-func generateImage(model, prompt, negative, out string, size, steps int, seed int64, bits int, cfg, budget float64, useGPU, quiet bool) error {
-	dir, err := imageModelDir(model)
+func generateImage(model, prompt, negative, out string, size, steps int, seed int64, bits int, cfg, budget float64, useGPU, quiet bool, accel imageAcceleration) error {
+	if accel.projections && !useGPU {
+		return fmt.Errorf("-gpu-projections requires -gpu")
+	}
+	if (useGPU || accel.vae) && gpu.Backend() == "" {
+		return fmt.Errorf("GPU image generation requires a build with -tags wgpu or wgpu24")
+	}
+	if steps < 2 {
+		return fmt.Errorf("-steps must be at least 2")
+	}
+	if accel.turboLoRA != "" && (steps != 6 || cfg != 1 || negative != "") {
+		return fmt.Errorf("-turbo-lora requires 6 steps, -cfg 1 and no negative prompt")
+	}
+	say := func(format string, args ...any) {
+		if !quiet {
+			fmt.Fprintf(os.Stderr, format+"\n", args...)
+		}
+	}
+	dir, err := imageModelDir(model, say)
 	if err != nil {
 		return err
 	}
@@ -897,11 +972,6 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 	side := size / 32 * 2
 	if side < 2 {
 		return fmt.Errorf("a size of %d leaves nothing to draw; 64 is the smallest that works", size)
-	}
-	say := func(format string, args ...any) {
-		if !quiet {
-			fmt.Fprintf(os.Stderr, format+"\n", args...)
-		}
 	}
 
 	// Both prompts go through the encoder in one load, since it is seven
@@ -936,6 +1006,13 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 	}
 	defer m.Close()
 	say("transformer: loaded in %v", time.Since(start).Round(time.Second))
+	if accel.turboLoRA != "" {
+		start = time.Now()
+		if err := qwenimage.LoadTurboLoRA(m, accel.turboLoRA); err != nil {
+			return err
+		}
+		say("turbo: adapter loaded in %v", time.Since(start).Round(time.Second))
+	}
 	if useGPU {
 		start = time.Now()
 		name, held, err := qwenimage.UseGPU(m, uint64(budget*(1<<30)))
@@ -943,12 +1020,22 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 			return err
 		}
 		say("gpu: %s holding %.1fGiB of feed-forward weights in %v", name, float64(held)/(1<<30), time.Since(start).Round(time.Second))
+		if accel.projections {
+			if err := qwenimage.UseGPUProjections(m, uint64(budget*(1<<30))); err != nil {
+				return err
+			}
+			say("gpu: streaming attention projections")
+		}
 	}
 
 	latents := qwenimage.Noise(rand.New(rand.NewPCG(uint64(seed), 0)), side, side)
 	layout := qwenimage.NewLayout(text.Rows, side, side)
 	start = time.Now()
-	err = qwenimage.Generate(m, latents, text, layout, qwenimage.NewSchedule(steps, side*side), guide, func(i int) {
+	schedule := qwenimage.NewSchedule(steps, side*side)
+	if accel.turboLoRA != "" {
+		schedule = qwenimage.NewTurboSchedule(side * side)
+	}
+	err = qwenimage.Generate(m, latents, text, layout, schedule, guide, func(i int) {
 		say("step %d/%d in %v", i+1, steps, time.Since(start).Round(time.Second))
 	})
 	if err != nil {
@@ -972,7 +1059,11 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 	if err != nil {
 		return err
 	}
-	px, err := qwenimage.Decode(dec, stats.Denormalize(latents, side, side))
+	decode := qwenimage.Decode
+	if accel.vae {
+		decode = qwenimage.DecodeGPU
+	}
+	px, err := decode(dec, stats.Denormalize(latents, side, side))
 	if err != nil {
 		return err
 	}
@@ -993,39 +1084,120 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 	return nil
 }
 
-// imageModelDir resolves a checkpoint name or path to the directory
-// holding its three components.
-func imageModelDir(name string) (qwenimage.ModelDir, error) {
-	candidates := []string{name}
-	if home, err := os.UserHomeDir(); err == nil && !filepath.IsAbs(name) {
-		candidates = append(candidates, filepath.Join(home, ".cache", "tensai", name))
+// imageModelDir resolves -model the way resolveModel does for run and
+// chat: a path that exists, a name "tensai models" prints, or a repo.
+// The two repos tensai image knows how to download are fetched when
+// anything is missing, which also finishes an interrupted download; with
+// everything in place that is a stat per file and nothing on the wire.
+func imageModelDir(ref string, say func(string, ...any)) (qwenimage.ModelDir, error) {
+	root := llm.CacheRoot()
+	local := func(p string) (qwenimage.ModelDir, error) {
+		if !isImageModel(p) {
+			return "", fmt.Errorf("%s holds no image checkpoint: want text_encoder, transformer and vae (diffusers) or text_encoders, diffusion_models and vae (ComfyUI)", p)
+		}
+		return qwenimage.ModelDir(p), nil
 	}
-	for _, c := range candidates {
-		if _, err := os.Stat(filepath.Join(c, "transformer")); err == nil {
-			return qwenimage.ModelDir(c), nil
+	if strings.ContainsAny(ref, `/\`) || ref == "." || ref == ".." {
+		if _, err := os.Stat(ref); err == nil {
+			return local(ref)
 		}
 	}
-	return "", fmt.Errorf("no checkpoint called %q; run \"tensai image -fetch\" to download it, or point -model at a directory with text_encoder, transformer and vae", name)
+	if ref == filepath.Base(ref) {
+		if p := filepath.Join(root, ref); isDir(p) {
+			return local(p)
+		}
+		return "", fmt.Errorf("no cached image model %q under %s (see \"tensai models\", or give %s or %s to download)", ref, root, imageRepo, comfyImageRepo)
+	}
+	if filepath.IsAbs(ref) {
+		return "", fmt.Errorf("no model at %s", ref)
+	}
+	dir := imageCacheDir(ref)
+	fetch := map[string]func(string, func(string, ...any)) error{
+		imageRepo:      fetchImageModel,
+		comfyImageRepo: fetchComfyImageModel,
+	}[ref]
+	if fetch == nil {
+		if isImageModel(dir) {
+			return qwenimage.ModelDir(dir), nil
+		}
+		return "", fmt.Errorf("%s is not cached, and tensai image can download only %s and %s", ref, imageRepo, comfyImageRepo)
+	}
+	if err := fetch(dir, say); err != nil {
+		return "", err
+	}
+	if ref == imageRepo {
+		// It sits under its bare name, as run and chat cache a repo;
+		// the record lets the listing name it by the repo.
+		llm.RecordOrigin(dir, ref)
+	}
+	return qwenimage.ModelDir(dir), nil
 }
 
-// imageRepo is where the checkpoint lives.
-const imageRepo = "Qwen/Qwen-Image-2.1"
+// isImageModel reports whether dir holds a checkpoint tensai image can
+// run, in the diffusers layout or ComfyUI's.
+func isImageModel(dir string) bool {
+	return isDir(filepath.Join(dir, "transformer")) || qwenimage.ModelDir(dir).Comfy()
+}
+
+// imageCacheDir is where a repo's checkpoint is cached. Qwen's sits under
+// its bare name, as run and chat cache a repo. ComfyUI's has the same
+// bare name, so it goes under its org instead, which the listing prints
+// as the repo.
+func imageCacheDir(repo string) string {
+	root := llm.CacheRoot()
+	if repo == imageRepo {
+		return filepath.Join(root, filepath.Base(repo))
+	}
+	return filepath.Join(root, filepath.FromSlash(repo))
+}
+
+// fetchFile downloads one file of a repo into dir/sub unless it is
+// already there, naming it only when there is something to fetch.
+func fetchFile(repo, dir, sub, name string, say func(string, ...any)) (string, error) {
+	p := filepath.Join(dir, sub, name)
+	if _, err := os.Stat(p); err == nil {
+		return p, nil
+	}
+	say("fetching %s/%s from %s", sub, name, repo)
+	return llm.Fetch("https://huggingface.co/"+repo+"/resolve/main/"+sub+"/", filepath.Join(dir, sub), name)
+}
+
+// imageRepo is where the checkpoint lives, and comfyImageRepo is
+// ComfyUI's repackaging of it.
+const (
+	imageRepo      = "Qwen/Qwen-Image-2.1"
+	comfyImageRepo = "Comfy-Org/Qwen-Image-2.1"
+)
+
+// fetchComfyImageModel downloads ComfyUI's int8 files into dir, laid out
+// as the repo has them, and the two small files it does not ship (the
+// VAE's config, whose latent statistics the decoder needs, and the
+// tokenizer) from Qwen's.
+func fetchComfyImageModel(dir string, say func(string, ...any)) error {
+	for _, f := range []struct{ repo, sub, name string }{
+		{imageRepo, "processor", "tokenizer.json"},
+		{imageRepo, "vae", "config.json"},
+		{comfyImageRepo, "vae", "qwen_image_2.1_vae_bf16.safetensors"},
+		{comfyImageRepo, "text_encoders", "qwen3vl_8b_int8_convrot.safetensors"},
+		{comfyImageRepo, "diffusion_models", "qwen_image_2.1_int8_convrot.safetensors"},
+	} {
+		if _, err := fetchFile(f.repo, dir, f.sub, f.name, say); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 
 // fetchImageModel downloads the checkpoint's parts into dir. The shard
 // names come from each component's index rather than a list here, so a
 // repository that re-splits its weights still resolves.
 func fetchImageModel(dir string, say func(string, ...any)) error {
-	base := "https://huggingface.co/" + imageRepo + "/resolve/main/"
-	get := func(sub, name string) (string, error) {
-		return llm.Fetch(base+sub+"/", filepath.Join(dir, sub), name)
-	}
 	for _, f := range []struct{ sub, name string }{
 		{"processor", "tokenizer.json"},
 		{"vae", "config.json"},
 		{"vae", "diffusion_pytorch_model.safetensors"},
 	} {
-		say("%s/%s", f.sub, f.name)
-		if _, err := get(f.sub, f.name); err != nil {
+		if _, err := fetchFile(imageRepo, dir, f.sub, f.name, say); err != nil {
 			return err
 		}
 	}
@@ -1033,8 +1205,7 @@ func fetchImageModel(dir string, say func(string, ...any)) error {
 		{"transformer", "diffusion_pytorch_model.safetensors.index.json"},
 		{"text_encoder", "model.safetensors.index.json"},
 	} {
-		say("%s/%s", c.sub, c.index)
-		path, err := get(c.sub, c.index)
+		path, err := fetchFile(imageRepo, dir, c.sub, c.index, say)
 		if err != nil {
 			return err
 		}
@@ -1043,8 +1214,7 @@ func fetchImageModel(dir string, say func(string, ...any)) error {
 			return err
 		}
 		for _, n := range shards {
-			say("%s/%s", c.sub, n)
-			if _, err := get(c.sub, n); err != nil {
+			if _, err := fetchFile(imageRepo, dir, c.sub, n, say); err != nil {
 				return err
 			}
 		}

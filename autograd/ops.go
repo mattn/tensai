@@ -51,6 +51,41 @@ func (n *Node) MatMul(o *Node) *Node {
 	})
 }
 
+// MatMulT returns n * o^T over the last two axes: n is (..., m, k), o is
+// (..., p, k) and the result (..., m, p), leading axes broadcasting as in
+// MatMul. It is MatMul(o.T()) without copying the transpose: the product
+// and its gradients run on the transposed GEMM modes, so a tied output
+// projection can multiply by the (vocab, dim) embedding table as it is,
+// and the gradient flowing back to n is a plain product over the long
+// vocabulary axis rather than vocabulary-long dot products.
+func (n *Node) MatMulT(o *Node) *Node {
+	if tapeOf(n, o).Device() != nil {
+		return n.MatMul(o.T())
+	}
+	tp := tapeOf(n, o)
+	v := tp.tensor(matmulShape(n.Shape(), o.Shape(), gemmNT))
+	if err := tensai.MatMulNTInto(v, n.Value(), o.Value()); err != nil {
+		panic(err.Error())
+	}
+	return newNode("matmult", v, n, o).withBack(func(out *Node) {
+		// grad * o back to n's side, grad^T * n back to o's.
+		if n.requiresGrad {
+			d := tp.tensor(matmulShape(out.Grad().Shape, o.Shape(), gemmNN))
+			if err := tensai.MatMulInto(d, out.Grad(), o.Value()); err != nil {
+				panic(err.Error())
+			}
+			n.accum(d)
+		}
+		if o.requiresGrad {
+			d := tp.tensor(matmulShape(out.Grad().Shape, n.Shape(), gemmTN))
+			if err := tensai.MatMulTNInto(d, out.Grad(), n.Value()); err != nil {
+				panic(err.Error())
+			}
+			o.accum(d)
+		}
+	})
+}
+
 // Add returns the element-wise sum n + o, broadcasting the operands.
 func (n *Node) Add(o *Node) *Node {
 	if out, ok := devBinary(gpu.OpAdd, n, o); ok {

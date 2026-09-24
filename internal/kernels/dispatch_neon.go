@@ -761,3 +761,10 @@ func WriteRead(row, delta []float32, k, q float32, out []float32) {
 		out[i] += q * v
 	}
 }
+
+// DotVecs4 is DotVecs for four vectors at once.
+func DotVecs4(qs []float32, ks, outs [4][]float32) {
+	for j := range ks {
+		DotVecs(qs, ks[j], outs[j])
+	}
+}

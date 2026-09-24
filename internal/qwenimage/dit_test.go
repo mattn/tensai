@@ -133,19 +133,34 @@ func TestBlockInt8Error(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer w.Close()
-	b, err := LoadBlock(w, 0, 8)
-	if err != nil {
-		t.Fatal(err)
+	// Rotating the quantized weights and their inputs by a Hadamard
+	// matrix spreads outlier columns across their group; the two rows
+	// per width say what that buys.
+	in := append([]tensai.Float(nil), x.Data...)
+	defer func() { noRotate = false }()
+	for _, bits := range []int{8, 4} {
+		for _, off := range []bool{true, false} {
+			noRotate = off
+			b, err := LoadBlock(w, 0, bits)
+			if err != nil {
+				t.Fatal(err)
+			}
+			copy(x.Data, in)
+			if err := b.Forward(x, m, l, rope, NewScratch(seq)); err != nil {
+				t.Fatal(err)
+			}
+			var sq, ref float64
+			for i, v := range want {
+				d := float64(x.Data[i] - v)
+				sq += d * d
+				ref += float64(v) * float64(v)
+			}
+			how := "rotated"
+			if off {
+				how = "unrotated"
+			}
+			t.Logf("int%d %-9s relative error %.4f%% (rms %.4g against the block's %.4g)", bits, how,
+				100*math.Sqrt(sq/ref), math.Sqrt(sq/float64(len(want))), math.Sqrt(ref/float64(len(want))))
+		}
 	}
-	if err := b.Forward(x, m, l, rope, NewScratch(seq)); err != nil {
-		t.Fatal(err)
-	}
-	var sq, ref float64
-	for i, v := range want {
-		d := float64(x.Data[i] - v)
-		sq += d * d
-		ref += float64(v) * float64(v)
-	}
-	t.Logf("int8 relative error %.4f%% (rms %.4g against the block's %.4g)",
-		100*math.Sqrt(sq/ref), math.Sqrt(sq/float64(len(want))), math.Sqrt(ref/float64(len(want))))
 }

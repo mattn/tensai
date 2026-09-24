@@ -20,7 +20,120 @@ import (
 // sums sit far inside saturation. Group scales and the nibble-offset
 // correction (8 times the group's activation sum) fold in per group.
 
+// q4matvecColsNarrow handles groups of at most 64 rows. Low nibbles
+// multiply activation rows 0/2, high nibbles rows 1/3: two 32-byte loads
+// cover a tile without expanding its nibbles to interleaved byte lanes.
+// Each half accumulates at most 32*15*63 = 30240 in an int16 lane.
+// Asymmetric groups widen before adding the halves. Symmetric groups
+// may add and subtract the zero-point correction modulo 2^16 first:
+// their final signed sum is bounded by 64*8*63 = 32256. Widening only
+// at the group boundary preserves the original integer and float sums.
+func q4matvecColsNarrow(out []tensai.Float, xu []uint8, xq []uint32, sx tensai.Float, gsum []int32, qw []uint8, scale []tensai.Float, sm []uint32, group, cols, lo, hi int) {
+	if !simd.HasAVX2 {
+		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, sm, group, cols, lo, hi)
+		return
+	}
+	quads := len(xq)
+	groups := len(gsum)
+	vecEnd := lo + ((hi - lo) &^ 31)
+	if vecEnd > lo {
+		mask := archsimd.BroadcastUint16x16(0x0F0F)
+		mMin := archsimd.BroadcastUint32x8(0xFFFF0000)
+		even := archsimd.BroadcastUint16x16(0x0200).AsInt8x32()
+		odd := archsimd.BroadcastUint16x16(0x0301).AsInt8x32()
+		clear(out[lo:vecEnd])
+		// Tiles outermost: the nibble walk and the tile-major table walk
+		// both advance strictly sequentially per worker.
+		for jt := lo; jt < vecEnd; jt += 32 {
+			tile := qw[(jt/q4Tile)*quads*2*q4Tile:]
+			d0 := out[jt : jt+8 : jt+8]
+			d1 := out[jt+8 : jt+16 : jt+16]
+			d2 := out[jt+16 : jt+24 : jt+24]
+			d3 := out[jt+24 : jt+32 : jt+32]
+			if sm != nil {
+				tab := sm[(jt/q4Tile)*groups*q4Tile:]
+				for g := 0; g < groups; g++ {
+					ib := g * group / 4
+					ie := min(ib+group/4, quads)
+					gsf := archsimd.BroadcastFloat32x8(tensai.Float(gsum[g]))
+					var a0, a1, a2, a3 archsimd.Int16x16
+					weights := tile[ib*2*q4Tile : ie*2*q4Tile]
+					for i4, x := range xq[ib:ie] {
+						xp := archsimd.BroadcastUint32x8(x).AsInt8x32()
+						row := (*[2 * q4Tile]uint8)(weights[i4*2*q4Tile:])
+						xlo := xp.PermuteOrZeroGrouped(even)
+						xhi := xp.PermuteOrZeroGrouped(odd)
+						v := simd.LoadU8x32(row[:]).AsUint16x16()
+						a0 = a0.Add(v.And(mask).AsUint8x32().DotProductPairsSaturated(xlo))
+						a1 = a1.Add(v.ShiftAllRight(4).And(mask).AsUint8x32().DotProductPairsSaturated(xhi))
+						v = simd.LoadU8x32(row[32:]).AsUint16x16()
+						a2 = a2.Add(v.And(mask).AsUint8x32().DotProductPairsSaturated(xlo))
+						a3 = a3.Add(v.ShiftAllRight(4).And(mask).AsUint8x32().DotProductPairsSaturated(xhi))
+					}
+					tg := tab[g*q4Tile : (g+1)*q4Tile : (g+1)*q4Tile]
+					u := simd.LoadU32x8(tg)
+					f := a0.GetLo().ExtendToInt32().Add(a1.GetLo().ExtendToInt32()).ConvertToFloat32().Mul(u.ShiftAllLeft(16).AsFloat32x8()).Sub(gsf.Mul(u.And(mMin).AsFloat32x8()))
+					simd.StoreF32x8(simd.LoadF32x8(d0).Add(f), d0)
+					u = simd.LoadU32x8(tg[8:])
+					f = a0.GetHi().ExtendToInt32().Add(a1.GetHi().ExtendToInt32()).ConvertToFloat32().Mul(u.ShiftAllLeft(16).AsFloat32x8()).Sub(gsf.Mul(u.And(mMin).AsFloat32x8()))
+					simd.StoreF32x8(simd.LoadF32x8(d1).Add(f), d1)
+					u = simd.LoadU32x8(tg[16:])
+					f = a2.GetLo().ExtendToInt32().Add(a3.GetLo().ExtendToInt32()).ConvertToFloat32().Mul(u.ShiftAllLeft(16).AsFloat32x8()).Sub(gsf.Mul(u.And(mMin).AsFloat32x8()))
+					simd.StoreF32x8(simd.LoadF32x8(d2).Add(f), d2)
+					u = simd.LoadU32x8(tg[24:])
+					f = a2.GetHi().ExtendToInt32().Add(a3.GetHi().ExtendToInt32()).ConvertToFloat32().Mul(u.ShiftAllLeft(16).AsFloat32x8()).Sub(gsf.Mul(u.And(mMin).AsFloat32x8()))
+					simd.StoreF32x8(simd.LoadF32x8(d3).Add(f), d3)
+				}
+			} else {
+				tab := scale[(jt/q4Tile)*groups*q4Tile:]
+				for g := 0; g < groups; g++ {
+					ib := g * group / 4
+					ie := min(ib+group/4, quads)
+					corr := archsimd.BroadcastInt16x16(int16(8 * gsum[g]))
+					var a0, a1, a2, a3 archsimd.Int16x16
+					weights := tile[ib*2*q4Tile : ie*2*q4Tile]
+					for i4, x := range xq[ib:ie] {
+						xp := archsimd.BroadcastUint32x8(x).AsInt8x32()
+						row := (*[2 * q4Tile]uint8)(weights[i4*2*q4Tile:])
+						xlo := xp.PermuteOrZeroGrouped(even)
+						xhi := xp.PermuteOrZeroGrouped(odd)
+						v := simd.LoadU8x32(row[:]).AsUint16x16()
+						a0 = a0.Add(v.And(mask).AsUint8x32().DotProductPairsSaturated(xlo))
+						a1 = a1.Add(v.ShiftAllRight(4).And(mask).AsUint8x32().DotProductPairsSaturated(xhi))
+						v = simd.LoadU8x32(row[32:]).AsUint16x16()
+						a2 = a2.Add(v.And(mask).AsUint8x32().DotProductPairsSaturated(xlo))
+						a3 = a3.Add(v.ShiftAllRight(4).And(mask).AsUint8x32().DotProductPairsSaturated(xhi))
+					}
+					a0 = a0.Add(a1).Sub(corr)
+					a2 = a2.Add(a3).Sub(corr)
+					tg := tab[g*q4Tile : (g+1)*q4Tile : (g+1)*q4Tile]
+					simd.StoreF32x8(simd.LoadF32x8(d0).Add(a0.GetLo().ExtendToInt32().ConvertToFloat32().Mul(simd.LoadF32x8(tg))), d0)
+					simd.StoreF32x8(simd.LoadF32x8(d1).Add(a0.GetHi().ExtendToInt32().ConvertToFloat32().Mul(simd.LoadF32x8(tg[8:]))), d1)
+					simd.StoreF32x8(simd.LoadF32x8(d2).Add(a2.GetLo().ExtendToInt32().ConvertToFloat32().Mul(simd.LoadF32x8(tg[16:]))), d2)
+					simd.StoreF32x8(simd.LoadF32x8(d3).Add(a2.GetHi().ExtendToInt32().ConvertToFloat32().Mul(simd.LoadF32x8(tg[24:]))), d3)
+				}
+			}
+		}
+		sxv := archsimd.BroadcastFloat32x8(sx)
+		for j := lo; j < vecEnd; j += 8 {
+			simd.StoreF32x8(simd.LoadF32x8(out[j:]).Mul(sxv), out[j:])
+		}
+	}
+	archsimd.ClearAVXUpperBits()
+	if vecEnd < hi {
+		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, sm, group, cols, vecEnd, hi)
+	}
+}
+
 func q4matvecCols(out []tensai.Float, xu []uint8, xq []uint32, sx tensai.Float, gsum []int32, qw []uint8, scale []tensai.Float, sm []uint32, group, cols, lo, hi int) {
+	if group <= 64 {
+		q4matvecColsNarrow(out, xu, xq, sx, gsum, qw, scale, sm, group, cols, lo, hi)
+		return
+	}
+	q4matvecColsWide(out, xu, xq, sx, gsum, qw, scale, sm, group, cols, lo, hi)
+}
+
+func q4matvecColsWide(out []tensai.Float, xu []uint8, xq []uint32, sx tensai.Float, gsum []int32, qw []uint8, scale []tensai.Float, sm []uint32, group, cols, lo, hi int) {
 	if !simd.HasAVX2 {
 		q4matvecColsGeneric(out, xu, sx, gsum, qw, scale, sm, group, cols, lo, hi)
 		return

@@ -3,6 +3,7 @@ package qwenimage
 import (
 	"fmt"
 	"math"
+	"sync"
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
@@ -54,16 +55,49 @@ type linear struct {
 	f  *tensai.Matrix  // (out, in), as the checkpoint stores it
 	q  *quant.QMatrix  // (in, out), the layout the int8 kernels want
 	q4 *quant.Q4Matrix // the same at four bits
+	// rot is the width of the Hadamard groups the quantized weights
+	// were rotated in, 0 for none. The input is rotated the same way
+	// before the product: H is orthogonal, so x W^T = (x H)(W H)^T, and
+	// the rotation spreads the outlier columns of both across their
+	// group, which is where eight bits lose the most.
+	rot  int
+	lora *lowRank
 }
 
-func (l *linear) apply(out, x *tensai.Matrix) error {
+// inputs is how many input features the layer reads.
+func (l *linear) inputs() int {
 	switch {
 	case l.q != nil:
-		return l.q.MatMul(x, out)
+		return l.q.Rows
 	case l.q4 != nil:
-		return l.q4.MatMul(x, out)
+		return l.q4.Rows
 	}
-	return tensai.DotTBInto(out, x, l.f)
+	return l.f.Cols
+}
+
+// convRotGroup is the rotation width: ComfyUI's, so its int8 weights are
+// already in the form the kernels want.
+const convRotGroup = 256
+
+func (l *linear) apply(out, x *tensai.Matrix) error {
+	if l.rot > 0 {
+		r := rotatedCopy(x, l.rot)
+		defer rotPool.Put(r)
+		x = r
+	}
+	var err error
+	switch {
+	case l.q != nil:
+		err = l.q.MatMul(x, out)
+	case l.q4 != nil:
+		err = l.q4.MatMul(x, out)
+	default:
+		err = tensai.DotTBInto(out, x, l.f)
+	}
+	if err == nil && l.lora != nil {
+		err = l.lora.add(out, x)
+	}
+	return err
 }
 
 // Block is one of the transformer's 32 layers.
@@ -74,8 +108,9 @@ type Block struct {
 	mlpOut               *linear
 	// dev holds the feed-forward's weights when they live on a device,
 	// and g is what to reach it through.
-	dev *deviceWeights
-	g   *gpu.Device
+	dev               *deviceWeights
+	g                 *gpu.Device
+	streamProjections bool
 }
 
 // devOf returns the device this block's weights were uploaded to.
@@ -118,7 +153,7 @@ func LoadBlock(w weights, i, bits int) (*Block, error) {
 		{&b.mlpGate, p + "img_mlp.gate_layer.weight", ditMLP, ditDim},
 		{&b.mlpOut, p + "img_mlp.out.weight", ditDim, ditMLP},
 	} {
-		if *f.dst, err = loadLinear(w, f.name, f.rows, f.cols, bits); err != nil {
+		if *f.dst, err = loadLinear(w, f.name, f.rows, f.cols, bits, convRotGroup); err != nil {
 			return nil, err
 		}
 	}
@@ -134,13 +169,19 @@ func LoadBlock(w weights, i, bits int) (*Block, error) {
 // loadLinear reads one weight matrix, quantizing it on the way in when
 // asked. The float form is dropped as soon as the quantized one exists,
 // so loading a 7B model never needs its float32 size.
-func loadLinear(w weights, name string, rows, cols, bits int) (*linear, error) {
+func loadLinear(w weights, name string, rows, cols, bits, rot int) (*linear, error) {
 	m, err := matrix(w, name, rows, cols)
 	if err != nil {
 		return nil, err
 	}
 	if bits != 8 && bits != 4 {
 		return &linear{f: m}, nil
+	}
+	if rot > 0 && (cols%rot != 0 || noRotate) {
+		rot = 0
+	}
+	if rot > 0 {
+		rotateRows(m, rot)
 	}
 	// The kernels contract over the stored matrix's rows, so the
 	// checkpoint's (out, in) has to change hands before it quantizes;
@@ -157,9 +198,44 @@ func loadLinear(w weights, name string, rows, cols, bits int) (*linear, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &linear{q4: q}, nil
+		return &linear{q4: q, rot: rot}, nil
 	}
-	return &linear{q: quant.Quantize(t)}, nil
+	return &linear{q: quant.Quantize(t), rot: rot}, nil
+}
+
+// noRotate turns the rotation off, for measuring what it buys.
+var noRotate bool
+
+// rotateRows rotates each row of m in groups of width g, in place.
+func rotateRows(m *tensai.Matrix, g int) {
+	workpool.Run(m.Rows, 1, func(lo, hi int) {
+		for r := lo; r < hi; r++ {
+			row := m.Data[r*m.Cols : (r+1)*m.Cols]
+			for c := 0; c+g <= len(row); c += g {
+				hadamard(row[c : c+g])
+			}
+		}
+	})
+}
+
+// rotPool recycles the rotated copies of activations.
+var rotPool sync.Pool
+
+// rotatedCopy returns x with every row rotated in groups of g, in a
+// matrix from rotPool that the caller puts back.
+func rotatedCopy(x *tensai.Matrix, g int) *tensai.Matrix {
+	r, _ := rotPool.Get().(*tensai.Matrix)
+	if r == nil {
+		r = &tensai.Matrix{}
+	}
+	n := x.Rows * x.Cols
+	if cap(r.Data) < n {
+		r.Data = make([]tensai.Float, n)
+	}
+	r.Rows, r.Cols, r.Data = x.Rows, x.Cols, r.Data[:n]
+	copy(r.Data, x.Data)
+	rotateRows(r, g)
+	return r
 }
 
 func vector(w weights, name string, n int) ([]tensai.Float, error) {
@@ -301,7 +377,7 @@ func (b *Block) Forward(x *tensai.Matrix, m *Modulation, l *Layout, rope *Rope, 
 		dst *tensai.Matrix
 		w   *linear
 	}{{s.q, b.toQ}, {s.k, b.toK}, {s.v, b.toV}} {
-		if err := p.w.apply(p.dst, s.norm); err != nil {
+		if err := b.project(p.dst, s.norm, p.w); err != nil {
 			return err
 		}
 	}
@@ -318,7 +394,7 @@ func (b *Block) Forward(x *tensai.Matrix, m *Modulation, l *Layout, rope *Rope, 
 	} else if err := attention(s.attn, s.q, s.k, s.v, l.KeyLimit, s); err != nil {
 		return err
 	}
-	if err := b.toOut.apply(s.norm, s.attn); err != nil {
+	if err := b.project(s.norm, s.attn, b.toOut); err != nil {
 		return err
 	}
 	addGated(x, s.norm, m.Gate1, l.Row)

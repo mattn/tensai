@@ -23,12 +23,16 @@ wrote out.png, 256x256
 ## チェックポイントの入手
 
 ```bash
-tensai image -fetch "a calico cat asleep on a stack of books"
+tensai image "a calico cat asleep on a stack of books"
+tensai image -model Comfy-Org/Qwen-Image-2.1 "a calico cat asleep on a stack of books"
 ```
 
-`-fetch` が `~/.cache/tensai/Qwen-Image-2.1` の下に一式 (合計およそ 31GB) を落としてから描きます。中断した場合は続きから再開します。重みファイル名は各コンポーネントの index から読むので、リポジトリ側で分割数が変わっても解決できます。2 回目以降の `-fetch` は既にあるものを見つけるだけで何もしません。
+`-model` は `run` や `chat` と同じ形でチェックポイントを指定します。リポジトリ名、`tensai models` が表示する名前、パスのどれでも受け付けます。次の 2 つのリポジトリは初回に自動でダウンロードします。中断などでファイルが欠けていれば、次の実行でそのファイルだけを取り直します。すべて揃っていれば通信はしません。
 
-`-model` はキャッシュ下の名前でも、`text_encoder`・`transformer`・`vae`・`processor` を持つディレクトリへのパスでも受け付けます。
+- `Qwen/Qwen-Image-2.1` (既定): diffusers 形式のチェックポイントで、およそ 31GB です。`~/.cache/tensai/Qwen-Image-2.1` に置きます。重みファイル名は各コンポーネントの index から読むので、リポジトリ側で分割数が変わっても解決できます。
+- `Comfy-Org/Qwen-Image-2.1`: ComfyUI 向けに詰め直したもので、`~/.cache/tensai/Comfy-Org/Qwen-Image-2.1` に置きます。transformer とプロンプトエンコーダが最初から 8 ビットなので、int8 版の合計はおよそ 17GB です。重みは入力 256 列ごとに Hadamard 行列で回転させてから、行ごとのスケール付き int8 にしてあります。ローダーはこの 2 つを戻してから自前の量子化をかけるので、どちらのチェックポイントも同じコードで動きます。ComfyUI 版にはトークナイザと VAE の潜在統計が含まれないため、この小さな 2 ファイルだけは Qwen のリポジトリから取ります。
+
+パスにはどちらの配置のディレクトリも指定できます。diffusers なら `text_encoder`・`transformer`・`vae`・`processor`、ComfyUI なら `text_encoders`・`diffusion_models`・`vae` に `processor/tokenizer.json` と `vae/config.json` を加えたものです。ComfyUI の配置では `_int8_convrot` のファイルを選び、無ければ `_bf16` を使います。以前ダウンロードに使っていた `-fetch` は、指定しても何もしません。
 
 ## 幅とメモリ
 
@@ -41,6 +45,8 @@ tensai image -fetch "a calico cat asleep on a stack of books"
 | `-q4` | 3.5 GB | 13.5% |
 
 誤差は同じモデルの float 版との比較で、深さに対して掛け算では増えません。1 ブロックで 8 ビットが 7.2%、4 ビットが 12.8%、8 ブロックで 9.1% と 13.5% です。どちらもプロンプトどおりの絵になり、4 ビットは細部の解釈が変わります。
+
+上の数字は回転を入れる前のものです。今は量子化の前に、すべての重みを入力 256 列ごとに Hadamard 行列で回転させ、積の入力にも同じ回転を掛けます。行列は直交なので積の結果は変わりませんが、行のスケールを決めてしまう少数の外れ値の列がグループ全体にならされます。8 ビットが一番損をしていたのはそこです。ComfyUI の int8 ファイルと同じ方式なので、そちらの重みは最初からこの形で届きます。参照入力での最初のブロックでは、8 ビットの誤差が 6.95% から 3.48% とほぼ半分になり、4 ビットは 19.3% から 16.2% になります。モデル全体の 4 ブロック分で見ると、8 ビットの velocity 誤差は CPU で 7.8% から 2.4%、`-gpu` で 4.8% から 2.1% に下がります。デバイス上では feed-forward の出力側の射影が読む値もデバイスで作られるので、回転もデバイスで掛けます。行を 256 ずつのグループとして見て H との積を 1 回計算するだけで、射影そのものの数パーセントのコストです。
 
 70 億パラメータの量子化には数分かかり、結果は毎回同じなので、チェックポイントの隣に `tensai-q8.cache` (または `tensai-q4.cache`) として書き、次回は mmap で読みます。初回は遅く、2 回目からは速くなります。プロンプトエンコーダの起動が 5 分 23 秒から 7 秒、transformer が 7 分 7 秒から 2 秒です。キャッシュは隣の `.safetensors` の名前・サイズ・更新時刻で紐付けてあるので、再ダウンロードすれば作り直します。
 
@@ -81,7 +87,7 @@ Attention の射影と各種ノルム、3 軸の rotary embedding は CPU に残
 ```
 tensai image [flags] <prompt>
 
-  -model string   キャッシュ下の名前、またはパス (既定 "Qwen-Image-2.1")
+  -model string   リポジトリ名、キャッシュ内の名前、またはパス (既定 "Qwen/Qwen-Image-2.1")
   -o string       書き出し先 (既定 "out.png")
   -size int       幅と高さ、ピクセル (既定 256)
   -steps int      デノイジングのステップ数 (既定 20)
@@ -90,7 +96,6 @@ tensai image [flags] <prompt>
   -f32            重みを float のまま持つ。およそ 42GB 必要
   -negative str   避けたいもの。-cfg を 1 より大きくする必要がある
   -cfg float      どれだけ避けるか (既定 1、off)
-  -fetch          先にチェックポイントを落とす。およそ 31GB
   -gpu            feed-forward と attention を GPU で走らせる
   -gpu-budget num GPU に載せてよい重みの GB 数 (既定 4)
   -cpuprofile str CPU プロファイルの保存先

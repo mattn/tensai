@@ -522,3 +522,54 @@ func TestDropoutMask(t *testing.T) {
 		t.Fatalf("the mask kept %d of %d elements, which tests nothing", kept, len(x.Data))
 	}
 }
+
+// MatMulT is MatMul by the transpose without the copy: the product and
+// both gradients must match what the explicit Transpose gives, for plain
+// matrices and for a stack whose second operand broadcasts over a group
+// axis, the shape grouped-query attention multiplies.
+func TestMatMulTMatchesTranspose(t *testing.T) {
+	rng := rand.New(rand.NewPCG(5, 6))
+	random := func(shape ...int) *tensai.Tensor {
+		x := tensai.NewTensor(shape...)
+		for i := range x.Data {
+			x.Data[i] = tensai.Float(rng.NormFloat64())
+		}
+		return x
+	}
+	for _, c := range []struct{ a, b []int }{
+		{[]int{5, 7}, []int{3, 7}},
+		{[]int{2, 2, 3, 5, 8}, []int{2, 2, 1, 6, 8}},
+	} {
+		av, bv := random(c.a...), random(c.b...)
+		a1, b1 := Param(av.Clone()), Param(bv.Clone())
+		a2, b2 := Param(av.Clone()), Param(bv.Clone())
+		y1, y2 := a1.MatMulT(b1), a2.MatMul(b2.T())
+		w := Input(random(y1.Shape()...))
+		y1.Mul(w).Sum().Backward()
+		y2.Mul(w).Sum().Backward()
+		for _, p := range [][2]*tensai.Tensor{
+			{y1.Value(), y2.Value()}, {a1.Grad(), a2.Grad()}, {b1.Grad(), b2.Grad()},
+		} {
+			if !sameShape(p[0].Shape, p[1].Shape) {
+				t.Fatalf("%v x %v^T: shape %v, want %v", c.a, c.b, p[0].Shape, p[1].Shape)
+			}
+			for i := range p[0].Data {
+				if d := math.Abs(float64(p[0].Data[i] - p[1].Data[i])); d > 1e-4 {
+					t.Fatalf("%v x %v^T: element %d = %v, want %v", c.a, c.b, i, p[0].Data[i], p[1].Data[i])
+				}
+			}
+		}
+	}
+}
+
+func sameShape(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

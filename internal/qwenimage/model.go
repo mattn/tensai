@@ -61,7 +61,11 @@ func (m *Transformer) Close() error {
 					w.q4.Free()
 				}
 			}
+			if b.dev.rot != nil && b == m.blocks[0] {
+				b.dev.rot.Free() // shared by every block
+			}
 			b.dev, b.g = nil, nil
+			b.streamProjections = false
 		}
 		m.dev.Close()
 		m.dev = nil
@@ -76,6 +80,18 @@ func (m *Transformer) Close() error {
 
 // ditLayers is how many blocks the checkpoint has.
 const ditLayers = 32
+
+// openTransformerSource opens the transformer at path: a directory of
+// shards, or one ComfyUI file.
+func openTransformerSource(path string) (interface {
+	weights
+	Close() error
+}, error) {
+	if singleFile(path) {
+		return openComfy(path, nil)
+	}
+	return safetensors.OpenSharded(filepath.Join(path, "diffusion_pytorch_model.safetensors.index.json"))
+}
 
 // LoadTransformer reads the denoising transformer. With bits set to 8
 // the weights quantize as they arrive, which takes the 14GB checkpoint
@@ -105,7 +121,7 @@ func loadTransformer(dir string, bits, layers int) (*Transformer, error) {
 		}
 	}
 
-	w, err := safetensors.OpenSharded(filepath.Join(dir, "diffusion_pytorch_model.safetensors.index.json"))
+	w, err := openTransformerSource(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +144,7 @@ func loadTransformer(dir string, bits, layers int) (*Transformer, error) {
 		// The pieces outside the blocks are a rounding error of the
 		// model's size and sit on every token's path, so they stay in
 		// float whatever the blocks do.
-		if *f.dst, err = loadLinear(w, f.name, f.rows, f.cols, 0); err != nil {
+		if *f.dst, err = loadLinear(w, f.name, f.rows, f.cols, 0, 0); err != nil {
 			return nil, err
 		}
 	}

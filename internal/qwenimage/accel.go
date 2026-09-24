@@ -24,46 +24,99 @@ import (
 // deviceWeights is one block's feed-forward, resident.
 type deviceWeights struct {
 	proj, gate, out *deviceLinear
+	// rot is the Hadamard matrix the output projection's input is
+	// rotated by, shared by every block, nil when it is not rotated.
+	rot *gpu.Tensor
 }
 
 // deviceLinear is one weight matrix on the device, at whichever width
 // the model was loaded with.
 type deviceLinear struct {
-	q8 *gpu.QMatrix
-	q4 *gpu.Q4Matrix
+	q8   *gpu.QMatrix
+	q4   *gpu.Q4Matrix
+	lora *lowRank
+	g    *gpu.Device
+}
+
+// UseGPUProjections streams one attention projection at a time. Its
+// weights are released before the next upload, bounding extra residency.
+func UseGPUProjections(m *Transformer, budget uint64) error {
+	if m.dev == nil {
+		return fmt.Errorf("qwenimage: enable the GPU before projections")
+	}
+	var resident, peak uint64
+	for _, b := range m.blocks {
+		resident += mlpBytes(b)
+		for _, l := range []*linear{b.toQ, b.toK, b.toV, b.toOut} {
+			if l == nil || (l.q == nil && l.q4 == nil) {
+				return fmt.Errorf("qwenimage: projections need quantized weights")
+			}
+			peak = max(peak, linearGPUBytes(l)+l.lora.bytes())
+		}
+	}
+	if resident+peak > budget {
+		return fmt.Errorf("qwenimage: GPU projections need %d MiB of spare weight budget", (peak+(1<<20)-1)>>20)
+	}
+	for _, b := range m.blocks {
+		b.streamProjections = true
+	}
+	return nil
+}
+
+func (b *Block) project(dst, x *tensai.Matrix, l *linear) error {
+	if b.streamProjections && x.Rows >= 256 {
+		return streamProjection(b.g, l, dst, x)
+	}
+	return l.apply(dst, x)
 }
 
 func uploadLinear(g *gpu.Device, l *linear) (*deviceLinear, uint64, error) {
 	switch {
 	case l.q != nil:
 		q, err := g.UploadQ8(l.q)
-		return &deviceLinear{q8: q}, uint64(len(l.q.Q)), err
+		return &deviceLinear{q8: q, lora: l.lora, g: g}, linearGPUBytes(l), err
 	case l.q4 != nil:
 		q, err := g.UploadQ4(l.q4)
-		return &deviceLinear{q4: q}, uint64(len(l.q4.Q)), err
+		return &deviceLinear{q4: q, lora: l.lora, g: g}, linearGPUBytes(l), err
 	}
 	return nil, 0, fmt.Errorf("qwenimage: the device needs quantized weights; this model holds floats")
 }
 
 func (d *deviceLinear) matmul(x *gpu.Tensor) (*gpu.Tensor, error) {
+	var out *gpu.Tensor
+	var err error
 	if d.q8 != nil {
-		return d.q8.MatMul(x)
+		out, err = d.q8.MatMul(x)
+	} else {
+		out, err = d.q4.MatMul(x)
 	}
-	return d.q4.MatMul(x)
-}
-
-// bytes is what a block's feed-forward weighs at a given width.
-func mlpBytes(b *Block) uint64 {
-	n := uint64(0)
-	for _, l := range []*linear{b.mlpProj, b.mlpGate, b.mlpOut} {
-		switch {
-		case l.q != nil:
-			n += uint64(len(l.q.Q))
-		case l.q4 != nil:
-			n += uint64(len(l.q4.Q))
+	if err != nil {
+		return nil, err
+	}
+	if d.lora != nil {
+		if err := d.lora.addGPU(d.g, out, x); err != nil {
+			out.Free()
+			return nil, err
 		}
 	}
-	return n
+	return out, nil
+}
+
+// linearGPUBytes counts the device's padded weights and scale tables.
+func linearGPUBytes(l *linear) uint64 {
+	switch {
+	case l.q != nil:
+		padded := uint64((l.q.Cols + 3) / 4 * 4)
+		return uint64(l.q.Rows)*padded + padded*4
+	case l.q4 != nil:
+		padded := uint64((l.q4.Cols + 3) / 4 * 4)
+		return uint64((l.q4.Rows+1)/2)*padded + uint64((l.q4.Rows+63)/64)*padded*4
+	}
+	return 0
+}
+
+func mlpBytes(b *Block) uint64 {
+	return linearGPUBytes(b.mlpProj) + linearGPUBytes(b.mlpGate) + linearGPUBytes(b.mlpOut)
 }
 
 // UseGPU moves every block's feed-forward onto a device, if what that
@@ -74,17 +127,18 @@ func UseGPU(m *Transformer, budget uint64) (string, uint64, error) {
 	if len(m.blocks) == 0 {
 		return "", 0, fmt.Errorf("qwenimage: no blocks to move")
 	}
-	var want uint64
+	var want, adapterPeak uint64
 	for _, b := range m.blocks {
 		want += mlpBytes(b)
+		adapterPeak = max(adapterPeak, b.mlpProj.lora.bytes()+b.mlpGate.lora.bytes()+b.mlpOut.lora.bytes())
 	}
 	if want == 0 {
 		return "", 0, fmt.Errorf("qwenimage: the device needs quantized weights; this model holds floats")
 	}
-	if want > budget {
-		return "", 0, fmt.Errorf("qwenimage: the feed-forward weights are %.1fGiB and the budget is %.1fGiB; "+
+	if want+adapterPeak > budget {
+		return "", 0, fmt.Errorf("qwenimage: feed-forward weights and adapter scratch need %.2fGiB and the budget is %.2fGiB; "+
 			"draw at four bits or raise the budget",
-			float64(want)/(1<<30), float64(budget)/(1<<30))
+			float64(want+adapterPeak)/(1<<30), float64(budget)/(1<<30))
 	}
 	g, err := gpu.Open(gpu.HighPerformance)
 	if err != nil {
@@ -100,8 +154,24 @@ func UseGPU(m *Transformer, budget uint64) (string, uint64, error) {
 				one>>20, lim>>20)
 		}
 	}
+	// The output projection's input, the gated product, is made on the
+	// device, so its rotation happens there: one product with H over
+	// the rows viewed in groups, a few per cent of the projection.
+	var rot *gpu.Tensor
+	if r := m.blocks[0].mlpOut.rot; r > 0 {
+		h := tensai.NewMatrix(r, r)
+		for i := 0; i < r; i++ {
+			h.Data[i*r+i] = 1
+		}
+		rotateRows(h, r) // the rows of I H are H
+		var err error
+		if rot, err = g.Upload(h.Tensor()); err != nil {
+			g.Close()
+			return "", 0, err
+		}
+	}
 	for _, b := range m.blocks {
-		w := &deviceWeights{}
+		w := &deviceWeights{rot: rot}
 		for _, f := range []struct {
 			dst **deviceLinear
 			src *linear
@@ -131,6 +201,13 @@ func (b *Block) mlpOnDevice(dst, x *tensai.Matrix) (err error) {
 			err = e
 		}
 	}()
+	// The gate and the projection were quantized rotated, and read the
+	// same input; its rotation is done here before it goes up.
+	if rot := b.mlpGate.rot; rot > 0 {
+		r := rotatedCopy(x, rot)
+		defer rotPool.Put(r)
+		x = r
+	}
 	in := &tensai.Tensor{Shape: []int{x.Rows, x.Cols}, Data: x.Data}
 	gx, err := b.devOf().Upload(in)
 	if err != nil {
@@ -151,7 +228,23 @@ func (b *Block) mlpOnDevice(dst, x *tensai.Matrix) (err error) {
 	if err := gate.SiluMul(up); err != nil {
 		return err
 	}
-	out, err := b.dev.out.matmul(gate)
+	in2 := gate
+	if b.dev.rot != nil {
+		rows, cols, g := x.Rows, b.mlpOut.inputs(), b.mlpOut.rot
+		grouped, err := gate.View(0, rows*cols/g, g)
+		if err != nil {
+			return err
+		}
+		r, err := grouped.MatMul(b.dev.rot)
+		if err != nil {
+			return err
+		}
+		defer r.Free()
+		if in2, err = r.View(0, rows, cols); err != nil {
+			return err
+		}
+	}
+	out, err := b.dev.out.matmul(in2)
 	if err != nil {
 		return err
 	}
@@ -258,5 +351,47 @@ func (b *Block) attentionPart(out, q *tensai.Matrix, gk, gv *gpu.Tensor, lo, hi 
 		return err
 	}
 	copy(out.Data[lo*out.Cols:hi*out.Cols], got.Data)
+	return nil
+}
+
+// Includes weight packing, upload, input rotation, computation and readback.
+func streamProjection(g *gpu.Device, l *linear, dst, x *tensai.Matrix) (err error) {
+	w, _, err := uploadLinear(g, l)
+	if err != nil {
+		return err
+	}
+	if w.q8 != nil {
+		defer w.q8.Free()
+	} else {
+		defer w.q4.Free()
+	}
+	if l.rot > 0 {
+		r := rotatedCopy(x, l.rot)
+		defer rotPool.Put(r)
+		x = r
+	}
+	if err := g.BeginBatch(); err != nil {
+		return err
+	}
+	defer func() {
+		if e := g.Flush(); err == nil {
+			err = e
+		}
+	}()
+	in, err := g.Upload(x.Tensor())
+	if err != nil {
+		return err
+	}
+	defer in.Free()
+	out, err := w.matmul(in)
+	if err != nil {
+		return err
+	}
+	defer out.Free()
+	host, err := out.Download()
+	if err != nil {
+		return err
+	}
+	copy(dst.Data, host.Data)
 	return nil
 }

@@ -16,6 +16,7 @@ import (
 
 	"github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/safetensors"
+	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/internal/kernels"
 	"github.com/mattn/tensai/internal/workpool"
 )
@@ -43,7 +44,7 @@ type conv struct {
 // pixel), so they are built a tile at a time and reused.
 const imcolBudget = 64 << 20
 
-func loadConv(f *safetensors.File, prefix string, ksz int) (*conv, error) {
+func loadConv(f weights, prefix string, ksz int) (*conv, error) {
 	wt, err := f.Tensor(prefix + ".weight")
 	if err != nil {
 		return nil, err
@@ -78,9 +79,12 @@ func loadConv(f *safetensors.File, prefix string, ksz int) (*conv, error) {
 }
 
 // apply runs the convolution over a (h*w, in) feature map.
-func (c *conv) apply(x *tensai.Matrix, h, w int) (*tensai.Matrix, error) {
+func (c *conv) apply(x *tensai.Matrix, h, w int, g *gpu.Device) (*tensai.Matrix, error) {
 	if x.Cols != c.in || x.Rows != h*w {
 		return nil, fmt.Errorf("qwenimage: conv wants %dx%d, got %dx%d", h*w, c.in, x.Rows, x.Cols)
+	}
+	if g != nil {
+		return c.onGPU(g, x, h, w)
 	}
 	out := tensai.NewMatrix(h*w, c.out)
 	if c.ksz == 1 {
@@ -160,7 +164,7 @@ type resBlock struct {
 	shortcut     *conv // nil when the block keeps its width
 }
 
-func loadResBlock(f *safetensors.File, prefix string) (*resBlock, error) {
+func loadResBlock(f vaeWeights, prefix string) (*resBlock, error) {
 	b := &resBlock{}
 	var err error
 	if b.norm1, err = gamma(f, prefix+".norm1.gamma"); err != nil {
@@ -183,24 +187,24 @@ func loadResBlock(f *safetensors.File, prefix string) (*resBlock, error) {
 	return b, nil
 }
 
-func (b *resBlock) apply(x *tensai.Matrix, h, w int) (*tensai.Matrix, error) {
+func (b *resBlock) apply(x *tensai.Matrix, h, w int, g *gpu.Device) (*tensai.Matrix, error) {
 	skip := x
 	if b.shortcut != nil {
 		var err error
-		if skip, err = b.shortcut.apply(x, h, w); err != nil {
+		if skip, err = b.shortcut.apply(x, h, w, g); err != nil {
 			return nil, err
 		}
 	}
 	y := clone(x)
 	rmsNorm(y, b.norm1)
 	kernels.Silu(y.Data)
-	y, err := b.conv1.apply(y, h, w)
+	y, err := b.conv1.apply(y, h, w, g)
 	if err != nil {
 		return nil, err
 	}
 	rmsNorm(y, b.norm2)
 	kernels.Silu(y.Data)
-	if y, err = b.conv2.apply(y, h, w); err != nil {
+	if y, err = b.conv2.apply(y, h, w, g); err != nil {
 		return nil, err
 	}
 	kernels.AddSlice(y.Data, skip.Data)
@@ -215,7 +219,7 @@ type attnBlock struct {
 	proj *conv
 }
 
-func loadAttn(f *safetensors.File, prefix string) (*attnBlock, error) {
+func loadAttn(f weights, prefix string) (*attnBlock, error) {
 	a := &attnBlock{}
 	var err error
 	if a.norm, err = gamma(f, prefix+".norm.gamma"); err != nil {
@@ -230,11 +234,11 @@ func loadAttn(f *safetensors.File, prefix string) (*attnBlock, error) {
 	return a, nil
 }
 
-func (a *attnBlock) apply(x *tensai.Matrix, h, w int) (*tensai.Matrix, error) {
+func (a *attnBlock) apply(x *tensai.Matrix, h, w int, g *gpu.Device) (*tensai.Matrix, error) {
 	n, dim := x.Rows, x.Cols
 	y := clone(x)
 	rmsNorm(y, a.norm)
-	qkv, err := a.qkv.apply(y, h, w)
+	qkv, err := a.qkv.apply(y, h, w, g)
 	if err != nil {
 		return nil, err
 	}
@@ -256,7 +260,7 @@ func (a *attnBlock) apply(x *tensai.Matrix, h, w int) (*tensai.Matrix, error) {
 			kernels.Axpy(e, qkv.Data[j*3*dim+2*dim:j*3*dim+3*dim], row)
 		}
 	}
-	if att, err = a.proj.apply(att, h, w); err != nil {
+	if att, err = a.proj.apply(att, h, w, g); err != nil {
 		return nil, err
 	}
 	kernels.AddSlice(att.Data, x.Data)
@@ -277,11 +281,11 @@ type upBlock struct {
 	dupOut, dupRepeat, dupT int
 }
 
-func (u *upBlock) apply(x *tensai.Matrix, h, w int) (*tensai.Matrix, int, int, error) {
+func (u *upBlock) apply(x *tensai.Matrix, h, w int, g *gpu.Device) (*tensai.Matrix, int, int, error) {
 	src := x
 	var err error
 	for _, r := range u.resnets {
-		if x, err = r.apply(x, h, w); err != nil {
+		if x, err = r.apply(x, h, w, g); err != nil {
 			return nil, 0, 0, err
 		}
 	}
@@ -289,7 +293,7 @@ func (u *upBlock) apply(x *tensai.Matrix, h, w int) (*tensai.Matrix, int, int, e
 	if u.up != nil {
 		x = nearest2x(x, h, w)
 		oh, ow = 2*h, 2*w
-		if x, err = u.up.apply(x, oh, ow); err != nil {
+		if x, err = u.up.apply(x, oh, ow, g); err != nil {
 			return nil, 0, 0, err
 		}
 	}
@@ -374,13 +378,25 @@ var stages = []struct {
 	{288, 144, false, false},
 }
 
+// vaeWeights is what the decoder reads: tensors, and whether an optional
+// one (a resnet's shortcut) is there.
+type vaeWeights interface {
+	weights
+	Info(string) (string, []int, bool)
+}
+
 // LoadDecoder reads the decoder half of a Qwen-Image-2.1 VAE checkpoint.
 func LoadDecoder(path string) (*Decoder, error) {
-	f, err := safetensors.Open(path)
+	file, err := safetensors.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer file.Close()
+	// ComfyUI ships the same decoder under Wan's own names.
+	var f vaeWeights = file
+	if isComfyVAE(file) {
+		f = comfyVAE{file}
+	}
 
 	d := &Decoder{}
 	if d.postQuant, err = loadConv(f, "post_quant_conv", 1); err != nil {
@@ -433,34 +449,49 @@ func LoadDecoder(path string) (*Decoder, error) {
 // Decode turns a (64, h, w) latent into a (4, 16h, 16w) RGBA image whose
 // samples run from -1 to 1.
 func Decode(d *Decoder, z *tensai.Tensor) (*tensai.Tensor, error) {
+	return decode(d, z, nil)
+}
+
+// DecodeGPU runs decoder convolutions on a GPU, uploading one filter at
+// a time so full-resolution features do not compete with resident weights.
+func DecodeGPU(d *Decoder, z *tensai.Tensor) (*tensai.Tensor, error) {
+	g, err := gpu.Open(gpu.HighPerformance)
+	if err != nil {
+		return nil, err
+	}
+	defer g.Close()
+	return decode(d, z, g)
+}
+
+func decode(d *Decoder, z *tensai.Tensor, g *gpu.Device) (*tensai.Tensor, error) {
 	if len(z.Shape) != 3 || z.Shape[0] != d.postQuant.in {
 		return nil, fmt.Errorf("qwenimage: want a (%d, h, w) latent, got shape %v", d.postQuant.in, z.Shape)
 	}
 	h, w := z.Shape[1], z.Shape[2]
-	x, err := d.postQuant.apply(channelsLast(z), h, w)
+	x, err := d.postQuant.apply(channelsLast(z), h, w, g)
 	if err != nil {
 		return nil, err
 	}
-	if x, err = d.convIn.apply(x, h, w); err != nil {
+	if x, err = d.convIn.apply(x, h, w, g); err != nil {
 		return nil, err
 	}
-	if x, err = d.midRes[0].apply(x, h, w); err != nil {
+	if x, err = d.midRes[0].apply(x, h, w, g); err != nil {
 		return nil, err
 	}
-	if x, err = d.midAttn.apply(x, h, w); err != nil {
+	if x, err = d.midAttn.apply(x, h, w, g); err != nil {
 		return nil, err
 	}
-	if x, err = d.midRes[1].apply(x, h, w); err != nil {
+	if x, err = d.midRes[1].apply(x, h, w, g); err != nil {
 		return nil, err
 	}
 	for _, u := range d.ups {
-		if x, h, w, err = u.apply(x, h, w); err != nil {
+		if x, h, w, err = u.apply(x, h, w, g); err != nil {
 			return nil, err
 		}
 	}
 	rmsNorm(x, d.normOut)
 	kernels.Silu(x.Data)
-	if x, err = d.convOut.apply(x, h, w); err != nil {
+	if x, err = d.convOut.apply(x, h, w, g); err != nil {
 		return nil, err
 	}
 	out := tensai.NewTensor(x.Cols, h, w)
@@ -489,7 +520,7 @@ func clone(x *tensai.Matrix) *tensai.Matrix {
 	return &tensai.Matrix{Rows: x.Rows, Cols: x.Cols, Data: append([]tensai.Float(nil), x.Data...)}
 }
 
-func gamma(f *safetensors.File, name string) ([]tensai.Float, error) {
+func gamma(f weights, name string) ([]tensai.Float, error) {
 	t, err := f.Tensor(name)
 	if err != nil {
 		return nil, err

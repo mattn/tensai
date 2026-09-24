@@ -43,6 +43,17 @@ func BenchmarkGPUBlock512(b *testing.B) {
 		}
 	}
 	bl := m.blocks[0]
+	mod, _, err := m.conditioning(0.7)
+	if err != nil {
+		b.Fatal(err)
+	}
+	initial, x := clone(s.norm), clone(s.norm)
+	rope := l.Rope()
+	block := func(stream bool) error {
+		bl.streamProjections = stream
+		copy(x.Data, initial.Data)
+		return bl.Forward(x, mod, l, rope, s)
+	}
 	for _, tc := range []struct {
 		name string
 		run  func() error
@@ -60,7 +71,10 @@ func BenchmarkGPUBlock512(b *testing.B) {
 		}},
 		{"attention", func() error { return bl.attentionOnDevice(s.attn, s.q, s.k, s.v, l, s) }},
 		{"output", func() error { return bl.toOut.apply(s.norm, s.attn) }},
+		{"stream_output", func() error { return streamProjection(bl.g, bl.toOut, s.norm, s.attn) }},
 		{"ffn", func() error { return bl.mlpOnDevice(s.attn, s.norm) }},
+		{"block_cpu_projections", func() error { return block(false) }},
+		{"block_gpu_projections", func() error { return block(true) }},
 	} {
 		b.Run(tc.name, func(b *testing.B) {
 			if err := tc.run(); err != nil {

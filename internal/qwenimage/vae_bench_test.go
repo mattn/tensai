@@ -7,9 +7,15 @@ import (
 	"testing"
 
 	"github.com/mattn/tensai"
+	"github.com/mattn/tensai/gpu"
 )
 
-func BenchmarkDecoder512(b *testing.B) {
+func BenchmarkDecoder512(b *testing.B)    { benchmarkDecoder(b, false) }
+func BenchmarkDecoderGPU512(b *testing.B) { benchmarkDecoder(b, true) }
+func benchmarkDecoder(b *testing.B, device bool) {
+	if device && gpu.Backend() == "" {
+		b.Skip("requires a GPU build")
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		b.Fatal(err)
@@ -26,9 +32,13 @@ func BenchmarkDecoder512(b *testing.B) {
 	for i := range z.Data {
 		z.Data[i] = tensai.Float(math.Sin(float64(i) * 0.13))
 	}
+	decode := Decode
+	if device {
+		decode = DecodeGPU
+	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := Decode(d, z); err != nil {
+		if _, err := decode(d, z); err != nil {
 			b.Fatal(err)
 		}
 	}
