@@ -48,14 +48,12 @@ var (
 const spinFor = 100 * time.Microsecond
 
 // maxWorkers caps the resident pool. Decode matvecs stream weights from
-// memory, and beyond eight workers the extra SMT siblings contend for the
-// same cores and memory channels: on the 8C/16T reference machine the
-// full complement costs about 7% of end-to-end decode. The cost is the
-// spinning as much as the work, so the cap is on the residents rather
-// than on the chunks a call hands out -- which is why bulk work that
-// wants every core, like a repack or a weight upload, goes through Bulk
-// instead of borrowing this pool.
-const maxWorkers = 8
+// memory; four residents saturate the bandwidth of the 8C/16T reference
+// machine with the Q4 kernels, and eight cost 5-7% in full-model decode.
+// Q8 also benefits from the smaller pool. The cap is on residents, not
+// chunks: idle spinning workers still compete with useful work. Bulk
+// loading and repacking use all available CPUs through Bulk instead.
+const maxWorkers = 4
 
 func setup() {
 	workers = runtime.GOMAXPROCS(0)

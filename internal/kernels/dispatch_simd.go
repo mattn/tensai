@@ -572,8 +572,22 @@ func DotVec(a, b []float32) float32 {
 	}
 	n := len(a) &^ 7
 	var acc archsimd.Float32x8
-	for i := 0; i < n; i += 8 {
-		acc = simd.LoadF32x8(a[i:]).MulAdd(simd.LoadF32x8(b[i:]), acc)
+	// The common attention head width: fixed bounds remove per-vector
+	// checks while retaining the same FMA chain and horizontal sum.
+	if len(a) == 64 {
+		aa, bb := (*[64]float32)(a), (*[64]float32)(b)
+		acc = simd.LoadF32x8(aa[0:8]).MulAdd(simd.LoadF32x8(bb[0:8]), acc)
+		acc = simd.LoadF32x8(aa[8:16]).MulAdd(simd.LoadF32x8(bb[8:16]), acc)
+		acc = simd.LoadF32x8(aa[16:24]).MulAdd(simd.LoadF32x8(bb[16:24]), acc)
+		acc = simd.LoadF32x8(aa[24:32]).MulAdd(simd.LoadF32x8(bb[24:32]), acc)
+		acc = simd.LoadF32x8(aa[32:40]).MulAdd(simd.LoadF32x8(bb[32:40]), acc)
+		acc = simd.LoadF32x8(aa[40:48]).MulAdd(simd.LoadF32x8(bb[40:48]), acc)
+		acc = simd.LoadF32x8(aa[48:56]).MulAdd(simd.LoadF32x8(bb[48:56]), acc)
+		acc = simd.LoadF32x8(aa[56:64]).MulAdd(simd.LoadF32x8(bb[56:64]), acc)
+	} else {
+		for i := 0; i < n; i += 8 {
+			acc = simd.LoadF32x8(a[i:]).MulAdd(simd.LoadF32x8(b[i:]), acc)
+		}
 	}
 	var buf [8]float32
 	simd.StoreF32x8(acc, buf[:])
@@ -1126,12 +1140,12 @@ func AxpyRows(out, ws []float32, rows [][]float32, off int) {
 	// Eight accumulators is the register file's limit, and naming them
 	// keeps them there: an array indexed by the loop variable spills.
 	for b := 0; b+64 <= n; b += 64 {
-		o := out[b:]
+		o := out[b : b+64 : b+64]
 		a0, a1, a2, a3 := simd.LoadF32x8(o), simd.LoadF32x8(o[8:]), simd.LoadF32x8(o[16:]), simd.LoadF32x8(o[24:])
 		a4, a5, a6, a7 := simd.LoadF32x8(o[32:]), simd.LoadF32x8(o[40:]), simd.LoadF32x8(o[48:]), simd.LoadF32x8(o[56:])
 		for i, w := range ws {
 			av := archsimd.BroadcastFloat32x8(w)
-			r := rows[i][off+b:]
+			r := rows[i][off+b : off+b+64 : off+b+64]
 			a0 = simd.LoadF32x8(r).MulAdd(av, a0)
 			a1 = simd.LoadF32x8(r[8:]).MulAdd(av, a1)
 			a2 = simd.LoadF32x8(r[16:]).MulAdd(av, a2)
