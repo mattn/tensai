@@ -23,12 +23,16 @@ Every piece is checked against the reference implementation — diffusers for th
 ## Getting the checkpoint
 
 ```bash
-tensai image -fetch "a calico cat asleep on a stack of books"
+tensai image "a calico cat asleep on a stack of books"
+tensai image -model Comfy-Org/Qwen-Image-2.1 "a calico cat asleep on a stack of books"
 ```
 
-`-fetch` downloads the components under `~/.cache/tensai/Qwen-Image-2.1`, about 31GB in all, and then draws. It resumes what an interrupted run left behind, and the weight files come from each component's index rather than a list, so a repository that re-splits them still resolves. A second `-fetch` finds everything in place and costs nothing.
+`-model` names a checkpoint the way `run` and `chat` do: a repo, a name `tensai models` prints, or a path. Two repos download on first use, and a later run that finds a file missing (an interrupted download) fetches just that file; with everything in place nothing goes over the network.
 
-`-model` takes a name under the cache or a path to any directory holding `text_encoder`, `transformer`, `vae` and `processor`.
+- `Qwen/Qwen-Image-2.1`, the default: the diffusers checkpoint, about 31GB, cached as `~/.cache/tensai/Qwen-Image-2.1`. The weight files come from each component's index rather than a list, so a repository that re-splits them still resolves.
+- `Comfy-Org/Qwen-Image-2.1`: ComfyUI's repackaging, cached as `~/.cache/tensai/Comfy-Org/Qwen-Image-2.1`. Its int8 files come to about 17GB, since the transformer and the prompt encoder are already eight bits. They hold each weight as int8 with a scale per row after rotating every 256 input columns by a Hadamard matrix, and the loader undoes both before quantizing its own way, so the two checkpoints run the same code. ComfyUI ships neither the tokenizer nor the VAE's latent statistics, and those two small files come from Qwen's repo.
+
+A path may point at a directory in either layout: `text_encoder`, `transformer`, `vae` and `processor` for diffusers, or `text_encoders`, `diffusion_models` and `vae` with `processor/tokenizer.json` and `vae/config.json` beside them for ComfyUI, which picks the `_int8_convrot` files and falls back to `_bf16`. `-fetch`, which used to do the downloading, is still accepted and does nothing.
 
 ## Width and memory
 
@@ -68,7 +72,7 @@ The weights stay resident for the whole run, which is where the care goes. A buf
 ```
 tensai image [flags] <prompt>
 
-  -model string   a name under the cache, or a path (default "Qwen-Image-2.1")
+  -model string   a repo, a cached name, or a path (default "Qwen/Qwen-Image-2.1")
   -o string       where to write the picture (default "out.png")
   -size int       width and height in pixels (default 256)
   -steps int      denoising steps (default 20)
@@ -77,7 +81,6 @@ tensai image [flags] <prompt>
   -f32            keep the weights as floats, which needs about 42GB
   -negative str   what to steer away from; needs -cfg above 1
   -cfg float      how far to steer away from it (default 1, off)
-  -fetch          download the checkpoint first, about 31GB
   -gpu            run feed-forward and attention on the GPU
   -gpu-budget num gigabytes of weights the GPU may hold (default 4)
   -cpuprofile str write a CPU profile to this file

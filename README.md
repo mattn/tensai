@@ -449,7 +449,8 @@ tensai run -q8 "What is the capital of France?"
 tensai chat -q8 -model ./model.gguf
 tensai serve -q8 -addr :8080                      # OpenAI-compatible API
 tensai run -q4 -tool wikipedia "Who is Linus Torvalds?"   # the model looks it up itself
-tensai image -fetch -size 256 "a calico cat asleep on a stack of books"   # -fetch downloads the checkpoint (~31GB) once
+tensai image -size 256 "a calico cat asleep on a stack of books"   # downloads Qwen/Qwen-Image-2.1 (~31GB) on first use
+tensai image -model Comfy-Org/Qwen-Image-2.1 "a calico cat"         # or ComfyUI's int8 repackaging (~17GB)
 GOEXPERIMENT=simd go run -tags wgpu24 ./cmd/tensai bench -q8   # CPU vs GPU
 go run -tags wgpu ./_example/wgpu          # needs wgpu-native, see above
 go run -tags wgpu ./_example/wgpu -sweep  # GPU vs CPU across sizes

@@ -320,7 +320,7 @@ tensai serve -q8 -addr 127.0.0.1:8080
 `models` lists only what `run`, `chat`, and `serve` can load — a directory
 with a `config.json`, or a `.gguf` file. It also lists the checkpoints
 `tensai image` draws with (a directory holding `transformer`, `text_encoder`
-and `vae`): their kind is `diffusers`, and the column that says `tools` or
+and `vae`, or ComfyUI's single files): their kind is `diffusers` or `comfyui`, and the column that says `tools` or
 `think` for a language model says `image`. One fetched under its `org/repo`
 name sits a level down and lists under that name. The examples cache their datasets in the same place, and those are
 counted separately rather than listed as models; `models rm` still removes

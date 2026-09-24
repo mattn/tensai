@@ -57,7 +57,7 @@ type teLayer struct {
 // embedding table is 600M parameters and a prompt touches a few dozen
 // rows of it.
 type TextEncoder struct {
-	w      *safetensors.Shards
+	w      textSource
 	layers []*teLayer
 	// release unmaps the cache the layers point into, when they came
 	// from one.
@@ -75,7 +75,7 @@ func LoadTextEncoder(dir string, bits int) (*TextEncoder, error) {
 // what lets the wiring be checked against a reference on a machine that
 // cannot hold all 36.
 func loadTextEncoder(dir string, bits, layers int) (*TextEncoder, error) {
-	w, err := safetensors.OpenSharded(filepath.Join(dir, "model.safetensors.index.json"))
+	w, err := openTextSource(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -151,23 +151,57 @@ func (t *TextEncoder) Close() error {
 // embed reads one row per token out of the embedding table, which is far
 // too large to hold for the handful of rows a prompt needs.
 func (t *TextEncoder) embed(ids []int) (*tensai.Matrix, error) {
-	raw, shape, err := t.w.Raw("model.language_model.embed_tokens.weight")
+	return t.w.embedRows("model.language_model.embed_tokens.weight", ids, teDim)
+}
+
+// textSource is where the encoder's weights come from: the diffusers
+// checkpoint's shards, or ComfyUI's single file. Either keeps the file
+// open for the embedding rows a prompt asks for.
+type textSource interface {
+	weights
+	Close() error
+	embedRows(name string, ids []int, dim int) (*tensai.Matrix, error)
+}
+
+// openTextSource opens the encoder at path: a directory of shards, or
+// one ComfyUI file.
+func openTextSource(path string) (textSource, error) {
+	if singleFile(path) {
+		return openComfy(path, comfyTextName)
+	}
+	w, err := safetensors.OpenSharded(filepath.Join(path, "model.safetensors.index.json"))
 	if err != nil {
 		return nil, err
 	}
-	if len(shape) != 2 || shape[1] != teDim {
+	return shardText{w}, nil
+}
+
+// shardText reads the diffusers checkpoint, whose table is bfloat16.
+type shardText struct{ *safetensors.Shards }
+
+func (s shardText) embedRows(name string, ids []int, dim int) (*tensai.Matrix, error) {
+	raw, shape, err := s.Raw(name)
+	if err != nil {
+		return nil, err
+	}
+	if len(shape) != 2 || shape[1] != dim {
 		return nil, fmt.Errorf("qwenimage: embedding table has shape %v", shape)
 	}
-	out := tensai.NewMatrix(len(ids), teDim)
+	return embedBF16(raw, shape[0], dim, ids)
+}
+
+// embedBF16 widens the rows ids of a bfloat16 table.
+func embedBF16(raw []byte, rows, dim int, ids []int) (*tensai.Matrix, error) {
+	out := tensai.NewMatrix(len(ids), dim)
 	for r, id := range ids {
-		if id < 0 || id >= shape[0] {
-			return nil, fmt.Errorf("qwenimage: token %d is outside the %d-row table", id, shape[0])
+		if id < 0 || id >= rows {
+			return nil, fmt.Errorf("qwenimage: token %d is outside the %d-row table", id, rows)
 		}
-		row := raw[id*teDim*2:]
-		for c := 0; c < teDim; c++ {
+		row := raw[id*dim*2:]
+		for c := 0; c < dim; c++ {
 			// bfloat16 is the top half of a float32's bits.
 			bits := uint32(row[2*c]) | uint32(row[2*c+1])<<8
-			out.Data[r*teDim+c] = math.Float32frombits(bits << 16)
+			out.Data[r*dim+c] = math.Float32frombits(bits << 16)
 		}
 	}
 	return out, nil

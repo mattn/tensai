@@ -43,7 +43,7 @@ type conv struct {
 // pixel), so they are built a tile at a time and reused.
 const imcolBudget = 64 << 20
 
-func loadConv(f *safetensors.File, prefix string, ksz int) (*conv, error) {
+func loadConv(f weights, prefix string, ksz int) (*conv, error) {
 	wt, err := f.Tensor(prefix + ".weight")
 	if err != nil {
 		return nil, err
@@ -160,7 +160,7 @@ type resBlock struct {
 	shortcut     *conv // nil when the block keeps its width
 }
 
-func loadResBlock(f *safetensors.File, prefix string) (*resBlock, error) {
+func loadResBlock(f vaeWeights, prefix string) (*resBlock, error) {
 	b := &resBlock{}
 	var err error
 	if b.norm1, err = gamma(f, prefix+".norm1.gamma"); err != nil {
@@ -215,7 +215,7 @@ type attnBlock struct {
 	proj *conv
 }
 
-func loadAttn(f *safetensors.File, prefix string) (*attnBlock, error) {
+func loadAttn(f weights, prefix string) (*attnBlock, error) {
 	a := &attnBlock{}
 	var err error
 	if a.norm, err = gamma(f, prefix+".norm.gamma"); err != nil {
@@ -374,13 +374,25 @@ var stages = []struct {
 	{288, 144, false, false},
 }
 
+// vaeWeights is what the decoder reads: tensors, and whether an optional
+// one (a resnet's shortcut) is there.
+type vaeWeights interface {
+	weights
+	Info(string) (string, []int, bool)
+}
+
 // LoadDecoder reads the decoder half of a Qwen-Image-2.1 VAE checkpoint.
 func LoadDecoder(path string) (*Decoder, error) {
-	f, err := safetensors.Open(path)
+	file, err := safetensors.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer file.Close()
+	// ComfyUI ships the same decoder under Wan's own names.
+	var f vaeWeights = file
+	if isComfyVAE(file) {
+		f = comfyVAE{file}
+	}
 
 	d := &Decoder{}
 	if d.postQuant, err = loadConv(f, "post_quant_conv", 1); err != nil {
@@ -489,7 +501,7 @@ func clone(x *tensai.Matrix) *tensai.Matrix {
 	return &tensai.Matrix{Rows: x.Rows, Cols: x.Cols, Data: append([]tensai.Float(nil), x.Data...)}
 }
 
-func gamma(f *safetensors.File, name string) ([]tensai.Float, error) {
+func gamma(f weights, name string) ([]tensai.Float, error) {
 	t, err := f.Tensor(name)
 	if err != nil {
 		return nil, err
