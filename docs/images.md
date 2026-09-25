@@ -67,13 +67,13 @@ The step grows faster than the token count, because attention is a square in the
 
 Attention scores, softmax, and value aggregation also run on the GPU. The text prefix uses causal attention and the image queries read the full sequence; queries are tiled to bound score memory. Keys and values are uploaded once per block and shared by all query tiles. By default attention projections, norms, and three-axis rotary embedding remain on the CPU. Feed-forward dispatches are batched into one submission. No additional resident weights are needed.
 
-The weights stay resident for the whole run, which is where the care goes. A buffer on this device is capped at 128MiB — int8 weights are under it and float ones are not — and past somewhere around five and a half gigabytes resident the driver drops the device, silently: allocations keep reporting success and the process falls over later. Nothing surfaces that, so `-gpu-budget` counts what is about to be uploaded and refuses first. Eight-bit feed-forward weights are 4.5GiB, above the default of 4, so `-gpu` alone asks for `-q4` (about 2.5GiB including scale tables) or a raised budget.
+The weights stay resident for the whole run, which is where the care goes. A buffer on this device is capped at 128MiB — int8 weights are under it and float ones are not — and past somewhere around five and a half gigabytes resident the driver drops the device, silently: allocations keep reporting success and the process falls over later. Nothing surfaces that, so `-gpu-budget` counts what is about to be uploaded and stops before it. Eight-bit feed-forward weights are 4.5GiB, above the default of 4, so `-gpu` alone fills the budget block by block and leaves the rest on the CPU, saying how many of them went up; `-q4` (about 2.5GiB including scale tables) or a raised budget takes all of them.
 
 ## Optional acceleration
 
-`-gpu-projections` requires `-gpu` and streams Q/K/V and attention-output weights one at a time. It includes the same ConvRot input rotation as the CPU path and reserves extra weight budget for the largest streamed projection. CPU projections remain the default; transfer costs can outweigh the saving on smaller images or other devices.
+`-gpu-projections` requires `-gpu` and streams Q/K/V and attention-output weights one at a time, for the blocks whose feed-forward is already resident. It includes the same ConvRot input rotation as the CPU path and reserves extra weight budget for the largest streamed projection. `-gpu` turns it on, and a budget with no room for it says so and leaves the projections on the CPU; `-gpu-projections=false` keeps them there on purpose, which can be the faster choice on smaller images or other devices.
 
-`-gpu-vae` runs decoder convolutions on the GPU, uploading one filter at a time and tiling feature maps within the device storage limit. It can be used independently of `-gpu`; the transformer releases its device before decoding. Norms, activations, upsampling and decoder attention remain on the CPU. Float accumulation order differs, so output pixels need not be bit-identical.
+`-gpu-vae` runs decoder convolutions on the GPU, uploading one filter at a time and tiling feature maps within the device storage limit. `-gpu` turns it on as well, and `-gpu-vae=false` declines it. It can be used independently of `-gpu`; the transformer releases its device before decoding. Norms, activations, upsampling and decoder attention remain on the CPU. Float accumulation order differs, so output pixels need not be bit-identical.
 
 For fewer denoising passes, `-turbo-lora` accepts the [Viggle Qwen-Image-2.1 v0.2.1 six-step adapter](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo). Download the adapter separately (rank 128 is about 680 MB; rank 256 about 1.3 GB):
 
@@ -116,8 +116,8 @@ tensai image [flags] <prompt>
   -cfg float      how far to steer away from it (default 1, off)
   -gpu            run feed-forward and attention on the GPU
   -gpu-budget num gigabytes of weights the GPU may hold (default 4)
-  -gpu-projections stream attention projections to the GPU (requires -gpu)
-  -gpu-vae        run decoder convolutions on the GPU
+  -gpu-projections stream attention projections to the GPU (on with -gpu)
+  -gpu-vae        run decoder convolutions on the GPU (on with -gpu)
   -turbo-lora str path to a Viggle six-step LoRA (sets steps to 6)
   -cpuprofile str write a CPU profile to this file
   -q              print nothing but errors

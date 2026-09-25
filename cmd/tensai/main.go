@@ -399,8 +399,8 @@ func main() {
 		fs.Bool("fetch", false, "no longer needed: a repo named by -model downloads, or finishes downloading, on its own")
 		useGPU := fs.Bool("gpu", false, "run feed-forward and attention on the GPU (needs a wgpu build tag and quantized weights)")
 		budget := fs.Float64("gpu-budget", 4, "gigabytes of weights the GPU may hold; past what a device can take it is dropped, and nothing reports that")
-		gpuProjections := fs.Bool("gpu-projections", false, "stream attention projection weights to the GPU (requires -gpu)")
-		gpuVAE := fs.Bool("gpu-vae", false, "run decoder convolutions on the GPU")
+		gpuProjections := fs.Bool("gpu-projections", false, "stream attention projection weights to the GPU; on with -gpu unless set to false")
+		gpuVAE := fs.Bool("gpu-vae", false, "run decoder convolutions on the GPU; on with -gpu unless set to false")
 		turboLoRA := fs.String("turbo-lora", "", "path to a Viggle Qwen-Image-2.1 six-step LoRA; uses 6 steps and cfg=1")
 		cpuprofile := fs.String("cpuprofile", "", "write a CPU profile of image generation to this file")
 		fs.Parse(os.Args[2:])
@@ -428,7 +428,23 @@ func main() {
 		case *q4:
 			bits = 4
 		}
-		if err := generateImage(*model, text, *negative, *out, *size, *steps, *seed, bits, *cfg, *budget, *useGPU, *quiet, imageAcceleration{*gpuProjections, *gpuVAE, *turboLoRA}); err != nil {
+		// -gpu means the device, not a third of it: the projections and
+		// the decoder go there too unless the command line says not to.
+		// Which is which matters later, because a budget too tight for
+		// the projections is worth reporting only to whoever asked.
+		asked := map[string]bool{}
+		fs.Visit(func(f *flag.Flag) { asked[f.Name] = true })
+		if *useGPU {
+			*gpuProjections = *gpuProjections || !asked["gpu-projections"]
+			*gpuVAE = *gpuVAE || !asked["gpu-vae"]
+		}
+		accel := imageAcceleration{
+			projections:      *gpuProjections,
+			projectionsAsked: asked["gpu-projections"],
+			vae:              *gpuVAE,
+			turboLoRA:        *turboLoRA,
+		}
+		if err := generateImage(*model, text, *negative, *out, *size, *steps, *seed, bits, *cfg, *budget, *useGPU, *quiet, accel); err != nil {
 			fmt.Fprintln(os.Stderr, "tensai image:", err)
 			os.Exit(1)
 		}
@@ -938,6 +954,10 @@ func joinArgs(a []string) string {
 
 type imageAcceleration struct {
 	projections, vae bool
+	// projectionsAsked separates -gpu-projections from what -gpu turns
+	// on by itself, so a budget with no room for them stops the run only
+	// when they were the point of it.
+	projectionsAsked bool
 	turboLoRA        string
 }
 
@@ -1019,12 +1039,20 @@ func generateImage(model, prompt, negative, out string, size, steps int, seed in
 		if err != nil {
 			return err
 		}
-		say("gpu: %s holding %.1fGiB of feed-forward weights in %v", name, float64(held)/(1<<30), time.Since(start).Round(time.Second))
+		where := "feed-forward weights"
+		if on, total := m.BlocksOnDevice(); on < total {
+			where = fmt.Sprintf("the feed-forward of %d of %d blocks", on, total)
+		}
+		say("gpu: %s holding %.1fGiB of %s in %v", name, float64(held)/(1<<30), where, time.Since(start).Round(time.Second))
 		if accel.projections {
-			if err := qwenimage.UseGPUProjections(m, uint64(budget*(1<<30))); err != nil {
+			switch err := qwenimage.UseGPUProjections(m, uint64(budget*(1<<30))); {
+			case err == nil:
+				say("gpu: streaming attention projections")
+			case accel.projectionsAsked:
 				return err
+			default:
+				say("gpu: attention projections stay on the CPU (%v)", err)
 			}
-			say("gpu: streaming attention projections")
 		}
 	}
 

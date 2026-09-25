@@ -79,8 +79,10 @@ Attention の射影と各種ノルム、3 軸の rotary embedding は CPU に残
 128MiB が上限で (int8 の重みは収まり float は収まりません)、常駐がおよそ 5.5GB を
 超えるとドライバがデバイスを落とします。しかも静かに落ちます。確保は成功を返し続け、
 後からプロセスが倒れます。それを知らせる仕組みが無いので、`-gpu-budget` が
-アップロード前に合計を数えて断ります。8 ビットの feed-forward は 4.5GiB で既定の 4 を
-超えるため、`-gpu` 単独だと `-q4` (2.3GiB) か予算を上げるよう求めます。
+アップロード前に合計を数えて、そこで止めます。8 ビットの feed-forward は 4.5GiB で
+既定の 4 を超えるため、`-gpu` 単独では予算に入るブロックだけを載せ、残りは CPU に
+置いたまま、何ブロック載ったかを出します。全部載せるには `-q4` (2.3GiB) か予算の
+引き上げです。
 
 ## フラグ
 
@@ -98,6 +100,8 @@ tensai image [flags] <prompt>
   -cfg float      どれだけ避けるか (既定 1、off)
   -gpu            feed-forward と attention を GPU で走らせる
   -gpu-budget num GPU に載せてよい重みの GB 数 (既定 4)
+  -gpu-projections attention の射影を GPU にストリームする (-gpu で有効)
+  -gpu-vae        デコーダの畳み込みを GPU で走らせる (-gpu で有効)
   -cpuprofile str CPU プロファイルの保存先
   -q              エラー以外を出さない
 ```

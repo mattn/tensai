@@ -16,7 +16,12 @@ func TestProjectionBudget(t *testing.T) {
 		t.Fatal("accepted a CPU-only model")
 	}
 	// Configuration validation must not allocate or touch the fake device.
+	// The block stands in for one whose feed-forward went up, since only
+	// those can stream, and what they hold is the resident side of the
+	// budget.
 	m.dev = &gpu.Device{}
+	b.dev = &deviceWeights{}
+	m.held = mlpBytes(b)
 	need := mlpBytes(b) + linearGPUBytes(l)
 	if err := UseGPUProjections(m, need-1); err == nil || b.streamProjections {
 		t.Fatal("exceeded budget")
