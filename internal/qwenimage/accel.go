@@ -225,8 +225,25 @@ func (m *Transformer) BlocksOnDevice() (on, total int) {
 
 // mlpOnDevice runs the feed-forward for one block on the device: the
 // rows go up once, the three projections and the gate stay there, and
-// only the result comes back.
-func (b *Block) mlpOnDevice(dst, x *tensai.Matrix) (err error) {
+// only the result comes back. The gated product is the widest buffer, so
+// rows are tiled to keep it under the device's binding limit.
+func (b *Block) mlpOnDevice(dst, x *tensai.Matrix) error {
+	chunk := x.Rows
+	if limit := b.devOf().StorageLimit(); limit > 0 {
+		chunk = max(1, int(limit/(uint64(b.mlpOut.inputs())*4)))
+	}
+	for lo := 0; lo < x.Rows; lo += chunk {
+		hi := min(lo+chunk, x.Rows)
+		d := &tensai.Matrix{Rows: hi - lo, Cols: dst.Cols, Data: dst.Data[lo*dst.Cols : hi*dst.Cols]}
+		s := &tensai.Matrix{Rows: hi - lo, Cols: x.Cols, Data: x.Data[lo*x.Cols : hi*x.Cols]}
+		if err := b.mlpRows(d, s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (b *Block) mlpRows(dst, x *tensai.Matrix) (err error) {
 	if err = b.g.BeginBatch(); err != nil {
 		return err
 	}
