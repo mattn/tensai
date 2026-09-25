@@ -1330,11 +1330,6 @@ func audioCmd(args []string) error {
 	if secs := float64(len(samples)) / qwenaudio.SampleRate; secs > 30 {
 		fmt.Fprintf(os.Stderr, "the audio runs %.0fs; Qwen2-Audio hears only the first 30\n", secs)
 	}
-	// Qwen2-Audio's chat template opens with this rather than the
-	// Qwen identity run and chat give a Qwen model.
-	if o.System == llm.DefaultSystem {
-		o.System = "You are a helpful assistant."
-	}
 	finish()
 	if o.GGUF != "" {
 		return fmt.Errorf("the audio encoder is read from a safetensors checkpoint, not a gguf")

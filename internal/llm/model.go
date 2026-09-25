@@ -72,6 +72,9 @@ type config struct {
 	// Outer goes in front of every weight name, for checkpoints that nest
 	// a complete language model under one (Qwen2-Audio).
 	Outer string `json:"-"`
+	// Audio marks a checkpoint with an audio encoder beside the language
+	// model (Qwen2-Audio), whose prompts can carry encoded audio.
+	Audio bool `json:"-"`
 	// ChatStyle overrides the template family when it differs from the
 	// architecture — DeepSeek's R1 distills are qwen2/llama blocks that
 	// speak DeepSeek's turn markers. Set by the GGUF loader, never JSON.
@@ -331,7 +334,7 @@ func loadConfig(path string) (config, error) {
 			// Qwen2-Audio wraps a whole Qwen2 checkpoint under
 			// language_model., names and all, and its text_config lists
 			// only what differs from Qwen2Config's defaults.
-			c.Prefix, c.Outer = "", "language_model."
+			c.Prefix, c.Outer, c.Audio = "", "language_model.", true
 			c.HiddenSize = cmp.Or(c.HiddenSize, 4096)
 			c.Layers = cmp.Or(c.Layers, 32)
 			c.Heads = cmp.Or(c.Heads, 32)

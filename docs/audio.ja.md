@@ -44,6 +44,18 @@ tensai audio clip.wav "What is this sound?"
 
 `-model` の既定は `Qwen/Qwen2-Audio-7B-Instruct` で、約 16GB あります。初回に `~/.cache/tensai/Qwen/Qwen2-Audio-7B-Instruct` へダウンロードします。`tensai models` に表示され、`tensai run -model Qwen/Qwen2-Audio-7B-Instruct` とすれば言語モデルをテキストだけで動かせます。
 
+## サーバ
+
+`tensai serve -model Qwen/Qwen2-Audio-7B-Instruct` とすると、`/v1/chat/completions` が OpenAI の API と同じ形で音声を受けます。メッセージの content を部品のリストにし、音声は base64 の WAV を入れた `input_audio` 部品で送ります。
+
+```json
+{"messages": [{"role": "user", "content": [
+  {"type": "input_audio", "input_audio": {"data": "UklGR...", "format": "wav"}},
+  {"type": "text", "text": "What's that sound?"}]}]}
+```
+
+1 つの会話に複数の音声を入れられます。モデルのチャットテンプレートと同じ順に番号を振ります。毎ターン履歴をまるごと送り直すクライアントでも、音声の計算は 1 回で済みます。エンコード済みの音声を中身で覚えておくので、プロンプトキャッシュが新しい質問の直前まで再利用されます (4 秒の音声への追加の質問が、初回の 23.8 秒に対して 4.4 秒でした)。エンコーダは未知の音声を含むリクエストのときだけ読み込み、終わったら解放します。常駐はさせません。WAV 以外の形式や、エンコーダを持たないモデルへの音声は拒否します。
+
 ## フラグ
 
 ```

@@ -1,6 +1,7 @@
 package qwenaudio
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -22,6 +23,16 @@ func ReadWAV(path string) ([]float32, error) {
 	samples, rate, err := decodeWAV(f)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return Resample(samples, rate, SampleRate), nil
+}
+
+// DecodeWAV is ReadWAV for a file already in memory, the way an API
+// request carries one.
+func DecodeWAV(data []byte) ([]float32, error) {
+	samples, rate, err := decodeWAV(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
 	}
 	return Resample(samples, rate, SampleRate), nil
 }

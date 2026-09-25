@@ -44,6 +44,18 @@ tensai audio clip.wav "What is this sound?"
 
 The default `-model` is `Qwen/Qwen2-Audio-7B-Instruct`, about 16GB, downloaded on first use into `~/.cache/tensai/Qwen/Qwen2-Audio-7B-Instruct`. `tensai models` lists it, and `tensai run -model Qwen/Qwen2-Audio-7B-Instruct` runs its language model on text alone.
 
+## Serving
+
+`tensai serve -model Qwen/Qwen2-Audio-7B-Instruct` takes audio in `/v1/chat/completions` the way OpenAI's API sends it: a message's content as a list of parts, a clip as an `input_audio` part holding base64 WAV.
+
+```json
+{"messages": [{"role": "user", "content": [
+  {"type": "input_audio", "input_audio": {"data": "UklGR...", "format": "wav"}},
+  {"type": "text", "text": "What's that sound?"}]}]}
+```
+
+A conversation can carry several clips, numbered in order the way the model's chat template numbers them, and a client that resends the whole history with each turn pays for its audio once: an encoded clip is remembered by its content, so the prompt cache reuses everything up to the new question (a follow-up about a four-second clip took 4.4s against 23.8s for the first). The encoder loads for a request with a clip it has not seen and is released after it, rather than staying resident. Other formats are refused, as is audio sent to a model without an encoder.
+
 ## Flags
 
 ```

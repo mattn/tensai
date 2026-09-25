@@ -142,6 +142,9 @@ type Engine struct {
 
 	steps  int
 	logits []float32
+	// audioWeights is where the audio encoder's weights are, for a model
+	// that has one; the server encodes a request's audio from them.
+	audioWeights string
 }
 
 // ggufArch reads just the architecture out of a gguf's metadata, which
@@ -216,6 +219,7 @@ func Open(o Options) (*Engine, error) {
 
 	var tok *tokenizer.Tokenizer
 	var model *qwen
+	var audioWeights string
 	var err error
 	start := time.Now()
 	if o.GGUF != "" {
@@ -256,6 +260,9 @@ func Open(o Options) (*Engine, error) {
 		}
 		if model, err = loadQwen(paths[1], weights, o.Bits); err != nil {
 			return nil, err
+		}
+		if model.cfg.Audio {
+			audioWeights = weights
 		}
 		model.cfg.ChatTemplate = chatTemplate(base, o.Data, local)
 		if !local {
@@ -316,6 +323,10 @@ func Open(o Options) (*Engine, error) {
 	system := o.System
 	if system == DefaultSystem {
 		switch {
+		case model.cfg.Audio:
+			// Qwen2-Audio's chat template opens with this rather than
+			// the Qwen identity.
+			system = "You are a helpful assistant."
 		case style == "gpt-oss":
 			// The harmony system block: identity, reasoning effort, and
 			// the channel contract the model was trained on.
@@ -349,7 +360,7 @@ func Open(o Options) (*Engine, error) {
 	}
 
 	e := &Engine{
-		opts: o, model: model, draft: draftM, tok: tok, tm: tm,
+		opts: o, model: model, draft: draftM, tok: tok, tm: tm, audioWeights: audioWeights,
 		system: system, imEnd: stopID(0), eot: stopID(1),
 		rng:  rand.New(rand.NewPCG(uint64(o.Seed), 0)),
 		vlog: vlog,
@@ -1142,6 +1153,13 @@ func (e *Engine) Serve(addr, apiKey string) error {
 	// its own resident cache, which this does not reach.
 	s.cache.enabled = !e.opts.GPU
 	s.cache.hasDelta = e.model.hasDelta()
+	if e.audioWeights != "" {
+		id, ok := e.tok.ID(audioToken)
+		if !ok {
+			return fmt.Errorf("the tokenizer has no %s token", audioToken)
+		}
+		s.audio, s.audioID = &audioStore{weights: e.audioWeights}, id
+	}
 	return s.listen(addr)
 }
 
