@@ -1960,7 +1960,8 @@ fn gelu_mul_ip(@builtin(workgroup_id) wg: vec3<u32>,
 // subtracts in registers — no correction plane needed — and each group's
 // running partial folds with its (group, column) scale at the boundary.
 // Same shape as qmatmul: 16 words x 16 row-splits per 256-lane workgroup
-// with a shared-memory reduction.
+// with a shared-memory reduction. One row per workgroup suits a matvec,
+// where there is only the one; q4matmul_t below takes the batches.
 struct Q4MParams { rows: u32, cols: u32, words: u32, m: u32, groups: u32, flags: u32, pad1: u32, pad2: u32 }
 @group(0) @binding(29) var<uniform> q4p: Q4MParams;
 @group(0) @binding(30) var<storage, read> q4w: array<u32>;
@@ -2030,6 +2031,110 @@ fn q4matmul(@builtin(workgroup_id) wid: vec3<u32>,
                     o = o + q4out[r * q4p.cols + j + l];
                 }
                 q4out[r * q4p.cols + j + l] = o;
+            }
+        }
+    }
+}
+
+// q4matmul_t is the batched shape of the same product, tiled the way
+// qmatmul_t tiles the eight-bit one. A workgroup owns Q4TR output rows
+// by sixty-four columns and walks K one scale group at a time, staging
+// the group's activations and its packed nibbles in shared memory: the
+// weights are then read once for the whole tile of rows instead of once
+// per row, which is what a batch needs and what q4matmul, a matvec run
+// once per row, cannot give it.
+//
+// A K slice is exactly one group, so a group's partials fold with their
+// scales at the end of each slice and never have to be carried.
+
+const Q4WG = 16u; // packed words per workgroup: sixty-four columns
+const Q4TR = 32u; // output rows per workgroup, two per lane
+const Q4TK = 64u; // K slice depth: one scale group
+
+var<workgroup> q4ta: array<f32, 2048>; // Q4TR x Q4TK activations
+var<workgroup> q4tw: array<u32, 512>;  // (Q4TK/2) x Q4WG packed nibbles
+
+@compute @workgroup_size(256, 1, 1)
+fn q4matmul_t(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let wsub = lid.x % Q4WG;
+    let rsub = lid.x / Q4WG;
+    let w = wid.x * Q4WG + wsub;
+    let r0 = wid.y * Q4TR;
+    let ra = rsub * 2u;
+    let pairs = (q4p.rows + 1u) / 2u;
+    var acc0 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var acc1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    let ktiles = (q4p.rows + Q4TK - 1u) / Q4TK;
+    for (var kt = 0u; kt < ktiles; kt = kt + 1u) {
+        let kbase = kt * Q4TK;
+        // Stage the activation slice, each lane eight consecutive k.
+        for (var st = 0u; st < 8u; st = st + 1u) {
+            let idx = lid.x * 8u + st;
+            let rr = idx / Q4TK;
+            let kk = idx % Q4TK;
+            var a = 0.0;
+            if (r0 + rr < q4p.m && kbase + kk < q4p.rows) {
+                a = q4x[(r0 + rr) * q4p.rows + kbase + kk];
+            }
+            q4ta[idx] = a;
+        }
+        // Stage the nibbles still packed; a lane unpacks what it reads,
+        // and eight multiply-adds share the unpacking.
+        let pbase = kbase / 2u;
+        for (var st = 0u; st < 2u; st = st + 1u) {
+            let idx = lid.x * 2u + st;
+            let ii = idx / Q4WG;
+            let ww = wid.x * Q4WG + idx % Q4WG;
+            var pw = 0u;
+            if (pbase + ii < pairs && ww < q4p.words) {
+                pw = q4w[(pbase + ii) * q4p.words + ww];
+            }
+            q4tw[idx] = pw;
+        }
+        workgroupBarrier();
+        var run0 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        var run1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        for (var i = 0u; i < Q4TK / 2u; i = i + 1u) {
+            let pw = q4tw[i * Q4WG + wsub];
+            let lo = vec4<f32>(
+                f32(pw & 0xFu), f32(pw >> 8u & 0xFu),
+                f32(pw >> 16u & 0xFu), f32(pw >> 24u & 0xFu)) - vec4<f32>(8.0, 8.0, 8.0, 8.0);
+            let hi = vec4<f32>(
+                f32(pw >> 4u & 0xFu), f32(pw >> 12u & 0xFu),
+                f32(pw >> 20u & 0xFu), f32(pw >> 28u & 0xFu)) - vec4<f32>(8.0, 8.0, 8.0, 8.0);
+            let k0 = 2u * i;
+            run0 = run0 + q4ta[ra * Q4TK + k0] * lo + q4ta[ra * Q4TK + k0 + 1u] * hi;
+            run1 = run1 + q4ta[(ra + 1u) * Q4TK + k0] * lo + q4ta[(ra + 1u) * Q4TK + k0 + 1u] * hi;
+        }
+        if (w < q4p.words) {
+            let sb = kt * q4p.words * 4u + w * 4u;
+            let sc = vec4<f32>(q4sc[sb], q4sc[sb + 1u], q4sc[sb + 2u], q4sc[sb + 3u]);
+            acc0 = acc0 + run0 * sc;
+            acc1 = acc1 + run1 * sc;
+        }
+        workgroupBarrier();
+    }
+    if (w < q4p.words) {
+        let j = w * 4u;
+        let rA = r0 + ra;
+        for (var l = 0u; l < 4u; l = l + 1u) {
+            if (j + l < q4p.cols) {
+                var bv = 0.0;
+                if ((q4p.flags & 1u) != 0u) {
+                    bv = q4bias[j + l];
+                }
+                let vv = vec2<f32>(acc0[l], acc1[l]) + vec2<f32>(bv, bv);
+                for (var r = 0u; r < 2u; r = r + 1u) {
+                    if (rA + r < q4p.m) {
+                        let idx = (rA + r) * q4p.cols + j + l;
+                        var o = vv[r];
+                        if ((q4p.flags & 2u) != 0u) {
+                            o = o + q4out[idx];
+                        }
+                        q4out[idx] = o;
+                    }
+                }
             }
         }
     }
@@ -2691,6 +2796,7 @@ type gpuPipelines struct {
 	laySoftmaxBwd, layPermute                      uintptr
 	scale, softmax, attn, qmatmul                  uintptr
 	rmsnorm, rope, addIP, siluMulIP, q4matmul      uintptr
+	q4matmulT, layQ4matmulT                        uintptr
 	geluMulIP, qmatmulB, attnG, qmatmulT           uintptr
 	qacts, qmatmulI, attnF16, rowsToF16            uintptr
 	attnSplit, attnReduce, ropeCache               uintptr
@@ -2733,6 +2839,7 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.addIP, &g.pipes.layAddIP, "add_ip"},
 		{&g.pipes.siluMulIP, &g.pipes.laySiluMulIP, "silu_mul_ip"},
 		{&g.pipes.q4matmul, &g.pipes.layQ4matmul, "q4matmul"},
+		{&g.pipes.q4matmulT, &g.pipes.layQ4matmulT, "q4matmul_t"},
 		{&g.pipes.geluMulIP, &g.pipes.layGeluMulIP, "gelu_mul_ip"},
 		{&g.pipes.qmatmulB, &g.pipes.layQmatmulB, "qmatmul_b"},
 		{&g.pipes.attnG, &g.pipes.layAttnG, "attn_causal_g"},
@@ -2832,6 +2939,7 @@ func (g *Device) releasePipelines() {
 		g.pipes.matmulTS, g.pipes.scale, g.pipes.softmax, g.pipes.attn,
 		g.pipes.qmatmul, g.pipes.rmsnorm, g.pipes.rope,
 		g.pipes.addIP, g.pipes.siluMulIP, g.pipes.q4matmul,
+		g.pipes.q4matmulT,
 		g.pipes.geluMulIP, g.pipes.qmatmulB, g.pipes.attnG,
 		g.pipes.qmatmulT, g.pipes.sliceCols, g.pipes.qacts, g.pipes.qmatmulI,
 		g.pipes.attnF16, g.pipes.rowsToF16,
@@ -5747,6 +5855,15 @@ func (q *Q4Matrix) MatMulRMSNorm(x, norm *Tensor, eps float64, bias, dst *Tensor
 	return q.MatMulOpts(nx, bias, dst)
 }
 
+// q4GPUTileRows is Q4TR in the shader: how many output rows one
+// workgroup of the tiled kernel covers, and the two must agree.
+// q4GPUTileBatch is where that kernel starts to pay, since it stages a
+// whole slice for a tile of rows that a shorter batch cannot fill.
+const (
+	q4GPUTileRows  = 32
+	q4GPUTileBatch = 32
+)
+
 func (q *Q4Matrix) MatMulOpts(x, bias, dst *Tensor) (*Tensor, error) {
 	if q.freed || x.freed || (bias != nil && bias.freed) || (dst != nil && dst.freed) {
 		return nil, errors.New("tensai: gpu tensor already freed")
@@ -5815,11 +5932,16 @@ func (q *Q4Matrix) MatMulOpts(x, bias, dst *Tensor) (*Tensor, error) {
 		{binding: 33, buffer: bufOut, size: outBytes},
 		{binding: 35, buffer: biasBuf, size: biasSize},
 	}
-	bindGroup := g.cachedBindGroup(g.pipes.layQ4matmul, entries[:])
+	pipe, lay := g.pipes.q4matmul, g.pipes.layQ4matmul
+	gy := uint32(m)
+	if m >= q4GPUTileBatch && g.pipes.q4matmulT != 0 {
+		pipe, lay = g.pipes.q4matmulT, g.pipes.layQ4matmulT
+		gy = uint32((m + q4GPUTileRows - 1) / q4GPUTileRows)
+	}
+	bindGroup := g.cachedBindGroup(lay, entries[:])
 	runtime.KeepAlive(&entries)
 
-	err := g.dispatch(g.pipes.q4matmul, bindGroup,
-		uint32((q.words+15)/16), uint32(m), 1)
+	err := g.dispatch(pipe, bindGroup, uint32((q.words+15)/16), gy, 1)
 	if err != nil {
 		if dst == nil {
 			g.dropBuffer(bufOut)

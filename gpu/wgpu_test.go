@@ -1176,9 +1176,15 @@ func TestGPUQ4MatMul(t *testing.T) {
 
 	rng := rand.New(rand.NewPCG(63, 0))
 	for _, c := range []struct{ m, rows, cols int }{
-		{1, 256, 512}, // multiple full groups
-		{3, 100, 33},  // partial final group, guarded column tail
-		{2, 33, 7},    // odd rows: pad nibble must contribute zero
+		{1, 256, 512},  // multiple full groups
+		{3, 100, 33},   // partial final group, guarded column tail
+		{2, 33, 7},     // odd rows: pad nibble must contribute zero
+		{4, 128, 64},   // exactly one row tile
+		{9, 130, 65},   // two full tiles and a one-row tail
+		{70, 256, 128}, // many tiles, as a prompt or an image batch gives
+		{32, 200, 96},  // exactly one tile of the batched kernel
+		{33, 64, 12},   // one tile and one row, K exactly one group
+		{40, 70, 20},   // batched, with a partial group at the end of K
 	} {
 		w := tensai.RandomMatrix(c.rows, c.cols, rng)
 		q, err := quant.Quantize4(w)
