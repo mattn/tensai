@@ -56,12 +56,28 @@ func CacheRoot() string {
 }
 
 // DefaultDataDir is where a repo's files live when Options.Data is
-// empty: a per-repo directory under CacheRoot.
+// empty: CacheRoot/org/name, so two organizations publishing the same
+// name never share a directory. Downloads from before the org joined the
+// path sit under the bare name, and one recorded as coming from this
+// repo is still its home.
 func DefaultDataDir(repo string) string {
 	if repo == "" {
 		repo = DefaultRepo
 	}
-	return filepath.Join(CacheRoot(), path.Base(repo))
+	root := CacheRoot()
+	legacy := filepath.Join(root, path.Base(repo))
+	if !ValidRepo(repo) || Origin(legacy) == repo {
+		return legacy
+	}
+	return filepath.Join(root, filepath.FromSlash(repo))
+}
+
+// ValidRepo reports whether repo is a plain org/name, the only form that
+// is safe to turn into a path under the cache.
+func ValidRepo(repo string) bool {
+	org, name, ok := strings.Cut(repo, "/")
+	return ok && org != "" && name != "" && org != "." && org != ".." && name != "." && name != ".." &&
+		!strings.ContainsAny(name, "/\\") && !strings.ContainsAny(org, "\\")
 }
 
 // Options selects and configures a model. The zero value is not runnable:
@@ -1573,10 +1589,11 @@ func sample(logits []float32, temp, topP float64, rng *rand.Rand) int {
 	return cands[0].id
 }
 
-// originFile names the repo a cached model was downloaded from. The
-// cache directory is named after the repo's last element, which is what
-// makes a listed name typeable, but that drops the organization -- and
-// with it the only way to fetch the same checkpoint on another machine.
+// originFile names the repo a cached model was downloaded from. A
+// download from before the cache kept the organization in the path sits
+// under the repo's last element alone, and this is the only record of
+// where it came from: how the listing names it, and how DefaultDataDir
+// knows it is still that repo's.
 const originFile = ".tensai-origin"
 
 // recordOrigin remembers where a download came from, so a listing can
@@ -1609,9 +1626,7 @@ func Origin(dir string) string {
 	repo := strings.TrimSpace(string(b))
 	// Only a plain org/name is worth handing back: it is going to be
 	// printed and then typed at -model.
-	parts := strings.Split(repo, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" ||
-		strings.ContainsAny(repo, `\`) || strings.Contains(repo, "..") {
+	if !ValidRepo(repo) || strings.Contains(repo, "..") {
 		return ""
 	}
 	return repo

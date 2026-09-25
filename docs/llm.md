@@ -152,8 +152,12 @@ form you hand it, in this order:
 Omit it for the default checkpoint. A local reference never downloads: a name
 that is not cached, and carries no org to fetch it from, is an error pointing
 back at the listing. A download lands in the user cache directory
-(`~/.cache/tensai` on Linux); to keep a model anywhere else, fetch it there and
-name its path. `-draft` takes the same forms, minus `.gguf`.
+(`~/.cache/tensai` on Linux) under its org and name, so `-model
+Qwen/Qwen3-4B-Instruct-2507` is kept in `Qwen/Qwen3-4B-Instruct-2507` there and
+the same name from another organization never shares its files. Downloads
+from older versions sit under the name alone and are still used for the repo
+they came from. To keep a model anywhere else, fetch it there and name its
+path. `-draft` takes the same forms, minus `.gguf`.
 
 Gated repositories -- Gemma and Llama among them -- serve 401 until their
 licence is accepted and a token is sent. tensai looks for one in `HF_TOKEN`,
@@ -335,11 +339,13 @@ qwen2.5-0.5b-instruct-q8_0.gguf             531MB  gguf      tools       2026-08
 ```
 
 A model downloaded from a repo is named by that repo, organization included,
-because the cache directory drops it — and without it the listing cannot say
-what to type on a machine that does not have the model yet. Either form works
-against a cache that already holds it, and `models rm` takes either as well.
-Checkpoints cached before this, or placed by hand, keep their bare directory
-name until something downloads them again.
+which is what to type on a machine that does not have the model yet. It sits
+in a directory for the organization, so `models rm Qwen/Qwen3-0.6B` removes
+that one model and leaves the organization's others alone. Older downloads,
+kept under the bare name, list by the repo they recorded, and `models rm`
+takes either form for them; a bare name that is an organization's directory
+is refused rather than removed with everything in it. Checkpoints placed by
+hand keep their directory name.
 
 The fourth column says what `serve` will do with the model — accept a request
 offering `tools`, and give `-think` a block to reason in — not how well it will
