@@ -570,10 +570,16 @@ func (e *Engine) sample(w io.Writer, limit int) (int, string) {
 	}
 	finish := "length"
 	pen := newPenaltyState(e.penalty(), e.context)
+	var elapsed time.Duration
 	for ; gen < limit && e.steps < e.nCtx-1; gen++ {
 		pen.apply(e.logits)
 		next := sample(e.logits, e.opts.Temp, e.opts.TopP, e.rng)
 		if next == e.imEnd || next == e.eot {
+			// The end marker goes into the cache so a chat can carry on
+			// after it, but it is not a token of the answer: the rate
+			// stops here, or an answer that ended by itself would read
+			// slower than one cut off at the limit.
+			elapsed = time.Since(start)
 			e.feed([]int{next})
 			finish = "stop"
 			break
@@ -582,9 +588,12 @@ func (e *Engine) sample(w io.Writer, limit int) (int, string) {
 		e.feed([]int{next})
 		pen.push([]int{next}, true)
 	}
+	if elapsed == 0 {
+		elapsed = time.Since(start)
+	}
 	fmt.Fprintln(w)
 	fmt.Fprintf(e.opts.Log, "(%d tokens, %.1f tok/s)\n",
-		gen, float64(gen)/time.Since(start).Seconds())
+		gen, float64(gen)/elapsed.Seconds())
 	return gen, finish
 }
 
