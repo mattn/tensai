@@ -17,17 +17,20 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"runtime/pprof"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/mattn/tensai/gpu"
-	"github.com/mattn/tensai/internal/llm"
-	"github.com/mattn/tensai/internal/qwenimage"
-	"github.com/mattn/tensai/internal/simd"
 	"image/png"
 	"math/rand/v2"
+
+	"github.com/mattn/tensai/gpu"
+	"github.com/mattn/tensai/internal/llm"
+	"github.com/mattn/tensai/internal/qwenaudio"
+	"github.com/mattn/tensai/internal/qwenimage"
+	"github.com/mattn/tensai/internal/simd"
 )
 
 const version = "0.0.31"
@@ -44,6 +47,7 @@ commands:
   ask      answer a question by scoring options, no generation
   bench    compare CPU and GPU prefill and decode speed
   image    generate a picture from a prompt with Qwen-Image
+  audio    answer a question about a WAV file with Qwen2-Audio
   models   list cached models; "models rm <name>" deletes one
   version  print the version
 
@@ -381,6 +385,11 @@ func main() {
 	case "models":
 		if err := modelsCmd(args); err != nil {
 			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	case "audio":
+		if err := audioCmd(args); err != nil {
+			fmt.Fprintln(os.Stderr, "tensai audio:", err)
 			os.Exit(1)
 		}
 	case "image":
@@ -1287,4 +1296,75 @@ func shardNames(index string) ([]string, error) {
 		return nil, fmt.Errorf("%s names no weight files", index)
 	}
 	return out, nil
+}
+
+// audioRepo is the checkpoint tensai audio runs by default.
+const audioRepo = "Qwen/Qwen2-Audio-7B-Instruct"
+
+// audioCmd answers a question about a WAV file. Qwen2-Audio is a Qwen2
+// language model with Whisper's encoder in front: the encoder turns the
+// audio into embeddings that take the place of the prompt's audio
+// placeholder, and the language model answers as it would in run.
+func audioCmd(args []string) error {
+	fs := flag.NewFlagSet("tensai audio", flag.ExitOnError)
+	o, finish := modelFlags(fs)
+	fs.Set("model", audioRepo)
+	n := fs.Int("n", 256, "max tokens to generate")
+	fs.Usage = func() {
+		fmt.Fprintln(fs.Output(), "usage: tensai audio [flags] <file.wav> [question]")
+		fs.PrintDefaults()
+	}
+	fs.Parse(args)
+	if fs.NArg() < 1 {
+		fs.Usage()
+		os.Exit(2)
+	}
+	question := joinArgs(fs.Args()[1:])
+	if question == "" {
+		question = "What do you hear in this audio?"
+	}
+	samples, err := qwenaudio.ReadWAV(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+	if secs := float64(len(samples)) / qwenaudio.SampleRate; secs > 30 {
+		fmt.Fprintf(os.Stderr, "the audio runs %.0fs; Qwen2-Audio hears only the first 30\n", secs)
+	}
+	// Qwen2-Audio's chat template opens with this rather than the
+	// Qwen identity run and chat give a Qwen model.
+	if o.System == llm.DefaultSystem {
+		o.System = "You are a helpful assistant."
+	}
+	finish()
+	if o.GGUF != "" {
+		return fmt.Errorf("the audio encoder is read from a safetensors checkpoint, not a gguf")
+	}
+	// The encoder runs first and is gone before the language model
+	// loads: the two together come close to filling a 16GB machine.
+	weights := filepath.Join(o.Data, "model.safetensors.index.json")
+	if o.Repo != "" {
+		if weights, err = llm.FetchWeights(o.Repo, o.Data); err != nil {
+			return err
+		}
+	}
+	start := time.Now()
+	enc, err := qwenaudio.LoadEncoder(weights, 0)
+	if err != nil {
+		return fmt.Errorf("%s holds no Qwen2-Audio encoder: %w", o.Data, err)
+	}
+	mel, frames := qwenaudio.LogMel(samples)
+	rows := enc.Encode(mel, frames)
+	enc = nil
+	debug.FreeOSMemory()
+	fmt.Fprintf(os.Stderr, "audio: %.1fs as %d tokens in %v\n",
+		float64(len(samples))/qwenaudio.SampleRate, rows.Rows, time.Since(start).Round(time.Millisecond))
+
+	e, err := llm.Open(*o)
+	if err != nil {
+		return err
+	}
+	defer e.Close()
+	prompt := "Audio 1: <|audio_bos|><|AUDIO|><|audio_eos|>\n" + question
+	_, err = e.GenerateWith(os.Stdout, prompt, "<|AUDIO|>", rows, *n)
+	return err
 }

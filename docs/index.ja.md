@@ -32,6 +32,7 @@ pred, _ := net.Predict(inputs)
 - **トークナイザ** — Hugging Face `tokenizer.json` のバイトレベル BPE (GPT-2, cl100k, o200k 系) と SentencePiece。リファレンス実装と完全一致することを検証済み
 - **LLM 推論** — `_example/gpt2`、そして 10 のモデルファミリーを `run` / `chat` / `serve` サブコマンドで動かす `tensai` コマンド
 - **画像生成** — `tensai image` が Qwen-Image-2.1 (プロンプトエンコーダ、32 層の denoising transformer、VAE デコーダ) をすべて純 Go で走らせる
+- **音声理解**: `tensai audio` が Qwen2-Audio (Whisper のエンコーダと Qwen2 の言語モデル) で WAV ファイルについての質問に答える。これも純 Go
 
 ## 次に読むページ
 
@@ -40,6 +41,7 @@ pred, _ := net.Predict(inputs)
 - [モデルフォーマット](formats.md) — TFLite, ONNX, safetensors, GGUF
 - [LLM 推論](llm.md) — 純 Go で本物の言語モデルを動かす
 - [画像生成](images.md) — Qwen-Image-2.1 でプロンプトから絵を描く。これも純 Go
+- [音声理解](audio.md): Qwen2-Audio で音声を書き起こしたり、音について尋ねたりする
 - [サンプル](examples.md) — hello-world から GPT-2 まで 13 個の実行可能サンプル
 
 ## 設計メモ
