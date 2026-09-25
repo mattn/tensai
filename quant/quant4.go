@@ -339,9 +339,11 @@ func (q *Q4Matrix) MatMul(x, out *tensai.Matrix) error {
 	}
 	// Tile-aligned, so the row-tail matvec's vector span starts on a
 	// layout tile like the batch kernel's 8-column steps do.
-	workpool.Run(q.Cols, q4Tile, func(lo, hi int) {
-		run(lo, hi)
-	})
+	// A batch is compute-bound where a decode matvec is bandwidth-bound,
+	// so it wants every CPU rather than the resident pool's four: the cap
+	// that keeps idle spinners off a matvec's memory traffic only leaves
+	// two thirds of the machine idle here.
+	workpool.Bulk(q.Cols, q4Tile, run)
 	return nil
 }
 

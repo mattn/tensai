@@ -187,9 +187,11 @@ func (q *TernaryMatrix) MatMul(x, out *tensai.Matrix) error {
 		run(0, q.Cols)
 		return nil
 	}
-	workpool.Run(q.Cols, tTile, func(lo, hi int) {
-		run(lo, hi)
-	})
+	// A batch is compute-bound where a decode matvec is bandwidth-bound,
+	// so it wants every CPU rather than the resident pool's four: the cap
+	// that keeps idle spinners off a matvec's memory traffic only leaves
+	// two thirds of the machine idle here.
+	workpool.Bulk(q.Cols, tTile, run)
 	return nil
 }
 
