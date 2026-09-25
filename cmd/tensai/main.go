@@ -1190,7 +1190,6 @@ func isImageModel(dir string) bool {
 	return isDir(filepath.Join(dir, "transformer")) || qwenimage.ModelDir(dir).Comfy()
 }
 
-
 // fetchFile downloads one file of a repo into dir/sub unless it is
 // already there, naming it only when there is something to fetch.
 func fetchFile(repo, dir, sub, name string, say func(string, ...any)) (string, error) {
