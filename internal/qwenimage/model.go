@@ -40,8 +40,11 @@ type Transformer struct {
 	// release unmaps the cache the weights point into, when they came
 	// from one.
 	release func() error
-	// dev is the device the feed-forward runs on, when it does.
-	dev *gpu.Device
+	// dev is the device the feed-forward runs on, when it does, and
+	// held is what its blocks' weights weigh there -- less than the
+	// whole model when the budget only stretched to some of them.
+	dev  *gpu.Device
+	held uint64
 }
 
 // Close releases the device, if one is in use, and the mapped cache a

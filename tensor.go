@@ -124,13 +124,55 @@ func Dot(a, b *Matrix) (*Matrix, error) {
 }
 
 // DotInto computes out = a * b into an existing matrix, overwriting it.
-func DotInto(out, a, b *Matrix) error {
+// dotShapes and dotTBShapes reject a product whose operands do not
+// line up, so both the parallel entry points and the serial ones say the
+// same thing about the same mistake.
+func dotShapes(out, a, b *Matrix) error {
 	if a.Cols != b.Rows {
 		return fmt.Errorf("tensai: dot shape mismatch: %dx%d * %dx%d", a.Rows, a.Cols, b.Rows, b.Cols)
 	}
 	if out.Rows != a.Rows || out.Cols != b.Cols {
 		return fmt.Errorf("tensai: dot output shape mismatch: got %dx%d, want %dx%d",
 			out.Rows, out.Cols, a.Rows, b.Cols)
+	}
+	return nil
+}
+
+func dotTBShapes(out, a, b *Matrix) error {
+	if a.Cols != b.Cols {
+		return fmt.Errorf("tensai: dottb shape mismatch: %dx%d * (%dx%d)^T", a.Rows, a.Cols, b.Rows, b.Cols)
+	}
+	if out.Rows != a.Rows || out.Cols != b.Rows {
+		return fmt.Errorf("tensai: dottb output shape mismatch: got %dx%d, want %dx%d",
+			out.Rows, out.Cols, a.Rows, b.Rows)
+	}
+	return nil
+}
+
+// DotIntoSerial is DotInto with no fan-out of its own, and DotTBIntoSerial
+// is DotTBInto the same way. A caller that is already one worker of a
+// parallel region wants its whole product here: splitting it again would
+// put as many goroutines on the machine as the two nestings multiply to,
+// and each of them on a slice of a row too thin to pay for the crossing.
+func DotIntoSerial(out, a, b *Matrix) error {
+	if err := dotShapes(out, a, b); err != nil {
+		return err
+	}
+	dotRows(out, a, b, 0, a.Rows)
+	return nil
+}
+
+func DotTBIntoSerial(out, a, b *Matrix) error {
+	if err := dotTBShapes(out, a, b); err != nil {
+		return err
+	}
+	dotTBRows(out, a, b, 0, a.Rows)
+	return nil
+}
+
+func DotInto(out, a, b *Matrix) error {
+	if err := dotShapes(out, a, b); err != nil {
+		return err
 	}
 	// Rows are independent, so large products are split across CPUs. Small
 	// ones stay single-threaded to avoid goroutine overhead.
@@ -229,12 +271,8 @@ func dotTARowsGeneric(out, a, b *Matrix, lo, hi int) {
 // operands are read row-wise, so the whole product runs on the vectorized
 // row-dot kernel and no transpose is materialized.
 func DotTBInto(out, a, b *Matrix) error {
-	if a.Cols != b.Cols {
-		return fmt.Errorf("tensai: dottb shape mismatch: %dx%d * (%dx%d)^T", a.Rows, a.Cols, b.Rows, b.Cols)
-	}
-	if out.Rows != a.Rows || out.Cols != b.Rows {
-		return fmt.Errorf("tensai: dottb output shape mismatch: got %dx%d, want %dx%d",
-			out.Rows, out.Cols, a.Rows, b.Rows)
+	if err := dotTBShapes(out, a, b); err != nil {
+		return err
 	}
 	workers := dotWorkerCount(a.Rows, a.Cols, b.Rows)
 	if workers == 1 {

@@ -44,20 +44,27 @@ func UseGPUProjections(m *Transformer, budget uint64) error {
 	if m.dev == nil {
 		return fmt.Errorf("qwenimage: enable the GPU before projections")
 	}
-	var resident, peak uint64
+	// Only a block whose feed-forward already went up can stream its
+	// projections, since that is what put a device within its reach, and
+	// what those blocks hold is what the spare budget is measured against.
+	var peak uint64
+	var on []*Block
 	for _, b := range m.blocks {
-		resident += mlpBytes(b)
+		if b.dev == nil {
+			continue
+		}
 		for _, l := range []*linear{b.toQ, b.toK, b.toV, b.toOut} {
 			if l == nil || (l.q == nil && l.q4 == nil) {
 				return fmt.Errorf("qwenimage: projections need quantized weights")
 			}
 			peak = max(peak, linearGPUBytes(l)+l.lora.bytes())
 		}
+		on = append(on, b)
 	}
-	if resident+peak > budget {
+	if m.held+peak > budget {
 		return fmt.Errorf("qwenimage: GPU projections need %d MiB of spare weight budget", (peak+(1<<20)-1)>>20)
 	}
-	for _, b := range m.blocks {
+	for _, b := range on {
 		b.streamProjections = true
 	}
 	return nil
@@ -135,10 +142,20 @@ func UseGPU(m *Transformer, budget uint64) (string, uint64, error) {
 	if want == 0 {
 		return "", 0, fmt.Errorf("qwenimage: the device needs quantized weights; this model holds floats")
 	}
-	if want+adapterPeak > budget {
-		return "", 0, fmt.Errorf("qwenimage: feed-forward weights and adapter scratch need %.2fGiB and the budget is %.2fGiB; "+
+	// Blocks are independent -- Forward asks each one whether it has a
+	// device -- so a budget that cannot take the whole feed-forward takes
+	// as many blocks as it holds and leaves the rest on the CPU. Refusing
+	// the device outright would be slower than either.
+	room := budget
+	if room < adapterPeak {
+		room = 0
+	} else {
+		room -= adapterPeak
+	}
+	if mlpBytes(m.blocks[0]) > room {
+		return "", 0, fmt.Errorf("qwenimage: one block's feed-forward and the adapter scratch need %.2fGiB and the budget is %.2fGiB; "+
 			"draw at four bits or raise the budget",
-			float64(want+adapterPeak)/(1<<30), float64(budget)/(1<<30))
+			float64(mlpBytes(m.blocks[0])+adapterPeak)/(1<<30), float64(budget)/(1<<30))
 	}
 	g, err := gpu.Open(gpu.HighPerformance)
 	if err != nil {
@@ -170,7 +187,11 @@ func UseGPU(m *Transformer, budget uint64) (string, uint64, error) {
 			return "", 0, err
 		}
 	}
+	var held uint64
 	for _, b := range m.blocks {
+		if held+mlpBytes(b) > room {
+			break
+		}
 		w := &deviceWeights{rot: rot}
 		for _, f := range []struct {
 			dst **deviceLinear
@@ -184,9 +205,22 @@ func UseGPU(m *Transformer, budget uint64) (string, uint64, error) {
 			*f.dst = d
 		}
 		b.dev, b.g = w, g
+		held += mlpBytes(b)
 	}
-	m.dev = g
-	return g.Name(), want, nil
+	m.dev, m.held = g, held
+	return g.Name(), held, nil
+}
+
+// BlocksOnDevice reports how many of a model's blocks hold their
+// feed-forward on the device and how many there are, which differ when
+// the budget only stretched to some of them.
+func (m *Transformer) BlocksOnDevice() (on, total int) {
+	for _, b := range m.blocks {
+		if b.dev != nil {
+			on++
+		}
+	}
+	return on, len(m.blocks)
 }
 
 // mlpOnDevice runs the feed-forward for one block on the device: the

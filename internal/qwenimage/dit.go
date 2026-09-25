@@ -3,6 +3,7 @@ package qwenimage
 import (
 	"fmt"
 	"math"
+	"runtime"
 	"sync"
 
 	"github.com/mattn/tensai"
@@ -311,57 +312,88 @@ func applyRope(x *tensai.Matrix, rope *Rope) {
 // two per cent of its arithmetic. Gathering a head into its own pair of
 // matrices and multiplying costs two copies and buys the same kernels
 // the projections run on.
+// Heads are independent, so a worker takes whole heads rather than a
+// slice of every stage of one: a head's gather, both its products and
+// the softmax between them stay on the goroutine whose buffers they run
+// through, and one barrier stands where three per head used to.
+//
+// Queries go a tile at a time. A tile's scores are made and spent inside
+// it, so the sequence's square is never written out to memory and read
+// back twice -- and that square was the one buffer here that grew with
+// the square of the image, where a tile's rows do not.
 func attention(out, q, k, v *tensai.Matrix, keyLimit []int, s *Scratch) error {
-
 	scale := tensai.Float(1 / math.Sqrt(ditHeadDim))
-	for h := 0; h < ditHeads; h++ {
-		off := h * ditHeadDim
-		gather(s.qh, q, off)
-		gather(s.kh, k, off)
-		gather(s.vh, v, off)
-		if err := tensai.DotTBInto(s.scores, s.qh, s.kh); err != nil {
+	errs := make([]error, len(s.heads))
+	var wg sync.WaitGroup
+	for w := 1; w < len(s.heads); w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			errs[w] = attentionHeads(out, q, k, v, keyLimit, s.heads[w], scale, w, len(s.heads))
+		}(w)
+	}
+	errs[0] = attentionHeads(out, q, k, v, keyLimit, s.heads[0], scale, 0, len(s.heads))
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
 			return err
 		}
-		softmaxRows(s.scores, scale, keyLimit)
-		if err := tensai.DotInto(s.oh, s.scores, s.vh); err != nil {
-			return err
-		}
-		scatter(out, s.oh, off)
 	}
 	return nil
 }
 
-// gather copies one head's slice of every token into its own matrix.
-func gather(dst, src *tensai.Matrix, off int) {
-	workpool.Run(src.Rows, 1, func(lo, hi int) {
-		for r := lo; r < hi; r++ {
-			copy(dst.Data[r*ditHeadDim:(r+1)*ditHeadDim], src.Data[r*src.Cols+off:])
+// attentionHeads runs the heads w, w+workers, ... through one worker's
+// buffers, a tile of queries at a time.
+func attentionHeads(out, q, k, v *tensai.Matrix, keyLimit []int, b *headBuf, scale tensai.Float, w, workers int) error {
+	n := q.Rows
+	for h := w; h < ditHeads; h += workers {
+		off := h * ditHeadDim
+		gatherRows(b.kh, k, off, 0, n)
+		gatherRows(b.vh, v, off, 0, n)
+		for t := 0; t < n; t += attnTile {
+			rows := min(attnTile, n-t)
+			b.tile(rows, n)
+			gatherRows(b.qt, q, off, t, t+rows)
+			if err := tensai.DotTBIntoSerial(b.st, b.qt, b.kh); err != nil {
+				return err
+			}
+			softmaxTile(b.st, scale, keyLimit[t:t+rows])
+			if err := tensai.DotIntoSerial(b.ot, b.st, b.vh); err != nil {
+				return err
+			}
+			scatterRows(out, b.ot, off, t)
 		}
-	})
+	}
+	return nil
 }
 
-// scatter is the inverse, writing a head's output back where it belongs.
-func scatter(dst, src *tensai.Matrix, off int) {
-	workpool.Run(src.Rows, 1, func(lo, hi int) {
-		for r := lo; r < hi; r++ {
-			copy(dst.Data[r*dst.Cols+off:][:ditHeadDim], src.Data[r*ditHeadDim:])
-		}
-	})
+// gatherRows copies one head's slice of the rows lo..hi into a matrix of
+// its own, which is where the kernels want it.
+func gatherRows(dst, src *tensai.Matrix, off, lo, hi int) {
+	for r := lo; r < hi; r++ {
+		copy(dst.Data[(r-lo)*ditHeadDim:][:ditHeadDim], src.Data[r*src.Cols+off:])
+	}
 }
 
-// softmaxRows scales a head's scores and normalizes each row over the
-// keys its limit allows, leaving the rest at zero so the value product
-// can read the whole row.
-func softmaxRows(x *tensai.Matrix, scale tensai.Float, keyLimit []int) {
-	workpool.Run(x.Rows, 1, func(lo, hi int) {
-		for r := lo; r < hi; r++ {
-			row := x.Data[r*x.Cols : (r+1)*x.Cols]
-			lim := keyLimit[r]
-			kernels.ScaleSlice(row[:lim], scale)
-			kernels.Softmax(row[:lim])
-			clear(row[lim:])
-		}
-	})
+// scatterRows is the inverse, writing a tile of one head's output back
+// where it belongs among the others.
+func scatterRows(dst, src *tensai.Matrix, off, at int) {
+	for r := 0; r < src.Rows; r++ {
+		copy(dst.Data[(at+r)*dst.Cols+off:][:ditHeadDim], src.Data[r*ditHeadDim:])
+	}
+}
+
+// softmaxTile scales a tile of a head's scores and normalizes each row
+// over the keys its limit allows, leaving the rest at zero so the value
+// product can read the whole row.
+func softmaxTile(x *tensai.Matrix, scale tensai.Float, keyLimit []int) {
+	for r := 0; r < x.Rows; r++ {
+		row := x.Data[r*x.Cols : (r+1)*x.Cols]
+		lim := keyLimit[r]
+		kernels.ScaleSlice(row[:lim], scale)
+		kernels.Softmax(row[:lim])
+		clear(row[lim:])
+	}
 }
 
 // Forward runs one block over the joint sequence, in place.
@@ -448,11 +480,24 @@ func addGated(x, y *tensai.Matrix, gate [][]tensai.Float, row []int) {
 type Scratch struct {
 	norm, q, k, v, attn *tensai.Matrix
 	gate, up            *tensai.Matrix
-	// One head at a time, gathered out of the packed projections, plus
-	// its square of scores.
-	qh, kh, vh, oh *tensai.Matrix
-	scores         *tensai.Matrix
+	// One set of head buffers per attention worker.
+	heads []*headBuf
 }
+
+// headBuf is one worker's room for a head: the keys and values it
+// gathers out of the packed projections, and the tile of queries it is
+// on with their scores and their outputs.
+type headBuf struct {
+	kh, vh *tensai.Matrix // the whole sequence, one head wide
+	qt, ot *tensai.Matrix // attnTile rows of it
+	st     *tensai.Matrix // attnTile queries over every key
+}
+
+// attnTile is how many queries one pass of a head takes. Sixty-four rows
+// of a 512x512 image's keys is a quarter of a megabyte, which stays in
+// cache from the product that writes the scores to the one that spends
+// them.
+const attnTile = 64
 
 // NewScratch sizes the buffers for a sequence of at most n tokens.
 func NewScratch(n int) *Scratch {
@@ -462,21 +507,41 @@ func NewScratch(n int) *Scratch {
 	}
 	s.gate = tensai.NewMatrix(n, ditMLP)
 	s.up = tensai.NewMatrix(n, ditMLP)
-	for _, m := range []**tensai.Matrix{&s.qh, &s.kh, &s.vh, &s.oh} {
-		*m = tensai.NewMatrix(n, ditHeadDim)
+	s.heads = make([]*headBuf, min(runtime.GOMAXPROCS(0), ditHeads))
+	for i := range s.heads {
+		s.heads[i] = &headBuf{
+			kh: tensai.NewMatrix(n, ditHeadDim),
+			vh: tensai.NewMatrix(n, ditHeadDim),
+			qt: tensai.NewMatrix(attnTile, ditHeadDim),
+			ot: tensai.NewMatrix(attnTile, ditHeadDim),
+			st: tensai.NewMatrix(attnTile, n),
+		}
 	}
-	s.scores = tensai.NewMatrix(n, n)
 	return s
 }
 
 func (s *Scratch) reset(n int) {
-	for _, m := range []*tensai.Matrix{s.norm, s.q, s.k, s.v, s.attn, s.gate, s.up, s.qh, s.kh, s.vh, s.oh} {
+	for _, m := range []*tensai.Matrix{s.norm, s.q, s.k, s.v, s.attn, s.gate, s.up} {
 		cols := m.Cols
 		m.Rows = n
 		m.Data = m.Data[:n*cols]
 	}
-	s.scores.Rows, s.scores.Cols = n, n
-	s.scores.Data = s.scores.Data[:n*n]
+	for _, b := range s.heads {
+		for _, m := range []*tensai.Matrix{b.kh, b.vh} {
+			m.Rows = n
+			m.Data = m.Data[:n*ditHeadDim]
+		}
+	}
+}
+
+// tile points a worker's buffers at rows queries over n keys.
+func (b *headBuf) tile(rows, n int) {
+	for _, m := range []*tensai.Matrix{b.qt, b.ot} {
+		m.Rows = rows
+		m.Data = m.Data[:rows*ditHeadDim]
+	}
+	b.st.Rows, b.st.Cols = rows, n
+	b.st.Data = b.st.Data[:rows*n]
 }
 
 // OpenTransformer opens the checkpoint's sharded transformer weights.
