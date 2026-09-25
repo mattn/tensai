@@ -29,7 +29,7 @@ tensai image -model Comfy-Org/Qwen-Image-2.1 "a calico cat asleep on a stack of 
 
 `-model` は `run` や `chat` と同じ形でチェックポイントを指定します。リポジトリ名、`tensai models` が表示する名前、パスのどれでも受け付けます。次の 2 つのリポジトリは初回に自動でダウンロードします。中断などでファイルが欠けていれば、次の実行でそのファイルだけを取り直します。すべて揃っていれば通信はしません。
 
-- `Qwen/Qwen-Image-2.1` (既定): diffusers 形式のチェックポイントで、およそ 31GB です。`~/.cache/tensai/Qwen-Image-2.1` に置きます。重みファイル名は各コンポーネントの index から読むので、リポジトリ側で分割数が変わっても解決できます。
+- `Qwen/Qwen-Image-2.1` (既定): diffusers 形式のチェックポイントで、およそ 31GB です。`~/.cache/tensai/Qwen/Qwen-Image-2.1` に置きます (組織名を付ける前のバージョンで取得した `~/.cache/tensai/Qwen-Image-2.1` があればそれを使います)。重みファイル名は各コンポーネントの index から読むので、リポジトリ側で分割数が変わっても解決できます。
 - `Comfy-Org/Qwen-Image-2.1`: ComfyUI 向けに詰め直したもので、`~/.cache/tensai/Comfy-Org/Qwen-Image-2.1` に置きます。transformer とプロンプトエンコーダが最初から 8 ビットなので、int8 版の合計はおよそ 17GB です。重みは入力 256 列ごとに Hadamard 行列で回転させてから、行ごとのスケール付き int8 にしてあります。ローダーはこの 2 つを戻してから自前の量子化をかけるので、どちらのチェックポイントも同じコードで動きます。ComfyUI 版にはトークナイザと VAE の潜在統計が含まれないため、この小さな 2 ファイルだけは Qwen のリポジトリから取ります。
 
 パスにはどちらの配置のディレクトリも指定できます。diffusers なら `text_encoder`・`transformer`・`vae`・`processor`、ComfyUI なら `text_encoders`・`diffusion_models`・`vae` に `processor/tokenizer.json` と `vae/config.json` を加えたものです。ComfyUI の配置では `_int8_convrot` のファイルを選び、無ければ `_bf16` を使います。以前ダウンロードに使っていた `-fetch` は、指定しても何もしません。

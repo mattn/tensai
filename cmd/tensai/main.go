@@ -739,6 +739,14 @@ func modelsCmd(args []string) error {
 					}
 					continue
 				}
+				// A download from before the org joined the path sits
+				// under the bare name, and it is this repo's only if it
+				// says so: the bare name may as well be another repo's
+				// model, or this org's own directory with its other
+				// models in it.
+				if llm.Origin(filepath.Join(root, base)) != name {
+					return fmt.Errorf("no cached model %q (see \"tensai models\")", name)
+				}
 				name = base
 			}
 			if name != filepath.Base(name) || name == "." || name == ".." {
@@ -747,6 +755,9 @@ func modelsCmd(args []string) error {
 			target := filepath.Join(root, name)
 			if _, err := os.Stat(target); err != nil {
 				return fmt.Errorf("no cached model %q (see \"tensai models\")", name)
+			}
+			if held := nestedModels(target); len(held) > 0 {
+				return fmt.Errorf("%s is an organization holding %s; remove them by that name", name, strings.Join(held, ", "))
 			}
 			if err := os.RemoveAll(target); err != nil {
 				return err
@@ -883,6 +894,22 @@ func modelsCmd(args []string) error {
 		fmt.Fprintln(os.Stderr, what)
 	}
 	return nil
+}
+
+// nestedModels names the models an org directory holds, as the listing
+// prints them.
+func nestedModels(dir string) []string {
+	var held []string
+	subs, _ := os.ReadDir(dir)
+	for _, sub := range subs {
+		if !sub.IsDir() {
+			continue
+		}
+		if _, _, ok := describeModelDir(filepath.Join(dir, sub.Name())); ok {
+			held = append(held, filepath.Base(dir)+"/"+sub.Name())
+		}
+	}
+	return held
 }
 
 // describeModelDir reports whether dir holds a model and, if so, its
@@ -1139,7 +1166,7 @@ func imageModelDir(ref string, say func(string, ...any)) (qwenimage.ModelDir, er
 	if filepath.IsAbs(ref) {
 		return "", fmt.Errorf("no model at %s", ref)
 	}
-	dir := imageCacheDir(ref)
+	dir := llm.DefaultDataDir(ref)
 	fetch := map[string]func(string, func(string, ...any)) error{
 		imageRepo:      fetchImageModel,
 		comfyImageRepo: fetchComfyImageModel,
@@ -1153,11 +1180,7 @@ func imageModelDir(ref string, say func(string, ...any)) (qwenimage.ModelDir, er
 	if err := fetch(dir, say); err != nil {
 		return "", err
 	}
-	if ref == imageRepo {
-		// It sits under its bare name, as run and chat cache a repo;
-		// the record lets the listing name it by the repo.
-		llm.RecordOrigin(dir, ref)
-	}
+	llm.RecordOrigin(dir, ref)
 	return qwenimage.ModelDir(dir), nil
 }
 
@@ -1167,17 +1190,6 @@ func isImageModel(dir string) bool {
 	return isDir(filepath.Join(dir, "transformer")) || qwenimage.ModelDir(dir).Comfy()
 }
 
-// imageCacheDir is where a repo's checkpoint is cached. Qwen's sits under
-// its bare name, as run and chat cache a repo. ComfyUI's has the same
-// bare name, so it goes under its org instead, which the listing prints
-// as the repo.
-func imageCacheDir(repo string) string {
-	root := llm.CacheRoot()
-	if repo == imageRepo {
-		return filepath.Join(root, filepath.Base(repo))
-	}
-	return filepath.Join(root, filepath.FromSlash(repo))
-}
 
 // fetchFile downloads one file of a repo into dir/sub unless it is
 // already there, naming it only when there is something to fetch.

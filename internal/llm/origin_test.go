@@ -75,3 +75,30 @@ func TestGGUFOrigin(t *testing.T) {
 		}
 	}
 }
+
+// Two organizations can publish the same name; each gets its own
+// directory, and a download from before the org joined the path is kept
+// only by the repo it records.
+func TestDefaultDataDirKeepsTheOrg(t *testing.T) {
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())         // macOS
+	t.Setenv("LocalAppData", t.TempDir()) // Windows
+	root := CacheRoot()
+	if got, want := DefaultDataDir("Qwen/Qwen3-4B"), filepath.Join(root, "Qwen", "Qwen3-4B"); got != want {
+		t.Errorf("fresh download: %s, want %s", got, want)
+	}
+	legacy := filepath.Join(root, "Qwen3-4B")
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	recordOrigin(legacy, "Qwen/Qwen3-4B")
+	if got := DefaultDataDir("Qwen/Qwen3-4B"); got != legacy {
+		t.Errorf("recorded legacy download: %s, want %s", got, legacy)
+	}
+	if got, want := DefaultDataDir("other/Qwen3-4B"), filepath.Join(root, "other", "Qwen3-4B"); got != want {
+		t.Errorf("same name from another org: %s, want %s", got, want)
+	}
+	if got := DefaultDataDir("a/../../escape"); filepath.Dir(got) != root {
+		t.Errorf("a path that is no repo left the cache root: %s", got)
+	}
+}
