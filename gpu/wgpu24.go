@@ -353,8 +353,15 @@ func libCandidates() []string {
 	if p := os.Getenv("TENSAI_WGPU_LIB"); p != "" {
 		return []string{p}
 	}
-	if runtime.GOOS == "darwin" {
+	switch runtime.GOOS {
+	case "darwin":
 		return []string{"libwgpu_native.dylib"}
+	case "windows":
+		// The release zip ships wgpu_native.dll; the name with the lib
+		// prefix turns up in MSYS2/MinGW-style installs. Without these
+		// a Windows build asked for a .so and reported the library
+		// missing however plainly it sat beside the binary.
+		return []string{"wgpu_native.dll", "libwgpu_native.dll"}
 	}
 	return []string{"libwgpu_native.so"}
 }
