@@ -3,6 +3,7 @@
 package gpu
 
 import (
+	"math"
 	"math/rand/v2"
 	"testing"
 
@@ -355,5 +356,65 @@ func BenchmarkGPUDecodeAttn(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		run()
+	}
+}
+
+// A tall, narrow matvec runs in row chunks (qmatmul_sk + qmatmul_skr).
+// The chunked sums reorder the additions, so the check is against the
+// exact dequantized product rather than the one-pass kernel's bits, with
+// the bias and the residual the down projection's epilogue adds.
+func TestGPUMatMulSplitK(t *testing.T) {
+	g := openTestGPU(t)
+	defer g.Close()
+	rng := rand.New(rand.NewPCG(66, 0))
+	const rows, cols = 4864, 896
+	cq := quant.Quantize(tensai.RandomMatrix(rows, cols, rng))
+	if splitKChunks(&QMatrix{rows: rows, words: cols / 4}) < 2 {
+		t.Fatal("the down projection's shape no longer splits")
+	}
+	q, err := g.UploadQ8(cq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Free()
+	xt := randTensor(rng, 1, rows)
+	bt := randTensor(rng, cols)
+	rt := randTensor(rng, 1, cols)
+	want := make([]float64, cols)
+	for j := range cols {
+		var s float64
+		for i := range rows {
+			s += float64(xt.Data[i]) * float64(cq.Q[cq.Index(i, j)])
+		}
+		want[j] = s*float64(cq.Scale[j]) + float64(bt.Data[j]) + float64(rt.Data[j])
+	}
+	x, err := g.Upload(xt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer x.Free()
+	bias, err := g.Upload(bt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bias.Free()
+	dst, err := g.Upload(rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Free()
+	if _, err := q.MatMulOpts(x, bias, dst); err != nil {
+		t.Fatal(err)
+	}
+	got, err := dst.Download()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var worst float64
+	for j, w := range want {
+		worst = max(worst, math.Abs(float64(got.Data[j])-w)/max(1, math.Abs(w)))
+	}
+	if worst > 1e-5 {
+		t.Errorf("worst relative error %g", worst)
 	}
 }

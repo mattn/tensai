@@ -1316,6 +1316,70 @@ fn qmatmul(@builtin(workgroup_id) wid: vec3<u32>,
     }
 }
 
+// qmatmul_sk is qmatmul for a tall, narrow matvec (decode's down
+// projection: 4864 rows, 896 columns) whose 14 workgroups leave the
+// device's compute units unevenly loaded. wid.y takes a chunk of rows,
+// pad1 rows long, so the chunks multiply the workgroups; each writes its
+// chunk's per-word sums to qpart and qmatmul_skr folds them in order.
+@group(0) @binding(46) var<storage, read_write> qpart: array<vec4<f32>>;
+
+@compute @workgroup_size(256, 1, 1)
+fn qmatmul_sk(@builtin(workgroup_id) wid: vec3<u32>,
+              @builtin(local_invocation_id) lid: vec3<u32>) {
+    let w = wid.x * QWG + lid.x % QWG;
+    let rsub = lid.x / QWG;
+    let start = wid.y * qp.pad1;
+    let end = min(qp.rows, start + qp.pad1);
+    var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    if (w < qp.words) {
+        for (var i = start + rsub; i < end; i = i + QSPLIT) {
+            let xv = qxv[i];
+            let pw = qwt[i * qp.words + w];
+            acc = acc + xv * vec4<f32>(
+                f32(i32(pw << 24u) >> 24u),
+                f32(i32(pw << 16u) >> 24u),
+                f32(i32(pw << 8u) >> 24u),
+                f32(i32(pw) >> 24u));
+        }
+    }
+    qred[lid.x] = acc;
+    workgroupBarrier();
+    if (lid.x < QWG && w < qp.words) {
+        var sum = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        for (var v = 0u; v < QSPLIT; v = v + 1u) {
+            sum = sum + qred[v * QWG + lid.x];
+        }
+        qpart[wid.y * qp.words + w] = sum;
+    }
+}
+
+// qmatmul_skr folds qmatmul_sk's chunks, one lane per packed word, and
+// finishes as qmatmul does: scale, then bias and residual by flags.
+@compute @workgroup_size(64, 1, 1)
+fn qmatmul_skr(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let w = gid.x;
+    if (w >= qp.words) {
+        return;
+    }
+    var sum = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    for (var c = 0u; c < qp.pad2; c = c + 1u) {
+        sum = sum + qpart[c * qp.words + w];
+    }
+    let j = w * 4u;
+    for (var l = 0u; l < 4u; l = l + 1u) {
+        if (j + l < qp.cols) {
+            var o = sum[l] * qsc[j + l];
+            if ((qp.flags & 1u) != 0u) {
+                o = o + qbias[j + l];
+            }
+            if ((qp.flags & 2u) != 0u) {
+                o = o + qov[j + l];
+            }
+            qov[j + l] = o;
+        }
+    }
+}
+
 // qmatmul_b is qmatmul's batched twin for prefill: a workgroup still
 // covers 16 packed words split 16 ways, but accumulates QROWS activation
 // rows per weight word, so the weight stream a matvec pays once per row
@@ -2809,6 +2873,8 @@ type gpuPipelines struct {
 	layQ4matmul, layGeluMulIP, layQmatmulB         uintptr
 	layAttnG, layQmatmulT, layQacts, layQmatmulI   uintptr
 	layAttnF16, layRowsToF16                       uintptr
+	qmatmulSK, qmatmulSKR, layQmatmulSK            uintptr
+	layQmatmulSKR                                  uintptr
 }
 
 // initPipelines compiles every kernel from g.module; the caller holds
@@ -2834,6 +2900,8 @@ func (g *Device) initPipelines() error {
 		{&g.pipes.softmax, &g.pipes.laySoftmax, "softmax_last"},
 		{&g.pipes.attn, &g.pipes.layAttn, "attn_causal"},
 		{&g.pipes.qmatmul, &g.pipes.layQmatmul, "qmatmul"},
+		{&g.pipes.qmatmulSK, &g.pipes.layQmatmulSK, "qmatmul_sk"},
+		{&g.pipes.qmatmulSKR, &g.pipes.layQmatmulSKR, "qmatmul_skr"},
 		{&g.pipes.rmsnorm, &g.pipes.layRmsnorm, "rmsnorm_row"},
 		{&g.pipes.rope, &g.pipes.layRope, "rope_rows"},
 		{&g.pipes.addIP, &g.pipes.layAddIP, "add_ip"},
@@ -4928,6 +4996,11 @@ func (q *QMatrix) matmulF32(x, bias, dst, norm *Tensor, eps float32, scr *Tensor
 	if m >= 32 && q.g.hasIntDot {
 		return q.matmulIntDot(x, bias, dst, m, outShape)
 	}
+	// The prologues stage a whole row per workgroup, so only a plain
+	// matvec splits.
+	if chunks := splitKChunks(q); m == 1 && scr == nil && norm == nil && chunks > 1 {
+		return q.matmulSplitK(x, bias, dst, chunks, outShape)
+	}
 
 	g := q.g
 	g.mu.Lock()
@@ -5004,6 +5077,90 @@ func (q *QMatrix) matmulF32(x, bias, dst, norm *Tensor, eps float32, scr *Tensor
 		if dst == nil {
 			g.dropBuffer(bufOut)
 		}
+		return nil, err
+	}
+	if dst != nil {
+		return dst, nil
+	}
+	return &Tensor{g: g, buf: bufOut, shape: outShape}, nil
+}
+
+// splitKChunks is how many row chunks a single-row matvec splits into.
+// Parallelism in the matvec is one workgroup per 64 output columns, so a
+// tall, narrow matrix -- decode's down projection, 4864 rows into 896
+// columns, is 14 workgroups -- leaves some compute units with two and
+// the rest with one, and runs at the speed of the busiest. Cutting its
+// rows into chunks of about 800 multiplies the workgroups; on the
+// integrated Radeon that took a Qwen2.5-0.5B decode token from 21.2 to
+// 18.9ms, where 2 and 4 chunks bought half as much and 12 no more. A
+// matrix whose columns already give 24 workgroups keeps the one pass.
+func splitKChunks(q *QMatrix) int {
+	const minRows, chunkRows, wideEnough = 2048, 800, 24
+	if q.rows < minRows || (q.words+15)/16 >= wideEnough {
+		return 1
+	}
+	return (q.rows + chunkRows - 1) / chunkRows
+}
+
+// matmulSplitK is the single-row matvec cut into row chunks: qmatmul_sk
+// sums each chunk per packed word, qmatmul_skr folds the chunks in order
+// and finishes the columns. The partial sums change the order of the
+// additions, so the result agrees with the one-pass kernel to rounding
+// rather than bit for bit.
+func (q *QMatrix) matmulSplitK(x, bias, dst *Tensor, chunks int, outShape []int) (*Tensor, error) {
+	g := q.g
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	wgpuMu.Lock()
+	defer wgpuMu.Unlock()
+	if g.closed {
+		return nil, errors.New("tensai: gpu is closed")
+	}
+	uncapturedCB = ""
+	per := (q.rows + chunks - 1) / chunks
+	per = (per + 15) / 16 * 16
+	chunks = (q.rows + per - 1) / per
+	outBytes := uint64(q.cols) * 4
+	partBytes := uint64(chunks*q.words) * 16
+	var flags uint32
+	biasBuf, biasSize := q.scales, uint64(q.words*4)*4
+	if bias != nil {
+		flags |= 1
+		biasBuf, biasSize = bias.buf, uint64(bias.Size())*4
+	}
+	bufOut := uintptr(0)
+	if dst != nil {
+		flags |= 2
+		bufOut = dst.buf
+	} else {
+		bufOut = g.takeOutBuffer(outBytes)
+	}
+	part := g.takeOutBuffer(partBytes)
+	defer g.putBuffer(gpuTensorUsage, partBytes, part)
+	params := [8]uint32{uint32(q.rows), uint32(q.cols), uint32(q.words), 1, flags, 0, uint32(per), uint32(chunks)}
+	bufParams, offParams, release := g.paramsBuffer(unsafe.Pointer(&params[0]), 32)
+	defer release()
+	sk := [5]wgpuBindGroupEntry{
+		{binding: 15, buffer: bufParams, offset: offParams, size: 32},
+		{binding: 16, buffer: q.buf, size: uint64(q.rows*q.words) * 4},
+		bind(18, x),
+		{binding: 46, buffer: part, size: partBytes},
+	}
+	bg := g.cachedBindGroup(g.pipes.layQmatmulSK, sk[:4])
+	if err := g.dispatch(g.pipes.qmatmulSK, bg, uint32((q.words+15)/16), uint32(chunks), 1); err != nil {
+		return nil, err
+	}
+	skr := [5]wgpuBindGroupEntry{
+		{binding: 15, buffer: bufParams, offset: offParams, size: 32},
+		{binding: 17, buffer: q.scales, size: uint64(q.words*4) * 4},
+		{binding: 19, buffer: bufOut, size: outBytes},
+		{binding: 34, buffer: biasBuf, size: biasSize},
+		{binding: 46, buffer: part, size: partBytes},
+	}
+	bg2 := g.cachedBindGroup(g.pipes.layQmatmulSKR, skr[:])
+	runtime.KeepAlive(&sk)
+	runtime.KeepAlive(&skr)
+	if err := g.dispatch(g.pipes.qmatmulSKR, bg2, uint32((q.words+63)/64), 1, 1); err != nil {
 		return nil, err
 	}
 	if dst != nil {
