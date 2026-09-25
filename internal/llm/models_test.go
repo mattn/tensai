@@ -109,11 +109,14 @@ func TestModelInvariants(t *testing.T) {
 	}
 }
 
-// The device has to answer what the CPU answers. It reads the same
-// weights -- the requantized ones, since that is what -gpu loads -- so
-// the two differ only in the order their kernels accumulate, and a
-// wrong head width or a cache bound to the wrong layer shows up as a
-// different token rather than a rounding difference. Skips wherever no
+// The device has to answer what the model answers. It reads the same
+// weights as the CPU -- the requantized ones, since that is what -gpu
+// loads -- but where the CPU quantizes each activation row to 7 bits,
+// the device keeps it float, so on a model with large activation
+// outliers (gemma) the CPU is the one further from the truth. Both are
+// therefore measured against the float32 CPU run: the device may not
+// stray much further from it than the CPU does, which a wrong head
+// width or a cache bound to the wrong layer would. Skips wherever no
 // device opens, which includes every build without a wgpu tag.
 func TestDeviceMatchesCPU(t *testing.T) {
 	root := CacheRoot()
@@ -136,9 +139,7 @@ func TestDeviceMatchesCPU(t *testing.T) {
 			continue
 		}
 		t.Run(filepath.Base(path), func(t *testing.T) {
-			// -gpu loads with direct off, so the cpu side has to as
-			// well or the two would be comparing different weights.
-			m, tok, err := loadGGUF(path, 4, false, false, io.Discard)
+			f, tok, err := loadGGUF(path, 0, false, false, io.Discard)
 			if err != nil {
 				t.Skip(err)
 			}
@@ -148,15 +149,24 @@ func TestDeviceMatchesCPU(t *testing.T) {
 			if len(tokens) < 2 {
 				t.Skip("tokenizer produced nothing to feed")
 			}
+			f.reset()
+			ref := append([]float32(nil), f.prefill(tokens, 0)...)
+			f = nil
+			// -gpu loads with direct off, so the cpu side has to as
+			// well or the two would be comparing different weights.
+			m, _, err := loadGGUF(path, 4, false, false, io.Discard)
+			if err != nil {
+				t.Skip(err)
+			}
 			m.reset()
-			want := append([]float32(nil), m.prefill(tokens, 0)...)
+			cpu := append([]float32(nil), m.prefill(tokens, 0)...)
 
 			gq, err := newGPUQwen(m, g, 512, io.Discard, io.Discard)
 			if err != nil {
 				t.Skip(err) // no kernels for this shape, or no room
 			}
 			got := append([]float32(nil), gq.prefill(tokens, 0)...)
-			compareLogits(t, "prefill", want, got)
+			compareToFloat(t, "prefill", ref, cpu, got)
 
 			// And the device's own two paths have to agree, which is
 			// where a cache written at the wrong width would show.
@@ -165,28 +175,46 @@ func TestDeviceMatchesCPU(t *testing.T) {
 			for i, tok := range tokens {
 				one = gq.step(tok, i)
 			}
-			compareLogits(t, "device decode", want, one)
+			if argmax(one) != argmax(got) {
+				t.Fatalf("device decode picks token %d, device prefill %d", argmax(one), argmax(got))
+			}
+			// Decode reads the keys and values back from the f16 cache
+			// where prefill attends in f32, so the two differ by more
+			// than rounding; a cache at the wrong width differs by far
+			// more than this.
+			span := logitSpan(ref)
+			if d := maxAbsDiff(got, one); d > 0.10*span {
+				t.Errorf("device decode differs from device prefill by %v, %.1f%% of the logit span", d, 100*d/span)
+			}
 		})
 	}
 }
 
-func compareLogits(t *testing.T, what string, want, got []float32) {
+// compareToFloat checks the device against the float32 run with the
+// CPU's quantized run as the yardstick for how far quantization alone
+// moves the logits.
+func compareToFloat(t *testing.T, what string, ref, cpu, got []float32) {
 	t.Helper()
-	if len(want) != len(got) {
-		t.Fatalf("%s: %d logits, want %d", what, len(got), len(want))
+	if len(got) != len(ref) {
+		t.Fatalf("%s: %d logits, want %d", what, len(got), len(ref))
 	}
-	if argmax(want) != argmax(got) {
-		t.Fatalf("%s picks token %d, the cpu picks %d", what, argmax(got), argmax(want))
+	if top := argmax(got); top != argmax(ref) && top != argmax(cpu) {
+		t.Fatalf("%s picks token %d, float32 picks %d and the quantized cpu %d", what, top, argmax(ref), argmax(cpu))
 	}
+	span := logitSpan(ref)
+	dCPU, dDev := maxAbsDiff(cpu, ref), maxAbsDiff(got, ref)
+	t.Logf("%s: from float32 the cpu is %.1f%% of the logit span away, the device %.1f%%", what, 100*dCPU/span, 100*dDev/span)
+	if dDev > dCPU+0.05*span {
+		t.Errorf("%s strays %v from float32 where the cpu strays %v (span %v)", what, dDev, dCPU, span)
+	}
+}
+
+func maxAbsDiff(a, b []float32) float64 {
 	var worst float64
-	for i := range want {
-		if d := math.Abs(float64(want[i] - got[i])); d > worst {
-			worst = d
-		}
+	for i := range a {
+		worst = max(worst, math.Abs(float64(a[i]-b[i])))
 	}
-	if span := logitSpan(want); worst > 0.25*span {
-		t.Errorf("%s differs from the cpu by %v, %.1f%% of the logit span", what, worst, 100*worst/span)
-	}
+	return worst
 }
 
 // checkPrefillMatchesDecode is the invariant that catches a KV cache
