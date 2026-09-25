@@ -276,10 +276,18 @@ type qwen struct {
 	// bits is the width the weights were loaded at, which the loader
 	// chose itself when asked to.
 	bits int
+	// soft holds input embeddings made outside the model (Qwen2-Audio's
+	// audio), fed at positions whose token id is Vocab plus a row.
+	soft *tensai.Matrix
 }
 
 // embedRow copies token's embedding into dst.
 func (m *qwen) embedRow(token int, dst []float32) {
+	if r := token - m.cfg.Vocab; r >= 0 && m.soft != nil && r < m.soft.Rows {
+		hs := m.cfg.HiddenSize
+		copy(dst, m.soft.Data[r*hs:(r+1)*hs])
+		return
+	}
 	if m.embedRows != nil {
 		if err := m.embedRows.row(token, dst); err != nil {
 			panic(err)

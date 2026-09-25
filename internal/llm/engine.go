@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/gguf"
 	"github.com/mattn/tensai/gpu"
 	"github.com/mattn/tensai/internal/sysmem"
@@ -1023,13 +1024,57 @@ func softmax64(ll []float64) []float64 {
 func (e *Engine) Generate(w io.Writer, prompt string, raw bool, n int) RunResult {
 	text := prompt
 	if !raw {
-		text = e.tm.bos + e.systemTurn()
-		if e.tm.foldSystem && e.system != "" {
-			prompt = e.system + "\n\n" + prompt
-		}
-		text += e.tm.userOpen + prompt + e.tm.userClose + e.tm.asstOpen + e.tm.asstPrefill
+		text = e.render(prompt)
 	}
-	ids := e.tok.Encode(text)
+	return e.run(w, text, e.tok.Encode(text), n)
+}
+
+// render wraps a single user turn in the chat template.
+func (e *Engine) render(prompt string) string {
+	text := e.tm.bos + e.systemTurn()
+	if e.tm.foldSystem && e.system != "" {
+		prompt = e.system + "\n\n" + prompt
+	}
+	return text + e.tm.userOpen + prompt + e.tm.userClose + e.tm.asstOpen + e.tm.asstPrefill
+}
+
+// GenerateWith is Generate with rows of input embeddings standing in for
+// a placeholder token: the prompt names placeholder once, and it widens
+// to one position per row, each fed its row in place of a token's
+// embedding. It is how Qwen2-Audio's encoded audio reaches the model.
+func (e *Engine) GenerateWith(w io.Writer, prompt, placeholder string, rows *tensai.Matrix, n int) (RunResult, error) {
+	id, ok := e.tok.ID(placeholder)
+	if !ok {
+		return RunResult{}, fmt.Errorf("the tokenizer has no %s token", placeholder)
+	}
+	if hs := e.model.cfg.HiddenSize; rows.Cols != hs {
+		return RunResult{}, fmt.Errorf("embeddings are %d wide, the model %d", rows.Cols, hs)
+	}
+	if e.draft != nil {
+		return RunResult{}, fmt.Errorf("-draft cannot verify a prompt it has no embeddings for")
+	}
+	text := e.render(prompt)
+	var ids []int
+	seen := 0
+	for _, tk := range e.tok.Encode(text) {
+		if tk != id {
+			ids = append(ids, tk)
+			continue
+		}
+		seen++
+		for r := range rows.Rows {
+			ids = append(ids, e.model.cfg.Vocab+r)
+		}
+	}
+	if seen != 1 {
+		return RunResult{}, fmt.Errorf("the prompt holds %s %d times, want once", placeholder, seen)
+	}
+	e.model.soft = rows
+	return e.run(w, text, ids, n), nil
+}
+
+// run feeds a rendered prompt's ids and samples the answer.
+func (e *Engine) run(w io.Writer, text string, ids []int, n int) RunResult {
 	fmt.Fprintf(e.opts.Log, "prompt: %d tokens\n", len(ids))
 	fmt.Fprintf(e.vlog, "rendered prompt: %s\n", clip(text, 600))
 	fmt.Fprintf(e.vlog, "sampling: temp %.2f, top-p %.2f, seed %d, limit %d tokens\n",
@@ -1380,6 +1425,14 @@ func weightBytes(weights string) int64 {
 		}
 	}
 	return total
+}
+
+// FetchWeights downloads a repo's weights into dir unless they are
+// already there, and returns what to load them from: model.safetensors,
+// or the index of its shards. tensai audio reads its encoder out of the
+// same files before the language model loads.
+func FetchWeights(repo, dir string) (string, error) {
+	return fetchWeights("https://huggingface.co/"+repo+"/resolve/main/", dir)
 }
 
 func fetchWeights(base, dir string) (string, error) {
