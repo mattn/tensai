@@ -14,7 +14,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -118,7 +120,49 @@ func Load(path string) (*Tokenizer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return Parse(raw)
+	t, err := Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	// Some checkpoints list part of their added tokens only in the
+	// tokenizer_config.json beside it -- Qwen2-Audio's audio markers
+	// among them -- and transformers reads both, so this does too.
+	if raw, err := os.ReadFile(filepath.Join(filepath.Dir(path), "tokenizer_config.json")); err == nil {
+		t.addConfigTokens(raw)
+	}
+	return t, nil
+}
+
+// addConfigTokens adds the added_tokens_decoder entries tokenizer.json
+// left out. A config that does not parse adds nothing: the file is only
+// consulted for what it may add.
+func (t *Tokenizer) addConfigTokens(raw []byte) {
+	var cfg struct {
+		Added map[string]struct {
+			Content string `json:"content"`
+		} `json:"added_tokens_decoder"`
+	}
+	if json.Unmarshal(raw, &cfg) != nil {
+		return
+	}
+	n := len(t.specials)
+	for key, at := range cfg.Added {
+		id, err := strconv.Atoi(key)
+		if err != nil || at.Content == "" {
+			continue
+		}
+		if _, ok := t.byID[id]; ok {
+			continue
+		}
+		if _, ok := t.vocab[at.Content]; ok {
+			continue
+		}
+		t.specials = append(t.specials, special{content: at.Content, id: id})
+		t.byID[id] = at.Content
+	}
+	if len(t.specials) != n {
+		sortSpecials(t)
+	}
 }
 
 // AddedToken is a token matched verbatim in the input, the way a chat
