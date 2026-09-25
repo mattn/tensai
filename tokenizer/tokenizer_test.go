@@ -70,6 +70,37 @@ func TestSpecialTokens(t *testing.T) {
 	}
 }
 
+// Tokens listed only in tokenizer_config.json's added_tokens_decoder are
+// special as well, the way transformers reads the pair; ones tokenizer.json
+// already has, or the vocabulary does, stay as they were.
+func TestLoadAddsConfigTokens(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "tokenizer.json"), fixture(gpt2Pre, stringMerges), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `{"added_tokens_decoder": {
+		"12": {"content": "<|end|>", "special": true},
+		"15": {"content": "<|AUDIO|>", "special": true},
+		"11": {"content": "hello", "special": false}}}`
+	if err := os.WriteFile(filepath.Join(dir, "tokenizer_config.json"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := Load(filepath.Join(dir, "tokenizer.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id, ok := tok.ID("<|AUDIO|>"); !ok || id != 15 {
+		t.Fatalf("ID(<|AUDIO|>) = %d, %v", id, ok)
+	}
+	got := tok.Encode("hello<|AUDIO|><|end|>")
+	if want := []int{11, 15, 12}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("encode: got %v want %v", got, want)
+	}
+	if dec := tok.Decode(got); dec != "hello<|AUDIO|><|end|>" {
+		t.Fatalf("decode: %q", dec)
+	}
+}
+
 func TestDigitSplitting(t *testing.T) {
 	// The gpt2 pattern keeps a digit run as one pre-token, so the merges
 	// build "123"; the cl100k pattern with \p{N} isolates each digit, so

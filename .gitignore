@@ -28,3 +28,5 @@ internal/qwenimage/testdata/*.f32
 internal/qwenimage/testdata/*.i32
 internal/qwenimage/testdata/*.f64
 /out.png
+internal/qwenaudio/testdata/*.f32
+internal/qwenaudio/testdata/*.wav

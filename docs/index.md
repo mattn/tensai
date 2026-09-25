@@ -28,6 +28,7 @@ Despite its size, tensai reaches surprisingly far: the same kernels that train a
 - **SIMD acceleration** — AVX2 kernels written with Go's experimental `simd/archsimd` package; build with `GOEXPERIMENT=simd`, and every other build uses the portable fallbacks automatically
 - **WebGPU backend** — `-tags wgpu` runs batched `MatMul`, attention, and a full quantized transformer decode step on any GPU wgpu-native reaches, through `purego` with no cgo
 - **Image generation** — `tensai image` runs Qwen-Image-2.1 end to end: the prompt encoder, 32 denoising blocks and the decoder, all in pure Go
+- **Audio understanding**: `tensai audio` answers questions about a WAV file with Qwen2-Audio, Whisper's encoder in front of a Qwen2 language model, all in pure Go
 - **int8 / int4 quantization** — weight-only quantized matmuls that reach memory bandwidth, plus MXFP4 for gpt-oss
 - **Model formats** — TFLite and ONNX export, safetensors read/write, and a GGUF reader covering the K-quants — all with in-tree encoders, still no dependencies
 - **Tokenizers** — Hugging Face `tokenizer.json` byte-level BPE (GPT-2, cl100k, o200k families) and SentencePiece, verified to match the reference implementations exactly
@@ -40,6 +41,7 @@ Despite its size, tensai reaches surprisingly far: the same kernels that train a
 - [Model Formats](formats.md) — TFLite, ONNX, safetensors, GGUF
 - [LLM Inference](llm.md) — run real language models in pure Go
 - [Image Generation](images.md) — draw a prompt with Qwen-Image-2.1, also in pure Go
+- [Audio Understanding](audio.md): transcribe or ask about a sound with Qwen2-Audio
 - [Examples](examples.md) — thirteen runnable examples, from hello-world to GPT-2 in pure Go
 
 ## Design notes

@@ -35,6 +35,9 @@ type chatMessage struct {
 	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 	Name       string     `json:"name,omitempty"`
+	// Audio holds the clips a content list carried, in order; each left
+	// audioToken in Content where it stood.
+	Audio [][]byte `json:"-"`
 }
 
 // toolFunc is one function signature: the JSON Schema in Parameters is
@@ -764,6 +767,8 @@ type server struct {
 	step    func(int, int) []float32
 	reset   func()
 	vlog    io.Writer
+	audio   *audioStore // nil for a model that cannot hear
+	audioID int         // the audio placeholder's token id
 }
 
 // tokenizerIface is the slice of the tokenizer the server needs.
@@ -920,7 +925,18 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "this model's chat template has no tool-calling convention, so tools cannot be offered to it")
 		return
 	}
+	var clips [][]byte
+	for _, m := range req.Messages {
+		clips = append(clips, m.Audio...)
+	}
+	if len(clips) > 0 && s.audio == nil {
+		httpError(w, http.StatusBadRequest, "this model takes no audio")
+		return
+	}
 	prompt := render(s.tm, req.Messages, s.system, tools)
+	if s.audio != nil {
+		prompt = numberAudio(prompt)
+	}
 	// A turn continuing after a tool result was handed the reasoning
 	// marker in the prompt, so what the model writes now starts inside
 	// the block rather than in front of it.
@@ -938,6 +954,21 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.audio != nil {
+		var reset bool
+		var err error
+		if ids, reset, err = s.audio.expand(s.model, ids, clips, s.audioID); err != nil {
+			httpError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if reset {
+			s.cache.live, s.cache.ckpt = nil, nil
+		}
+		if len(ids) >= s.nCtx-1 {
+			httpError(w, http.StatusBadRequest, fmt.Sprintf("prompt of %d tokens exceeds the %d-token context", len(ids), s.nCtx))
+			return
+		}
+	}
 	// A draft model verifies against a rebuilt context, so it starts over
 	// whatever the target does.
 	if s.draft != nil {

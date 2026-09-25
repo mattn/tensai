@@ -11,6 +11,7 @@ package llm
 // Dot kernel or, with -q8, the int8 kernel.
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -68,6 +69,12 @@ type config struct {
 	// the families that put it at the top level. qwen3_5 ships a vision
 	// tower beside it, so its text weights sit under language_model.
 	Prefix string `json:"-"`
+	// Outer goes in front of every weight name, for checkpoints that nest
+	// a complete language model under one (Qwen2-Audio).
+	Outer string `json:"-"`
+	// Audio marks a checkpoint with an audio encoder beside the language
+	// model (Qwen2-Audio), whose prompts can carry encoded audio.
+	Audio bool `json:"-"`
 	// ChatStyle overrides the template family when it differs from the
 	// architecture — DeepSeek's R1 distills are qwen2/llama blocks that
 	// speak DeepSeek's turn markers. Set by the GGUF loader, never JSON.
@@ -272,10 +279,18 @@ type qwen struct {
 	// bits is the width the weights were loaded at, which the loader
 	// chose itself when asked to.
 	bits int
+	// soft holds input embeddings made outside the model (Qwen2-Audio's
+	// audio), fed at positions whose token id is Vocab plus a row.
+	soft *tensai.Matrix
 }
 
 // embedRow copies token's embedding into dst.
 func (m *qwen) embedRow(token int, dst []float32) {
+	if r := token - m.cfg.Vocab; r >= 0 && m.soft != nil && r < m.soft.Rows {
+		hs := m.cfg.HiddenSize
+		copy(dst, m.soft.Data[r*hs:(r+1)*hs])
+		return
+	}
 	if m.embedRows != nil {
 		if err := m.embedRows.row(token, dst); err != nil {
 			panic(err)
@@ -315,6 +330,16 @@ func loadConfig(path string) (config, error) {
 		}
 		c.TieEmbedding = c.TieEmbedding || tied
 		c.Prefix = "language_model."
+		if modelType == "qwen2_audio" {
+			// Qwen2-Audio wraps a whole Qwen2 checkpoint under
+			// language_model., names and all, and its text_config lists
+			// only what differs from Qwen2Config's defaults.
+			c.Prefix, c.Outer, c.Audio = "", "language_model.", true
+			c.HiddenSize = cmp.Or(c.HiddenSize, 4096)
+			c.Layers = cmp.Or(c.Layers, 32)
+			c.Heads = cmp.Or(c.Heads, 32)
+			c.KVHeads = cmp.Or(c.KVHeads, c.Heads)
+		}
 		var inner struct {
 			RopeArgs struct {
 				Theta   float64 `json:"rope_theta"`
@@ -363,6 +388,21 @@ type weightsFile interface {
 	Close() error
 }
 
+// outerNamed reads a language model nested under a prefix as if it
+// stood at the top of the file.
+type outerNamed struct {
+	weightsFile
+	prefix string
+}
+
+func (w outerNamed) Tensor(name string) (*tensai.Tensor, error) {
+	return w.weightsFile.Tensor(w.prefix + name)
+}
+
+func (w outerNamed) Raw(name string) ([]byte, []int, error) {
+	return w.weightsFile.Raw(w.prefix + name)
+}
+
 // loadQwen reads a checkpoint — a single model.safetensors or a sharded
 // one via its index.json — quantizing each weight to `bits` (0 keeps
 // float32) as it loads, so the full float32 model never has to fit in
@@ -380,6 +420,9 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 	}
 	if err != nil {
 		return nil, err
+	}
+	if cfg.Outer != "" {
+		f = outerNamed{f, cfg.Outer}
 	}
 	defer f.Close()
 

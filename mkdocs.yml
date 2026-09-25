@@ -79,6 +79,7 @@ plugins:
             Tokenizers: トークナイザ
             LLM Inference: LLM 推論
             Image Generation: 画像生成
+            Audio Understanding: 音声理解
             Examples: サンプル
 
 nav:
@@ -97,6 +98,7 @@ nav:
   - Tokenizers: tokenizers.md
   - LLM Inference: llm.md
   - Image Generation: images.md
+  - Audio Understanding: audio.md
   - Examples: examples.md
 
 extra:
