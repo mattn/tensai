@@ -695,16 +695,22 @@ func repackTernary(dst *quant.TernaryMatrix, typ string, raw []byte, out, in, co
 // embedTable reads token embeddings from the file a row at a time,
 // for a table too large to expand into float32.
 type embedTable struct {
-	f       *gguf.File
+	f       rowSource
 	name    string
 	inverse *hadamard
 }
 
+// rowSource is a checkpoint that reads a tensor a few rows at a time:
+// a gguf, or a safetensors file or set of shards.
+type rowSource interface {
+	TensorRows(name string, from, to int) (*tensai.Tensor, error)
+}
+
 // newEmbedTable reads rows from an open file, which stays open for the
-// model's life: the load's own handle is handed over rather than the
+// model's life: a gguf load hands over its own handle rather than the
 // header being parsed a second time.
-func newEmbedTable(g *gguf.File, name string) *embedTable {
-	return &embedTable{f: g, name: name}
+func newEmbedTable(src rowSource, name string) *embedTable {
+	return &embedTable{f: src, name: name}
 }
 
 // row writes one token's embedding into dst, rotated back to the
@@ -848,6 +854,7 @@ func layoutName(bits int, direct bool) string {
 }
 
 func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen, *tokenizer.Tokenizer, error) {
+	defer loadGC()()
 	g, err := gguf.Open(path)
 	if err != nil {
 		return nil, nil, err

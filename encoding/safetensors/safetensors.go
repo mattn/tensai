@@ -219,24 +219,81 @@ func (f *File) Tensor(name string) (*tensai.Tensor, error) {
 		shape = []int{1}
 	}
 	out := tensai.NewTensor(shape...)
-	switch e.Dtype {
+	widen(e.Dtype, buf, out.Data)
+	return out, nil
+}
+
+// widen converts a tensor's stored values to float32.
+func widen(dtype string, buf []byte, dst []float32) {
+	switch dtype {
 	case "F32":
-		for i := range out.Data {
-			out.Data[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[i*4:]))
+		for i := range dst {
+			dst[i] = math.Float32frombits(binary.LittleEndian.Uint32(buf[i*4:]))
 		}
 	case "F16":
-		for i := range out.Data {
-			out.Data[i] = f16to32(binary.LittleEndian.Uint16(buf[i*2:]))
+		for i := range dst {
+			dst[i] = f16to32(binary.LittleEndian.Uint16(buf[i*2:]))
 		}
 	case "BF16":
-		for i := range out.Data {
-			out.Data[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(buf[i*2:])) << 16)
+		for i := range dst {
+			dst[i] = math.Float32frombits(uint32(binary.LittleEndian.Uint16(buf[i*2:])) << 16)
 		}
 	case "F64":
-		for i := range out.Data {
-			out.Data[i] = float32(math.Float64frombits(binary.LittleEndian.Uint64(buf[i*8:])))
+		for i := range dst {
+			dst[i] = float32(math.Float64frombits(binary.LittleEndian.Uint64(buf[i*8:])))
 		}
 	}
+}
+
+// TensorRows loads rows [from, to) of a tensor's first dimension,
+// converted to float32 as Tensor converts them: an embedding table read
+// a token at a time never needs the rest of itself in memory. A to below
+// zero or past the end means through the last row.
+func (f *File) TensorRows(name string, from, to int) (*tensai.Tensor, error) {
+	e, ok := f.entries[name]
+	if !ok {
+		return nil, fmt.Errorf("safetensors: no tensor %q", name)
+	}
+	size, err := dtypeSize(e.Dtype)
+	if err != nil {
+		return nil, fmt.Errorf("%w (tensor %q)", err, name)
+	}
+	if e.Dtype == "U8" || e.Dtype == "I8" {
+		return nil, fmt.Errorf("safetensors: tensor %q is %s; use Raw (tensor %q)", name, e.Dtype, name)
+	}
+	rows, rowLen := 1, 1
+	if len(e.Shape) > 0 {
+		rows = e.Shape[0]
+		for _, d := range e.Shape[1:] {
+			rowLen *= d
+		}
+	}
+	if to < 0 || to > rows {
+		to = rows
+	}
+	if from < 0 || from > to {
+		return nil, fmt.Errorf("safetensors: tensor %q: row range [%d,%d) is not within %d rows", name, from, to, rows)
+	}
+	lo := f.dataOff + e.DataOffsets[0] + int64(from*rowLen)*size
+	n := int64((to-from)*rowLen) * size
+	var buf []byte
+	if f.data != nil {
+		if lo+n > int64(len(f.data)) {
+			return nil, fmt.Errorf("safetensors: tensor %q extends past the file", name)
+		}
+		buf = f.data[lo : lo+n]
+	} else {
+		buf = make([]byte, n)
+		if _, err := f.r.ReadAt(buf, lo); err != nil {
+			return nil, fmt.Errorf("safetensors: reading tensor %q: %w", name, err)
+		}
+	}
+	shape := []int{to - from}
+	if len(e.Shape) > 1 {
+		shape = append(shape, e.Shape[1:]...)
+	}
+	out := tensai.NewTensor(shape...)
+	widen(e.Dtype, buf, out.Data)
 	return out, nil
 }
 
@@ -446,6 +503,15 @@ func (s *Shards) Tensor(name string) (*tensai.Tensor, error) {
 		return nil, fmt.Errorf("safetensors: no tensor %q", name)
 	}
 	return f.Tensor(name)
+}
+
+// TensorRows loads rows of one tensor from its shard.
+func (s *Shards) TensorRows(name string, from, to int) (*tensai.Tensor, error) {
+	f, ok := s.byName[name]
+	if !ok {
+		return nil, fmt.Errorf("safetensors: no tensor %q", name)
+	}
+	return f.TensorRows(name, from, to)
 }
 
 // Raw returns one tensor's packed bytes from its shard.

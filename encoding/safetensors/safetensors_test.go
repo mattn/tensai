@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	tensai "github.com/mattn/tensai"
@@ -237,5 +238,53 @@ func TestHeaderErrors(t *testing.T) {
 	}
 	if _, err := f.Tensor("x"); err == nil {
 		t.Fatal("expected error for truncated tensor data")
+	}
+}
+
+// TensorRows hands back a slice of rows exactly as Tensor has them, from
+// a mapped file and from a plain reader alike.
+func TestTensorRows(t *testing.T) {
+	rng := rand.New(rand.NewPCG(2, 0))
+	x := tensai.NewTensor(7, 5)
+	for i := range x.Data {
+		x.Data[i] = float32(rng.NormFloat64())
+	}
+	path := filepath.Join(t.TempDir(), "model.safetensors")
+	if err := SaveFile(path, map[string]*tensai.Tensor{"embed": x}, nil); err != nil {
+		t.Fatal(err)
+	}
+	mapped, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mapped.Close()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := NewFile(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []*File{mapped, plain} {
+		for _, r := range [][2]int{{0, 1}, {3, 6}, {6, 7}, {2, -1}} {
+			got, err := f.TensorRows("embed", r[0], r[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			to := r[1]
+			if to < 0 {
+				to = 7
+			}
+			if want := []int{to - r[0], 5}; !reflect.DeepEqual(got.Shape, want) {
+				t.Fatalf("rows %v: shape %v, want %v", r, got.Shape, want)
+			}
+			if !reflect.DeepEqual(got.Data, x.Data[r[0]*5:to*5]) {
+				t.Errorf("rows %v differ from the tensor's", r)
+			}
+		}
+		if _, err := f.TensorRows("embed", 5, 3); err == nil {
+			t.Error("a backwards row range was accepted")
+		}
 	}
 }
