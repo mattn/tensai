@@ -558,7 +558,7 @@ func (e *Engine) thoughtFilter(w io.Writer, inReasoning bool) *thoughtFilter {
 	if e.tm.reasonOpen == "" || e.opts.Think {
 		return nil
 	}
-	return &thoughtFilter{w: w, open: e.tm.reasonOpen, close: e.tm.reasonClose, inside: inReasoning}
+	return &thoughtFilter{w: w, open: e.tm.reasonOpen, close: e.tm.reasonClose, answer: e.tm.answerOpen, inside: inReasoning}
 }
 
 // sample emits up to limit tokens to w, whatever they are: the caller
@@ -620,14 +620,28 @@ func (e *Engine) sample(w io.Writer, limit int) (int, string) {
 type thoughtFilter struct {
 	w           io.Writer
 	open, close string
+	answer      string // an answer header to drop at the very start
 	held        strings.Builder
 	inside      bool
+	started     bool // past the point where the answer header could be
 }
 
 func (f *thoughtFilter) Write(p []byte) (int, error) {
 	f.held.WriteString(string(p))
 	for {
 		text := f.held.String()
+		if !f.started && !f.inside && f.answer != "" {
+			if strings.HasPrefix(text, f.answer) {
+				f.held.Reset()
+				f.held.WriteString(text[len(f.answer):])
+				f.started = true
+				continue
+			}
+			if strings.HasPrefix(f.answer, text) {
+				return len(p), nil // it could still become the header
+			}
+		}
+		f.started = true
 		marker := f.open
 		if f.inside {
 			marker = f.close
@@ -774,10 +788,7 @@ func (e *Engine) finishToolTurn(turn string, inReasoning bool) (content, visible
 	if inReasoning {
 		turn = e.tm.reasonOpen + turn
 	}
-	reason := ""
-	if e.tm.reasonOpen != "" {
-		reason, turn = splitReasoning(turn, e.tm.reasonOpen, e.tm.reasonClose)
-	}
+	reason, turn := e.tm.split(turn)
 	content, calls = e.parseCalls(turn)
 	visible = content
 	if e.opts.Think && reason != "" {
@@ -1830,6 +1841,10 @@ type tmpl struct {
 	// What is between them is the model reasoning, not its reply, and the
 	// API keeps the two apart.
 	reasonOpen, reasonClose string
+	// answerOpen heads the answer when the model writes it without a
+	// reasoning block in front (harmony's final channel); it is dropped
+	// like the markers around the reasoning.
+	answerOpen string
 }
 
 // or is the first non-empty of two strings, for naming a setting that
@@ -1896,6 +1911,19 @@ func templateDefault(tpl, name string) string {
 // with.
 const llmjp3System = "以下は、タスクを説明する指示です。要求を適切に満たす応答を書きなさい。"
 
+// split separates a turn's reasoning from its answer, dropping the
+// markers around both.
+func (tm tmpl) split(s string) (reason, rest string) {
+	rest = s
+	if tm.reasonOpen != "" {
+		reason, rest = splitReasoning(s, tm.reasonOpen, tm.reasonClose)
+	}
+	if tm.answerOpen != "" {
+		rest = strings.TrimSpace(strings.TrimPrefix(rest, tm.answerOpen))
+	}
+	return reason, rest
+}
+
 func templateFor(modelType string, think bool) tmpl {
 	if modelType == "llm-jp-3" {
 		// "### 指示:" and "### 応答:" are plain text; a finished answer
@@ -1910,11 +1938,17 @@ func templateFor(modelType string, think bool) tmpl {
 		// The harmony format: role blocks between <|start|> and <|end|>,
 		// the assistant answering in channels (analysis for reasoning,
 		// final for the reply) and finishing with <|return|>.
+		// The analysis channel is the reasoning, kept apart from the
+		// answer like a <think> block; its closing marker runs on
+		// through the final channel's header to the answer itself.
 		return tmpl{
 			sysOpen: "<|start|>system<|message|>", sysClose: "<|end|>",
 			userOpen: "<|start|>user<|message|>", userClose: "<|end|>",
 			asstOpen: "<|start|>assistant", asstClose: "<|return|>",
-			stops: []string{"<|return|>"},
+			stops:       []string{"<|return|>"},
+			reasonOpen:  "<|channel|>analysis<|message|>",
+			reasonClose: "<|end|><|start|>assistant<|channel|>final<|message|>",
+			answerOpen:  "<|channel|>final<|message|>",
 		}
 	}
 	if modelType == "mistral" {

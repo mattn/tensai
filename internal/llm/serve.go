@@ -364,10 +364,7 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 			// The model's own template drops reasoning from history, so a
 			// client that echoes a whole turn back does not get to teach
 			// it that thinking belongs in the answer.
-			text := m.Content
-			if tm.reasonOpen != "" {
-				_, text = splitReasoning(text, tm.reasonOpen, tm.reasonClose)
-			}
+			_, text := tm.split(m.Content)
 			b.WriteString(tm.asstOpen)
 			if i > lastQuery {
 				b.WriteString(tm.asstPrefill)
@@ -1099,6 +1096,10 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if inReasoning {
 		reasonState = 1
 	}
+	// An answer the model heads with the final channel, no reasoning in
+	// front, loses the header the way a reasoned one loses it with the
+	// closing marker.
+	headerSeen := s.tm.answerOpen == "" || inReasoning
 	emit := func(piece string, final bool) {
 		if s.tm.reasonOpen == "" || reasonState == 2 {
 			answer(piece, final)
@@ -1107,6 +1108,20 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		reasonHeld.WriteString(piece)
 		for {
 			text := reasonHeld.String()
+			if !headerSeen && reasonState == 0 {
+				if strings.HasPrefix(text, s.tm.answerOpen) {
+					reasonHeld.Reset()
+					reasonHeld.WriteString(text[len(s.tm.answerOpen):])
+					headerSeen, reasonState = true, 2
+					answer(reasonHeld.String(), final)
+					reasonHeld.Reset()
+					return
+				}
+				if strings.HasPrefix(s.tm.answerOpen, text) && !final {
+					return
+				}
+				headerSeen = true
+			}
 			marker := s.tm.reasonOpen
 			if reasonState == 1 {
 				marker = s.tm.reasonClose
@@ -1277,10 +1292,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// way one the model opened itself does.
 		content = s.tm.reasonOpen + content
 	}
-	reasoning := ""
-	if s.tm.reasonOpen != "" {
-		reasoning, content = splitReasoning(content, s.tm.reasonOpen, s.tm.reasonClose)
-	}
+	reasoning, content := s.tm.split(content)
 	var calls []toolCall
 	if len(tools) > 0 {
 		if s.tm.toolCalls == "gemma4" {

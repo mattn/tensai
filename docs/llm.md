@@ -369,7 +369,9 @@ With `-think`, a model that reasons before it answers keeps the two apart on the
 }
 ```
 
-Without `-think` the qwen3 and smollm3 families open the turn with an empty block, so there is nothing to separate. gpt-oss reasons in harmony channels instead, which this does not cover.
+Without `-think` the qwen3 and smollm3 families open the turn with an empty block, so there is nothing to separate. The harmony family (gpt-oss, LLM-jp-4) always reasons first, in its analysis channel, so that channel is the reasoning and the final channel the answer: `run` and `chat` print the answer alone unless `-think` asks for the turn as written, markers and all, and `serve` returns the analysis as `reasoning_content`.
+
+A checkpoint loaded from safetensors leaves its embedding table in the file and reads a row per token, as a gguf load does. Held as float32 the table costs vocabulary x hidden x 4 bytes, which for LLM-jp-4's 196608 words is 3.2GB of a 16GB machine; an lm head whose staging copies would outgrow the loader's budget is quantized on its own before the layers, and the collector runs harder while a load is in progress, so the 8B model peaks at about 10GB rather than 14 and decodes without paging.
 
 ### Tool calling
 
