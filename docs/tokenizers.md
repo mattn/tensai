@@ -1,6 +1,6 @@
 # Tokenizers
 
-The `tokenizer` package loads Hugging Face `tokenizer.json` files and implements the byte-level BPE family, plus SentencePiece built from GGUF vocabularies.
+The `tokenizer` package loads Hugging Face `tokenizer.json` files and implements the byte-level BPE family and the SentencePiece Unigram model, plus SentencePiece built from GGUF vocabularies.
 
 ```go
 import "github.com/mattn/tensai/tokenizer"
@@ -24,6 +24,10 @@ Anything else is rejected rather than silently mis-tokenized. Special tokens are
 ## SentencePiece
 
 `NewSPM` builds a SentencePiece tokenizer from a GGUF vocabulary — the Gemma and Llama-2-era models.
+
+## Unigram
+
+A `tokenizer.json` whose model is `Unigram` (LLM-jp's) keeps a log probability per piece, and a text splits into the pieces whose scores sum highest: a Viterbi search over every split, which gives different tokens from merging the best-scoring pair greedily on the same vocabulary. A character no piece covers costs the lowest score less ten, as in sentencepiece and `tokenizers`, and comes out as its UTF-8 byte tokens. The normalizer understood is the one this family ships, a U+2581 in front of every segment between special tokens and in place of every space; any other is refused. Decoding takes that leading space back off at the start and after a special token, the way LLM-jp's own tokenizer does, and `DecodeNext` decodes a stream of single tokens to the same text.
 
 ## Verification
 

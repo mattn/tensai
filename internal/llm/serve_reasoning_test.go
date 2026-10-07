@@ -12,7 +12,8 @@ import (
 // piece i, and the last id is the end-of-turn the server stops on.
 type scriptedTok struct{ pieces []string }
 
-func (t scriptedTok) Encode(s string) []int { return []int{0} }
+func (t scriptedTok) Encode(s string) []int          { return []int{0} }
+func (t scriptedTok) DecodeNext(prev, id int) string { return t.Decode([]int{id}) }
 func (t scriptedTok) Decode(ids []int) string {
 	var b strings.Builder
 	for _, id := range ids {

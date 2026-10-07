@@ -771,8 +771,18 @@ type server struct {
 	audioID int         // the audio placeholder's token id
 }
 
+// decodeNext renders the last of the generated ids for the stream.
+func decodeNext(tok tokenizerIface, out []int) string {
+	prev := -1
+	if len(out) > 1 {
+		prev = out[len(out)-2]
+	}
+	return tok.DecodeNext(prev, out[len(out)-1])
+}
+
 // tokenizerIface is the slice of the tokenizer the server needs.
 type tokenizerIface interface {
+	DecodeNext(prev, id int) string
 	Encode(string) []int
 	Decode([]int) string
 }
@@ -1222,7 +1232,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			out = append(out, next)
 			if flush != nil {
-				push(s.tok.Decode([]int{next}), false)
+				push(decodeNext(s.tok, out), false)
 			}
 			return true
 		}
@@ -1251,7 +1261,7 @@ func (s *server) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			out = append(out, next)
 			ps.push([]int{next}, true)
 			if flush != nil {
-				push(s.tok.Decode([]int{next}), false)
+				push(decodeNext(s.tok, out), false)
 			}
 			logits = s.step(next, steps)
 			steps++

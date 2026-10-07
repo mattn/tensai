@@ -1,6 +1,6 @@
 # トークナイザ
 
-`tokenizer` パッケージは Hugging Face の `tokenizer.json` を読み込み、バイトレベル BPE 系を実装します。GGUF の語彙から組み立てる SentencePiece もあります。
+`tokenizer` パッケージは Hugging Face の `tokenizer.json` を読み込み、バイトレベル BPE 系と SentencePiece の Unigram モデルを実装します。GGUF の語彙から組み立てる SentencePiece もあります。
 
 ```go
 import "github.com/mattn/tensai/tokenizer"
@@ -24,6 +24,10 @@ GPT-2、Llama 3、Qwen が使う形のバイトレベル BPE です。これら�
 ## SentencePiece
 
 `NewSPM` は GGUF の語彙から SentencePiece トークナイザを組み立てます — Gemma や Llama-2 世代のモデル用です。
+
+## Unigram
+
+モデルが `Unigram` の `tokenizer.json` (LLM-jp のもの) は、語彙ごとに対数確率を持ちます。テキストは、スコアの合計が最大になる分割で区切ります。全分割を対象にしたビタビ探索で、同じ語彙でもスコアの高いペアを貪欲に結合する方式とは結果が変わります。どの語彙にも含まれない文字は、sentencepiece や `tokenizers` と同じく最低スコアから 10 引いたコストで扱い、UTF-8 のバイトトークンとして出します。理解する正規化はこの系統のものだけで、特殊トークンで区切った各区間の先頭と空白を U+2581 にします。それ以外は拒否します。デコードでは、先頭と特殊トークンの直後に付いた空白を、LLM-jp 自身のトークナイザと同じく落とします。`DecodeNext` は、1 トークンずつのストリームを全体と同じ文字列にデコードします。
 
 ## 検証
 
