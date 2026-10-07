@@ -17,6 +17,7 @@ import (
 	"math"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 
@@ -408,6 +409,7 @@ func (w outerNamed) Raw(name string) ([]byte, []int, error) {
 // float32) as it loads, so the full float32 model never has to fit in
 // memory at once.
 func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
+	defer loadGC()()
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		return nil, err
@@ -568,10 +570,25 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 		headSz = cfg.HeadDim
 	}
 	m := &qwen{cfg: cfg, headSz: headSz}
-	m.embed, err = f.Tensor("model." + cfg.Prefix + "embed_tokens.weight")
+	// The embedding table stays in the file and every token reads its own
+	// row, as a gguf load does: held as float32 it is vocabulary x hidden
+	// x 4 bytes, 3.2GB for LLM-jp-4's 196608 words, of which a step needs
+	// one row. A second handle serves the rows, since the load's own
+	// closes when the weights are in.
+	embedName := "model." + cfg.Prefix + "embed_tokens.weight"
+	var rows rowSource
+	if strings.HasSuffix(weightsPath, ".index.json") {
+		rows, err = safetensors.OpenSharded(weightsPath)
+	} else {
+		rows, err = safetensors.Open(weightsPath)
+	}
 	if err != nil {
 		return nil, err
 	}
+	if _, err := rows.TensorRows(cfg.Outer+embedName, 0, 1); err != nil {
+		return nil, err
+	}
+	m.embedRows = newEmbedTable(rows, cfg.Outer+embedName)
 	m.normW = normVec("model." + cfg.Prefix + "norm.weight")
 	m.blocks = make([]qblock, cfg.Layers)
 	// Layers load concurrently: reads are ReadAt against one descriptor
@@ -582,15 +599,26 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 	sem := make(chan struct{}, min(runtime.NumCPU(), 8))
 	stage := layerStage(cfg, m.headSz)
 	// The lm head — the largest single tensor — transposes and quantizes
-	// alongside the layers (its own column loop is parallel too).
+	// alongside the layers (its own column loop is parallel too). One
+	// whose staging is more than the gate holds goes first and alone
+	// instead: the gate counts it as the whole budget, so beside the
+	// layers it took LLM-jp-4's 196608-word head (a float32 copy and its
+	// transpose, 6.4GB) on top of everything else, 12.7GB in all.
+	lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
+	alone := lmStage > loadGate.total
 	wg.Add(1)
-	go func() {
+	lmHead := func() {
 		defer wg.Done()
-		lmStage := 3 * 4 * int64(cfg.Vocab) * int64(cfg.HiddenSize)
 		got := loadGate.acquire(lmStage)
 		defer loadGate.release(got)
 		if cfg.TieEmbedding {
-			em, err := m.embed.Matrix()
+			// The tied head is the table transposed; it is read whole
+			// here and dropped once quantized.
+			t, err := f.Tensor(embedName)
+			if err != nil {
+				panic(err)
+			}
+			em, err := t.Matrix()
 			if err != nil {
 				panic(err)
 			}
@@ -603,7 +631,13 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 		} else {
 			m.lmT, m.qLmT = linq("lm_head.weight")
 		}
-	}()
+	}
+	if alone {
+		lmHead()
+		runtime.GC()
+	} else {
+		go lmHead()
+	}
 	for i := range m.blocks {
 		wg.Add(1)
 		go func(i int) {
@@ -720,6 +754,17 @@ func (g *memGate) release(n int64) {
 // loadGate is shared by both loaders; 2GB of in-flight staging keeps a
 // 16-core load fast for small models and a 7B load bounded.
 var loadGate = newMemGate(2 << 30)
+
+// loadGC collects harder while a load runs and returns what restores
+// the setting. The gate bounds the staging copies alive at once, but a
+// copy is only given back when the collector runs, and at the default
+// GOGC=100 the heap grows to twice what is live -- with a 7B model's
+// quantized weights accumulating, that peaked at 14GB of a 16GB machine
+// for a model that keeps 7.
+func loadGC() func() {
+	prev := debug.SetGCPercent(25)
+	return func() { debug.SetGCPercent(prev) }
+}
 
 // layerStage estimates one layer's peak float32 staging: the largest
 // fused matrix (sources, transposes, and the concatenated copy overlap,
