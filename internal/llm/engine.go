@@ -321,6 +321,11 @@ func Open(o Options) (*Engine, error) {
 	if model.cfg.ChatStyle == "" && strings.Contains(model.cfg.ChatTemplate, "<|start|>system<|message|>") {
 		model.cfg.ChatStyle = "gpt-oss"
 	}
+	// LLM-jp-3's instruction models are Llamas too, prompted Alpaca-style
+	// in Japanese.
+	if model.cfg.ChatStyle == "" && strings.Contains(model.cfg.ChatTemplate, "### 指示:") {
+		model.cfg.ChatStyle = "llm-jp-3"
+	}
 	style := model.cfg.ChatStyle
 	if style == "" {
 		style = model.cfg.ModelType
@@ -336,6 +341,10 @@ func Open(o Options) (*Engine, error) {
 			system = "You are a helpful assistant."
 		case style == "gpt-oss":
 			system = harmonySystem(model.cfg.ChatTemplate, time.Now())
+		case style == "llm-jp-3":
+			// The template writes this sentence for any system message,
+			// whatever it says.
+			system = llmjp3System
 		case style == "deepseek":
 			// DeepSeek recommends no system prompt for the R1 distills.
 			system = ""
@@ -1125,6 +1134,14 @@ func (e *Engine) run(w io.Writer, text string, ids []int, n int) RunResult {
 
 // Chat runs an interactive multi-turn loop: one line of in per turn, the
 // KV cache carrying the conversation, until EOF or an empty line.
+// last is the token the context ends in, -1 when it is empty.
+func (e *Engine) last() int {
+	if len(e.context) == 0 {
+		return -1
+	}
+	return e.context[len(e.context)-1]
+}
+
 func (e *Engine) Chat(in io.Reader, w io.Writer, n int) {
 	pre := e.tm.bos + e.systemTurn()
 	if pre != "" {
@@ -1143,9 +1160,11 @@ func (e *Engine) Chat(in io.Reader, w io.Writer, n int) {
 			text = e.system + "\n\n" + text
 		}
 		first = false
-		e.feed(e.tok.Encode(e.tm.userOpen + text + e.tm.userClose + e.tm.asstOpen + e.tm.asstPrefill))
+		e.feed(e.tok.EncodeAfter(e.last(), e.tm.userOpen+text+e.tm.userClose+e.tm.asstOpen+e.tm.asstPrefill))
 		e.generate(w, n)
-		e.feed(e.tok.Encode("\n"))
+		if !e.tm.bareTurns {
+			e.feed(e.tok.EncodeAfter(e.last(), "\n"))
+		}
 		if e.steps >= e.nCtx-64 {
 			fmt.Fprintln(e.opts.Log, "context window exhausted")
 			break
@@ -1796,7 +1815,10 @@ type tmpl struct {
 	// not to every turn in the history.
 	asstPrefill string
 	foldSystem  bool
-	stops       []string
+	// bareTurns says nothing separates a finished answer from the next
+	// turn; the rest put a newline after the end marker, as ChatML does.
+	bareTurns bool
+	stops     []string
 	// toolCalls names the function-calling convention the family was
 	// trained on, empty when it has none. "hermes" is the one the ChatML
 	// families speak: tool signatures inside a <tools> block appended to
@@ -1870,7 +1892,20 @@ func templateDefault(tpl, name string) string {
 	return m[1]
 }
 
+// llmjp3System is the instruction preamble LLM-jp-3's template opens
+// with.
+const llmjp3System = "以下は、タスクを説明する指示です。要求を適切に満たす応答を書きなさい。"
+
 func templateFor(modelType string, think bool) tmpl {
+	if modelType == "llm-jp-3" {
+		// "### 指示:" and "### 応答:" are plain text; a finished answer
+		// ends with the end-of-sequence token.
+		return tmpl{
+			bos:      "<s>",
+			userOpen: "\n\n### 指示:\n", asstOpen: "\n\n### 応答:\n", asstClose: "</s>",
+			stops: []string{"</s>"}, bareTurns: true,
+		}
+	}
 	if modelType == "gpt-oss" {
 		// The harmony format: role blocks between <|start|> and <|end|>,
 		// the assistant answering in channels (analysis for reasoning,

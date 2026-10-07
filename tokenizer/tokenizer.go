@@ -445,7 +445,7 @@ func (t *Tokenizer) Encode(s string) []int {
 
 func (t *Tokenizer) encodeText(s string) []int {
 	if t.unigram {
-		return t.unigramEncode(s)
+		return t.unigramEncode(s, true)
 	}
 	if t.spmBPE {
 		return t.spmBPEEncode(s)
@@ -483,6 +483,28 @@ func (t *Tokenizer) Decode(ids []int) string {
 		}
 	}
 	return string(bs)
+}
+
+// EncodeAfter is Encode for text that continues a sequence ending in
+// prev, -1 for none: what a chat feeds turn by turn should come out as
+// the tokens of the whole conversation encoded at once. Only a Unigram
+// tokenizer needs the context, since its normalizer marks the start of
+// every segment and text after an ordinary token is no segment start.
+func (t *Tokenizer) EncodeAfter(prev int, s string) []int {
+	if !t.unigram || s == "" {
+		return t.Encode(s)
+	}
+	if _, special := t.byID[prev]; prev < 0 || special {
+		return t.Encode(s)
+	}
+	// Up to the first added token the text continues the sequence.
+	cut := len(s)
+	for _, sp := range t.specials {
+		if i := strings.Index(s, sp.content); i >= 0 && i < cut {
+			cut = i
+		}
+	}
+	return append(t.unigramEncode(s[:cut], false), t.Encode(s[cut:])...)
 }
 
 // DecodeNext renders one generated token given the one before it, -1
