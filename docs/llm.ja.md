@@ -32,7 +32,7 @@ greedy の続きは GPT-2 のよく知られたリファレンス出力とトー
 1 トークンあたり約 10 ミリ秒 — 同規模の qwen3 が 4 ミリ秒なので、システムプロンプトが
 数千トークンあると待たされます。アーキテクチャが許すチャンク化を実装すれば大半は
 縮みますが、まだ入っていません。
-| llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | みんながフォークしたブロック |
+| llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama, LLM-jp-4 | みんながフォークしたブロック。LLM-jp-4 は Unigram トークナイザと harmony のチャット形式を持ち、形式は同梱のテンプレートから判定する |
 | smollm3 | SmolLM3-3B | 4 層ごとに RoPE をスキップ |
 | gemma3 | Gemma 3 | 5/6 層のスライディングウィンドウ、サンドイッチ norm、gelu-tanh ゲート、SentencePiece |
 | gemma4 | Gemma 4 E2B/E4B/12b | トークンごとにディスクから読む per-layer embedding、2 種類のヘッド幅、深い層は前の層の KV キャッシュに attend、logits は tanh でキャップ |

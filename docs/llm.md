@@ -33,7 +33,7 @@ prefilling one. Roughly ten milliseconds a token on an AVX2 machine for the
 0.8B, against four for a qwen3 of the same size — enough that a couple of
 thousand tokens of system prompt is a wait. The chunked formulation the
 architecture allows would close most of that and is not implemented yet.
-| llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama | the block everyone forked |
+| llama | Llama 2/3, SmolLM2, Mistral, R1-Distill-Llama, LLM-jp-4 | the block everyone forked; LLM-jp-4 brings a Unigram tokenizer and the harmony chat format, which its own template gives away |
 | smollm3 | SmolLM3-3B | RoPE skipped every fourth layer |
 | gemma3 | Gemma 3 | sliding windows on 5/6 layers, sandwich norms, gelu-tanh gate, SentencePiece |
 | gemma4 | Gemma 4 E2B/E4B/12b | per-layer embeddings read from disk a token at a time, two head widths, the deeper layers attending against an earlier layer's cache, logits through a tanh cap |

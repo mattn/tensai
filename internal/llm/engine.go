@@ -18,6 +18,7 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -314,6 +315,12 @@ func Open(o Options) (*Engine, error) {
 			draftM.cfg.Layers, draftM.cfg.HiddenSize, time.Since(start).Round(time.Millisecond))
 	}
 
+	// A checkpoint of another architecture trained on the harmony format
+	// -- LLM-jp-4 is a Llama -- speaks gpt-oss's markers, which only its
+	// own template says.
+	if model.cfg.ChatStyle == "" && strings.Contains(model.cfg.ChatTemplate, "<|start|>system<|message|>") {
+		model.cfg.ChatStyle = "gpt-oss"
+	}
 	style := model.cfg.ChatStyle
 	if style == "" {
 		style = model.cfg.ModelType
@@ -328,9 +335,7 @@ func Open(o Options) (*Engine, error) {
 			// the Qwen identity.
 			system = "You are a helpful assistant."
 		case style == "gpt-oss":
-			// The harmony system block: identity, reasoning effort, and
-			// the channel contract the model was trained on.
-			system = "You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\n\nReasoning: low\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message."
+			system = harmonySystem(model.cfg.ChatTemplate, time.Now())
 		case style == "deepseek":
 			// DeepSeek recommends no system prompt for the R1 distills.
 			system = ""
@@ -552,6 +557,7 @@ func (e *Engine) thoughtFilter(w io.Writer, inReasoning bool) *thoughtFilter {
 func (e *Engine) sample(w io.Writer, limit int) (int, string) {
 	start := time.Now()
 	gen := 0
+	prev := -1 // the last token shown, which a Unigram decode reads
 	if e.draft != nil {
 		var stats specStats
 		var finish string
@@ -559,7 +565,8 @@ func (e *Engine) sample(w io.Writer, limit int) (int, string) {
 			limit, e.nCtx, e.opts.SpecK, e.opts.Temp, e.opts.TopP, func(id int) bool {
 				return id == e.imEnd || id == e.eot
 			}, e.rng, func(id int) bool {
-				fmt.Fprint(w, e.tok.Decode([]int{id}))
+				fmt.Fprint(w, e.tok.DecodeNext(prev, id))
+				prev = id
 				gen++
 				return true
 			})
@@ -584,7 +591,8 @@ func (e *Engine) sample(w io.Writer, limit int) (int, string) {
 			finish = "stop"
 			break
 		}
-		fmt.Fprint(w, e.tok.Decode([]int{next}))
+		fmt.Fprint(w, e.tok.DecodeNext(prev, next))
+		prev = next
 		e.feed([]int{next})
 		pen.push([]int{next}, true)
 	}
@@ -1829,6 +1837,37 @@ func (e *Engine) systemTurn() string {
 		return ""
 	}
 	return e.tm.sysOpen + e.system + e.tm.sysClose
+}
+
+// harmonySystem is the harmony system block: identity, knowledge
+// cutoff, reasoning effort, and the channel contract the model was
+// trained on. gpt-oss gets the block tensai has always sent it; a model
+// whose template names an identity of its own gets that identity, its
+// cutoff, and the current date its template writes.
+func harmonySystem(tpl string, now time.Time) string {
+	const tail = "Reasoning: low\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message."
+	identity := templateDefault(tpl, "model_identity")
+	if identity == "" || strings.Contains(identity, "OpenAI") {
+		return "You are ChatGPT, a large language model trained by OpenAI.\nKnowledge cutoff: 2024-06\n\n" + tail
+	}
+	block := identity + "\n"
+	if cutoff := templateDefault(tpl, "knowledge_cutoff"); cutoff != "" {
+		block += "Knowledge cutoff: " + cutoff + "\n"
+	}
+	if strings.Contains(tpl, "conversation_start_date") {
+		block += "Current date: " + now.Format("2006-01-02") + "\n"
+	}
+	return block + "\n" + tail
+}
+
+// templateDefault reads the default a Jinja chat template assigns a
+// variable it lets the caller override: {%- set name = "value" %}.
+func templateDefault(tpl, name string) string {
+	m := regexp.MustCompile(`set ` + name + ` = "([^"]*)"`).FindStringSubmatch(tpl)
+	if m == nil {
+		return ""
+	}
+	return m[1]
 }
 
 func templateFor(modelType string, think bool) tmpl {

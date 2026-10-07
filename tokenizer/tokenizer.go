@@ -40,9 +40,15 @@ type Tokenizer struct {
 	byteID      [256]int
 	unkID       int
 	spacePrefix bool
-	byteEnc     [256]rune
-	byteDec     map[rune]byte
-	cache       map[string][]int
+	// unigram selects the Viterbi search over scored pieces (see
+	// unigram.go); fallback spells uncovered characters as byte tokens.
+	unigram  bool
+	fallback bool
+	maxPiece int     // longest piece in bytes, the search's reach
+	unkScore float64 // what an uncovered character costs
+	byteEnc  [256]rune
+	byteDec  map[rune]byte
+	cache    map[string][]int
 }
 
 // splitConfig selects between the two pre-tokenization scanners.
@@ -99,8 +105,12 @@ type jsonFile struct {
 	PreTokenizer json.RawMessage `json:"pre_tokenizer"`
 	Model        struct {
 		Type   string          `json:"type"`
-		Vocab  map[string]int  `json:"vocab"`
+		Vocab  json.RawMessage `json:"vocab"`
 		Merges json.RawMessage `json:"merges"`
+		// Unigram's: the unknown piece and whether characters no
+		// piece covers fall back to byte tokens.
+		UnkID        *int `json:"unk_id"`
+		ByteFallback bool `json:"byte_fallback"`
 	} `json:"model"`
 }
 
@@ -195,6 +205,10 @@ func Parse(raw []byte) (*Tokenizer, error) {
 	if err := json.Unmarshal(raw, &f); err != nil {
 		return nil, fmt.Errorf("tokenizer: parsing json: %w", err)
 	}
+	// A Unigram model brings its own normalizer, checked there.
+	if f.Model.Type == "Unigram" {
+		return parseUnigram(&f, f.Model.Vocab)
+	}
 	// An NFC normalizer passes through: virtually all real-world text is
 	// already NFC, and canonical composition tables are not worth a
 	// dependency. Callers with decomposed input can pre-normalize it.
@@ -209,7 +223,11 @@ func Parse(raw []byte) (*Tokenizer, error) {
 	if f.Model.Type != "" && f.Model.Type != "BPE" {
 		return nil, fmt.Errorf("tokenizer: unsupported model type %q", f.Model.Type)
 	}
-	t, err := newBPE(f.Model.Vocab, f.PreTokenizer)
+	var vocab map[string]int
+	if err := json.Unmarshal(f.Model.Vocab, &vocab); err != nil {
+		return nil, fmt.Errorf("tokenizer: parsing vocab: %w", err)
+	}
+	t, err := newBPE(vocab, f.PreTokenizer)
 	if err != nil {
 		return nil, err
 	}
@@ -426,6 +444,9 @@ func (t *Tokenizer) Encode(s string) []int {
 }
 
 func (t *Tokenizer) encodeText(s string) []int {
+	if t.unigram {
+		return t.unigramEncode(s)
+	}
 	if t.spmBPE {
 		return t.spmBPEEncode(s)
 	}
@@ -445,6 +466,9 @@ func (t *Tokenizer) encodeText(s string) []int {
 
 // Decode turns token ids back into text.
 func (t *Tokenizer) Decode(ids []int) string {
+	if t.unigram {
+		return t.unigramDecode(ids, true)
+	}
 	if t.spm {
 		return t.spmDecode(ids)
 	}
@@ -459,6 +483,19 @@ func (t *Tokenizer) Decode(ids []int) string {
 		}
 	}
 	return string(bs)
+}
+
+// DecodeNext renders one generated token given the one before it, -1
+// for the first, so that a stream of single tokens concatenates to what
+// Decode makes of the whole run. Only a Unigram tokenizer needs the
+// context: the space its normalizer put at the head of a segment comes
+// off after an added token, not in the middle of the text.
+func (t *Tokenizer) DecodeNext(prev, id int) string {
+	if !t.unigram {
+		return t.Decode([]int{id})
+	}
+	_, special := t.byID[prev]
+	return t.unigramDecode([]int{id}, prev < 0 || special)
 }
 
 // bpe merges one pre-token's stand-in characters by rank.
