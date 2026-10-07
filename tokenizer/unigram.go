@@ -139,11 +139,14 @@ func checkUnigramNormalizer(norm, pre json.RawMessage) error {
 
 // unigramEncode normalizes one text segment (the stretch between two
 // added tokens) and finds its highest-scoring split.
-func (t *Tokenizer) unigramEncode(s string) []int {
+func (t *Tokenizer) unigramEncode(s string, segStart bool) []int {
 	if s == "" {
 		return nil
 	}
-	s = "▁" + strings.ReplaceAll(s, " ", "▁")
+	s = strings.ReplaceAll(s, " ", "▁")
+	if segStart {
+		s = "▁" + s
+	}
 	n := len(s)
 	// best[i] is the highest score of any split of s[:i]; from[i] the
 	// start of its last piece and id[i] that piece, -1 for a character

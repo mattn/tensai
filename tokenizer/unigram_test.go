@@ -96,3 +96,33 @@ func TestUnigramRefusesOtherNormalizers(t *testing.T) {
 		t.Error("a normalizer the tokenizer does not implement was accepted")
 	}
 }
+
+// A sequence fed in pieces, each encoded after the token the last one
+// ended in, comes out as the whole encoded at once.
+func TestUnigramEncodeAfter(t *testing.T) {
+	tok, err := Parse(unigramFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The pieces break where the whole would break anyway: no piece
+	// spans them, so only the U+2581 a segment start adds can differ.
+	for _, parts := range [][]string{
+		{"a", " b"},
+		{"<|start|>a", "<|message|>b"},
+		{"c", "<|message|>a", " b"},
+	} {
+		var whole string
+		var fed []int
+		for _, p := range parts {
+			whole += p
+			prev := -1
+			if len(fed) > 0 {
+				prev = fed[len(fed)-1]
+			}
+			fed = append(fed, tok.EncodeAfter(prev, p)...)
+		}
+		if want := tok.Encode(whole); !reflect.DeepEqual(fed, want) {
+			t.Errorf("%q fed in pieces = %v, whole = %v", parts, fed, want)
+		}
+	}
+}
