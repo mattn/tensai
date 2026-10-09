@@ -764,8 +764,9 @@ type server struct {
 	step    func(int, int) []float32
 	reset   func()
 	vlog    io.Writer
-	audio   *audioStore // nil for a model that cannot hear
-	audioID int         // the audio placeholder's token id
+	audio   *audioStore  // nil for a model that cannot hear
+	audioID int          // the audio placeholder's token id
+	embed   *EmbedServer // nil without an embedding model
 }
 
 // decodeNext renders the last of the generated ids for the stream.
@@ -812,25 +813,34 @@ var webUI []byte
 
 func (s *server) listen(addr string) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", s.auth(s.chatCompletions))
-	mux.HandleFunc("/v1/systemone", s.auth(s.systemOne))
-	mux.HandleFunc("/v1/models", s.auth(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, map[string]any{
-			"object": "list",
-			"data": []map[string]any{{
-				"id": "tensai", "object": "model", "owned_by": "tensai",
-			}},
+	var routes, models []string
+	if s.engine != nil {
+		mux.HandleFunc("/v1/chat/completions", s.auth(s.chatCompletions))
+		mux.HandleFunc("/v1/systemone", s.auth(s.systemOne))
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/" {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(webUI)
 		})
-	}))
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
+		routes = append(routes, "/v1/chat/completions", "/v1/systemone")
+		models = append(models, "tensai")
+	}
+	if s.embed != nil {
+		mux.HandleFunc("/v1/embeddings", s.auth(s.embeddings))
+		routes = append(routes, "/v1/embeddings")
+		models = append(models, s.embed.Name)
+	}
+	mux.HandleFunc("/v1/models", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		data := make([]map[string]any, len(models))
+		for i, id := range models {
+			data[i] = map[string]any{"id": id, "object": "model", "owned_by": "tensai"}
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Write(webUI)
-	})
-	fmt.Printf("listening on %s (POST /v1/chat/completions, /v1/systemone)\n", addr)
+		writeJSON(w, map[string]any{"object": "list", "data": data})
+	}))
+	fmt.Printf("listening on %s (POST %s)\n", addr, strings.Join(routes, ", "))
 	return http.ListenAndServe(addr, mux)
 }
 

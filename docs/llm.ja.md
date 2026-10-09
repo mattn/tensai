@@ -117,7 +117,8 @@ usage: tensai <command> [flags]
 commands:
   run      generate a completion for a prompt
   chat     interactive multi-turn chat on stdin
-  serve    OpenAI-compatible /v1/chat/completions server
+  serve    OpenAI-compatible /v1/chat/completions and /v1/embeddings server
+  embed    turn texts into vectors with an embedding model
   bench    compare CPU and GPU prefill and decode speed
   models   list cached models; "models rm <name>" deletes one
   version  print the version
@@ -324,7 +325,7 @@ qwen2.5-0.5b-instruct-q8_0.gguf             531MB  gguf      tools       2026-08
 チェックポイントも、実際に扱われるとおりに並びます。読み取りコストは `.gguf`
 1 つあたり約 80ms のメタデータ解析で、ディレクトリはタダです。
 
-`serve` は `/v1/chat/completions` (messages 配列、SSE ストリーミング、使用量カウント) を公開するので、OpenAI クライアントを向ければ何でも純 Go のモデルとチャットできます。`ask -batch` の型つき質問を HTTP で受ける `/v1/systemone` もあります。組み込みのチャットデモページが `GET /` で提供されます。
+`serve` は `/v1/chat/completions` (messages 配列、SSE ストリーミング、使用量カウント) を公開するので、OpenAI クライアントを向ければ何でも純 Go のモデルとチャットできます。`ask -batch` の型つき質問を HTTP で受ける `/v1/systemone` もあります。組み込みのチャットデモページが `GET /` で提供されます。`-embed` で埋め込みモデルを指定すると、チャットモデルと並べて `/v1/embeddings` も提供します。詳しくは[テキスト埋め込み](embeddings.md)を参照してください。
 
 ### 思考の分離
 

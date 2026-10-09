@@ -18,10 +18,12 @@ import (
 // refused, and Think whether -think leaves the model a block to reason
 // in. Both follow the loader exactly, family fallback included, so a
 // checkpoint whose template is not on disk gets the same answer here as
-// it would get there.
+// it would get there. Embed marks a model that answers /v1/embeddings
+// instead of generating, which has neither.
 type Caps struct {
 	Tools bool
 	Think bool
+	Embed bool
 }
 
 // Inspect reads the capabilities of a cached model: a directory holding
@@ -56,6 +58,9 @@ func Inspect(path string) Caps {
 		}
 		defer g.Close()
 		style, _ = g.String("general.architecture")
+		if style == "modern-bert" {
+			return Caps{Embed: true}
+		}
 		tpl, _ = g.String("tokenizer.chat_template")
 		// The same turn markers the loader reads the style from.
 		if strings.Contains(tpl, "<｜User｜>") {
@@ -81,6 +86,9 @@ func Inspect(path string) Caps {
 // rather than tabulating a column of yes and no.
 func (c Caps) String() string {
 	var have []string
+	if c.Embed {
+		have = append(have, "embed")
+	}
 	if c.Tools {
 		have = append(have, "tools")
 	}

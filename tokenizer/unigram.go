@@ -21,9 +21,9 @@ import (
 const unigramPenalty = 10
 
 // parseUnigram builds a Unigram tokenizer from tokenizer.json's parts.
-// Only the normalizer this family uses is understood: prefix U+2581 and
-// turn every space into one. Anything else is refused rather than
-// tokenized differently from the model's training.
+// Only the normalizations checkUnigramNormalizer names are understood;
+// anything else is refused rather than tokenized differently from the
+// model's training.
 func parseUnigram(f *jsonFile, rawVocab json.RawMessage) (*Tokenizer, error) {
 	var vocab [][2]json.RawMessage
 	if err := json.Unmarshal(rawVocab, &vocab); err != nil {
@@ -32,7 +32,8 @@ func parseUnigram(f *jsonFile, rawVocab json.RawMessage) (*Tokenizer, error) {
 	if len(vocab) == 0 {
 		return nil, fmt.Errorf("tokenizer: empty vocab")
 	}
-	if err := checkUnigramNormalizer(f.Normalizer, f.PreTokenizer); err != nil {
+	noPrefix, err := checkUnigramNormalizer(f.Normalizer, f.PreTokenizer)
+	if err != nil {
 		return nil, err
 	}
 	t := &Tokenizer{
@@ -44,6 +45,7 @@ func parseUnigram(f *jsonFile, rawVocab json.RawMessage) (*Tokenizer, error) {
 		cache:    map[string][]int{},
 		scores:   make([]float32, len(vocab)),
 		unigram:  true,
+		noPrefix: noPrefix,
 		unkID:    -1,
 		fallback: f.Model.ByteFallback,
 	}
@@ -99,12 +101,24 @@ func parseUnigram(f *jsonFile, rawVocab json.RawMessage) (*Tokenizer, error) {
 	return t, nil
 }
 
-// checkUnigramNormalizer accepts the sentencepiece-style normalizer: a
-// U+2581 put in front of the text and in place of every space, spelled
-// as two Replace steps.
-func checkUnigramNormalizer(norm, pre json.RawMessage) error {
+// checkUnigramNormalizer accepts the two sentencepiece-style spellings
+// of the same normalization, every space turned into U+2581: two Replace
+// steps that also put one in front of the text, or a Metaspace
+// pre-tokenizer that does not (prepend_scheme "never", Ruri v3). It
+// reports whether the front U+2581 is left off.
+func checkUnigramNormalizer(norm, pre json.RawMessage) (noPrefix bool, err error) {
 	if len(pre) > 0 && string(pre) != "null" {
-		return fmt.Errorf("tokenizer: unsupported unigram pre_tokenizer %s", pre)
+		var m struct {
+			Type        string `json:"type"`
+			Replacement string `json:"replacement"`
+			Prepend     string `json:"prepend_scheme"`
+			Split       bool   `json:"split"`
+		}
+		if json.Unmarshal(pre, &m) != nil || m.Type != "Metaspace" || m.Replacement != "▁" ||
+			m.Prepend != "never" || m.Split || (len(norm) > 0 && string(norm) != "null") {
+			return false, fmt.Errorf("tokenizer: unsupported unigram pre_tokenizer %s", pre)
+		}
+		return true, nil
 	}
 	var n struct {
 		Type        string `json:"type"`
@@ -118,7 +132,7 @@ func checkUnigramNormalizer(norm, pre json.RawMessage) error {
 		} `json:"normalizers"`
 	}
 	if err := json.Unmarshal(norm, &n); err != nil || n.Type != "Sequence" || len(n.Normalizers) != 2 {
-		return fmt.Errorf("tokenizer: unsupported unigram normalizer %s", norm)
+		return false, fmt.Errorf("tokenizer: unsupported unigram normalizer %s", norm)
 	}
 	pat := func(i int) string {
 		p := n.Normalizers[i].Pattern
@@ -132,9 +146,63 @@ func checkUnigramNormalizer(norm, pre json.RawMessage) error {
 	}
 	if n.Normalizers[0].Type != "Replace" || pat(0) != `(?<!\n)^` || n.Normalizers[0].Content != "▁" ||
 		n.Normalizers[1].Type != "Replace" || pat(1) != " " || n.Normalizers[1].Content != "▁" {
-		return fmt.Errorf("tokenizer: unsupported unigram normalizer %s", norm)
+		return false, fmt.Errorf("tokenizer: unsupported unigram normalizer %s", norm)
 	}
-	return nil
+	return false, nil
+}
+
+// NewUnigram builds a Unigram tokenizer from the parallel vocabulary
+// arrays a GGUF file carries: pieces, their log probabilities, and their
+// token types. Control and user-defined pieces are matched verbatim
+// ahead of the search, as tokenizer.json's added tokens are, and byte
+// pieces make the fallback. prefix puts U+2581 in front of each segment
+// the way the Replace-normalizer models do; Ruri v3's Metaspace does not.
+func NewUnigram(tokens []string, scores []float32, types []int32, prefix bool) (*Tokenizer, error) {
+	if len(tokens) != len(scores) || len(tokens) != len(types) {
+		return nil, fmt.Errorf("tokenizer: unigram arrays disagree: %d tokens, %d scores, %d types",
+			len(tokens), len(scores), len(types))
+	}
+	t := &Tokenizer{
+		vocab:    make(map[string]int, len(tokens)),
+		inverse:  make([]string, len(tokens)),
+		byID:     map[int]string{},
+		ranks:    map[[2]string]int{},
+		byteDec:  map[rune]byte{},
+		cache:    map[string][]int{},
+		scores:   scores,
+		unigram:  true,
+		noPrefix: !prefix,
+		unkID:    -1,
+	}
+	for i := range t.byteID {
+		t.byteID[i] = -1
+	}
+	minScore := math.Inf(1)
+	for id, piece := range tokens {
+		t.inverse[id] = piece
+		switch types[id] {
+		case spmControl, spmUserDef:
+			t.specials = append(t.specials, special{content: piece, id: id})
+			t.byID[id] = piece
+			continue
+		case spmUnknown:
+			t.unkID = id
+		case spmByte:
+			var b byte
+			if _, err := fmt.Sscanf(piece, "<0x%02X>", &b); err == nil {
+				t.byteID[b] = id
+				t.fallback = true
+			}
+		}
+		if _, dup := t.vocab[piece]; !dup {
+			t.vocab[piece] = id
+		}
+		minScore = min(minScore, float64(scores[id]))
+		t.maxPiece = max(t.maxPiece, len(piece))
+	}
+	t.unkScore = minScore - unigramPenalty
+	sortSpecials(t)
+	return t, nil
 }
 
 // unigramEncode normalizes one text segment (the stretch between two
@@ -144,7 +212,7 @@ func (t *Tokenizer) unigramEncode(s string, segStart bool) []int {
 		return nil
 	}
 	s = strings.ReplaceAll(s, " ", "▁")
-	if segStart {
+	if segStart && !t.noPrefix {
 		s = "▁" + s
 	}
 	n := len(s)
@@ -231,7 +299,7 @@ func (t *Tokenizer) unigramDecode(ids []int, segStart bool) string {
 			continue
 		}
 		text := strings.ReplaceAll(piece, "▁", " ")
-		if segStart {
+		if segStart && !t.noPrefix {
 			text = strings.TrimPrefix(text, " ")
 		}
 		sb.WriteString(text)

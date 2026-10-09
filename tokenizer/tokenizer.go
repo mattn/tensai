@@ -44,6 +44,7 @@ type Tokenizer struct {
 	// unigram.go); fallback spells uncovered characters as byte tokens.
 	unigram  bool
 	fallback bool
+	noPrefix bool    // no U+2581 in front of a segment (Metaspace "never")
 	maxPiece int     // longest piece in bytes, the search's reach
 	unkScore float64 // what an uncovered character costs
 	byteEnc  [256]rune

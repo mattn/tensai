@@ -874,6 +874,8 @@ func loadGGUF(path string, bits int, direct, cache bool, vlog io.Writer) (*qwen,
 	arch, _ := g.String("general.architecture")
 	switch arch {
 	case "llama", "qwen2", "qwen3", "qwen35", "smollm3", "gemma3", "gemma4", "phi3", "qwen2moe", "qwen3moe", "gpt-oss", "k2-horizon":
+	case "modern-bert":
+		return nil, nil, fmt.Errorf("%s is an embedding model, which turns text into vectors rather than generating it: use \"tensai embed\", or serve it for /v1/embeddings", path)
 	default:
 		return nil, nil, fmt.Errorf("unsupported architecture %q (this example speaks qwen2(+moe), qwen3(+moe), qwen35, llama, smollm3, gemma3, gemma4, phi3, gpt-oss, and k2-horizon)", arch)
 	}

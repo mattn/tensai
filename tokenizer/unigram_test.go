@@ -126,3 +126,59 @@ func TestUnigramEncodeAfter(t *testing.T) {
 		}
 	}
 }
+
+// metaspaceFixture is unigramFixture with Ruri v3's spelling: no
+// normalizer, and a Metaspace pre-tokenizer that turns spaces into
+// U+2581 without putting one in front.
+func metaspaceFixture() []byte {
+	raw := string(unigramFixture())
+	i := strings.Index(raw, `"normalizer"`)
+	j := strings.Index(raw, `"model"`)
+	return []byte(raw[:i] + `"normalizer": null,
+		"pre_tokenizer": {"type": "Metaspace", "replacement": "▁", "prepend_scheme": "never", "split": false},
+		` + raw[j:])
+}
+
+// Without the front U+2581 the same vocabulary splits differently, and
+// the GGUF arrays build the same tokenizer as the tokenizer.json does.
+func TestUnigramNoPrefix(t *testing.T) {
+	fromJSON, err := Parse(metaspaceFixture())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pieces := []string{"<unk>", "<|start|>", "<|message|>", "▁", "a", "b", "▁a", "▁ab", "ab", "▁b", "c"}
+	scores := []float32{0, 0, 0, -2, -3, -3, -2.5, -6, -2, -4, -3}
+	types := []int32{spmControl, spmControl, spmControl, 1, 1, 1, 1, 1, 1, 1, 1}
+	for b := range 256 {
+		pieces = append(pieces, fmt.Sprintf("<0x%02X>", b))
+		scores = append(scores, 0)
+		types = append(types, spmByte)
+	}
+	fromGGUF, err := NewUnigram(pieces, scores, types, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		a, b, spB, ab, c = 4, 5, 9, 8, 10
+		byteBase         = 11
+	)
+	for _, tc := range []struct {
+		in   string
+		want []int
+	}{
+		{"ab", []int{ab}},
+		{"a b", []int{a, spB}},
+		{"cé", []int{c, byteBase + 0xC3, byteBase + 0xA9}},
+		{"<|start|>a<|message|>b", []int{1, a, 2, b}},
+	} {
+		for name, tok := range map[string]*Tokenizer{"json": fromJSON, "gguf": fromGGUF} {
+			got := tok.Encode(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("%s: Encode(%q) = %v, want %v", name, tc.in, got, tc.want)
+			}
+			if back := tok.Decode(got); back != tc.in {
+				t.Errorf("%s: Decode(Encode(%q)) = %q", name, tc.in, back)
+			}
+		}
+	}
+}

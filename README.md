@@ -19,6 +19,7 @@
 - **int8 / int4 quantization** - `quant.Quantize` / `quant.Quantize4` build weight-only quantized twins: int4 group-wise with float32 accumulation, and int8 as a full integer path — weights in interleaved row quads, activations dynamically quantized to 7 bits, and the whole dot product running on the 256-bit u8 x s8 pairwise multiply-add plus a widening pair-add — two instructions per column, four rows deep — which reaches memory bandwidth (~31GB/s of weights on 16 cores). int4 halves the weights again — the difference between a 7B model fitting in RAM or not
 - **Image generation** - `tensai image "a calico cat asleep on a stack of books"` runs [Qwen-Image-2.1](https://huggingface.co/Qwen/Qwen-Image-2.1) end to end in pure Go: the prompt through the language half of a Qwen3-VL 8B encoder, twenty flow-matching steps through a 32-block denoising transformer, and a 2D autoencoder that turns each latent position into a sixteen-pixel square with an alpha channel. The weights quantize as they load (7GB at eight bits, 3.5GB at four) and the result is cached beside the checkpoint, so a 256x256 picture takes under four minutes on a laptop. Every piece agrees with diffusers and transformers to between 6.5e-8 and 2.4e-4. [Image Generation](docs/images.md) has the rest
 - **Audio understanding** - `tensai audio clip.wav "What is this sound?"` runs [Qwen2-Audio-7B-Instruct](https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct): WAV samples become Whisper's log-mel spectrogram, Whisper-large-v3's encoder turns each 40ms into a vector in the language model's embedding space, and those vectors stand in for the prompt's audio placeholder while the Qwen2 language model answers. The front end matches transformers to 1e-4 and the encoder to a relative 8e-6. [Audio Understanding](docs/audio.md) has the rest
+- **Text embeddings** - `tensai embed` turns texts into vectors with a ModernBERT encoder, [Ruri v3 310m](https://huggingface.co/cl-nagoya/ruri-v3-310m) by default, and `tensai serve` answers OpenAI's `/v1/embeddings` with one, alone or beside a chat model, for search and RAG. Its tokens match transformers exactly and its vectors sit at a cosine of 0.9935 to 0.998 from the original float32 model, the same as llama.cpp on the same file. [Text Embeddings](docs/embeddings.md) has the rest
 - **Loss functions** - `MeanSquaredError` for regression, `SoftmaxCrossEntropy` for multi-class classification, and `BinaryCrossEntropy` for binary targets
 - **Optimizers** - momentum `SGD`, `Adam`, and `AdamW` (decoupled weight decay)
 - **k-NN baseline** - a `knn.Classifier` whose distance matrix runs on the same SIMD matmul kernel; useful as a no-training baseline next to the networks
@@ -68,7 +69,7 @@ _example/tensor     Tour of the n-d Tensor: broadcasting, batched MatMul, attent
 _example/wgpu       WebGPU MatMul: adapter info, CPU cross-check, GPU vs CPU sweep
 _example/gpt2       The published GPT-2 (124M) checkpoint generating text in pure Go
 _example/flappy     Flappy Bird played by scoring a question each step: which question a scored token can decide
-cmd/tensai          The tensai command: run, chat, and serve subcommands over internal/llm
+cmd/tensai          The tensai command: run, chat, serve, and embed subcommands over internal/llm
 ```
 
 ## Usage
@@ -454,6 +455,7 @@ tensai run -q4 -tool wikipedia "Who is Linus Torvalds?"   # the model looks it u
 tensai image -size 256 "a calico cat asleep on a stack of books"   # downloads Qwen/Qwen-Image-2.1 (~31GB) on first use
 tensai image -model Comfy-Org/Qwen-Image-2.1 "a calico cat"         # or ComfyUI's int8 repackaging (~17GB)
 tensai audio clip.wav "What is this sound?"                         # downloads Qwen/Qwen2-Audio-7B-Instruct (~16GB) on first use
+tensai embed -sim "検索クエリ: 瑠璃色はどんな色？" "検索文書: 瑠璃色は濃い青"   # Ruri v3 embeddings (~204MB on first use)
 GOEXPERIMENT=simd go run -tags wgpu24 ./cmd/tensai bench -q8   # CPU vs GPU
 go run -tags wgpu ./_example/wgpu          # needs wgpu-native, see above
 go run -tags wgpu ./_example/wgpu -sweep  # GPU vs CPU across sizes

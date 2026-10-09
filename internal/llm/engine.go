@@ -1184,11 +1184,12 @@ func (e *Engine) Chat(in io.Reader, w io.Writer, n int) {
 }
 
 // Serve blocks on an OpenAI-compatible /v1/chat/completions server,
-// with a demo page on GET /. A non-empty apiKey guards the /v1 routes
-// behind an Authorization: Bearer header.
-func (e *Engine) Serve(addr, apiKey string) error {
+// with a demo page on GET /, and /v1/embeddings too when embed is not
+// nil. A non-empty apiKey guards the /v1 routes behind an
+// Authorization: Bearer header.
+func (e *Engine) Serve(addr, apiKey string, embed *EmbedServer) error {
 	s := &server{
-		apiKey: apiKey, engine: e,
+		apiKey: apiKey, engine: e, embed: embed,
 		model: e.model, tok: e.tok, system: e.system, nCtx: e.nCtx,
 		temp: e.opts.Temp, topP: e.opts.TopP, penalty: e.penalty(), imEnd: e.imEnd, eot: e.eot,
 		tm: e.tm, prefill: e.prefill, step: e.step, reset: e.reset,
