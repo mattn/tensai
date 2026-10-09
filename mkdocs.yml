@@ -80,6 +80,7 @@ plugins:
             LLM Inference: LLM 推論
             Image Generation: 画像生成
             Audio Understanding: 音声理解
+            Text Embeddings: テキスト埋め込み
             Examples: サンプル
 
 nav:
@@ -99,6 +100,7 @@ nav:
   - LLM Inference: llm.md
   - Image Generation: images.md
   - Audio Understanding: audio.md
+  - Text Embeddings: embeddings.md
   - Examples: examples.md
 
 extra:

@@ -128,7 +128,8 @@ usage: tensai <command> [flags]
 commands:
   run      generate a completion for a prompt
   chat     interactive multi-turn chat on stdin
-  serve    OpenAI-compatible /v1/chat/completions server
+  serve    OpenAI-compatible /v1/chat/completions and /v1/embeddings server
+  embed    turn texts into vectors with an embedding model
   bench    compare CPU and GPU prefill and decode speed
   models   list cached models; "models rm <name>" deletes one
   version  print the version
@@ -355,7 +356,7 @@ family fallback included, so a checkpoint whose own template is not on disk is
 listed the way it will be treated. Reading it costs a `.gguf` about 80ms of
 metadata parsing; directories are free.
 
-`serve` exposes `/v1/chat/completions` (messages array, SSE streaming, usage counts), so any OpenAI client pointed at it chats with a pure-Go model, and `/v1/systemone`, the typed questions of `ask -batch` over HTTP. A built-in chat demo page is served on `GET /`.
+`serve` exposes `/v1/chat/completions` (messages array, SSE streaming, usage counts), so any OpenAI client pointed at it chats with a pure-Go model, and `/v1/systemone`, the typed questions of `ask -batch` over HTTP. A built-in chat demo page is served on `GET /`. `-embed` adds `/v1/embeddings` from an embedding model beside the chat one; [Text Embeddings](embeddings.md) has the rest.
 
 ### Thinking
 

@@ -8,6 +8,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -43,8 +44,9 @@ const usage = `usage: tensai <command> [flags]
 commands:
   run      generate a completion for a prompt
   chat     interactive multi-turn chat on stdin
-  serve    OpenAI-compatible /v1/chat/completions server
+  serve    OpenAI-compatible /v1/chat/completions and /v1/embeddings server
   ask      answer a question by scoring options, no generation
+  embed    turn texts into vectors with an embedding model
   bench    compare CPU and GPU prefill and decode speed
   image    generate a picture from a prompt with Qwen-Image
   audio    answer a question about a WAV file with Qwen2-Audio
@@ -295,10 +297,29 @@ func main() {
 		}
 		addr := fs.String("addr", defAddr, "address to listen on (or $TENSAI_ADDR); loopback only unless widened")
 		apiKey := fs.String("api-key", os.Getenv("TENSAI_API_KEY"), "require this bearer token on the /v1 API (or $TENSAI_API_KEY)")
+		embedModel := fs.String("embed", "", "also answer /v1/embeddings with this embedding model, named the way -model is")
 		fs.Parse(args)
-		e := openEngine(o, finish)
+		finish()
+		var es *llm.EmbedServer
+		if *embedModel != "" {
+			es = openEmbedder(*embedModel, llm.BitsAuto, o.Verbose)
+		}
+		// An embedding model named by -model is the whole server.
+		if o.GGUF != "" && llm.IsEmbeddingModel(o.GGUF) {
+			if es != nil {
+				fmt.Fprintln(os.Stderr, "-model is already an embedding model; drop -embed")
+				os.Exit(2)
+			}
+			es = openEmbedder(o.GGUF, o.Bits, o.Verbose)
+			if err := llm.ServeEmbeddings(*addr, *apiKey, es); err != nil {
+				fmt.Fprintln(os.Stderr, err)
+				os.Exit(1)
+			}
+			return
+		}
+		e := openEngine(o, func() {})
 		defer e.Close()
-		if err := e.Serve(*addr, *apiKey); err != nil {
+		if err := e.Serve(*addr, *apiKey, es); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
@@ -382,6 +403,11 @@ func main() {
 			o.Bits = 8
 		}
 		benchCmd(o, *p, *n, *reps)
+	case "embed":
+		if err := embedCmd(args); err != nil {
+			fmt.Fprintln(os.Stderr, "tensai embed:", err)
+			os.Exit(1)
+		}
 	case "models":
 		if err := modelsCmd(args); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -1362,4 +1388,101 @@ func audioCmd(args []string) error {
 	prompt := "Audio 1: <|audio_bos|><|AUDIO|><|audio_eos|>\n" + question
 	_, err = e.GenerateWith(os.Stdout, prompt, "<|AUDIO|>", rows, *n)
 	return err
+}
+
+// embedModel is what tensai embed runs when -model names nothing else:
+// Ruri v3 310m, a Japanese ModernBERT, in the imatrix Q4_K_M conversion.
+const embedModel = "Targoyle/ruri-v3-310m-GGUF-Q4_K_M-imatrix/ruri-v3-310m-Q4_K_M-imatrix.gguf"
+
+// embedCmd prints one JSON line per text with its vector, or with -sim
+// the cosine similarity of every pair.
+func embedCmd(args []string) error {
+	fs := flag.NewFlagSet("tensai embed", flag.ExitOnError)
+	model := fs.String("model", embedModel, `which embedding model to run, named the way run's -model is: a name from "tensai models", a .gguf path, or org/repo/file.gguf`)
+	q8 := fs.Bool("q8", false, "run against int8-quantized weights: faster on short texts, slightly further from the original model")
+	q4 := fs.Bool("q4", false, "run against int4-quantized weights")
+	sim := fs.Bool("sim", false, "print the cosine similarity of every pair of texts instead of the vectors")
+	verbose := fs.Bool("v", false, "report what the model file says it is")
+	fs.Usage = func() {
+		fmt.Fprintln(fs.Output(), "usage: tensai embed [flags] [text ...]   (no texts: one per line on stdin)")
+		fs.PrintDefaults()
+	}
+	fs.Parse(args)
+	texts := fs.Args()
+	if len(texts) == 0 {
+		sc := bufio.NewScanner(os.Stdin)
+		sc.Buffer(make([]byte, 1<<20), 1<<26)
+		for sc.Scan() {
+			if line := strings.TrimRight(sc.Text(), "\r"); line != "" {
+				texts = append(texts, line)
+			}
+		}
+		if err := sc.Err(); err != nil {
+			return err
+		}
+	}
+	if len(texts) == 0 {
+		fs.Usage()
+		os.Exit(2)
+	}
+	bits := llm.BitsAuto
+	switch {
+	case *q8:
+		bits = 8
+	case *q4:
+		bits = 4
+	}
+	es := openEmbedder(*model, bits, *verbose)
+	defer es.Embedder.Close()
+	idss := make([][]int, len(texts))
+	for i, t := range texts {
+		idss[i] = es.Embedder.Tokenize(t)
+	}
+	vecs, err := es.Embedder.EmbedBatch(idss)
+	if err != nil {
+		return err
+	}
+	if !*sim {
+		for i, v := range vecs {
+			out, _ := json.Marshal(map[string]any{"index": i, "tokens": len(idss[i]), "embedding": v})
+			fmt.Println(string(out))
+		}
+	}
+	if *sim {
+		for _, a := range vecs {
+			row := make([]string, len(vecs))
+			for j, b := range vecs {
+				var dot float64
+				for k := range a {
+					dot += float64(a[k]) * float64(b[k])
+				}
+				row[j] = fmt.Sprintf("%.4f", dot)
+			}
+			fmt.Println(strings.Join(row, " "))
+		}
+	}
+	return nil
+}
+
+// openEmbedder loads the embedding model ref names, or exits.
+func openEmbedder(ref string, bits int, verbose bool) *llm.EmbedServer {
+	var o llm.Options
+	if err := resolveModel(&o, ref); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
+	if o.GGUF == "" {
+		fmt.Fprintf(os.Stderr, "%s is not a .gguf file, which is the only form an embedding model is read from\n", ref)
+		os.Exit(2)
+	}
+	vlog := io.Discard
+	if verbose {
+		vlog = os.Stderr
+	}
+	e, err := llm.LoadEmbedder(o.GGUF, bits, vlog)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	return llm.NewEmbedServer(e, o.GGUF)
 }
