@@ -18,7 +18,7 @@ The greedy continuation matches GPT-2's well-known reference output token for to
 
 ## Qwen and friends: ten model families
 
-The `tensai` command runs modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file. One runtime speaks eleven architectures:
+The `tensai` command runs modern instruction-tuned models: RMSNorm, rotary position embeddings, grouped-query attention, and a SwiGLU MLP, loaded from safetensors (config.json drives the dimensions, sharded checkpoints come through their index.json) or from a single llama.cpp GGUF that carries config, tokenizer, and weights in one file. One runtime speaks twelve architectures:
 
 | family | models | what it adds |
 |---|---|---|
@@ -41,6 +41,7 @@ architecture allows would close most of that and is not implemented yet.
 | qwen2moe / qwen3moe | Qwen1.5-MoE-A2.7B, Qwen3-30B-A3B | top-k routed experts, a shared expert on qwen2moe |
 | gpt-oss | gpt-oss-20b | MXFP4 experts, attention sinks, YaRN rope, harmony channels |
 | k2-horizon | K2-Horizon-7B | RMSNorm taken over four groups of the row, a word class that keeps combining marks and joiners together, a 512K context. GGUF only, and CPU only |
+| plamo3 | PLaMo 3 Translate | sandwich norms with per-norm offsets, 7/8 sliding layers on their own rope base, YaRN on the full ones, PLaMo's own tokenizer.jsonl. A prompt is a PFML3 translation record (English for text with kana, Japanese otherwise; `-raw` for lang, form, context, and glossary). safetensors only, CPU only |
 
 The dense 12b differs from the E-series again: no per-layer embeddings, a kv head count stated per layer (eight on the local layers, one on the global), and no value projection on the layers that narrow, which take their values from their keys. GPU decode sits that last one out.
 
