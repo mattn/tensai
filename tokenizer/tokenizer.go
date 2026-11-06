@@ -50,6 +50,13 @@ type Tokenizer struct {
 	byteEnc  [256]rune
 	byteDec  map[rune]byte
 	cache    map[string][]int
+	// plamo selects PLaMo's search (see plamo.go): integer costs per
+	// piece, and the thresholds that fence off runs of spaces and of
+	// repeated characters (0 = off).
+	plamo       bool
+	plamoCost   []int64
+	plamoSpaces int
+	plamoRepeat int
 }
 
 // splitConfig selects between the two pre-tokenization scanners.
@@ -408,7 +415,12 @@ func (t *Tokenizer) setMerges(lines []string) error {
 
 // Len reports the number of ids the tokenizer can produce, including added
 // tokens.
-func (t *Tokenizer) Len() int { return len(t.vocab) + len(t.byID) }
+func (t *Tokenizer) Len() int {
+	if t.plamo {
+		return len(t.inverse)
+	}
+	return len(t.vocab) + len(t.byID)
+}
 
 // ID looks up a token by its content — the way to find special tokens like
 // "<|im_start|>".
@@ -445,6 +457,9 @@ func (t *Tokenizer) Encode(s string) []int {
 }
 
 func (t *Tokenizer) encodeText(s string) []int {
+	if t.plamo {
+		return t.plamoEncode(s)
+	}
 	if t.unigram {
 		return t.unigramEncode(s, true)
 	}
@@ -467,6 +482,9 @@ func (t *Tokenizer) encodeText(s string) []int {
 
 // Decode turns token ids back into text.
 func (t *Tokenizer) Decode(ids []int) string {
+	if t.plamo {
+		return t.plamoDecode(ids)
+	}
 	if t.unigram {
 		return t.unigramDecode(ids, true)
 	}

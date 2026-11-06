@@ -412,7 +412,7 @@ func render(tm tmpl, msgs []chatMessage, defaultSystem string, tools []toolDef) 
 				text = system + "\n\n" + text
 			}
 			first = false
-			b.WriteString(tm.userOpen + text + tm.userClose)
+			b.WriteString(tm.userOpen + text + tm.closeUser(text))
 		}
 	}
 	if inTools {

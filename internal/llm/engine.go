@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	tensai "github.com/mattn/tensai"
 	"github.com/mattn/tensai/encoding/gguf"
@@ -250,16 +251,14 @@ func Open(o Options) (*Engine, error) {
 			o.Bits, why = pickBits("", weightBytes(weights)/2, sysmem.Available())
 			fmt.Fprintf(vlog, "width: int%d, %s\n", o.Bits, why)
 		}
-		var paths [2]string
-		for i, name := range []string{"tokenizer.json", "config.json"} {
-			if paths[i], err = fetch(base, o.Data, name); err != nil {
-				return nil, err
-			}
-		}
-		if tok, err = tokenizer.Load(paths[0]); err != nil {
+		cfgPath, err := fetch(base, o.Data, "config.json")
+		if err != nil {
 			return nil, err
 		}
-		if model, err = loadQwen(paths[1], weights, o.Bits); err != nil {
+		if tok, err = loadTokenizer(base, o.Data, cfgPath, local); err != nil {
+			return nil, err
+		}
+		if model, err = loadQwen(cfgPath, weights, o.Bits); err != nil {
 			return nil, err
 		}
 		if model.cfg.Audio {
@@ -281,6 +280,12 @@ func Open(o Options) (*Engine, error) {
 		if o.Draft != "" {
 			return nil, fmt.Errorf("%s keeps a recurrent state that cannot be rolled back, so -draft cannot verify against it", model.cfg.ModelType)
 		}
+	}
+	// The device kernels turn RoPE one way for every layer; PLaMo 3
+	// mixes plain RoPE on its sliding layers with YaRN on its full ones.
+	if o.GPU && model.cfg.ModelType == "plamo3" {
+		fmt.Fprintln(o.Log, "plamo3 mixes plain and YaRN RoPE, which the GPU path cannot do yet; decoding on the CPU")
+		o.GPU = false
 	}
 	how := "float32"
 	if o.Bits != 0 {
@@ -345,8 +350,9 @@ func Open(o Options) (*Engine, error) {
 			// The template writes this sentence for any system message,
 			// whatever it says.
 			system = llmjp3System
-		case style == "deepseek":
-			// DeepSeek recommends no system prompt for the R1 distills.
+		case style == "deepseek", style == "plamo3":
+			// DeepSeek recommends no system prompt for the R1 distills,
+			// and PLaMo's translation records have nowhere to put one.
 			system = ""
 		case style != "qwen2" && style != "qwen3":
 			system = "You are a helpful assistant."
@@ -1083,7 +1089,7 @@ func (e *Engine) render(prompt string) string {
 	if e.tm.foldSystem && e.system != "" {
 		prompt = e.system + "\n\n" + prompt
 	}
-	return text + e.tm.userOpen + prompt + e.tm.userClose + e.tm.asstOpen + e.tm.asstPrefill
+	return text + e.tm.userOpen + prompt + e.tm.closeUser(prompt) + e.tm.asstOpen + e.tm.asstPrefill
 }
 
 // GenerateWith is Generate with rows of input embeddings standing in for
@@ -1171,7 +1177,7 @@ func (e *Engine) Chat(in io.Reader, w io.Writer, n int) {
 			text = e.system + "\n\n" + text
 		}
 		first = false
-		e.feed(e.tok.EncodeAfter(e.last(), e.tm.userOpen+text+e.tm.userClose+e.tm.asstOpen+e.tm.asstPrefill))
+		e.feed(e.tok.EncodeAfter(e.last(), e.tm.userOpen+text+e.tm.closeUser(text)+e.tm.asstOpen+e.tm.asstPrefill))
 		e.generate(w, n)
 		if !e.tm.bareTurns {
 			e.feed(e.tok.EncodeAfter(e.last(), "\n"))
@@ -1758,6 +1764,35 @@ func Origin(dir string) string {
 // so a miss costs nothing but the answer -- and for a model the caller
 // named on disk the files are read where they are, never downloaded,
 // since the repo in hand is not the one they came from.
+// loadTokenizer reads the checkpoint's tokenizer: tokenizer.json, or
+// for PLaMo the tokenizer.jsonl its own tokenizer class reads, with the
+// tokenizer_config.json beside it that sets its boundary thresholds.
+func loadTokenizer(base, dir, cfgPath string, local bool) (*tokenizer.Tokenizer, error) {
+	var peek struct {
+		ModelType string `json:"model_type"`
+	}
+	if raw, err := os.ReadFile(cfgPath); err == nil {
+		json.Unmarshal(raw, &peek)
+	}
+	if peek.ModelType != "plamo3" {
+		path, err := fetch(base, dir, "tokenizer.json")
+		if err != nil {
+			return nil, err
+		}
+		return tokenizer.Load(path)
+	}
+	path, err := fetch(base, dir, "tokenizer.jsonl")
+	if err != nil {
+		return nil, err
+	}
+	if !local {
+		// Optional: without it the thresholds are off, which only
+		// changes how long runs of one character split.
+		fetch(base, dir, "tokenizer_config.json")
+	}
+	return tokenizer.LoadPlamo(path)
+}
+
 func chatTemplate(base, dir string, local bool) string {
 	get := func(name string) (string, bool) {
 		if local {
@@ -1830,7 +1865,11 @@ type tmpl struct {
 	// bareTurns says nothing separates a finished answer from the next
 	// turn; the rest put a newline after the end marker, as ChatML does.
 	bareTurns bool
-	stops     []string
+	// pickLang closes a user turn with a target language chosen from its
+	// text (plamo3): English for text with kana in it, Japanese for
+	// anything else, which is the pair the model is for.
+	pickLang bool
+	stops    []string
 	// toolCalls names the function-calling convention the family was
 	// trained on, empty when it has none. "hermes" is the one the ChatML
 	// families speak: tool signatures inside a <tools> block appended to
@@ -1923,6 +1962,21 @@ func (tm tmpl) split(s string) (reason, rest string) {
 		rest = strings.TrimSpace(strings.TrimPrefix(rest, tm.answerOpen))
 	}
 	return reason, rest
+}
+
+// closeUser is what follows a user message's text.
+func (tm tmpl) closeUser(text string) string {
+	if !tm.pickLang {
+		return tm.userClose
+	}
+	lang := "ja"
+	for _, r := range text {
+		if unicode.In(r, unicode.Hiragana, unicode.Katakana) {
+			lang = "en"
+			break
+		}
+	}
+	return "<|plamo:tag|>output<|plamo:key|>lang<|plamo:val|>" + lang + "<|plamo:msg|>"
 }
 
 func templateFor(modelType string, think bool) tmpl {
@@ -2036,6 +2090,27 @@ func templateFor(modelType string, think bool) tmpl {
 			t.sysOpen += "<|think|>\n"
 		}
 		return t
+	}
+	if modelType == "plamo3" {
+		// PLaMo 3 Translate takes no conversation: a prompt is a PFML3
+		// translation record, each user message an input element and
+		// each answer the output after it. The record's header rides on
+		// the BOS, and the <|plamo:tag|> that ends an output both stops
+		// the decode and opens the next input, so a chat -- or a
+		// /v1/chat/completions history -- is the translation history
+		// the model was trained on. With no target language given the
+		// model picks one; -raw takes a hand-built record with lang,
+		// form, context, and glossary elements instead.
+		return tmpl{
+			bos:        "<|plamo:bos|><|plamo:tag|>dataset<|plamo:msg|>translation<|plamo:tag|>",
+			userOpen:   "input<|plamo:msg|>",
+			userClose:  "<|plamo:tag|>output<|plamo:msg|>",
+			asstClose:  "<|plamo:tag|>",
+			foldSystem: true,
+			bareTurns:  true,
+			pickLang:   true,
+			stops:      []string{"<|plamo:tag|>", "<|plamo:bos|>"},
+		}
 	}
 	if modelType == "gemma3" {
 		return tmpl{

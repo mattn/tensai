@@ -97,6 +97,16 @@ type config struct {
 	YarnOrigCtx  int     `json:"-"`
 	YarnBetaFast float64 `json:"-"`
 	YarnBetaSlow float64 `json:"-"`
+	// YarnExact keeps the YaRN ramp's ends where they fall instead of
+	// rounding them outward to whole dimensions, as Hugging Face's
+	// truncate=false does (plamo3).
+	YarnExact bool `json:"-"`
+	// plamo3 interleaves sliding-window and full attention: every
+	// SWAEvery-th layer is full, the rest see WindowSize positions and
+	// turn RoPE at RopeLocalTheta without YaRN.
+	WindowSize     int     `json:"window_size"`
+	SWAEvery       int     `json:"sliding_window_pattern"`
+	RopeLocalTheta float64 `json:"rope_local_theta"`
 	// gemma4 varies its geometry layer by layer and the GGUF states it as
 	// arrays: FFPerLayer the feed-forward width, SWAPattern which layers
 	// slide a window (those use the narrower head and the local rope
@@ -203,6 +213,7 @@ type qblock struct {
 	unitQK       bool           // gemma4: attention logits are not divided by sqrt(head)
 	ropeFF       []float32      // gemma4 global layers: per-pair rope frequency divisor
 	window       int            // gemma3: sliding-attention span; 0 = full
+	noYarn       bool           // plamo3 sliding layers: plain RoPE despite the config's YaRN
 	ropeTheta    float64        // per-layer rope base; 0 = the config default
 	ropeFreq     []float64      // precomputed theta^(-2*i/head_dim)
 	geglu        bool           // gemma3: gelu-tanh gate instead of silu
@@ -357,6 +368,10 @@ func loadConfig(path string) (config, error) {
 	c.PartialRotary = outer.RopeArgs.Partial
 	switch c.ModelType {
 	case "qwen2", "qwen3", "llama", "smollm3":
+	case "plamo3":
+		if err := applyPlamo3(&c, raw); err != nil {
+			return c, err
+		}
 	case "qwen3_5":
 		if len(c.LayerTypes) != c.Layers {
 			return c, fmt.Errorf("qwen3_5 config lists %d layer types for %d layers", len(c.LayerTypes), c.Layers)
@@ -373,7 +388,7 @@ func loadConfig(path string) (config, error) {
 		// without this the harmony channels leak into the answer.
 		c.ChatStyle = "gpt-oss"
 	default:
-		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2, qwen3, qwen3_5, llama, smollm3, and gpt_oss)", c.ModelType)
+		return c, fmt.Errorf("unsupported model_type %q (this example speaks qwen2, qwen3, qwen3_5, llama, smollm3, plamo3, and gpt_oss)", c.ModelType)
 	}
 	return c, nil
 }
@@ -441,7 +456,7 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 	// one is folded in here and the kernel stays a plain multiply.
 	normVec := func(name string) []float32 {
 		v := vec(name)
-		if cfg.ModelType == "qwen3_5" {
+		if cfg.ModelType == "qwen3_5" || cfg.ModelType == "plamo3" {
 			w := make([]float32, len(v))
 			for i, x := range v {
 				w[i] = 1 + x
@@ -455,7 +470,7 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 		if err != nil {
 			return nil
 		}
-		if cfg.ModelType != "qwen3_5" {
+		if cfg.ModelType != "qwen3_5" && cfg.ModelType != "plamo3" {
 			return t.Data
 		}
 		w := make([]float32, len(t.Data))
@@ -647,6 +662,10 @@ func loadQwen(cfgPath, weightsPath string, bits int) (*qwen, error) {
 			got := loadGate.acquire(stage)
 			defer loadGate.release(got)
 			b := &m.blocks[i]
+			if cfg.ModelType == "plamo3" {
+				loadPlamo3Block(b, cfg, i, vec, linq)
+				return
+			}
 			b.noPE = i < len(cfg.NoRopeLayers) && cfg.NoRopeLayers[i] == 0
 			p := fmt.Sprintf("model.%slayers.%d.", cfg.Prefix, i)
 			b.ln1 = normVec(p + "input_layernorm.weight")
@@ -1277,7 +1296,7 @@ func (m *qwen) rope(h []float32, pos int, b *qblock) {
 	}
 	freqs := b.ropeFreq
 	half := len(h) / 2
-	yarn := m.cfg.YarnFactor > 1
+	yarn := m.cfg.YarnFactor > 1 && !b.noYarn
 	var low, high, mscale float64
 	if yarn {
 		// ggml's YaRN: dimensions below `low` keep their train-time
@@ -1287,8 +1306,11 @@ func (m *qwen) rope(h []float32, pos int, b *qblock) {
 		corr := func(rot float64) float64 {
 			return float64(len(h)) * math.Log(float64(m.cfg.YarnOrigCtx)/(rot*2*math.Pi)) / (2 * math.Log(theta))
 		}
-		low = math.Max(0, math.Floor(corr(m.cfg.YarnBetaFast)))
-		high = math.Min(float64(len(h)-1), math.Ceil(corr(m.cfg.YarnBetaSlow)))
+		low, high = corr(m.cfg.YarnBetaFast), corr(m.cfg.YarnBetaSlow)
+		if !m.cfg.YarnExact {
+			low = math.Max(0, math.Floor(low))
+			high = math.Min(float64(len(h)-1), math.Ceil(high))
+		}
 		mscale = 1 + 0.1*math.Log(m.cfg.YarnFactor)
 	}
 	for i := 0; i < half; i++ {
